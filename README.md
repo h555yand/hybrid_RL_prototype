@@ -1,5 +1,7 @@
 # Summary
 
+## This is a prototype to implement, test and proof ideas below.
+
 Replace the `JumpToGoalState` mixin in Monty's motor system with a model-free reinforcement learning (RL) agent that learns to navigate incrementally toward goal states provided by Learning Modules. Instead of teleporting the sensor to a target pose, the RL agent selects from existing Monty actions to move step-by-step toward the goal, learning from dense reward signals based on distance reduction.
 
 My idea is to take the best practices and bring them closer to how the brain works.
