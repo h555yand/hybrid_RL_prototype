@@ -19,7 +19,7 @@ dependencies = [
 description = "Project template repository for tbp.monty" # TODO: Update this description
 dynamic = ["version"]
 license = { file = "LICENSE" }
-name = "tbp.monty_project_template" # TODO: Update this name
+name = "tbp.hybrid_rl" # TODO: Update this name
 readme = "README.md"
 
 [project.optional-dependencies]
