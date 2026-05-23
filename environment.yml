@@ -16,7 +16,7 @@
 # Finally, activate the environment with:
 #     $ conda activate project # TODO: Update to your project's name
 #
-name: project # TODO: Update to your project's name
+name: hybrid_RL_prototype # TODO: Update to your project's name
 channels:
   - aihabitat
   - pytorch
