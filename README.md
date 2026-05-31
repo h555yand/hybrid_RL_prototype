@@ -61,7 +61,7 @@ I'm not suggesting replacing neural networks, I'm suggesting supplementing it an
 ## Architecture Overview
 
 Evidence LM's Goal-State Generator proposes the goal-state from the hypothesis-testing policy.
-**goal_pose** = [x, y, z, roll, pitch, yaw]  
+**goal_pose** = [x, y, z, pitch, yaw, roll]  
    ↓  
 **RLGoalApproachController** computes **State Vector** using **goal_pose** as well as sensory patch input and proprioceptive information.   
    ↓  
@@ -101,7 +101,7 @@ All spatial quantities are in the agent's local coordinate frame.
 | Index | Feature | Description |
 |----------|----------|----------|
 | 0-2   | position_error [x, y, z]   | direction to goal in agent's local frame   |
-| 3-5   | rotation_error [roll, pitch, yaw]   | orientation error (normalized angles)   |
+| 3-5   | rotation_error [pitch, yaw, roll]   | orientation error (normalized angles)   |
 | 6-8   | local_normal   | surface normal in agent's local frame   |
 | 9   | on_object   | whether sensor on object surface   |
 | 10   | alignment   | dot(goal_direction, surface_normal)   |

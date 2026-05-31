@@ -18,15 +18,18 @@
 #
 name: hybrid_RL_prototype # TODO: Update to your project's name
 channels:
-  - aihabitat
   - pytorch
   - pyg
-  - defaults
-  - conda-forge
+  - aihabitat
   - thousandbrainsproject
+  - conda-forge
+  - defaults
 
 dependencies:
   - thousandbrainsproject::tbp.monty==0.33.0 # TODO: Pin to desired tbp.monty version for reproducibility
   - pip
   - pip:
     - -e .[dev]
+    - trimesh
+    - pytest
+    - rtree
