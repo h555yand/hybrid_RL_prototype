@@ -33,3 +33,5 @@ dependencies:
     - trimesh
     - pytest
     - rtree
+    - hnswlib>=0.7
+    - pyglet<2

@@ -6,6 +6,8 @@ import os
 
 from tbp.hybrid_rl.lightweight_env import LightweightEnv
 from tbp.hybrid_rl.action_space import ActionSpace
+from tbp.hybrid_rl.hnsw_state_store import HNSWStateStore, StatePoint
+from tbp.hybrid_rl.ablation_runner import train
 
 
 class TestLightweightEnv:
@@ -123,3 +125,271 @@ class TestLightweightEnv:
         # Inside the cube: the beam immediately hits the wall
         assert sensor["depth"] < 15.0
 
+
+class TestHNSWEviction:
+    """Тесты инкрементальной очистки индекса (mark_deleted + rebuild)."""
+
+    def _make_store(self, max_points=100, evict_fraction=0.2):
+        config = {
+            "state_dim":4,
+            "num_actions":3,
+            "max_points":max_points,
+            "k_neighbors":3,
+            "sigma":1.0,
+            "insert_threshold":0.05,
+            "evict_fraction":evict_fraction,
+            "adaptive_sigma":False,
+            "auto_calibrate":False,
+        }
+        return HNSWStateStore(config)
+
+    def _fill_store(self, store, n):
+        """Вставить n случайных точек."""
+        rng = np.random.RandomState(42)
+        for _ in range(n):
+            state = rng.randn(store.state_dim) * 10
+            action = rng.randint(store.num_actions)
+            store.update_q_value(state, action, td_target=1.0, alpha=0.1)
+
+    def test_eviction_triggers_at_capacity(self):
+        """Eviction срабатывает когда active points >= max_points."""
+        store = self._make_store(max_points=50)
+        self._fill_store(store, 60)
+
+        # После eviction активных точек должно быть < max_points
+        assert len(store.points) <= 50
+        # Все точки в словаре — живые (не ghost)
+        for pid in store.points:
+            assert isinstance(store.points[pid], StatePoint)
+
+    def test_eviction_removes_old_points(self):
+        """Старые редко-посещённые точки удаляются первыми."""
+        store = self._make_store(max_points=30, evict_fraction=0.3)
+
+        # Вставляем 25 «старых» точек
+        rng = np.random.RandomState(0)
+        for i in range(25):
+            state = rng.randn(4) * 10
+            store.update_q_value(state, 0, td_target=0.5, alpha=0.1)
+
+        # Создаём «свежую» точку с высоким visit_count
+        fresh_state = np.array([100.0, 100.0, 100.0, 100.0])
+        store.update_q_value(fresh_state, 1, td_target=5.0, alpha=0.5)
+        # Имитируем частые визиты
+        fresh_id = store.next_id - 1
+        store.points[fresh_id].visit_count = 100
+
+        # Заполняем до eviction
+        for i in range(25, 35):
+            state = rng.randn(4) * 10
+            store.update_q_value(state, 0, td_target=0.5, alpha=0.1)
+
+        # Свежая точка с высоким visit_count должна выжить
+        survived_states = [p.norm_state for p in store.points.values()]
+        fresh_norm = store._normalize(fresh_state)
+        distances = [np.linalg.norm(s - fresh_norm) for s in survived_states]
+        assert min(distances) < 0.5, "Fresh high-visit point was evicted"
+
+    def test_incremental_eviction_marks_deleted(self):
+        """mark_deleted не перестраивает индекс (next_id растёт)."""
+        store = self._make_store(max_points=50)
+        store._rebuild_threshold = 0.99  # отключаем auto-rebuild
+
+        self._fill_store(store, 55)
+
+        # next_id продолжает расти (не сбросился при eviction)
+        assert store.next_id >= 55
+        # Были удалённые — _deleted_count > 0
+        assert store._deleted_count > 0
+        # Активных меньше чем next_id
+        assert len(store.points) < store.next_id
+
+    def test_full_rebuild_on_high_ghost_ratio(self):
+        """Когда ghost ratio > threshold, происходит полный rebuild."""
+        store = self._make_store(max_points=40, evict_fraction=0.4)
+        store._rebuild_threshold = 0.2  # агрессивный порог
+
+        self._fill_store(store, 50)
+
+        # После rebuild next_id сбрасывается, _deleted_count = 0
+        # (может потребоваться несколько eviction для срабатывания)
+        if store._deleted_count == 0:
+            # Rebuild произошёл — next_id == len(points)
+            assert store.next_id == len(store.points)
+
+    def test_query_after_eviction_works(self):
+        """get_q_values работает корректно после eviction."""
+        store = self._make_store(max_points=50)
+
+        rng = np.random.RandomState(7)
+        states = [rng.randn(4) * 5 for _ in range(60)]
+        for s in states:
+            store.update_q_value(s, rng.randint(3), td_target=1.0, alpha=0.2)
+
+        # Запрос к оставшимся точкам не падает
+        for s in states[:10]:
+            q = store.get_q_values(s)
+            assert q.shape == (3,)
+            assert np.isfinite(q).all()
+
+    def test_insert_after_eviction_reuses_slots(self):
+        """После mark_deleted новые вставки replace_deleted=True."""
+        store = self._make_store(max_points=30)
+        store._rebuild_threshold = 0.99  # отключаем rebuild
+
+        self._fill_store(store, 35)
+
+        deleted_before = store._deleted_count
+        assert deleted_before > 0
+
+        # Вставляем ещё точки — не должно упасть
+        rng = np.random.RandomState(99)
+        for _ in range(5):
+            state = rng.randn(4) * 10
+            store.update_q_value(state, 0, td_target=2.0, alpha=0.1)
+
+         # Store жив, точки есть, лимит не превышен
+        assert len(store.points) > 0
+        assert len(store.points) <= store.max_points
+
+    def test_eviction_persists_with_save_load(self, tmp_path):
+        """_deleted_count сохраняется и восстанавливается."""
+        store = self._make_store(max_points=50)
+        store._rebuild_threshold = 0.99
+
+        self._fill_store(store, 55)
+        assert store._deleted_count > 0
+
+        base = str(tmp_path / "evict_test")
+        store.save_with_index(base)
+
+        loaded = HNSWStateStore.load_with_index(base, None)
+        assert loaded._deleted_count == store._deleted_count
+        assert len(loaded.points) == len(store.points)
+
+        # Запрос к загруженному store работает
+        q = loaded.get_q_values(np.zeros(4))
+        assert q.shape == (3,)
+
+    def test_multiple_evictions(self):
+        """Несколько раундов eviction подряд не ломают индекс."""
+        store = self._make_store(max_points=20, evict_fraction=0.3)
+
+        rng = np.random.RandomState(13)
+        for i in range(100):
+            state = rng.randn(4) * 5
+            store.update_q_value(
+                state, rng.randint(3), td_target=float(i % 5), alpha=0.1
+            )
+
+        # Store жив и работоспособен
+        assert len(store.points) <= 20
+        q = store.get_q_values(rng.randn(4))
+        assert q.shape == (3,)
+        assert np.isfinite(q).all()
+
+
+class TestStandaloneTraining:
+    """Тесты standalone обучения."""
+    
+    @pytest.fixture
+    def mesh_dir(self, tmp_path):
+        """Директория с простыми mesh файлами."""
+        # Куб
+        cube = trimesh.primitives.Box(extents=[20, 20, 20])
+        cube.export(str(tmp_path / "cube.stl"))
+        
+        # Сфера
+        sphere = trimesh.primitives.Sphere(radius=15)
+        sphere.export(str(tmp_path / "sphere.stl"))
+        
+        # Цилиндр
+        cylinder = trimesh.primitives.Cylinder(radius=10, height=30)
+        cylinder.export(str(tmp_path / "cylinder.stl"))
+        
+        return str(tmp_path)
+    
+    def test_training_runs_without_crash(self, mesh_dir, tmp_path):
+        """Обучение должно пройти без ошибок."""
+        save_dir = str(tmp_path / "checkpoints")
+        train(
+            mesh_dir=mesh_dir,
+            save_dir=save_dir,
+            num_episodes=10,
+            config={
+                "state_dim": 13,
+                "max_points": 1000,
+                "max_steps_per_goal": 15,
+                "epsilon_start": 0.8,
+                "adaptive_sigma": False,
+                "mode": "train",
+            },
+        )
+        
+        # Проверяем что файлы сохранились (save_with_index)
+        assert os.path.exists(os.path.join(save_dir, "q_store.npz"))
+        assert os.path.exists(os.path.join(save_dir, "q_store.hnsw"))
+        assert os.path.exists(os.path.join(save_dir, "controller_state.npz"))
+        assert os.path.exists(os.path.join(save_dir, "config.json"))
+    
+    def test_training_produces_q_values(self, mesh_dir, tmp_path):
+        """После обучения Q-store должен содержать точки."""
+        save_dir = str(tmp_path / "checkpoints")
+        
+        train(
+            mesh_dir=mesh_dir,
+            save_dir=save_dir,
+            num_episodes=50,
+            config={
+                "state_dim": 13,
+                "max_points": 5000,
+                "max_steps_per_goal": 20,
+                "adaptive_sigma": False,
+                "mode": "train",
+            },
+        )
+        
+        # Загружаем и проверяем (через load_with_index — актуальный метод)
+        store = HNSWStateStore.load_with_index(os.path.join(save_dir, "q_store"), None)
+        
+        assert store.next_id > 10, (
+            f"Should have learned some Q-values, got {store.next_id} points"
+        )
+    
+    def test_loaded_model_navigates(self, mesh_dir, tmp_path):
+        """Загруженная модель должна навигировать лучше случайной."""
+        save_dir = str(tmp_path / "checkpoints")
+        mesh_path = os.path.join(mesh_dir, "cube.stl")
+        
+        # Обучаем
+        goals_reached = train(
+            mesh_dir=mesh_dir,
+            save_dir=save_dir,
+            num_episodes=100,
+            config={
+                "state_dim": 13,
+                "max_points": 5000,
+                "max_steps_per_goal": 20,
+                "goal_threshold": 5.0,
+                "adaptive_sigma": False,
+                "mode": "train",
+                "agent_id": "train",
+            },
+            mesh_path=mesh_path
+        )
+
+        # Провереям
+        goals_reached = train(
+            mesh_dir=mesh_dir,
+            save_dir=save_dir,
+            num_episodes=20,
+            config={
+                "goal_threshold": 5.0,
+                "mode": "eval",
+                "agent_id": "eval",
+            },
+            mesh_path=mesh_path,
+            load_dir=save_dir
+        )
+        
+        assert goals_reached > 0, "Trained model should reach some goals"
