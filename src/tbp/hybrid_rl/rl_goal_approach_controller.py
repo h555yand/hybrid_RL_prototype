@@ -194,7 +194,7 @@ class RLGoalApproachController:
         self,
         current_pose: np.ndarray,
         sensor_data: Dict[str, Any],
-    ) -> Optional[Action]:
+    ) -> Tuple[Optional[str], Optional[Dict]]:
         """Execute one step of the RL controller.
 
         This is the main method called by motor policy each timestep.
@@ -220,7 +220,7 @@ class RLGoalApproachController:
         """
         if self._current_goal is None:
             logger.warning("step() called without goal. Call set_new_goal() first.")
-            return None
+            return None, None
 
         self._steps += 1
         self._total_steps += 1
@@ -268,10 +268,10 @@ class RLGoalApproachController:
                     self._apply_success_backup_updates()
                     self.success_trails = self._episode_transitions.copy()
                 self._on_episode_done(state, termination_reason)
-                return None
+                return None, None
 
         # Choose action
-        action_index = self._choose_action(state)
+        action_index, explanation = self._choose_action(state, True)
 
         # Save for next step
         self._prev_state = state
@@ -299,8 +299,7 @@ class RLGoalApproachController:
             f"Action: {action_info}, "
             f"dist={dist_to_goal:.1f}mm, eps={self.epsilon:.3f}"
         )
-
-        return action
+        return action, explanation
 
     @property
     def is_active(self) -> bool:
@@ -603,7 +602,145 @@ class RLGoalApproachController:
         else:
             return self.eval_epsilon  # фиксированный, маленький
     
-    def _choose_action(self, state):
+    def _generate_choice_interpretation(
+        self,
+        action_index: int,
+        is_random: bool,
+        q_recommends: int,
+        h_recommends: int,
+        dominant_heuristic: str,
+        eps: float,
+        confidence: float,
+    ) -> str:
+        """Generate natural language interpretation of action choice."""
+        action_name = self.action_space.get_info(action_index).name
+        q_action_name = self.action_space.get_info(q_recommends).name
+        h_action_name = self.action_space.get_info(h_recommends).name
+
+        if is_random:
+            return (
+                f"Выбрано случайное действие ({action_name}) "
+                f"с вероятностью epsilon * 0.1 (исследование)."
+            )
+
+        if action_index == q_recommends and action_index == h_recommends:
+            return (
+                f"Действие {action_name} поддерживается и Q-значениями, "
+                f"и эвристикой — высокая согласованность."
+            )
+
+        if action_index == q_recommends:
+            return (
+                f"Действие {action_name} выбрано в основном по Q-значениям. "
+                f"Эвристика предпочтёт {h_action_name}, но Q сильнее."
+            )
+
+        if action_index == h_recommends:
+            return (
+                f"Действие {action_name} выбрано в основном по эвристике "
+                f"({dominant_heuristic}). Q предложил {q_action_name}, "
+                f"но при высоком epsilon эвристика доминирует."
+            )
+
+        return (
+            f"Действие {action_name} выбрано вероятностно (softmax, уверенность {confidence:.0%}). "
+            f"Q рекомендует {q_action_name}, эвристика — {h_action_name}. "
+            f"Доминирует эвристика: {dominant_heuristic}."
+        )
+
+    def _choose_action(self, state: np.ndarray, explain: bool = False):
+        q_values = self.q_store.get_q_values(state)
+        heuristic, heuristic_components = self._compute_heuristic_bias(state)
+        
+        q_norm = self._normalize_values(q_values)
+        h_norm = self._normalize_values(heuristic)
+        
+        eps = self._get_current_epsilon()
+        combined = (1 - eps) * q_norm + eps * h_norm
+        temperature = max(0.1, eps)
+        
+        # === ОСНОВНАЯ ЛОГИКА ВЫБОРА ===
+        is_random_override = False
+        action_index = None
+
+        if np.random.random() < eps * 0.1:
+            is_random_override = True
+            action_index = np.random.randint(self.num_actions)
+        else:
+            v = combined / temperature
+            v = v - np.max(v)
+            exp_v = np.exp(v)
+            probs = exp_v / exp_v.sum()
+            action_index = int(np.random.choice(len(probs), p=probs))
+        
+        # === Если нужна диагностика — собираем объяснение ===
+        if not explain:
+            return action_index
+        
+        # Вычисляем, что рекомендуют Q и эвристика
+        best_q_action = int(np.argmax(q_norm))
+        best_h_action = int(np.argmax(h_norm))
+        
+        # Считаем вклад эвристик (примерно)
+        contributions = {
+            name: float(np.max(bias)) for name, bias in heuristic_components.items()
+        }
+        dominant_heuristic = max(contributions, key=contributions.get) if contributions else "none"
+        
+        # Если не было random, считаем вероятности
+        if not is_random_override:
+            v = combined / temperature
+            v = v - np.max(v)
+            exp_v = np.exp(v)
+            probs = exp_v / exp_v.sum()
+        else:
+            probs = np.zeros(self.num_actions)
+            probs[action_index] = 1.0  # искусственно
+
+        confidence = float(probs[action_index])
+
+        explanation = {
+            "chosen_action": {
+                "index": action_index,
+                "name": self.action_space.get_info(action_index).name,
+                "probability": confidence,
+            },
+            "sampling_method": "random_exploration" if is_random_override else "softmax_sampling",
+            "temperature": temperature,
+            "epsilon": eps,
+            "blend": f"{(1-eps)*100:.0f}% Q + {eps*100:.0f}% heuristic",
+            "is_random_override": is_random_override,
+            "action_probabilities": {
+                self.action_space.get_info(i).name: float(probs[i])
+                for i in range(self.num_actions)
+            },
+            "advice": {
+                "q_recommends": {
+                    "index": best_q_action,
+                    "name": self.action_space.get_info(best_q_action).name,
+                },
+                "heuristic_recommends": {
+                    "index": best_h_action,
+                    "name": self.action_space.get_info(best_h_action).name,
+                },
+            },
+            "dominant_heuristic": dominant_heuristic,
+            "heuristic_contributions": contributions,
+            "confidence": confidence,
+            "is_confident": confidence > 0.7,
+            #"interpretation": self._generate_choice_interpretation(
+            #    action_index=action_index,
+            #    is_random=is_random_override,
+            #    q_recommends=best_q_action,
+            #    h_recommends=best_h_action,
+            #    dominant_heuristic=dominant_heuristic,
+            #    eps=eps,
+            #    confidence=confidence,
+            #),
+        }
+        return action_index, explanation
+
+    def _choose_action_old(self, state):
         q_values = self.q_store.get_q_values(state)
         heuristic = self._compute_heuristic_bias(state)
         
@@ -624,7 +761,111 @@ class RLGoalApproachController:
     # ══════════════════════════════════════════════════════════
     # HEURISTIC BIAS
     # ══════════════════════════════════════════════════════════
-    def _compute_heuristic_bias(self, state):
+    def _compute_heuristic_bias(self, state: np.ndarray) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+        """Compute heuristic bias and return both combined and per-component biases.
+
+        Args:
+            state: [13D] — current state vector.
+
+        Returns:
+            Tuple:
+                - bias: [num_actions] combined heuristic preference.
+                - components: dict mapping heuristic name to its raw bias vector.
+        """
+        bias = np.zeros(self.num_actions)
+        components = {}
+
+        # Распаковка state (13D)
+        local_pos_error = state[0:3]
+        # rot_error = state[3:6]  # not used
+        local_normal = state[6:9]
+        on_object = state[9]
+        alignment = state[10]
+        distance = state[11]
+        norm_depth = state[12]
+
+        # Параметры action space
+        surface_step = self.action_space.surface_step
+        free_step = self.action_space.free_step
+        normal_len = np.linalg.norm(local_normal)
+
+        # ═══════════════════════════════════════════════════
+        # Эвристика 1: ДВИГАЙСЯ К ЦЕЛИ
+        # ═══════════════════════════════════════════════════
+        move_to_goal_bias = np.zeros(self.num_actions)
+        goal_dir = local_pos_error / (distance + 1e-8)
+
+        if on_object > 0.5 and normal_len > 1e-8:
+            n_hat = local_normal / normal_len
+            tangent = goal_dir - np.dot(goal_dir, n_hat) * n_hat
+            tangent_len = np.linalg.norm(tangent)
+            if tangent_len > 1e-8:
+                tangent = tangent / tangent_len
+            else:
+                tangent = goal_dir
+        else:
+            tangent = goal_dir
+
+        tangent_angle = np.degrees(np.arctan2(tangent[1], tangent[0])) % 360
+        move_to_goal_bias += self.action_space.surface_direction_similarity(tangent_angle)
+        bias += move_to_goal_bias
+        components["move_to_goal"] = move_to_goal_bias
+
+        # ═══════════════════════════════════════════════════
+        # Эвристика 2: ДАЛЕКО → ЛЕТИ, БЛИЗКО → ПОЛЗИ
+        # ═══════════════════════════════════════════════════
+        fly_vs_crawl_bias = np.zeros(self.num_actions)
+        steps_needed = distance / surface_step
+        crossover = 2.0 + free_step / surface_step
+        fly_preference = np.tanh(steps_needed / crossover - 1.0)
+
+        if fly_preference > 0:
+            fly_vs_crawl_bias[self.action_space.IDX_FREE_FORWARD] += fly_preference
+            fly_vs_crawl_bias[self.action_space.IDX_FREE_BACKWARD] -= 0.5
+        else:
+            surface_mask = self.action_space.get_category_mask("surface")
+            free_mask = self.action_space.get_category_mask("free")
+            fly_vs_crawl_bias[surface_mask] *= (1.0 + abs(fly_preference))
+            fly_vs_crawl_bias[free_mask] -= abs(fly_preference)
+
+        bias += fly_vs_crawl_bias
+        components["fly_vs_crawl"] = fly_vs_crawl_bias
+
+        # ═══════════════════════════════════════════════════
+        # Эвристика 3: ЦЕЛЬ ЧЕРЕЗ ПОВЕРХНОСТЬ → ОТОРВИСЬ
+        # ═══════════════════════════════════════════════════
+        detach_urgency_bias = np.zeros(self.num_actions)
+        if alignment < 0 and on_object > 0.5:
+            detach_urgency = abs(alignment)
+            detach_urgency_bias[self.action_space.IDX_LOOK_UP] += detach_urgency
+
+        bias += detach_urgency_bias
+        components["detach_urgency"] = detach_urgency_bias
+
+        # ═══════════════════════════════════════════════════
+        # Эвристика 4: ОРИЕНТАЦИЯ СЕНСОРА
+        # ═══════════════════════════════════════════════════
+        orient_sensor_bias = np.zeros(self.num_actions)
+        sensor_forward = np.array([0.0, 0.0, -1.0])
+        if on_object > 0.5 and normal_len > 1e-8:
+            sensor_alignment = np.dot(sensor_forward, local_normal)
+            orient_need = max(0.0, 1.0 - sensor_alignment)
+            if alignment < 0:
+                orient_need *= 0.3
+            else:
+                orient_need *= 0.5
+
+            if local_normal[2] < 0:
+                orient_sensor_bias[self.action_space.IDX_LOOK_UP] += orient_need
+            else:
+                orient_sensor_bias[self.action_space.IDX_LOOK_DOWN] += orient_need
+
+        bias += orient_sensor_bias
+        components["orient_sensor"] = orient_sensor_bias
+
+        return bias, components
+        
+    def _compute_heuristic_bias_old(self, state):
         """Эвристические предпочтения действий.
         
         Все вычисления из геометрии и action space параметров.
@@ -977,7 +1218,7 @@ class RLGoalApproachController:
 
         state = self._compute_state(current_pose, sensor_data)
         q_values = self.q_store.get_q_values(state)
-        heuristic = self._compute_heuristic_bias(state)
+        heuristic, heuristic_components = self._compute_heuristic_bias(state)
 
         q_norm = self._normalize_values(q_values)
         h_norm = self._normalize_values(heuristic)

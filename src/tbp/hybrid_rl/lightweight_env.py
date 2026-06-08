@@ -193,7 +193,7 @@ class LightweightEnv:
         """Rough estimate of curvature."""
         return [0.0, 0.0]  # simplification for start
     
-    def _look_at_direction_simple(self, direction):
+    def _look_at_direction(self, direction):
         """
         Return euler angles [rx, ry, rz] IN DEGREES such that:
         R.from_euler("xyz", euler, degrees=True).apply([0, 0, -1]) ≈ direction
@@ -210,7 +210,7 @@ class LightweightEnv:
 
         return rot.as_euler("xyz", degrees=True)
 
-    def _look_at_direction(self, direction):
+    def _look_at_direction_complex(self, direction):
         """
         Calculates euler angles for looking in a direction.
         Builds a full rotation matrix so that -Z (forward) looks in

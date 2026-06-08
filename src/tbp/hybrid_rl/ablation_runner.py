@@ -13,6 +13,9 @@ import glob
 from tbp.hybrid_rl.rl_goal_approach_controller import RLGoalApproachController
 from tbp.hybrid_rl.lightweight_env import LightweightEnv
 from tbp.hybrid_rl.config import DEFAULT_CONFIG
+from tbp.hybrid_rl.visualize_env import visualize_agent_goal
+
+logger = logging.getLogger(__name__)
 
 
 def train(
@@ -28,6 +31,7 @@ def train(
     curriculum_config=None,
     episode_script: Optional[List[Dict[str, Any]]] = None,
     episode_pools: Optional[List[List[Dict[str, Any]]]] = None,
+    visualise=False
 ):
     """
     curriculum_config (optional):
@@ -197,14 +201,16 @@ def train(
         controller.set_new_goal(goal_pose)
         
         # Навигация
+        action_explanations = []
+        current_poses = []
         for step in range(controller.config["max_steps_per_goal"]):
             current_pose = env.get_pose()
             sensor_data = env.get_sensor_data()
             
-            action = controller.step(current_pose, sensor_data)
-            #if logging.getLevelName(logger.getEffectiveLevel()) == "DEBUG":
-            #    explain_action_info = controller.explain_action(current_pose, sensor_data)
-            #    logger.debug(f"explain_action_info: {explain_action_info}")
+            action, explanation = controller.step(current_pose, sensor_data)
+            # logger.debug(f"explain_action_info: {explanation}")
+            action_explanations.append(explanation)
+            current_poses.append(env.get_pose())
             
             if controller._current_goal is None:
                 # Эпизод завершён
@@ -219,6 +225,11 @@ def train(
         _episode_success = controller._total_goals_reached > _goals_before_episode
         if _episode_success:
             success_trails.append(controller.success_trails)
+            logger.debug(f"explain_action_info: {action_explanations}")
+            if visualise:
+                visualize_agent_goal(env, np.concatenate([start_pos, start_rot]), goal_pose)
+                for pose in current_poses:
+                    visualize_agent_goal(env, pose, goal_pose)
 
         # Curriculum promote check (after episode)
         if _use_curriculum and "train" in cfg["mode"]:
