@@ -1,41 +1,8 @@
 """
 RL Goal Approach Controller.
 
-Receives goal_pose from Evidence LM's Goal-State Generator,
-uses current proprioceptive state + sensor data to choose actions,
+Receives goal_pose, uses current proprioceptive state + sensor data to choose actions,
 and learns from dense reward (distance reduction to goal).
-
-Handles sensory "collisions" (passing through object, losing contact)
-from the start, using depth camera data rather than Habitat physics.
-
-RLGoalApproachController
-├── Public API
-│   ├── set_new_goal(goal_pose)
-│   ├── step(current_pose, sensor_data) → Action or None
-│   └── is_active → bool
-├── State Computation
-│   └── _compute_state(pose, sensors)
-├── Collision Detection
-│   └── _detect_collision(sensors) → str or None
-├── Reward
-│   └── _compute_reward(state, prev, action, collision) → (float, bool, str|None)
-├── Action Selection
-│   ├── _choose_action(state) → int
-│   └── _compute_heuristic_bias(state) → [num_actions]
-├── Coordinate Transforms
-│   ├── _world_to_local(vector, pose)
-│   └── _normalize_angles(angles)
-├── Math Utilities
-│   ├── _normalize_values(values)
-│   └── _softmax_sample(values, temperature)
-├── Episode Lifecycle
-│   └── _on_episode_done(state, termination_reason)
-├── Diagnostics
-│   ├── get_stats() → dict
-│   └── explain_action(pose, sensors) → dict
-└── Persistence
-    ├── save(dirpath)
-    └── load(dirpath, agent_id) → cls
 """
 
 import numpy as np

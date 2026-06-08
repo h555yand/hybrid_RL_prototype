@@ -4,35 +4,6 @@ HNSW-based State Store for Q-Learning.
 Replaces traditional hash-table Q-table with continuous state space
 using Hierarchical Navigable Small World graphs for fast KNN lookup
 and Gaussian kernel interpolation for Q-value estimation.
-
-HNSWStateStore
-├── Index Management
-│   └── _init_index()
-├── Normalization
-│   ├── _normalize(state)
-│   └── _update_normalization(state)
-├── Core API
-│   ├── get_q_values(state) → Q[num_actions]
-│   └── update_q_value(state, action, td_target, alpha)
-├── Point Management
-│   ├── _insert_point(norm_state, action, td_target, alpha)
-│   └── _interpolate_q_init(norm_state)
-├── Kernel
-│   ├── _gaussian_kernel(distances, sigma)
-│   └── _get_sigma(distances) — fixed or adaptive
-├── Eviction (incremental mark_deleted + periodic rebuild)
-│   ├── _evict_points()
-│   ├── _compute_eviction_scores()
-│   ├── _rebuild_index(surviving)
-│   └── _rebuild_from_active()
-├── Diagnostics
-│   ├── get_stats()
-│   └── get_nearest_points_info(state)
-└── Persistence
-    ├── save(filepath)
-    ├── save_with_index(filepath)
-    ├── load(filepath) — classmethod, rebuilds index
-    └── load_with_index(filepath) — classmethod, fast native load
 """
 
 import os
