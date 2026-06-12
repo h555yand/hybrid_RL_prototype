@@ -147,6 +147,7 @@ class LightweightEnv:
         min_dist: float = None,
         max_dist: float = None,
         max_attempts: int = 200,
+        mesh_sample=False
     ) -> np.ndarray:
         """
         A random point on the surface with an optional distance limit.
@@ -166,20 +167,37 @@ class LightweightEnv:
             and (min_dist is not None or max_dist is not None)
         )
 
-        for _ in range(max_attempts):
-            points, face_ids = self.mesh.sample(1, return_index=True)
-            normal = self.mesh.face_normals[face_ids[0]]
-            position = points[0] + normal * 2.0
+        if mesh_sample:
+            points, face_ids = self.mesh.sample(max_attempts, return_index=True)
+            for i in range(max_attempts):
+                # points, face_ids = self.mesh.sample(1, return_index=True)
+                normal = self.mesh.face_normals[face_ids[i]]
+                position = points[i] + normal * 2.0
 
-            if use_filter:
-                dist = float(np.linalg.norm(position - reference_pos))
-                if min_dist is not None and dist < min_dist:
-                    continue
-                if max_dist is not None and dist > max_dist:
-                    continue
+                if use_filter:
+                    dist = float(np.linalg.norm(position - reference_pos))
+                    if min_dist is not None and dist < min_dist:
+                        continue
+                    if max_dist is not None and dist > max_dist:
+                        continue
 
-            rotation = self._look_at_direction(-normal)
-            return np.concatenate([position, rotation])
+                rotation = self._look_at_direction(-normal)
+                return np.concatenate([position, rotation])
+        else:
+            for _ in range(max_attempts):
+                points, face_ids = self.mesh.sample(1, return_index=True)
+                normal = self.mesh.face_normals[face_ids[0]]
+                position = points[0] + normal * 2.0
+
+                if use_filter:
+                    dist = float(np.linalg.norm(position - reference_pos))
+                    if min_dist is not None and dist < min_dist:
+                        continue
+                    if max_dist is not None and dist > max_dist:
+                        continue
+
+                rotation = self._look_at_direction(-normal)
+                return np.concatenate([position, rotation])
 
         # Fallback: no point was within the range for max_attempts.
         # Return a random point.
@@ -350,6 +368,62 @@ class LightweightEnv:
         
         # Apply pitch rotation (around X axis)
         self.agent_rot[0] += rotation_degrees  # X-axis = pitch
+
+
+def get_cube_face_side(normal: np.ndarray, atol: float = 1e-5) -> tuple:
+    """
+    Определяет, к какой стороне куба относится нормаль.
+    
+    Возвращает кортеж из 3 целых чисел — квантованную нормаль:
+        (1, 0, 0)  → +X
+        (-1, 0, 0) → -X
+        (0, 1, 0)  → +Y
+        (0, -1, 0) → -Y
+        (0, 0, 1)  → +Z
+        (0, 0, -1) → -Z
+    
+    Если не совпадает ни с одной (ошибка), возвращает (0, 0, 0).
+    """
+    # Ожидаемые нормали сторон куба
+    cube_normals = {
+        (1, 0, 0):   np.array([ 1,  0,  0]),
+        (-1, 0, 0):  np.array([-1,  0,  0]),
+        (0, 1, 0):   np.array([ 0,  1,  0]),
+        (0, -1, 0):  np.array([ 0, -1,  0]),
+        (0, 0, 1):   np.array([ 0,  0,  1]),
+        (0, 0, -1):  np.array([ 0,  0, -1]),
+    }
+    
+    normal = np.array(normal)
+    normal = normal / np.linalg.norm(normal)  # нормализуем (на всякий случай)
+    
+    for side, expected in cube_normals.items():
+        if np.allclose(normal, expected, atol=atol):
+            return side
+    
+    # Если не нашли — возможно, шум или ошибка
+    print(f"Warning: Normal {normal} не совпадает ни с одной стороной куба")
+    return (0, 0, 0)
+
+
+def are_on_same_cube_side(mesh: trimesh.Trimesh, pos_a: np.ndarray, pos_b: np.ndarray) -> bool:
+    """
+    Возвращает True, если обе точки лежат на одной стороне куба (например, обе на +X).
+    """
+    # Найти ближайшие грани
+    _, face_idx_a = mesh.kdtree.query(pos_a)
+    _, face_idx_b = mesh.kdtree.query(pos_b)
+    
+    # Получить нормали граней
+    normal_a = mesh.face_normals[face_idx_a]
+    normal_b = mesh.face_normals[face_idx_b]
+    
+    # Определить стороны
+    side_a = get_cube_face_side(normal_a)
+    side_b = get_cube_face_side(normal_b)
+    
+    return side_a == side_b
+
 
 """
 Да, симулятора хватает для всех 13 компонент

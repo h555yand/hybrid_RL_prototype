@@ -47,6 +47,8 @@ def generate_episode_pools(
                     reference_pos=start_pos,
                     min_dist=min_d,
                     max_dist=max_d,
+                    max_attempts=2000,
+                    mesh_sample=True
                 )
                 curriculum_bounds = [float(min_d), float(max_d)]
             else:
@@ -255,9 +257,9 @@ def _build_eval_scripts_from_pools(
 #   Sphere r=50 mm     → max ~100 mm (diameter)
 #   Cylinder r=35,h=100→ max ~117 mm (sqrt(70²+100²))
 CURRICULUM_LEVELS = [
-    (10.0,  30.0),   # Level 0 — easy:   goal is close
-    (10.0,  70.0),   # Level 1 — medium
-    (10.0, 120.0),   # Level 2 — hard:   near-random distance
+    (10.0,  40.0),   # Level 0 — easy:   goal is close
+    (20.0,  80.0),   # Level 1 — medium
+    (40.0, 120.0),   # Level 2 — hard:   near-random distance
 ]
 
 
@@ -350,6 +352,7 @@ def _run_eval_on_same_figure(
     best_overrides: Dict[str, Any],
     eval_episodes: int,
     eval_episode_scripts: Optional[Dict[int, List[Dict[str, Any]]]] = None,
+    visualise=False
 ) -> Dict[str, Any]:
     """Run deterministic eval for the best checkpoint on a fixed mesh."""
     per_seed = []
@@ -380,6 +383,7 @@ def _run_eval_on_same_figure(
             return_metrics=True,
             agent_id=f"eval_{best_variant.lower()}_{seed}",
             episode_script=episode_script,
+            visualise=visualise
         )
 
         rates = metrics.get("stats", {}).get("termination_rates", {})
@@ -472,24 +476,24 @@ def _assess_training_readiness(
 def main() -> None:
     # Debug-first setup (edit these values directly in VS Code)
     # SEEDS = [11, 22, 33]
-    SEEDS = [11, 22]
+    SEEDS = [11]
 
-    RUN_TRAIN = True
+    RUN_TRAIN = False
     REGENERATE_SCRIPTS = False  # True  — всегда пересчитывать и перезаписывать
                                 # False — грузить с диска; пересчитать только если нет файлов
-    IS_LOAD = False  # загружать сохраненный граф состояний
+    IS_LOAD = True  # загружать сохраненный граф состояний
     if not IS_LOAD:
         epsilon_start = 1.0
     else:
         epsilon_start = 0.1
     PRESET = "curriculum"  # "default" | "goal_reward" | "max_steps" | "curriculum"
-    NUM_EPISODES = 2000
+    NUM_EPISODES = 5000
 
     RUN_POST_EVAL = True
-    EVAL_EPISODES = 150
-    EVAL_SOURCE_LEVEL = 0  # -1 = last curriculum level, 0 = first level, etc.
+    EVAL_EPISODES = 1000
+    EVAL_SOURCE_LEVEL = 2  # -1 = last curriculum level, 0 = first level, etc.
     EVAL_RANGE_MODE = "last"  # "last" | "first" | "range"
-    EVAL_RANGE_COUNT = 150
+    EVAL_RANGE_COUNT = EVAL_EPISODES
     EVAL_RANGE_START = 500
     EVAL_RANGE_END = 650
     #Как получить последние 150:
@@ -598,10 +602,10 @@ def main() -> None:
             )
         active_variants = variants or runner.default_variants()
 
-        result = runner.run(variants=active_variants)
+        result = runner.run(variants=active_variants, visualise=False)
         best_variant = str(result["best_variant"])
-        success_trails = result["raw_results"]['CL3'][0]['success_trails']
-        print("success_trails", success_trails)
+        # success_trails = result["raw_results"]['CL3'][0]['success_trails']
+        # logger.info("SUCCESS_trails", success_trails)
 
         print("\n=== Ablation Summaries ===")
         _print_summaries(result["summaries"])
@@ -619,6 +623,8 @@ def main() -> None:
             "curriculum_preset": PRESET,
         }
         
+        if "raw_results" in result:
+            del result["raw_results"]
         with open(train_output_json, "w", encoding="utf-8") as f:
             json.dump(result, f, indent=2, ensure_ascii=True)
         print(f"\nSaved full result to {train_output_json}")
@@ -676,6 +682,7 @@ def main() -> None:
             best_overrides=cfg,
             eval_episodes=EVAL_EPISODES,
             eval_episode_scripts=eval_scripts,
+            visualise=True
         )
 
         eval = post_eval["summary"]

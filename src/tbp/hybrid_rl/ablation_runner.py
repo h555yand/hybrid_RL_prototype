@@ -11,7 +11,7 @@ import random
 import glob
 
 from tbp.hybrid_rl.rl_goal_approach_controller import RLGoalApproachController
-from tbp.hybrid_rl.lightweight_env import LightweightEnv
+from tbp.hybrid_rl.lightweight_env import LightweightEnv, are_on_same_cube_side
 from tbp.hybrid_rl.config import DEFAULT_CONFIG
 from tbp.hybrid_rl.visualize_env import visualize_agent_goal
 
@@ -138,6 +138,7 @@ def train(
     # Статистика
     goals_reached = 0
     success_trails = []
+    success_actions = []
 
     for episode in range(num_episodes):
         episode_mesh_path = mesh_path
@@ -190,6 +191,7 @@ def train(
                     reference_pos=_start_pos,
                     min_dist=_min_d,
                     max_dist=_max_d,
+                    max_attempts=2000,
                 )
                 # Detect fallback: goal outside target range
                 _goal_dist = float(np.linalg.norm(goal_pose[:3] - _start_pos))
@@ -209,7 +211,8 @@ def train(
             
             action, explanation = controller.step(current_pose, sensor_data)
             # logger.debug(f"explain_action_info: {explanation}")
-            action_explanations.append(explanation)
+            if explanation is not None:
+                action_explanations.append(explanation["interpretation"])
             current_poses.append(env.get_pose())
             
             if controller._current_goal is None:
@@ -225,11 +228,15 @@ def train(
         _episode_success = controller._total_goals_reached > _goals_before_episode
         if _episode_success:
             success_trails.append(controller.success_trails)
-            logger.debug(f"explain_action_info: {action_explanations}")
+            success_actions.append(action_explanations)
+            logger.info(f"SUCCESS explain_action_info: {action_explanations}")
             if visualise:
-                visualize_agent_goal(env, np.concatenate([start_pos, start_rot]), goal_pose)
-                for pose in current_poses:
-                    visualize_agent_goal(env, pose, goal_pose)
+                same_side = are_on_same_cube_side(env.mesh, start_pos, goal_pose[0:3])
+                target_distance = float(np.linalg.norm(goal_pose[:3] - start_pos))
+                if target_distance > 80:
+                    visualize_agent_goal(env, np.concatenate([start_pos, start_rot]), goal_pose)
+                    #for pose in current_poses:
+                    #    visualize_agent_goal(env, pose, goal_pose)
 
         # Curriculum promote check (after episode)
         if _use_curriculum and "train" in cfg["mode"]:
@@ -295,7 +302,8 @@ def train(
             "success_rate": success_rate,
             "stats": stats,
             "curriculum_stats": _curriculum_stats if _use_curriculum else None,
-            "success_trails": success_trails
+            "success_trails": success_trails,
+            "success_actions": success_actions,
         }
 
     return goals_reached
@@ -425,7 +433,7 @@ class RLAblationRunner:
             },
         }
 
-    def run(self, variants: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, Any]:
+    def run(self, variants: Optional[Dict[str, Dict[str, Any]]] = None, visualise=False) -> Dict[str, Any]:
         variants = variants or self.default_variants()
         raw_results: Dict[str, List[Dict[str, Any]]] = {name: [] for name in variants}
 
@@ -462,6 +470,7 @@ class RLAblationRunner:
                     return_metrics=True,
                     curriculum_config=curriculum_config,
                     episode_pools=episode_pools,
+                    visualise=visualise
                 )
                 raw_results[variant_name].append(run_result)
 

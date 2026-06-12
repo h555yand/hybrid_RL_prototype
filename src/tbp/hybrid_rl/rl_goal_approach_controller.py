@@ -611,6 +611,7 @@ class RLGoalApproachController:
         dominant_heuristic: str,
         eps: float,
         confidence: float,
+        blend: str
     ) -> str:
         """Generate natural language interpretation of action choice."""
         action_name = self.action_space.get_info(action_index).name
@@ -619,10 +620,16 @@ class RLGoalApproachController:
 
         if is_random:
             return (
-                f"Выбрано случайное действие ({action_name}) "
-                f"с вероятностью epsilon * 0.1 (исследование)."
+                f"##### Случайное действие: {action_name} - {action_index} "
+                f"с вероятностью epsilon {eps} * 0.1 (исследование)."
             )
 
+        return (
+            f"##### Softmax действие; {action_name}, уверенность {confidence:.0%}). "
+            f"blend: {blend}. "
+            f"Q рекомендует: {q_action_name} - {q_recommends}; Эвристика: {h_action_name} - {h_recommends}. "
+        )
+    
         if action_index == q_recommends and action_index == h_recommends:
             return (
                 f"Действие {action_name} поддерживается и Q-значениями, "
@@ -728,15 +735,16 @@ class RLGoalApproachController:
             "heuristic_contributions": contributions,
             "confidence": confidence,
             "is_confident": confidence > 0.7,
-            #"interpretation": self._generate_choice_interpretation(
-            #    action_index=action_index,
-            #    is_random=is_random_override,
-            #    q_recommends=best_q_action,
-            #    h_recommends=best_h_action,
-            #    dominant_heuristic=dominant_heuristic,
-            #    eps=eps,
-            #    confidence=confidence,
-            #),
+            "interpretation": self._generate_choice_interpretation(
+                action_index=action_index,
+                is_random=is_random_override,
+                q_recommends=best_q_action,
+                h_recommends=best_h_action,
+                dominant_heuristic=dominant_heuristic,
+                eps=eps,
+                confidence=confidence,
+                blend=f"{(1-eps)*100:.0f}% Q + {eps*100:.0f}% heuristic",
+            ),
         }
         return action_index, explanation
 
