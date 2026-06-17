@@ -887,79 +887,109 @@ class RLGoalApproachController:
                     e_t = e_world - np.dot(e_world, n_hat) * n_hat
                     step = float(self.action_space.surface_step)
 
-                    right_world = rot.apply([1.0, 0.0, 0.0])
-                    tb1 = right_world - np.dot(right_world, n_hat) * n_hat
-                    tb1_norm = np.linalg.norm(tb1)
+                    tangential_dist = float(np.linalg.norm(e_t))
+                    normal_dist = abs(float(np.dot(e_world, n_hat)))
 
-                    if tb1_norm < 1e-8:
-                        up_world = rot.apply([0.0, 1.0, 0.0])
-                        tb1 = up_world - np.dot(up_world, n_hat) * n_hat
+                    should_crawl = not (normal_dist > tangential_dist * 2.0 and distance > 3 * step)
+
+                    if should_crawl:
+                        right_world = rot.apply([1.0, 0.0, 0.0])
+                        tb1 = right_world - np.dot(right_world, n_hat) * n_hat
                         tb1_norm = np.linalg.norm(tb1)
 
-                    if tb1_norm < 1e-8:
-                        tmp = np.array([0.0, 1.0, 0.0])
-                        if abs(np.dot(tmp, n_hat)) > 0.9:
-                            tmp = np.array([0.0, 0.0, 1.0])
-                        tb1 = np.cross(n_hat, tmp)
-                        tb1_norm = np.linalg.norm(tb1)
+                        if tb1_norm < 1e-8:
+                            up_world = rot.apply([0.0, 1.0, 0.0])
+                            tb1 = up_world - np.dot(up_world, n_hat) * n_hat
+                            tb1_norm = np.linalg.norm(tb1)
 
-                    tb1 /= (tb1_norm + 1e-12)
-                    tb2 = np.cross(n_hat, tb1)
-                    tb2 /= (np.linalg.norm(tb2) + 1e-12)
+                        if tb1_norm < 1e-8:
+                            tmp = np.array([0.0, 1.0, 0.0])
+                            if abs(np.dot(tmp, n_hat)) > 0.9:
+                                tmp = np.array([0.0, 0.0, 1.0])
+                            tb1 = np.cross(n_hat, tmp)
+                            tb1_norm = np.linalg.norm(tb1)
 
-                    best = None
-                    best_score = -1e18
-                    scores = np.full(8, -1e18, dtype=float)
+                        tb1 /= (tb1_norm + 1e-12)
+                        tb2 = np.cross(n_hat, tb1)
+                        tb2 /= (np.linalg.norm(tb2) + 1e-12)
 
-                    for i, deg in enumerate(self.action_space.SURFACE_DIRECTIONS):
-                        a = np.radians(deg)
-                        v_world = np.cos(a) * tb1 + np.sin(a) * tb2
-                        v_norm = float(np.linalg.norm(v_world))
-                        if v_norm < 1e-8:
-                            continue
-                        v_world /= v_norm
+                        best = None
+                        best_score = -1e18
+                        scores = np.full(8, -1e18, dtype=float)
 
-                        new_e = e_t - step * v_world
-                        score = float(np.dot(e_t, e_t) - np.dot(new_e, new_e))
-                        scores[i] = score
-                        if score > best_score:
-                            best_score = score
-                            best = i
+                        for i, deg in enumerate(self.action_space.SURFACE_DIRECTIONS):
+                            a = np.radians(deg)
+                            v_world = np.cos(a) * tb1 + np.sin(a) * tb2
+                            v_norm = float(np.linalg.norm(v_world))
+                            if v_norm < 1e-8:
+                                continue
+                            v_world /= v_norm
 
-                    HYST_ABS = 0.25
-                    if prev_action is not None and 0 <= prev_action < 8 and best is not None:
-                        prev_score = scores[int(prev_action)]
-                        if (best_score - prev_score) < HYST_ABS:
-                            best = int(prev_action)
+                            new_e = e_t - step * v_world
+                            score = float(np.dot(e_t, e_t) - np.dot(new_e, new_e))
+                            scores[i] = score
+                            if score > best_score:
+                                best_score = score
+                                best = i
 
-                    if best is not None:
-                        surface_move[best] = SURFACE_STRENGTH
+                        HYST_ABS = 0.25
+                        if prev_action is not None and 0 <= prev_action < 8 and best is not None:
+                            prev_score = scores[int(prev_action)]
+                            if (best_score - prev_score) < HYST_ABS:
+                                best = int(prev_action)
 
-                    logger.info(
-                        "SDBG e_t=%s scores=%s best=%s prev=%s",
-                        np.array2string(e_t, precision=3),
-                        np.array2string(scores, precision=3),
-                        str(best),
-                        str(prev_action),
-                    )
-                    logger.info(
-                        "HDBG on=%s depth=%.3f align=%.3f dist=%.3f "
-                        "n_world=%s e_world=%s tb1=%s tb2=%s best=%s prev=%s",
-                        on_object,
-                        float(sensor_data.get("depth", -1.0)),
-                        alignment,
-                        distance,
-                        np.array2string(n_hat, precision=3),
-                        np.array2string(e_world, precision=3),
-                        np.array2string(tb1, precision=3),
-                        np.array2string(tb2, precision=3),
-                        str(best),
-                        str(prev_action),
-                    )
-                    logger.info(f"current_pose {current_pose}")
+                        if best is not None:
+                            surface_move[best] = SURFACE_STRENGTH
+
+                        logger.info(
+                            "SDBG e_t=%s scores=%s best=%s prev=%s",
+                            np.array2string(e_t, precision=3),
+                            np.array2string(scores, precision=3),
+                            str(best),
+                            str(prev_action),
+                        )
+                        logger.info(
+                            "HDBG on=%s depth=%.3f align=%.3f dist=%.3f "
+                            "n_world=%s e_world=%s tb1=%s tb2=%s best=%s prev=%s",
+                            on_object,
+                            float(sensor_data.get("depth", -1.0)),
+                            alignment,
+                            distance,
+                            np.array2string(n_hat, precision=3),
+                            np.array2string(e_world, precision=3),
+                            np.array2string(tb1, precision=3),
+                            np.array2string(tb2, precision=3),
+                            str(best),
+                            str(prev_action),
+                        )
+                        logger.info(f"current_pose {current_pose}")
+                    else:
+                        logger.info(
+                            "SKIP_CRAWL normal_dist=%.3f tangential_dist=%.3f dist=%.3f",
+                            normal_dist,
+                            tangential_dist,
+                            distance,
+                        )
 
         bias += surface_move
         components["surface_move"] = surface_move
+
+        # If no progres 5 steps on surface - detach
+        stagnation_override = np.zeros(self.num_actions, dtype=float)
+        if on_object > 0.5 and alignment >= DETACH_ALIGN_THR:
+            if len(self._episode_transitions) >= 5:
+                recent_dists = [
+                    float(tr["state"][11])
+                    for tr in self._episode_transitions[-5:]
+                ]
+                dist_reduction = recent_dists[0] - recent_dists[-1]
+                if dist_reduction < self.action_space.surface_step * 0.5:
+                    stagnation_override[self.action_space.IDX_LOOK_UP] += 3.0
+                    for idx in range(8):
+                        stagnation_override[idx] -= 2.0
+        bias += stagnation_override
+        components["stagnation_override"] = stagnation_override
+
 
         # ------------------------------------------------------------
         # 2) Detach heuristic (goal "through" surface)
