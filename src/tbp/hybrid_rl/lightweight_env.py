@@ -2,6 +2,9 @@
 import trimesh
 import numpy as np
 from scipy.spatial.transform import Rotation as R
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class LightweightEnv:
@@ -124,7 +127,7 @@ class LightweightEnv:
             depth = distances[nearest_idx]
             face_idx = index_tri[nearest_idx]
             point_normal = self.mesh.face_normals[face_idx].tolist()
-            on_object = bool(depth < 10.0)  # 10mm
+            on_object = bool(depth < 3.0)  # было 10mm
         else:
             depth = 100.0
             point_normal = None
@@ -147,7 +150,8 @@ class LightweightEnv:
         min_dist: float = None,
         max_dist: float = None,
         max_attempts: int = 200,
-        mesh_sample=False
+        mesh_sample=False,
+        same_cube_side=False
     ) -> np.ndarray:
         """
         A random point on the surface with an optional distance limit.
@@ -176,9 +180,12 @@ class LightweightEnv:
 
                 if use_filter:
                     dist = float(np.linalg.norm(position - reference_pos))
+                    same_cube_side_check = is_on_same_cube_side(position, reference_pos)
                     if min_dist is not None and dist < min_dist:
                         continue
                     if max_dist is not None and dist > max_dist:
+                        continue
+                    if same_cube_side is not None and same_cube_side_check == False:
                         continue
 
                 rotation = self._look_at_direction(-normal)
@@ -250,7 +257,82 @@ class LightweightEnv:
         rot_matrix = np.column_stack([right, up, forward])
         return R.from_matrix(rot_matrix).as_euler("xyz")
 
-    def _move_tangentially(self, direction_degrees, step_size):
+    def _move_tangentially(self, direction_degrees, step_size, snap_to_surface: bool = True):
+        """
+        Movement tangent to the surface using a tangent basis (t1, t2).
+
+        This fixes degeneracy where local XZ directions, after rotation+projection,
+        collapse to ~1D on some faces/poses.
+
+        direction_degrees:
+            angle in the tangent plane:
+            0°   -> +t1
+            90°  -> +t2
+            180° -> -t1
+            270° -> -t2
+        """
+        rot = R.from_euler("xyz", self.agent_rot, degrees=True)
+
+        sensor_data = self.get_sensor_data()
+        if sensor_data["point_normal"] is None:
+            # Fallback: keep old behavior if no normal
+            angle_rad = np.radians(direction_degrees)
+            local_dir = np.array([np.sin(angle_rad), 0.0, -np.cos(angle_rad)], dtype=float)
+            local_dir /= (np.linalg.norm(local_dir) + 1e-12)
+            world_dir = rot.apply(local_dir)
+            self.agent_pos += world_dir * step_size
+            return
+
+        n = np.array(sensor_data["point_normal"], dtype=float)
+        n /= (np.linalg.norm(n) + 1e-12)
+
+        # Build tangent basis.
+        # Try sensor's right axis as primary tangent direction.
+        right_world = rot.apply([1.0, 0.0, 0.0])
+        t1 = right_world - np.dot(right_world, n) * n
+        t1_norm = np.linalg.norm(t1)
+
+        if t1_norm < 1e-8:
+            # If right is parallel to normal, try sensor up axis
+            up_world = rot.apply([0.0, 1.0, 0.0])
+            t1 = up_world - np.dot(up_world, n) * n
+            t1_norm = np.linalg.norm(t1)
+
+        if t1_norm < 1e-8:
+            # Pathological fallback: pick any vector not parallel to n
+            tmp = np.array([0.0, 1.0, 0.0])
+            if abs(np.dot(tmp, n)) > 0.9:
+                tmp = np.array([0.0, 0.0, 1.0])
+            t1 = np.cross(n, tmp)
+            t1_norm = np.linalg.norm(t1)
+
+        t1 /= (t1_norm + 1e-12)
+
+        # Second tangent axis
+        t2 = np.cross(n, t1)
+        t2 /= (np.linalg.norm(t2) + 1e-12)
+
+        a = np.radians(direction_degrees)
+        world_dir = np.cos(a) * t1 + np.sin(a) * t2
+        world_dir /= (np.linalg.norm(world_dir) + 1e-12)
+
+        # Move
+        self.agent_pos += world_dir * step_size
+
+        # Optional: snap back to surface at +2mm along normal for stability
+        if snap_to_surface:
+            closest, dist_to_mesh, face_id = self.mesh.nearest.on_surface([self.agent_pos])
+            hit_n = self.mesh.face_normals[face_id[0]]
+            hit_n = hit_n / (np.linalg.norm(hit_n) + 1e-12)
+            if np.dot(hit_n, n) < 0:
+                hit_n = -hit_n
+            self.agent_pos = closest[0] + hit_n * 2.0
+            # ← ДОБАВИТЬ ЭТУ СТРОКУ:
+            self.agent_rot = self._look_at_direction(-hit_n)
+        else:
+            logger.warning(f"SNAP FAILED: ray_origin={self.agent_pos}, n={n}")
+
+    def _move_tangentially_old(self, direction_degrees, step_size):
         """Movement tangent to the surface.
         0°  = forward    → -Z
         90° = right      → +X
@@ -370,60 +452,33 @@ class LightweightEnv:
         self.agent_rot[0] += rotation_degrees  # X-axis = pitch
 
 
-def get_cube_face_side(normal: np.ndarray, atol: float = 1e-5) -> tuple:
+def is_on_same_cube_side(pos_a, pos_b, cube_side=42.0, atol=1e-5):
     """
-    Определяет, к какой стороне куба относится нормаль.
+    Проверяет, лежат ли две точки на одной стороне куба (например, обе на +X при x = +42).
     
-    Возвращает кортеж из 3 целых чисел — квантованную нормаль:
-        (1, 0, 0)  → +X
-        (-1, 0, 0) → -X
-        (0, 1, 0)  → +Y
-        (0, -1, 0) → -Y
-        (0, 0, 1)  → +Z
-        (0, 0, -1) → -Z
+    Args:
+        pos_a: положение точки A [x, y, z]
+        pos_b: положение точки B [x, y, z]
+        cube_side: значение координаты грани куба (например, 42 мм)
+        atol: допуск на численную погрешность
     
-    Если не совпадает ни с одной (ошибка), возвращает (0, 0, 0).
+    Returns:
+        bool: True, если точки на одной стороне куба
     """
-    # Ожидаемые нормали сторон куба
-    cube_normals = {
-        (1, 0, 0):   np.array([ 1,  0,  0]),
-        (-1, 0, 0):  np.array([-1,  0,  0]),
-        (0, 1, 0):   np.array([ 0,  1,  0]),
-        (0, -1, 0):  np.array([ 0, -1,  0]),
-        (0, 0, 1):   np.array([ 0,  0,  1]),
-        (0, 0, -1):  np.array([ 0,  0, -1]),
-    }
+    pos_a = np.array(pos_a)
+    pos_b = np.array(pos_b)
     
-    normal = np.array(normal)
-    normal = normal / np.linalg.norm(normal)  # нормализуем (на всякий случай)
+    # Проверяем каждую ось
+    for i in range(3):
+        # Обе точки должны быть на грани (координата ≈ ±cube_side)
+        if (abs(abs(pos_a[i]) - cube_side) <= atol and 
+            abs(abs(pos_b[i]) - cube_side) <= atol):
+            
+            # И знак должен совпадать (обе +42 или обе -42)
+            if np.sign(pos_a[i]) == np.sign(pos_b[i]):
+                return True
     
-    for side, expected in cube_normals.items():
-        if np.allclose(normal, expected, atol=atol):
-            return side
-    
-    # Если не нашли — возможно, шум или ошибка
-    print(f"Warning: Normal {normal} не совпадает ни с одной стороной куба")
-    return (0, 0, 0)
-
-
-def are_on_same_cube_side(mesh: trimesh.Trimesh, pos_a: np.ndarray, pos_b: np.ndarray) -> bool:
-    """
-    Возвращает True, если обе точки лежат на одной стороне куба (например, обе на +X).
-    """
-    # Найти ближайшие грани
-    _, face_idx_a = mesh.kdtree.query(pos_a)
-    _, face_idx_b = mesh.kdtree.query(pos_b)
-    
-    # Получить нормали граней
-    normal_a = mesh.face_normals[face_idx_a]
-    normal_b = mesh.face_normals[face_idx_b]
-    
-    # Определить стороны
-    side_a = get_cube_face_side(normal_a)
-    side_b = get_cube_face_side(normal_b)
-    
-    return side_a == side_b
-
+    return False
 
 """
 Да, симулятора хватает для всех 13 компонент

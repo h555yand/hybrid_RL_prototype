@@ -132,7 +132,6 @@ Now we try to learn moving to target, then we can add new action and train new s
 1. Q-learning and discrete actions  
 The policy outputs an index from 0 to 17.  
 Fixed directions, surface_step, free_step, rotation_step are used.  
-Apply masking if on_object == 0 (disallow 0-7, 16-17).  
 2. Parameterized SAC (current proposal)  
 The policy outputs: action index (0-11) and a continuous parameter instaed of fixed step.
 Replacing of 8 direction MoveTangentially with one action with two parameters: angle_deg, distance. Others actions are stays the same.

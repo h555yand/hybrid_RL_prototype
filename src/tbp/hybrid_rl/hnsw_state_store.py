@@ -28,11 +28,12 @@ class StatePoint:
         visit_count: How many times this point was accessed/updated.
         last_step: Global step when this point was last touched.
     """
+    raw_state: np.ndarray           # NEW: исходный state (13D)
     norm_state: np.ndarray
     q_values: np.ndarray
     visit_count: int = 0
     last_step: int = 0
-
+    on_object: int = 0              # NEW: если фильтровать/диагностировать
 
 class HNSWStateStore:
     """Q-value store using HNSW index for nearest neighbor lookup.
@@ -67,9 +68,11 @@ class HNSWStateStore:
 
     def __init__(
         self,
-        config: Optional[Dict] = None
+        config: Optional[Dict] = None,
+        name: str = "not defined"
     ):
         self.config = {**DEFAULT_CONFIG, **(config or {})}
+        self.name = name
         self.state_dim = self.config["state_dim"]
         self.num_actions = self.config["num_actions"]
         self.max_points = self.config["max_points"]
@@ -90,6 +93,12 @@ class HNSWStateStore:
         self.min_weight_threshold = self.config["min_weight_threshold"]
 
         # HNSW index
+        self.norm_warmup_steps = int(self.config.get("norm_warmup_steps", 5000))
+        self.norm_min_std = float(self.config.get("norm_min_std", 1e-4))
+        self.rebuild_on_freeze = bool(self.config.get("rebuild_on_freeze", True))
+        self._norm_frozen = False
+        self._freeze_done = False  # чтобы не фризить повторно
+
         self._init_index()
 
         # Point storage: id → StatePoint
@@ -105,9 +114,41 @@ class HNSWStateStore:
         # Running normalization statistics
         self._state_mean = np.zeros(self.config["state_dim"])
         self._state_std = np.ones(self.config["state_dim"])
-        self._state_buffer: deque = deque(maxlen=5000)
+        self._state_buffer: deque = deque(maxlen=max(self.norm_warmup_steps, 5000))
         self._norm_update_interval: int = 50
         self._norm_min_samples: int = 50
+
+    def _update_normalization(self, state: np.ndarray):
+        # всегда копим
+        self._state_buffer.append(state.copy())
+
+        # если уже заморожено — ничего не делаем
+        if self._norm_frozen:
+            return
+
+        n = len(self._state_buffer)
+        if n < self._norm_min_samples:
+            return
+
+        # можно оставить ваш интервал (каждые 50), но freeze будет на warmup_steps
+        if n % self._norm_update_interval != 0:
+            return
+
+        buf = np.array(self._state_buffer)
+        new_mean = buf.mean(axis=0)
+        new_std = np.maximum(buf.std(axis=0), self.norm_min_std)
+
+        self._state_mean = new_mean
+        self._state_std = new_std
+
+        # freeze условие
+        if (not self._freeze_done) and n >= self.norm_warmup_steps:
+            self._norm_frozen = True
+            self._freeze_done = True
+            logger.info(f"Normalization frozen on {n} samples for {self.name}")
+
+            if self.rebuild_on_freeze and self.next_id > 0:
+                self._rebuild_index_with_renorm()   # реализуем ниже
 
     # Calibration #############
     def _record_distance(self, nearest_distance_sq: float):
@@ -196,21 +237,32 @@ class HNSWStateStore:
         """
         return (state - self._state_mean) / (self._state_std + 1e-8)
 
-    def _update_normalization(self, state: np.ndarray):
-        """Update running mean/std from observed states.
+    def _rebuild_index_with_renorm(self):
+        """Rebuild HNSW index after normalization is frozen/changed.
 
-        Called on every update_q_value to track state distribution.
-        Only recomputes statistics every _norm_update_interval steps
-        to avoid overhead.
+        Recomputes norm_state from raw_state for all ACTIVE points,
+        keeping point IDs unchanged (important if index labels == ids).
         """
-        self._state_buffer.append(state.copy())
+        logger.info(
+            "Rebuilding HNSW index with re-normalization: points=%d", len(self.points)
+        )
+        if len(self.points) > self.max_points:
+            self.max_points = len(self.points) + 1000
+        self._init_index()
+        self._deleted_count = 0
 
-        buffer_len = len(self._state_buffer)
-        if (buffer_len >= self._norm_min_samples
-                and buffer_len % self._norm_update_interval == 0):
-            buf = np.array(self._state_buffer)
-            self._state_mean = buf.mean(axis=0)
-            self._state_std = np.maximum(buf.std(axis=0), 1e-4)
+        if not self.points:
+            return
+
+        ids = np.array(list(self.points.keys()), dtype=np.int64)
+        data = np.vstack([self._normalize(self.points[i].raw_state) for i in ids])
+
+        # update stored norm_state too
+        for j, pid in enumerate(ids):
+            self.points[int(pid)].norm_state = data[j].copy()
+
+        self._index.add_items(data, ids)
+        logger.info(f"Rebuild with re-normalization done for {self.name}")
 
     # ══════════════════════════════════════════════════════════
     # GET Q-VALUES
@@ -340,7 +392,7 @@ class HNSWStateStore:
         norm_state = self._normalize(state)
         
         if self.next_id == 0:
-            self._insert_point(norm_state, action, td_target, alpha)
+            self._insert_point(state, norm_state, action, td_target, alpha)
             return
         
         k = min(self.k_neighbors, self.next_id)
@@ -366,20 +418,14 @@ class HNSWStateStore:
             self._updates_existing_count += 1
         else:
             if count_visit:
-                self._insert_point(norm_state, action, td_target, alpha)
+                self._insert_point(state, norm_state, action, td_target, alpha)
             # else: backup hit an unknown region — skip insertion;
             # we only refine states the agent actually visited online.
 
     # ══════════════════════════════════════════════════════════
     # POINT INSERTION
     # ══════════════════════════════════════════════════════════
-    def _insert_point(
-        self,
-        norm_state: np.ndarray,
-        action: int,
-        td_target: float,
-        alpha: float,
-    ):
+    def _insert_point(self, raw_state: np.ndarray, norm_state: np.ndarray, action: int, td_target: float, alpha: float):
         """Insert a new state point into the HNSW index.
 
         Q-values are initialized by interpolating from existing neighbors
@@ -400,10 +446,12 @@ class HNSWStateStore:
         # Create and store point
         point_id = self.next_id
         point = StatePoint(
+            raw_state=np.array(raw_state, copy=True),
             norm_state=norm_state.copy(),
             q_values=q_init,
             visit_count=1,
             last_step=self.global_step,
+            on_object=int(raw_state[9] > 0.5),
         )
 
         do_replace = self._deleted_count > 0
@@ -420,7 +468,7 @@ class HNSWStateStore:
 
         if self.next_id % 1000 == 0:
             logger.info(
-                f"HNSW store: {self.next_id} points, "
+                f"HNSW store {self.name}: {self.next_id} points, "
                 f"step {self.global_step}"
             )
 
@@ -609,6 +657,8 @@ class HNSWStateStore:
         Args:
             surviving_points: Dict of points that survived eviction.
         """
+        if len(self.points) > self.max_points:
+            self.max_points = len(self.points) + 1000
         self._init_index()
         self.points = {}
         self.next_id = 0
@@ -623,10 +673,12 @@ class HNSWStateStore:
             )
 
             self.points[new_id] = StatePoint(
-                norm_state=point.norm_state,
+                raw_state=point.raw_state.copy(),
+                norm_state=point.norm_state.copy(),
                 q_values=point.q_values.copy(),
                 visit_count=point.visit_count,
                 last_step=point.last_step,
+                on_object=point.on_object,
             )
             self.next_id += 1
 
@@ -818,6 +870,7 @@ class HNSWStateStore:
         q_values = np.array([self.points[i].q_values for i in ids])
         visit_counts = np.array([self.points[i].visit_count for i in ids])
         last_steps = np.array([self.points[i].last_step for i in ids])
+        raw_states = np.array([self.points[i].raw_state for i in ids])
 
         np.savez(
             filepath,
@@ -837,6 +890,7 @@ class HNSWStateStore:
             q_values=q_values,
             visit_counts=visit_counts,
             last_steps=last_steps,
+            raw_states=raw_states,
         )
 
         logger.info(f"HNSW store saved: {len(ids)} points to {filepath}")
@@ -965,6 +1019,7 @@ class HNSWStateStore:
             q_values = data["q_values"]
             visit_counts = data["visit_counts"]
             last_steps = data["last_steps"]
+            raw_states = data["raw_states"] if "raw_states" in data else None
 
             # Use saved IDs to match native HNSW index labels.
             # Without this, sequential 0..N-1 IDs mismatch the HNSW
@@ -980,12 +1035,16 @@ class HNSWStateStore:
             for i in range(len(norm_states)):
                 pid = int(point_ids[i])
                 store.points[pid] = StatePoint(
+                    raw_state=raw_states[i] if raw_states is not None else norm_states[i].copy(),
                     norm_state=norm_states[i],
                     q_values=q_values[i],
                     visit_count=int(visit_counts[i]),
                     last_step=int(last_steps[i]),
+                    on_object=int((raw_states[i][9] if raw_states is not None else 0.0) > 0.5)
                 )
             store.next_id = next_id
+            store._norm_frozen = True
+            store._freeze_done = True
 
         # Restore calibration state
         if os.path.exists(calibration_path):
@@ -1051,22 +1110,33 @@ class HNSWStateStore:
             q_values = data["q_values"]
             visit_counts = data["visit_counts"]
             last_steps = data["last_steps"]
+            raw_states = data["raw_states"] if "raw_states" in data else None
+
+            if "point_ids" in data:
+                point_ids = data["point_ids"]
+            else:
+                # Legacy files without point_ids: assume sequential.
+                # Safe only if no evictions happened before save.
+                point_ids = np.arange(len(norm_states))
 
             for i in range(len(norm_states)):
-                point_id = store.next_id
-                point = StatePoint(
+                pid = int(point_ids[i])
+                store.points[pid] = StatePoint(
+                    raw_state=raw_states[i] if raw_states is not None else norm_states[i].copy(),
                     norm_state=norm_states[i],
                     q_values=q_values[i],
                     visit_count=int(visit_counts[i]),
                     last_step=int(last_steps[i]),
+                    on_object=int((raw_states[i][9] if raw_states is not None else 0.0) > 0.5)
                 )
 
                 store._index.add_items(
                     norm_states[i].reshape(1, -1),
-                    np.array([point_id]),
+                    np.array([pid], dtype=np.int64),
                 )
-                store.points[point_id] = point
-                store.next_id += 1
+            store.next_id = (max(store.points.keys()) + 1) if store.points else 0
+            store._norm_frozen = True
+            store._freeze_done = True
 
             logger.info(
                 f"HNSW store loaded: {store.next_id} points from {filepath}"

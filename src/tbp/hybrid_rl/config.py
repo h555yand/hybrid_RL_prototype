@@ -4,7 +4,7 @@ DEFAULT_CONFIG = {
     # State
     "state_dim": 13,
     # HNSW store
-    "max_points": 50000,
+    "max_points": 100000,
     "k_neighbors": 7,
     "sigma": 1.0,
     "insert_threshold": 0.5,
@@ -14,6 +14,9 @@ DEFAULT_CONFIG = {
     "calibration_percentile": 10.0,
     "min_calibration_samples": 100,
     "min_weight_threshold": 0.01,
+    "norm_warmup_steps": 5000,          # сколько raw states накопить для freeze
+    "norm_min_std": 1e-4,               # защита от нулевой дисперсии
+    "rebuild_on_freeze": True,          # rebuild индекса после freeze
     # Actions
     "num_actions": 18,
     "surface_step": 5.0,   # mm

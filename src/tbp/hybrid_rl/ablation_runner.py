@@ -11,7 +11,7 @@ import random
 import glob
 
 from tbp.hybrid_rl.rl_goal_approach_controller import RLGoalApproachController
-from tbp.hybrid_rl.lightweight_env import LightweightEnv, are_on_same_cube_side
+from tbp.hybrid_rl.lightweight_env import LightweightEnv
 from tbp.hybrid_rl.config import DEFAULT_CONFIG
 from tbp.hybrid_rl.visualize_env import visualize_agent_goal
 
@@ -200,7 +200,7 @@ def train(
             else:
                 goal_pose = env.get_random_surface_point()
         
-        controller.set_new_goal(goal_pose)
+        controller.set_new_goal(goal_pose, start_pos)
         
         # Навигация
         action_explanations = []
@@ -226,17 +226,21 @@ def train(
             env.step(action_index, action_space)
         
         _episode_success = controller._total_goals_reached > _goals_before_episode
+        start_distance = float(np.linalg.norm(goal_pose[:3] - start_pos))
         if _episode_success:
             success_trails.append(controller.success_trails)
             success_actions.append(action_explanations)
-            logger.info(f"SUCCESS explain_action_info: {action_explanations}")
+            logger.info(f"SUCCESS, start_distance {start_distance}, explain_action_info: {action_explanations}")
             if visualise:
-                same_side = are_on_same_cube_side(env.mesh, start_pos, goal_pose[0:3])
-                target_distance = float(np.linalg.norm(goal_pose[:3] - start_pos))
-                if target_distance > 80:
-                    visualize_agent_goal(env, np.concatenate([start_pos, start_rot]), goal_pose)
-                    #for pose in current_poses:
-                    #    visualize_agent_goal(env, pose, goal_pose)
+                visualize_agent_goal(env, np.concatenate([start_pos, start_rot]), goal_pose)
+                for pose in current_poses:
+                    visualize_agent_goal(env, pose, goal_pose)
+        else:
+            logger.info(f"ERROR, start_distance {start_distance}, explain_action_info: {action_explanations}")
+            if visualise:
+                visualize_agent_goal(env, np.concatenate([start_pos, start_rot]), goal_pose)
+                for pose in current_poses:
+                    visualize_agent_goal(env, pose, goal_pose)
 
         # Curriculum promote check (after episode)
         if _use_curriculum and "train" in cfg["mode"]:
@@ -313,9 +317,12 @@ def train(
 class AblationSummary:
     variant: str
     success_rate: float
-    update_hit_rate: float
-    active_to_created_ratio: float
-    points_per_update_ratio: float
+    update_hit_rate_free: float
+    active_to_created_ratio_free: float
+    points_per_update_ratio_free: float
+    update_hit_rate_surface: float
+    active_to_created_ratio_surface: float
+    points_per_update_ratio_surface: float
     timeout_rate: float = 0.0
     collision_surface_violation_rate: float = 0.0
     levels_reached: float = 0.0
@@ -427,8 +434,8 @@ class RLAblationRunner:
                 **base,
                 "curriculum_config": {
                     "levels": levels,
-                    "promote_threshold": 0.2,
-                    "promote_window": 50,
+                    "promote_threshold": 0.8,
+                    "promote_window": 100,
                 },
             },
         }
@@ -494,18 +501,16 @@ class RLAblationRunner:
                 -s.success_rate,
                 s.timeout_rate,
                 s.collision_surface_violation_rate,
-                -s.update_hit_rate,
-                s.points_per_update_ratio,
             ),
         )
         return ranked[0].variant
 
     def _aggregate_variant(self, variant: str, runs: List[Dict[str, Any]]) -> AblationSummary:
-        def _metric(run: Dict[str, Any], key: str, default: float = 0.0) -> float:
+        def _metric(run: Dict[str, Any], key: str, default: float = 0.0, name="not defined") -> float:
             stats = run.get("stats", {})
             # Current train() returns controller stats with Q-store metrics nested under q_store.
             # Keep top-level fallback for compatibility with older synthetic tests.
-            q_store_stats = stats.get("q_store", {})
+            q_store_stats = stats.get(name, {})
             if key in q_store_stats:
                 return float(q_store_stats.get(key, default))
             return float(stats.get(key, default))
@@ -516,13 +521,23 @@ class RLAblationRunner:
             return float(rates.get(key, default))
 
         success_rate = float(np.mean([float(r["success_rate"]) for r in runs]))
-        update_hit_rate = float(np.mean([_metric(r, "update_hit_rate") for r in runs]))
-        active_to_created_ratio = float(
-            np.mean([_metric(r, "active_to_created_ratio") for r in runs])
+
+        update_hit_rate_free = float(np.mean([_metric(r, "update_hit_rate", name="q_store_free") for r in runs]))
+        active_to_created_ratio_free = float(
+            np.mean([_metric(r, "active_to_created_ratio", name="q_store_free") for r in runs])
         )
-        points_per_update_ratio = float(
-            np.mean([_metric(r, "points_per_update_ratio") for r in runs])
+        points_per_update_ratio_free = float(
+            np.mean([_metric(r, "points_per_update_ratio", name="q_store_free") for r in runs])
         )
+
+        update_hit_rate_surface = float(np.mean([_metric(r, "update_hit_rate", name="q_store_surface") for r in runs]))
+        active_to_created_ratio_surface = float(
+            np.mean([_metric(r, "active_to_created_ratio", name="q_store_surface") for r in runs])
+        )
+        points_per_update_ratio_surface = float(
+            np.mean([_metric(r, "points_per_update_ratio", name="q_store_surface") for r in runs])
+        )
+
         timeout_rate = float(np.mean([_termination_rate(r, "timeout") for r in runs]))
         collision_surface_violation_rate = float(
             np.mean([_termination_rate(r, "collision_surface_violation") for r in runs])
@@ -547,9 +562,12 @@ class RLAblationRunner:
         return AblationSummary(
             variant=variant,
             success_rate=success_rate,
-            update_hit_rate=update_hit_rate,
-            active_to_created_ratio=active_to_created_ratio,
-            points_per_update_ratio=points_per_update_ratio,
+            update_hit_rate_free=update_hit_rate_free,
+            active_to_created_ratio_free=active_to_created_ratio_free,
+            points_per_update_ratio_free=points_per_update_ratio_free,
+            update_hit_rate_surface=update_hit_rate_surface,
+            active_to_created_ratio_surface=active_to_created_ratio_surface,
+            points_per_update_ratio_surface=points_per_update_ratio_surface,
             timeout_rate=timeout_rate,
             collision_surface_violation_rate=collision_surface_violation_rate,
             levels_reached=levels_reached,

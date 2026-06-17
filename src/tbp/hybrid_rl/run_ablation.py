@@ -12,10 +12,21 @@ from tbp.hybrid_rl.lightweight_env import LightweightEnv
 from tbp.hybrid_rl.ablation_runner import RLAblationRunner, train
 from tbp.hybrid_rl.config import DEFAULT_CONFIG
 
-
 # logging.basicConfig(level=logging.DEBUG)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Curriculum levels: (min_dist_mm, max_dist_mm)
+# Anchored to the mesh geometry below — all ranges fit within max surface-to-surface
+# distances of the generated objects:
+#   Cube  80×80×80 mm  → max ~139 mm (space diagonal)
+#   Sphere r=50 mm     → max ~100 mm (diameter)
+#   Cylinder r=35,h=100→ max ~117 mm (sqrt(70²+100²))
+CURRICULUM_LEVELS = [
+    (10.0,  40.0),   # Level 0 — easy:   goal is close
+    (20.0,  80.0),   # Level 1 — medium
+    (40.0, 120.0),   # Level 2 — hard:   near-random distance
+]
 
 
 def generate_episode_pools(
@@ -48,7 +59,8 @@ def generate_episode_pools(
                     min_dist=min_d,
                     max_dist=max_d,
                     max_attempts=2000,
-                    mesh_sample=True
+                    mesh_sample=True,
+                    same_cube_side=True if level_idx == 0 else False
                 )
                 curriculum_bounds = [float(min_d), float(max_d)]
             else:
@@ -250,19 +262,6 @@ def _build_eval_scripts_from_pools(
     return eval_scripts
 
 
-# Curriculum levels: (min_dist_mm, max_dist_mm)
-# Anchored to the mesh geometry below — all ranges fit within max surface-to-surface
-# distances of the generated objects:
-#   Cube  80×80×80 mm  → max ~139 mm (space diagonal)
-#   Sphere r=50 mm     → max ~100 mm (diameter)
-#   Cylinder r=35,h=100→ max ~117 mm (sqrt(70²+100²))
-CURRICULUM_LEVELS = [
-    (10.0,  40.0),   # Level 0 — easy:   goal is close
-    (20.0,  80.0),   # Level 1 — medium
-    (40.0, 120.0),   # Level 2 — hard:   near-random distance
-]
-
-
 def _prepare_demo_meshes(data_dir: Path) -> None:
     """Create simple meshes for standalone ablation runs.
 
@@ -293,14 +292,17 @@ def _print_summaries(summaries: Dict[str, Dict[str, Any]]) -> None:
         print(
             f"{variant}: "
             f"success_rate={s['success_rate']:.4f}, "
-            f"update_hit_rate={s['update_hit_rate']:.4f}, "
-            f"active_to_created_ratio={s['active_to_created_ratio']:.4f}, "
-            f"points_per_update_ratio={s['points_per_update_ratio']:.4f}, "
             f"timeout_rate={s.get('timeout_rate', 0.0):.4f}, "
             f"collision_surface_violation_rate="
             f"{s.get('collision_surface_violation_rate', 0.0):.4f}, "
             f"levels_reached={s.get('levels_reached', 0.0):.2f}, "
             f"fallback_rate={s.get('fallback_rate', 0.0):.4f}"
+            f"update_hit_rate_free={s['update_hit_rate_free']:.4f}, "
+            f"active_to_created_ratio_free={s['active_to_created_ratio_free']:.4f}, "
+            f"points_per_update_ratio_free={s['points_per_update_ratio_free']:.4f}, "
+            f"update_hit_rate_surface={s['update_hit_rate_surface']:.4f}, "
+            f"active_to_created_ratio_surface={s['active_to_created_ratio_surface']:.4f}, "
+            f"points_per_update_ratio_surface={s['points_per_update_ratio_surface']:.4f}, "
         )
 
 
@@ -491,7 +493,7 @@ def main() -> None:
 
     RUN_POST_EVAL = True
     EVAL_EPISODES = 1000
-    EVAL_SOURCE_LEVEL = 2  # -1 = last curriculum level, 0 = first level, etc.
+    EVAL_SOURCE_LEVEL = 0  # -1 = last curriculum level, 0 = first level, etc.
     EVAL_RANGE_MODE = "last"  # "last" | "first" | "range"
     EVAL_RANGE_COUNT = EVAL_EPISODES
     EVAL_RANGE_START = 500
@@ -515,15 +517,18 @@ def main() -> None:
     # "auto"     — определяем автоматически
     base_config = {
         "mode": "train_adapt_epsilon",
+        "goal_threshold": 5.0, # mm
         "state_dim": 13,
-        "max_points": 100000,
+        "max_points": 500_000,
         "k_neighbors": 7,
-        "max_steps_per_goal": 20,
+        "max_steps_per_goal": 50,
         "adaptive_sigma": True,
         "insert_threshold": 0.50,
         "auto_calibrate": False,
         "epsilon_start": epsilon_start,      # initial exploration
         "epsilon_min": 0.05,       # minimum exploration
+        "reward_goal_reached": 60.0,
+        "reward_timeout": -8.0,
     }
     cfg = {**DEFAULT_CONFIG, **(base_config or {})}
 
@@ -592,9 +597,6 @@ def main() -> None:
             variants = runner.max_steps_variants(reward_overrides=best_overrides)
         elif PRESET == "curriculum":
             best_overrides = {
-                "reward_goal_reached": 60.0,
-                "reward_timeout": -8.0,
-                "max_steps_per_goal": 30,
             }
             variants = runner.curriculum_variants(
                 reward_overrides=best_overrides,
@@ -665,9 +667,6 @@ def main() -> None:
         if best_variant is None:
             best_variant = "CL3" # name must be real from training as folder with result
             best_overrides = {
-                "reward_goal_reached": 60.0,
-                # "goal_threshold": 5.0,
-                "reward_timeout": -8.0,
             }
         else:
             best_overrides = dict(active_variants.get(best_variant, {}))
@@ -682,7 +681,7 @@ def main() -> None:
             best_overrides=cfg,
             eval_episodes=EVAL_EPISODES,
             eval_episode_scripts=eval_scripts,
-            visualise=True
+            visualise=False
         )
 
         eval = post_eval["summary"]

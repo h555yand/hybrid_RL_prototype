@@ -76,9 +76,9 @@ class RLGoalApproachController:
         self.num_actions = self.action_space.NUM_ACTIONS
 
         # HNSW Q-store
-        self.q_store = HNSWStateStore(
-            config=self.config
-        )
+        # self.q_store = HNSWStateStore(config=self.config)
+        self.q_store_free = HNSWStateStore(config=self.config, name="free")
+        self.q_store_surface = HNSWStateStore(config=self.config, name="surface")
 
         # Q-learning parameters
         self.gamma = self.config["gamma"]
@@ -132,6 +132,7 @@ class RLGoalApproachController:
         self._episode_reward: float = 0.0
         self._episode_transitions: List[Dict[str, Any]] = []
         self.success_trails = []
+        self.start_pos: Optional[np.ndarray] = None
 
         # Lifetime stats
         self._total_episodes: int = 0
@@ -152,6 +153,10 @@ class RLGoalApproachController:
             f"epsilon={self.epsilon}"
         )
 
+    def _select_store(self, state: np.ndarray) -> HNSWStateStore:
+        # state[9] = on_object float
+        return self.q_store_surface if state[9] > 0.5 else self.q_store_free
+
     # ══════════════════════════════════════════════════════════
     # PUBLIC API
     # ══════════════════════════════════════════════════════════
@@ -166,7 +171,7 @@ class RLGoalApproachController:
             # AUTO: если мало опыта → train, иначе → eval
             return self.q_store.next_id < self.auto_train_threshold
 
-    def set_new_goal(self, goal_pose: np.ndarray):
+    def set_new_goal(self, goal_pose: np.ndarray, start_pos: np.ndarray):
         """Called when LM provides a new goal state.
 
         Resets episode state but preserves learned Q-values.
@@ -184,6 +189,7 @@ class RLGoalApproachController:
         self._episode_reward = 0.0
         self._episode_transitions = []
         self._total_episodes += 1
+        self.start_pos = start_pos.copy()
 
         logger.debug(
             f"New goal set (episode {self._total_episodes}): "
@@ -227,12 +233,25 @@ class RLGoalApproachController:
 
         # Build state
         state = self._compute_state(current_pose, sensor_data)
+        logger.info(
+            f"STEP {self._steps}: action={self._last_action}, "
+            f"dist={state[11]:.1f}, on={state[9]:.0f}, "
+            f"depth={sensor_data.get('depth',0):.1f}, "
+            f"pos={current_pose[:3]}"
+        )
 
         # Detect collision
         collision = self._detect_collision(sensor_data)
+        if collision:
+            logger.info(f"COLLISION: {collision} at step {self._steps}")
 
         # Learn from previous step
         done = False
+
+        # Two stores select
+        if self._prev_state is not None:
+            prev_store = self._select_store(self._prev_state)
+        next_store = self._select_store(state)
         
         if self._prev_state is not None:
             reward, done, termination_reason = self._compute_reward(
@@ -249,19 +268,21 @@ class RLGoalApproachController:
             if done:
                 td_target = reward
             else:
-                next_q = self.q_store.get_q_values(state)
+                # next_q = self.q_store.get_q_values(state)
+                next_q = next_store.get_q_values(state)
                 td_target = reward + self.gamma * np.max(next_q)
 
             #self.q_store.update_q_value(
             #    self._prev_state, self._last_action, td_target, self.alpha
             #)
             # Обучение: обновляем Q-values
-            self.q_store.update_q_value(
-                self._prev_state,
-                self._last_action,
-                td_target,
-                self._get_learning_rate(),
-            )
+            #self.q_store.update_q_value(
+            #    self._prev_state,
+            #    self._last_action,
+            #    td_target,
+            #    self._get_learning_rate(),
+            #)
+            prev_store.update_q_value(self._prev_state, self._last_action, td_target, self._get_learning_rate())
 
             if done:
                 if self.is_training and termination_reason == "goal_reached":
@@ -271,7 +292,12 @@ class RLGoalApproachController:
                 return None, None
 
         # Choose action
-        action_index, explanation = self._choose_action(state, True)
+        action_index, explanation = self._choose_action(
+            state=state,
+            current_pose=current_pose,
+            sensor_data=sensor_data,
+            explain=True
+        )
 
         # Save for next step
         self._prev_state = state
@@ -320,7 +346,8 @@ class RLGoalApproachController:
               regardless of absolute position/orientation
 
         Args:
-            current_pose: [x, y, z, roll, pitch, yaw]
+            current_pose: [x, y, z, pitch, yaw, roll]  # degrees
+            goal_pose:    [x, y, z, pitch, yaw, roll]  # degrees
             sensor_data: Sensor observations dict.
 
         Returns:
@@ -333,8 +360,7 @@ class RLGoalApproachController:
         local_pos_error = self._world_to_local(pos_error_world, current_pose)
 
         # ── Rotation error (градусы) ──
-        rot_error_rad = self._normalize_angles(goal[3:] - current_pose[3:])
-        rot_error_deg = np.degrees(rot_error_rad)
+        rot_error_deg = self._normalize_angles_deg(goal[3:] - current_pose[3:])
 
         # ── Surface normal (local frame) ──
         raw_normal = sensor_data.get("point_normal", None)
@@ -378,42 +404,25 @@ class RLGoalApproachController:
 
         return state  # 13D
 
-# ══════════════════════════════════════════════════════════
+    # ══════════════════════════════════════════════════════════
     # COLLISION DETECTION
     # ══════════════════════════════════════════════════════════
     def _detect_collision(self, sensor_data):
-        """Detect sensory collisions from depth/normal data.
-
-        Three types of sensory collision:
-            'inside_object': depth too small (clipped through surface)
-            'lost_object': was on object, now lost contact
-            'passed_through': surface normal flipped 180°
-
-        These are detected from sensor data, not Habitat physics.
-        Monty uses depth camera rendering, not rigid body collision.
-
-        Args:
-            sensor_data: Current sensor observations.
-
-        Returns:
-            Collision type string, or None if no collision.
-        """
-
-        # Объединяем в один тип: "surface_violation"
-        
-        # Проверка 1: внутри объекта
         depth = sensor_data.get("depth", self.config["max_sensor_range"])
-        if depth < self.config["min_valid_depth"]:
+        
+        was_on = (self._prev_sensor_data is not None 
+                and self._prev_sensor_data.get("on_object", False))
+        
+        # Проверка 1: внутри объекта — ТОЛЬКО если были на поверхности
+        if was_on and depth < self.config["min_valid_depth"]:
             return "surface_violation"
         
-        # Проверка 2: пролетели сквозь
+        # Проверка 2: пролетели сквозь — ТОЛЬКО если оба шага на поверхности
         if (self._prev_sensor_data is not None
-                and self._prev_sensor_data.get("on_object", False)
+                and was_on
                 and sensor_data.get("on_object", False)):
-            
             prev_normal = self._prev_sensor_data.get("point_normal")
             curr_normal = sensor_data.get("point_normal")
-            
             if prev_normal is not None and curr_normal is not None:
                 dot = np.dot(np.array(prev_normal), np.array(curr_normal))
                 if dot < self.config["normal_flip_threshold"]:
@@ -421,13 +430,12 @@ class RLGoalApproachController:
         
         # Проверка 3: потеряли объект
         if self._prev_sensor_data is not None:
-            was_on = self._prev_sensor_data.get("on_object", False)
             now_on = sensor_data.get("on_object", False)
             if was_on and not now_on:
                 return "lost_object"
         
         return None
-
+    
     # ══════════════════════════════════════════════════════════
     # REWARD
     # ══════════════════════════════════════════════════════════
@@ -580,7 +588,8 @@ class RLGoalApproachController:
         for depth, tr in enumerate(reversed(tail)):
             g_return = tr["reward"] + self.gamma * g_return
             lr = base_alpha * (self.success_backup_lambda ** depth)
-            self.q_store.update_q_value(
+            store = self._select_store(tr["state"])
+            store.update_q_value(
                 tr["state"],
                 tr["action"],
                 g_return,
@@ -611,7 +620,8 @@ class RLGoalApproachController:
         dominant_heuristic: str,
         eps: float,
         confidence: float,
-        blend: str
+        blend: str,
+        is_heuristic_override: bool
     ) -> str:
         """Generate natural language interpretation of action choice."""
         action_name = self.action_space.get_info(action_index).name
@@ -621,7 +631,12 @@ class RLGoalApproachController:
         if is_random:
             return (
                 f"##### Случайное действие: {action_name} - {action_index} "
-                f"с вероятностью epsilon {eps} * 0.1 (исследование)."
+                f"epsilon {eps}."
+            )
+        elif is_heuristic_override:
+            return (
+                f"##### Эвристика действие: {action_name} - {action_index} "
+                f"epsilon {eps}."
             )
 
         return (
@@ -655,38 +670,60 @@ class RLGoalApproachController:
             f"Доминирует эвристика: {dominant_heuristic}."
         )
 
-    def _choose_action(self, state: np.ndarray, explain: bool = False):
-        q_values = self.q_store.get_q_values(state)
-        heuristic, heuristic_components = self._compute_heuristic_bias(state)
+    def _choose_action(self,
+        state: np.ndarray,
+        current_pose: np.ndarray,
+        sensor_data: Dict[str, Any],
+        explain: bool = False
+    ):
+        store = self._select_store(state)
+        q_values = store.get_q_values(state)
+        # logger.info(f"DEBUG prev_action={self._last_action} prev_prev={self._prev_action}")
+        heuristic, heuristic_components = self._compute_heuristic_bias(
+            state=state,
+            current_pose=current_pose,      # тот же, что пришёл в step()
+            sensor_data=sensor_data,        # тот же, что пришёл в step()
+            prev_action=self._last_action,  # именно last_action
+        )
         
         q_norm = self._normalize_values(q_values)
         h_norm = self._normalize_values(heuristic)
+
+         # Вычисляем, что рекомендуют Q и эвристика
+        # best_q_action = int(np.argmax(q_norm))
+        # best_h_action = int(np.argmax(h_norm))
+        best_q_action = int(np.argmax(q_values))
+        best_h_action = int(np.argmax(heuristic))
         
         eps = self._get_current_epsilon()
         combined = (1 - eps) * q_norm + eps * h_norm
-        temperature = max(0.1, eps)
+        # temperature = max(0.1, eps)
+        temperature = min(0.02, (1-eps+1e-5))
         
         # === ОСНОВНАЯ ЛОГИКА ВЫБОРА ===
         is_random_override = False
+        is_heuristic_override = False
         action_index = None
 
-        if np.random.random() < eps * 0.1:
+        v = combined / temperature
+        v = v - np.max(v)
+        exp_v = np.exp(v)
+        probs = exp_v / exp_v.sum()
+
+        p_random = 0.02 * eps
+        if self._total_episodes < 3000:
+            action_index = best_h_action
+            is_heuristic_override = True
+        elif np.random.random() < p_random:
             is_random_override = True
             action_index = np.random.randint(self.num_actions)
+            probs[action_index] = 1.0
         else:
-            v = combined / temperature
-            v = v - np.max(v)
-            exp_v = np.exp(v)
-            probs = exp_v / exp_v.sum()
             action_index = int(np.random.choice(len(probs), p=probs))
         
         # === Если нужна диагностика — собираем объяснение ===
         if not explain:
-            return action_index
-        
-        # Вычисляем, что рекомендуют Q и эвристика
-        best_q_action = int(np.argmax(q_norm))
-        best_h_action = int(np.argmax(h_norm))
+            return action_index, None
         
         # Считаем вклад эвристик (примерно)
         contributions = {
@@ -694,16 +731,6 @@ class RLGoalApproachController:
         }
         dominant_heuristic = max(contributions, key=contributions.get) if contributions else "none"
         
-        # Если не было random, считаем вероятности
-        if not is_random_override:
-            v = combined / temperature
-            v = v - np.max(v)
-            exp_v = np.exp(v)
-            probs = exp_v / exp_v.sum()
-        else:
-            probs = np.zeros(self.num_actions)
-            probs[action_index] = 1.0  # искусственно
-
         confidence = float(probs[action_index])
 
         explanation = {
@@ -744,279 +771,276 @@ class RLGoalApproachController:
                 eps=eps,
                 confidence=confidence,
                 blend=f"{(1-eps)*100:.0f}% Q + {eps*100:.0f}% heuristic",
+                is_heuristic_override=is_heuristic_override
             ),
         }
         return action_index, explanation
 
-    def _choose_action_old(self, state):
-        q_values = self.q_store.get_q_values(state)
-        heuristic = self._compute_heuristic_bias(state)
-        
-        eps = self._get_current_epsilon()
-        
-        q_norm = self._normalize_values(q_values)
-        h_norm = self._normalize_values(heuristic)
-        
-        combined = (1 - eps) * q_norm + eps * h_norm
-        
-        # Чисто случайное действие
-        if np.random.random() < eps * 0.1:
-            return np.random.randint(self.num_actions)
-        
-        temperature = max(0.1, eps)
-        return self._softmax_sample(combined, temperature)
-
     # ══════════════════════════════════════════════════════════
     # HEURISTIC BIAS
     # ══════════════════════════════════════════════════════════
-    def _compute_heuristic_bias(self, state: np.ndarray) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
-        """Compute heuristic bias and return both combined and per-component biases.
+    def _compute_heuristic_bias(
+        self,
+        state: np.ndarray,
+        current_pose: np.ndarray,
+        sensor_data: dict,
+        prev_action: Optional[int] = None,
+    ) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+        """
+        Heuristic bias for action selection.
 
         Args:
-            state: [13D] — current state vector.
+            state: 13D state vector:
+                [0:3] local_pos_error (mm) in agent local frame
+                [3:6] rot_error_deg = [pitch_err, yaw_err, roll_err] degrees
+                [6:9] local_normal (unit-ish) in agent local frame
+                [9]   on_object (float 0/1)
+                [10]  alignment
+                [11]  distance (mm)
+                [12]  norm_depth
+            current_pose: [x, y, z, pitch, yaw, roll] degrees
+            sensor_data: dict with "point_normal" in WORLD coords (or None), "depth", "on_object"
+            prev_action: previous chosen action index (last step)
 
         Returns:
-            Tuple:
-                - bias: [num_actions] combined heuristic preference.
-                - components: dict mapping heuristic name to its raw bias vector.
+            bias: [NUM_ACTIONS]
+            components: dict of component biases
         """
-        bias = np.zeros(self.num_actions)
-        components = {}
+        logger.info("HEURISTIC_V2_ACTIVE")
+        logger.info(
+            "MODEDBG on=%s depth=%.3f normal_is_none=%s align=%.3f",
+            float(state[9]),
+            float(sensor_data.get("depth", -1.0)),
+            sensor_data.get("point_normal") is None,
+            float(state[10]),
+        )
 
-        # Распаковка state (13D)
+        bias = np.zeros(self.num_actions, dtype=float)
+        components: Dict[str, np.ndarray] = {}
+
+        # Unpack state
         local_pos_error = state[0:3]
-        # rot_error = state[3:6]  # not used
+        rot_error_deg = state[3:6]
         local_normal = state[6:9]
-        on_object = state[9]
-        alignment = state[10]
-        distance = state[11]
-        norm_depth = state[12]
+        on_object = float(state[9])
+        alignment = float(state[10])
+        distance = float(state[11])
 
-        # Параметры action space
-        surface_step = self.action_space.surface_step
-        free_step = self.action_space.free_step
-        normal_len = np.linalg.norm(local_normal)
+        eps = 1e-8
 
-        # ═══════════════════════════════════════════════════
-        # Эвристика 1: ДВИГАЙСЯ К ЦЕЛИ
-        # ═══════════════════════════════════════════════════
-        move_to_goal_bias = np.zeros(self.num_actions)
-        goal_dir = local_pos_error / (distance + 1e-8)
+        # Rotation: local -> world
+        rot = R.from_euler("xyz", current_pose[3:6], degrees=True)
 
-        if on_object > 0.5 and normal_len > 1e-8:
-            n_hat = local_normal / normal_len
-            tangent = goal_dir - np.dot(goal_dir, n_hat) * n_hat
-            tangent_len = np.linalg.norm(tangent)
-            if tangent_len > 1e-8:
-                tangent = tangent / tangent_len
-            else:
-                tangent = goal_dir
-        else:
-            tangent = goal_dir
+        # ------------------------------------------------------------
+        # 0) Suppress actions that waste steps for point-reaching
+        # ------------------------------------------------------------
+        suppress = np.zeros(self.num_actions, dtype=float)
+        suppress[self.action_space.IDX_ROTATE_POS] -= 2.0
+        suppress[self.action_space.IDX_ROTATE_NEG] -= 2.0
 
-        tangent_angle = np.degrees(np.arctan2(tangent[1], tangent[0])) % 360
-        move_to_goal_bias += self.action_space.surface_direction_similarity(tangent_angle)
-        bias += move_to_goal_bias
-        components["move_to_goal"] = move_to_goal_bias
+        near_goal = (distance < 3.0 * self.action_space.surface_step)
+        if not (on_object > 0.5 and near_goal):
+            suppress[self.action_space.IDX_ORIENT_HOR] -= 2.0
+            suppress[self.action_space.IDX_ORIENT_VERT] -= 2.0
 
-        # ═══════════════════════════════════════════════════
-        # Эвристика 2: ДАЛЕКО → ЛЕТИ, БЛИЗКО → ПОЛЗИ
-        # ═══════════════════════════════════════════════════
-        fly_vs_crawl_bias = np.zeros(self.num_actions)
-        steps_needed = distance / surface_step
-        crossover = 2.0 + free_step / surface_step
-        fly_preference = np.tanh(steps_needed / crossover - 1.0)
+        bias += suppress
+        components["suppress"] = suppress
 
-        if fly_preference > 0:
-            fly_vs_crawl_bias[self.action_space.IDX_FREE_FORWARD] += fly_preference
-            fly_vs_crawl_bias[self.action_space.IDX_FREE_BACKWARD] -= 0.5
-        else:
-            surface_mask = self.action_space.get_category_mask("surface")
-            free_mask = self.action_space.get_category_mask("free")
-            fly_vs_crawl_bias[surface_mask] *= (1.0 + abs(fly_preference))
-            fly_vs_crawl_bias[free_mask] -= abs(fly_preference)
+        # ------------------------------------------------------------
+        # 1) Surface move-to-goal (world tangent projection + dot argmax)
+        # ------------------------------------------------------------
+        surface_move = np.zeros(self.num_actions, dtype=float)
 
-        bias += fly_vs_crawl_bias
-        components["fly_vs_crawl"] = fly_vs_crawl_bias
+        # Precompute the same 8 local directions as in LightweightEnv._move_tangentially:
+        # 0° forward -> -Z, 90° right -> +X
+        dirs_local = []
+        for deg in self.action_space.SURFACE_DIRECTIONS:  # [0,45,...,315]
+            a = np.radians(deg)
+            v = np.array([np.sin(a), 0.0, -np.cos(a)], dtype=float)
+            v /= (np.linalg.norm(v) + eps)
+            dirs_local.append(v)
+        dirs_local = np.stack(dirs_local, axis=0)  # [8,3]
 
-        # ═══════════════════════════════════════════════════
-        # Эвристика 3: ЦЕЛЬ ЧЕРЕЗ ПОВЕРХНОСТЬ → ОТОРВИСЬ
-        # ═══════════════════════════════════════════════════
-        detach_urgency_bias = np.zeros(self.num_actions)
-        if alignment < 0 and on_object > 0.5:
-            detach_urgency = abs(alignment)
-            detach_urgency_bias[self.action_space.IDX_LOOK_UP] += detach_urgency
+        # Detach threshold (keep from previous heuristic)
+        DETACH_ALIGN_THR = -0.3
 
-        bias += detach_urgency_bias
-        components["detach_urgency"] = detach_urgency_bias
+        SURFACE_STRENGTH = 2.0
 
-        # ═══════════════════════════════════════════════════
-        # Эвристика 4: ОРИЕНТАЦИЯ СЕНСОРА
-        # ═══════════════════════════════════════════════════
-        orient_sensor_bias = np.zeros(self.num_actions)
-        sensor_forward = np.array([0.0, 0.0, -1.0])
-        if on_object > 0.5 and normal_len > 1e-8:
-            sensor_alignment = np.dot(sensor_forward, local_normal)
-            orient_need = max(0.0, 1.0 - sensor_alignment)
-            if alignment < 0:
-                orient_need *= 0.3
-            else:
-                orient_need *= 0.5
+        if on_object > 0.5 and alignment >= DETACH_ALIGN_THR:
+            n_world = sensor_data.get("point_normal", None)
+            forward_world = rot.apply([0.0, 0.0, -1.0])
 
-            if local_normal[2] < 0:
-                orient_sensor_bias[self.action_space.IDX_LOOK_UP] += orient_need
-            else:
-                orient_sensor_bias[self.action_space.IDX_LOOK_DOWN] += orient_need
+            if n_world is not None:
+                n_world = np.asarray(n_world, dtype=float)
+                n_len = float(np.linalg.norm(n_world))
+                if n_len > eps:
+                    n_hat = n_world / n_len
 
-        bias += orient_sensor_bias
-        components["orient_sensor"] = orient_sensor_bias
+                    logger.info(
+                        "FDBG forward_world=%s  -normal=%s  dot=%+.3f",
+                        np.array2string(forward_world, precision=3),
+                        np.array2string(-n_hat, precision=3),
+                        float(np.dot(forward_world, -n_hat)),
+                    )
+
+                    e_world = rot.apply(local_pos_error)
+                    e_t = e_world - np.dot(e_world, n_hat) * n_hat
+                    step = float(self.action_space.surface_step)
+
+                    right_world = rot.apply([1.0, 0.0, 0.0])
+                    tb1 = right_world - np.dot(right_world, n_hat) * n_hat
+                    tb1_norm = np.linalg.norm(tb1)
+
+                    if tb1_norm < 1e-8:
+                        up_world = rot.apply([0.0, 1.0, 0.0])
+                        tb1 = up_world - np.dot(up_world, n_hat) * n_hat
+                        tb1_norm = np.linalg.norm(tb1)
+
+                    if tb1_norm < 1e-8:
+                        tmp = np.array([0.0, 1.0, 0.0])
+                        if abs(np.dot(tmp, n_hat)) > 0.9:
+                            tmp = np.array([0.0, 0.0, 1.0])
+                        tb1 = np.cross(n_hat, tmp)
+                        tb1_norm = np.linalg.norm(tb1)
+
+                    tb1 /= (tb1_norm + 1e-12)
+                    tb2 = np.cross(n_hat, tb1)
+                    tb2 /= (np.linalg.norm(tb2) + 1e-12)
+
+                    best = None
+                    best_score = -1e18
+                    scores = np.full(8, -1e18, dtype=float)
+
+                    for i, deg in enumerate(self.action_space.SURFACE_DIRECTIONS):
+                        a = np.radians(deg)
+                        v_world = np.cos(a) * tb1 + np.sin(a) * tb2
+                        v_norm = float(np.linalg.norm(v_world))
+                        if v_norm < 1e-8:
+                            continue
+                        v_world /= v_norm
+
+                        new_e = e_t - step * v_world
+                        score = float(np.dot(e_t, e_t) - np.dot(new_e, new_e))
+                        scores[i] = score
+                        if score > best_score:
+                            best_score = score
+                            best = i
+
+                    HYST_ABS = 0.25
+                    if prev_action is not None and 0 <= prev_action < 8 and best is not None:
+                        prev_score = scores[int(prev_action)]
+                        if (best_score - prev_score) < HYST_ABS:
+                            best = int(prev_action)
+
+                    if best is not None:
+                        surface_move[best] = SURFACE_STRENGTH
+
+                    logger.info(
+                        "SDBG e_t=%s scores=%s best=%s prev=%s",
+                        np.array2string(e_t, precision=3),
+                        np.array2string(scores, precision=3),
+                        str(best),
+                        str(prev_action),
+                    )
+                    logger.info(
+                        "HDBG on=%s depth=%.3f align=%.3f dist=%.3f "
+                        "n_world=%s e_world=%s tb1=%s tb2=%s best=%s prev=%s",
+                        on_object,
+                        float(sensor_data.get("depth", -1.0)),
+                        alignment,
+                        distance,
+                        np.array2string(n_hat, precision=3),
+                        np.array2string(e_world, precision=3),
+                        np.array2string(tb1, precision=3),
+                        np.array2string(tb2, precision=3),
+                        str(best),
+                        str(prev_action),
+                    )
+                    logger.info(f"current_pose {current_pose}")
+
+        bias += surface_move
+        components["surface_move"] = surface_move
+
+        # ------------------------------------------------------------
+        # 2) Detach heuristic (goal "through" surface)
+        # ------------------------------------------------------------
+        detach = np.zeros(self.num_actions, dtype=float)
+        if on_object > 0.5 and alignment < DETACH_ALIGN_THR:
+            detach_urgency = min(1.0, abs(alignment))
+            detach[self.action_space.IDX_LOOK_UP] += 3.0 * detach_urgency
+            detach[self.action_space.IDX_FREE_FORWARD] -= 1.0
+            detach[self.action_space.IDX_FREE_BACKWARD] -= 1.0
+        bias += detach
+        components["detach"] = detach
+
+        # ------------------------------------------------------------
+        # 3) Free-space steering (when off surface)
+        # ------------------------------------------------------------
+        steer = np.zeros(self.num_actions, dtype=float)
+        if on_object <= 0.5:
+            norm_depth = float(state[12])  # depth / max_sensor_range
+            
+            if norm_depth < 0.1:  # ещё близко к поверхности (depth < 10mm)
+                # Приоритет: отлететь
+                steer[self.action_space.IDX_FREE_FORWARD] += 3.0
+                # Подавить повороты
+                steer[self.action_space.IDX_LOOK_UP] -= 1.0
+                steer[self.action_space.IDX_LOOK_DOWN] -= 1.0
+                steer[self.action_space.IDX_TURN_LEFT] -= 1.0
+                steer[self.action_space.IDX_TURN_RIGHT] -= 1.0
+            else:  # norm_depth >= 0.1 — отлетели, рулим к цели
+                # Направление на ПОЗИЦИЮ цели в локальной СК
+                goal_dir_local = local_pos_error.copy()  # state[0:3]
+                goal_dist = np.linalg.norm(goal_dir_local)
+                if goal_dist > 1e-8:
+                    goal_dir_local /= goal_dist
+                
+                gx, gy, gz = goal_dir_local
+                
+                # Yaw: отклонение в горизонтальной плоскости
+                # forward = [0,0,-1], цель впереди когда gz < 0
+                yaw_to_goal = np.degrees(np.arctan2(-gx, -gz))
+                
+                # Pitch: отклонение по вертикали
+                horiz_dist = np.sqrt(gx**2 + gz**2)
+                pitch_to_goal = np.degrees(np.arctan2(gy, horiz_dist))
+                
+                yaw_thr = 5.0
+                pitch_thr = 5.0
+                
+                if abs(yaw_to_goal) > yaw_thr:
+                    if yaw_to_goal > 0:
+                        steer[self.action_space.IDX_TURN_LEFT] += 2.0
+                    else:
+                        steer[self.action_space.IDX_TURN_RIGHT] += 2.0
+                elif abs(pitch_to_goal) > pitch_thr:
+                    if pitch_to_goal > 0:
+                        steer[self.action_space.IDX_LOOK_UP] += 2.0
+                    else:
+                        steer[self.action_space.IDX_LOOK_DOWN] += 2.0
+                else:
+                    steer[self.action_space.IDX_FREE_FORWARD] += 2.0
+                
+                steer[self.action_space.IDX_FREE_BACKWARD] -= 0.5
+                    
+        bias += steer
+        components["steer_in_air"] = steer
+
+        # ------------------------------------------------------------
+        # 4) Extra damping: if on surface and not detaching, discourage free moves
+        # ------------------------------------------------------------
+        damp_free = np.zeros(self.num_actions, dtype=float)
+        if on_object > 0.5 and alignment >= DETACH_ALIGN_THR:
+            damp_free[self.action_space.IDX_FREE_FORWARD] -= 2.0
+            damp_free[self.action_space.IDX_FREE_BACKWARD] -= 1.0
+        bias += damp_free
+        components["damp_free_on_surface"] = damp_free
 
         return bias, components
-        
-    def _compute_heuristic_bias_old(self, state):
-        """Эвристические предпочтения действий.
-        
-        Все вычисления из геометрии и action space параметров.
-        Нет магических чисел — всё выводится.
-        
-        Args:
-            state: [13D] — обновлённый state vector
-            
-        Returns:
-            bias: [18] — предпочтение для каждого действия
-                положительное = предпочтительно
-                отрицательное = нежелательно
-                ноль = нейтрально
-        """
-        bias = np.zeros(self.num_actions)
-        # Пока не работают просто возвращаем нули
-        # return bias
-        
-        # Распаковка state (13D)
-        local_pos_error = state[0:3]
-        # rot_error = state[3:6]  # не используем в эвристике
-        local_normal = state[6:9]
-        on_object = state[9]
-        alignment = state[10]
-        distance = state[11]
-        norm_depth = state[12]
-        
-        # Параметры action space
-        surface_step = self.action_space.surface_step
-        free_step = self.action_space.free_step
-        normal_len = np.linalg.norm(local_normal)
-        
-        # ═══════════════════════════════════════════════════
-        # Эвристика 1: ДВИГАЙСЯ К ЦЕЛИ
-        # Источник: tangent_movement()
-        #
-        # Проецируем направление к цели на касательную
-        # плоскость и находим ближайшее surface действие.
-        # Чистая геометрия, нет порогов.
-        # ═══════════════════════════════════════════════════
-        
-        goal_dir = local_pos_error / (distance + 1e-8)
-        
-        if on_object > 0.5 and normal_len > 1e-8:
-            # На поверхности: проецируем на касательную плоскость
-            n_hat = local_normal / normal_len
-            tangent = goal_dir - np.dot(goal_dir, n_hat) * n_hat
-            tangent_len = np.linalg.norm(tangent)
-            if tangent_len > 1e-8:
-                tangent = tangent / tangent_len
-            else:
-                # Цель точно по нормали — tangent неопределён
-                tangent = goal_dir
-        else:
-            # В воздухе: просто направление к цели
-            tangent = goal_dir
-        
-        # Угол tangent → cosine similarity для каждого surface действия
-        tangent_angle = np.degrees(np.arctan2(tangent[1], tangent[0])) % 360
-        bias += self.action_space.surface_direction_similarity(tangent_angle)
-        
-        # ═══════════════════════════════════════════════════
-        # Эвристика 2: ДАЛЕКО → ЛЕТИ, БЛИЗКО → ПОЛЗИ
-        # Источник: surface_crawl vs free movement
-        #
-        # Порог выводится из step sizes:
-        # crossover = точка где лететь и ползти одинаково
-        # ═══════════════════════════════════════════════════
-        
-        steps_needed = distance / surface_step
-        crossover = 2.0 + free_step / surface_step
-        # crossover при surface=5, free=10:
-        #   2.0 + 10/5 = 4.0 шага
-        #   Меньше 4 шагов → ползти
-        #   Больше 4 шагов → лететь
-        
-        # Плавный переход через tanh
-        fly_preference = np.tanh(steps_needed / crossover - 1.0)
-        # steps=1  → tanh(-0.75) = -0.64 → ползти
-        # steps=4  → tanh(0.0)   =  0.0  → нейтрально
-        # steps=8  → tanh(1.0)   =  0.76 → лететь
-        # steps=20 → tanh(4.0)   =  1.0  → точно лететь
-        
-        if fly_preference > 0:
-            # Далеко: предпочитаем свободный полёт
-            bias[self.action_space.IDX_FREE_FORWARD] += fly_preference
-            bias[self.action_space.IDX_FREE_BACKWARD] -= 0.5
-        else:
-            # Близко: усиливаем surface, ослабляем free
-            surface_mask = self.action_space.get_category_mask("surface")
-            free_mask = self.action_space.get_category_mask("free")
-            bias[surface_mask] *= (1.0 + abs(fly_preference))
-            bias[free_mask] -= abs(fly_preference)  # penalize free movement near goal
-        
-        # ═══════════════════════════════════════════════════
-        # Эвристика 3: ЦЕЛЬ ЧЕРЕЗ ПОВЕРХНОСТЬ → ОТОРВИСЬ
-        # Источник: геометрия (alignment < 0)
-        #
-        # Если цель по ту сторону объекта, нужно
-        # подняться над поверхностью. Сила пропорциональна
-        # тому насколько "глубоко" цель за поверхностью.
-        # ═══════════════════════════════════════════════════
-        
-        if alignment < 0 and on_object > 0.5:
-            # alignment = -1.0 → цель прямо за поверхностью → сильный отрыв
-            # alignment = -0.1 → цель почти вдоль поверхности → слабый отрыв
-            detach_urgency = abs(alignment)  # [0, 1]
-            bias[self.action_space.IDX_LOOK_UP] += detach_urgency
-        
-        # ═══════════════════════════════════════════════════
-        # Эвристика 4: ОРИЕНТАЦИЯ СЕНСОРА
-        # Источник: orient_to_surface()
-        #
-        # Сенсор должен смотреть на поверхность.
-        # Чем сильнее отклонение, тем больше bias.
-        # ═══════════════════════════════════════════════════
-        
-        sensor_forward = np.array([0.0, 0.0, -1.0])
-        if on_object > 0.5 and normal_len > 1e-8:
-            sensor_alignment = np.dot(sensor_forward, local_normal)
-            # sensor_alignment = 1.0 → идеально (смотрит на поверхность)
-            # sensor_alignment = 0.0 → перпендикулярно
-            # sensor_alignment = -1.0 → отвернулся
-            
-            orient_need = max(0.0, 1.0 - sensor_alignment)
-            # × 0.5: ориентация менее приоритетна чем движение
-            # Если мы в режиме "отрыва", ориентация менее важна
-            if alignment < 0:
-                orient_need *= 0.3  # снижаем приоритет стабилизации
-            else:
-                orient_need *= 0.5  # обычный приоритет
-            
-            if local_normal[2] < 0:
-                bias[self.action_space.IDX_LOOK_UP] += orient_need
-            else:
-                bias[self.action_space.IDX_LOOK_DOWN] += orient_need
-        
-        return bias
 
     # ══════════════════════════════════════════════════════════
     # COORDINATE TRANSFORMS
     # ══════════════════════════════════════════════════════════
-
     def _world_to_local(
         self,
         vector_world: np.ndarray,
@@ -1029,12 +1053,12 @@ class RLGoalApproachController:
 
         Args:
             vector_world: 3D vector in world coordinates.
-            pose: Agent pose [x, y, z, roll, pitch, yaw].
+            pose: Agent pose [x, y, z, [pitch,yaw,roll].
 
         Returns:
             3D vector in agent's local coordinates.
         """
-        rotation = R.from_euler("xyz", pose[3:6])
+        rotation = R.from_euler("xyz", pose[3:6], degrees=True)
         return rotation.inv().apply(vector_world)
 
     @staticmethod
@@ -1055,6 +1079,9 @@ class RLGoalApproachController:
     # ══════════════════════════════════════════════════════════
     # MATH UTILITIES
     # ══════════════════════════════════════════════════════════
+    @staticmethod
+    def _normalize_angles_deg(angles_deg: np.ndarray) -> np.ndarray:
+        return (angles_deg + 180.0) % 360.0 - 180.0
 
     @staticmethod
     def _normalize_values(values: np.ndarray) -> np.ndarray:
@@ -1115,6 +1142,7 @@ class RLGoalApproachController:
         """
         distance = np.linalg.norm(final_state[0:3])
         goal_reached = termination_reason == "goal_reached"
+        start_distance = np.linalg.norm(self._current_goal[0:3] - self.start_pos)
 
         if goal_reached:
             self._total_goals_reached += 1
@@ -1125,6 +1153,7 @@ class RLGoalApproachController:
             reason_key = "goal_reached"
             logger.info(
                 f"Episode {self._total_episodes} DONE: {reason}, "
+                f"start_dist={start_distance:.1f}mm, "
                 f"{self._steps} steps, "
                 f"reward={self._episode_reward:.1f}, "
                 f"final_dist={distance:.1f}mm, "
@@ -1198,115 +1227,12 @@ class RLGoalApproachController:
             "current_episode_reward": self._episode_reward,
             "termination_counts": dict(self._termination_counts),
             "termination_rates": termination_rates,
-            "q_store": self.q_store.get_stats(),
+            # "q_store": self.q_store.get_stats(),
+            "q_store_free": self.q_store_free.get_stats(),
+            "q_store_surface": self.q_store_surface.get_stats(),
         }
 
         return stats
-
-    def explain_action(
-        self,
-        current_pose: np.ndarray,
-        sensor_data: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        """Explain WHY the controller would choose a particular action.
-
-        Useful for debugging and understanding learned behavior.
-        Does NOT execute the action or update any state.
-
-        Args:
-            current_pose: Current agent pose.
-            sensor_data: Current sensor observations.
-
-        Returns:
-            Dict with state, Q-values, heuristic bias, combined scores,
-            chosen action, and nearest neighbor info.
-        """
-        if self._current_goal is None:
-            return {"error": "no active goal"}
-
-        state = self._compute_state(current_pose, sensor_data)
-        q_values = self.q_store.get_q_values(state)
-        heuristic, heuristic_components = self._compute_heuristic_bias(state)
-
-        q_norm = self._normalize_values(q_values)
-        h_norm = self._normalize_values(heuristic)
-        combined = (1.0 - self.epsilon) * q_norm + self.epsilon * h_norm
-
-        temperature = max(0.1, self.epsilon)
-        v = combined / temperature
-        v = v - np.max(v)
-        exp_v = np.exp(v)
-        probs = exp_v / exp_v.sum()
-
-        best_action = int(np.argmax(combined))
-        neighbors = self.q_store.get_nearest_points_info(state, k=5)
-
-        collision = self._detect_collision(sensor_data)
-        progress_raw_since_prev = None
-        progress_used_since_prev = None
-        progress_clipped_since_prev = None
-        detour_mode_active = False
-        if self._prev_state is not None:
-            prev_distance = float(self._prev_state[11])
-            distance = float(state[11])
-            prev_alignment = float(self._prev_state[10])
-            prev_on_object = float(self._prev_state[9])
-            progress_raw_since_prev = prev_distance - distance
-            progress_used_since_prev = progress_raw_since_prev
-            detour_mode_active = (
-                prev_alignment < self.config["detour_alignment_threshold"]
-                and (prev_on_object > 0.5 or collision == "lost_object")
-            )
-            if detour_mode_active and progress_raw_since_prev < 0.0:
-                min_progress = (
-                    -self.action_space.surface_step
-                    * self.config["detour_negative_progress_clip_steps"]
-                )
-                progress_used_since_prev = max(progress_raw_since_prev, min_progress)
-            progress_clipped_since_prev = (
-                progress_used_since_prev != progress_raw_since_prev
-            )
-
-        return {
-            "state": {
-                "local_pos_error": state[0:3].tolist(),
-                "rot_error": state[3:6].tolist(),
-                "local_normal": state[6:9].tolist(),
-                "on_object": float(state[9]),
-                "alignment": float(state[10]),
-                "distance": float(state[11]),
-                "norm_depth": float(state[12]),
-            },
-            "q_values": {
-                self.action_space.get_info(i).name: float(q_values[i])
-                for i in range(self.num_actions)
-            },
-            "heuristic_bias": {
-                self.action_space.get_info(i).name: float(heuristic[i])
-                for i in range(self.num_actions)
-            },
-            "action_probabilities": {
-                self.action_space.get_info(i).name: float(probs[i])
-                for i in range(self.num_actions)
-            },
-            "best_action": {
-                "index": best_action,
-                "name": self.action_space.get_info(best_action).name,
-                "q_value": float(q_values[best_action]),
-                "heuristic": float(heuristic[best_action]),
-                "probability": float(probs[best_action]),
-            },
-            "epsilon": self.epsilon,
-            "blend": f"{(1-self.epsilon)*100:.0f}% Q + {self.epsilon*100:.0f}% heuristic",
-            "reward_diagnostics": {
-                "detour_mode_active": detour_mode_active,
-                "progress_raw_since_prev": progress_raw_since_prev,
-                "progress_used_since_prev": progress_used_since_prev,
-                "progress_clipped_since_prev": progress_clipped_since_prev,
-                "collision_now": collision,
-            },
-            "nearest_neighbors": neighbors,
-        }
 
     # ══════════════════════════════════════════════════════════
     # PERSISTENCE
@@ -1326,7 +1252,8 @@ class RLGoalApproachController:
         os.makedirs(dirpath, exist_ok=True)
 
         # Save Q-store (with native HNSW index for fast reload)
-        self.q_store.save_with_index(os.path.join(dirpath, "q_store"))
+        self.q_store_free.save_with_index(os.path.join(dirpath, "q_store_free"))
+        self.q_store_surface.save_with_index(os.path.join(dirpath, "q_store_surface"))
 
         # Сохраняем текущий epsilon
         controller_state = {
@@ -1378,8 +1305,11 @@ class RLGoalApproachController:
         controller = cls(agent_id=agent_id, config=cfg)
         
         # Load Q-store (fast path with native index, fallback to rebuild)
-        controller.q_store = HNSWStateStore.load_with_index(
-            os.path.join(dirpath, "q_store"), extra_cfg=config
+        controller.q_store_free = HNSWStateStore.load_with_index(
+            os.path.join(dirpath, "q_store_free"), extra_cfg=config
+        )
+        controller.q_store_surface = HNSWStateStore.load_with_index(
+            os.path.join(dirpath, "q_store_surface"), extra_cfg=config
         )
 
         # Load controller state
@@ -1398,7 +1328,8 @@ class RLGoalApproachController:
             f"{loaded_total_steps} loaded_total_steps, "
             f"{loaded_total_goals_reached} loaded_total_goals_reached, "
             f"loaded_epsilon={loaded_epsilon:.3f}, "
-            f"loaded Q-store={controller.q_store.get_stats()['num_points']} points"
+            f"loaded Q-store={controller.q_store_surface.get_stats()['num_points']} points"
+            f"loaded Q-store={controller.q_store_free.get_stats()['num_points']} points"
         )
 
         return controller
