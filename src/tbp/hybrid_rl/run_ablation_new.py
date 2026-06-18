@@ -249,15 +249,15 @@ def _print_eval_results(eval_results: Dict[str, Any]) -> None:
 
 
 def main() -> None:
-    TRAIN_EPISODES_PER_LEVEL = 5000
+    TRAIN_EPISODES_PER_LEVEL = 5_000
     EVAL_EPISODES_PER_LEVEL = 500
     REGENERATE_SCRIPTS = False
     IS_LOAD = False
     RUN_TRAIN = True
-    RUN_EVAL = True
+    RUN_EVAL = False
 
     if IS_LOAD:
-        epsilon_start = 0.1
+        epsilon_start = 0.15
     else:
         epsilon_start = 1.0
 
@@ -278,7 +278,7 @@ def main() -> None:
         "reward_timeout": -8.0,
         "surface_step": 3.0,
         "free_step": 8.0,
-        "rotation_step": 10.0,
+        "rotation_step": 5.0,
     }
     cfg = {**DEFAULT_CONFIG, **base_config}
 
