@@ -180,13 +180,14 @@ class LightweightEnv:
 
                 if use_filter:
                     dist = float(np.linalg.norm(position - reference_pos))
-                    same_cube_side_check = is_on_same_cube_side(position, reference_pos)
                     if min_dist is not None and dist < min_dist:
                         continue
                     if max_dist is not None and dist > max_dist:
                         continue
-                    if same_cube_side is not None and same_cube_side_check == False:
-                        continue
+                    if same_cube_side == True:
+                        same_cube_side_check = is_on_same_cube_side(position, reference_pos)
+                        if same_cube_side_check == False:
+                            continue
 
                 rotation = self._look_at_direction(-normal)
                 return np.concatenate([position, rotation])
@@ -258,6 +259,64 @@ class LightweightEnv:
         return R.from_matrix(rot_matrix).as_euler("xyz")
 
     def _move_tangentially(self, direction_degrees, step_size, snap_to_surface: bool = True):
+        rot = R.from_euler("xyz", self.agent_rot, degrees=True)
+
+        sensor_data = self.get_sensor_data()
+        if sensor_data["point_normal"] is None:
+            angle_rad = np.radians(direction_degrees)
+            local_dir = np.array([np.sin(angle_rad), 0.0, -np.cos(angle_rad)], dtype=float)
+            local_dir /= (np.linalg.norm(local_dir) + 1e-12)
+            world_dir = rot.apply(local_dir)
+            self.agent_pos += world_dir * step_size
+            return
+
+        n = np.array(sensor_data["point_normal"], dtype=float)
+        n /= (np.linalg.norm(n) + 1e-12)
+
+        right_world = rot.apply([1.0, 0.0, 0.0])
+        t1 = right_world - np.dot(right_world, n) * n
+        t1_norm = np.linalg.norm(t1)
+
+        if t1_norm < 1e-8:
+            up_world = rot.apply([0.0, 1.0, 0.0])
+            t1 = up_world - np.dot(up_world, n) * n
+            t1_norm = np.linalg.norm(t1)
+
+        if t1_norm < 1e-8:
+            tmp = np.array([0.0, 1.0, 0.0])
+            if abs(np.dot(tmp, n)) > 0.9:
+                tmp = np.array([0.0, 0.0, 1.0])
+            t1 = np.cross(n, tmp)
+            t1_norm = np.linalg.norm(t1)
+
+        t1 /= (t1_norm + 1e-12)
+
+        t2 = np.cross(n, t1)
+        t2 /= (np.linalg.norm(t2) + 1e-12)
+
+        a = np.radians(direction_degrees)
+        world_dir = np.cos(a) * t1 + np.sin(a) * t2
+        world_dir /= (np.linalg.norm(world_dir) + 1e-12)
+
+        old_pos = self.agent_pos.copy()
+        self.agent_pos += world_dir * step_size
+
+        if snap_to_surface:
+            closest, dist_to_mesh, face_id = self.mesh.nearest.on_surface([self.agent_pos])
+            hit_n = self.mesh.face_normals[face_id[0]]
+            hit_n = hit_n / (np.linalg.norm(hit_n) + 1e-12)
+            if np.dot(hit_n, n) < 0:
+                hit_n = -hit_n
+
+            same_face = np.dot(hit_n, n) > 0.5
+
+            if same_face:
+                self.agent_pos = closest[0] + hit_n * 2.0
+                self.agent_rot = self._look_at_direction(-hit_n)
+            else:
+                self.agent_pos = old_pos
+
+    def _move_tangentially_old(self, direction_degrees, step_size, snap_to_surface: bool = True):
         """
         Movement tangent to the surface using a tangent basis (t1, t2).
 
@@ -331,39 +390,6 @@ class LightweightEnv:
             self.agent_rot = self._look_at_direction(-hit_n)
         else:
             logger.warning(f"SNAP FAILED: ray_origin={self.agent_pos}, n={n}")
-
-    def _move_tangentially_old(self, direction_degrees, step_size):
-        """Movement tangent to the surface.
-        0°  = forward    → -Z
-        90° = right      → +X
-        180° = backward  → +Z
-        270° = left      → -X
-        """
-        rot = R.from_euler("xyz", self.agent_rot, degrees=True)
-        
-        angle_rad = np.radians(direction_degrees)
-        local_dir = np.array([
-            np.sin(angle_rad),   # X: + = right
-            0.0,                 # Y: ignore
-            -np.cos(angle_rad)   # Z: -1 at 0° = forward
-        ])
-        
-        # Normalize in case (though it's unit)
-        local_dir /= (np.linalg.norm(local_dir) + 1e-12)
-        
-        # Transform to world
-        world_dir = rot.apply(local_dir)
-        
-        # Project onto tangent plane if normal is available
-        sensor_data = self.get_sensor_data()
-        if sensor_data["point_normal"] is not None:
-            normal = np.array(sensor_data["point_normal"])
-            world_dir -= np.dot(world_dir, normal) * normal
-            norm = np.linalg.norm(world_dir)
-            if norm > 1e-8:
-                world_dir /= norm
-        
-        self.agent_pos += world_dir * step_size
 
     def _move_forward(self, step_size):
         """Forward movement (where the sensor is looking)."""

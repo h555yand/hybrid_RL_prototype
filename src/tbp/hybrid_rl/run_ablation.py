@@ -12,8 +12,8 @@ from tbp.hybrid_rl.lightweight_env import LightweightEnv
 from tbp.hybrid_rl.ablation_runner import RLAblationRunner, train
 from tbp.hybrid_rl.config import DEFAULT_CONFIG
 
-# logging.basicConfig(level=logging.DEBUG)
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
+# logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Curriculum levels: (min_dist_mm, max_dist_mm)

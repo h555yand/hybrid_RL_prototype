@@ -15,6 +15,8 @@ from tbp.hybrid_rl.lightweight_env import LightweightEnv
 from tbp.hybrid_rl.config import DEFAULT_CONFIG
 from tbp.hybrid_rl.visualize_env import visualize_agent_goal
 
+GOAL_THRESHOLD_PER_LEVEL = [5.0, 3.0, 2.0]
+
 logger = logging.getLogger(__name__)
 
 
@@ -230,17 +232,17 @@ def train(
         if _episode_success:
             success_trails.append(controller.success_trails)
             success_actions.append(action_explanations)
-            logger.info(f"SUCCESS, start_distance {start_distance}, explain_action_info: {action_explanations}")
-            if visualise:
-                visualize_agent_goal(env, np.concatenate([start_pos, start_rot]), goal_pose)
-                for pose in current_poses:
-                    visualize_agent_goal(env, pose, goal_pose)
+            logger.debug(f"SUCCESS, start_distance {start_distance}, explain_action_info: {action_explanations}")
+            #if visualise:
+            #    visualize_agent_goal(env, np.concatenate([start_pos, start_rot]), goal_pose)
+            #    for pose in current_poses:
+            #        visualize_agent_goal(env, pose, goal_pose)
         else:
-            logger.info(f"ERROR, start_distance {start_distance}, explain_action_info: {action_explanations}")
-            if visualise:
-                visualize_agent_goal(env, np.concatenate([start_pos, start_rot]), goal_pose)
-                for pose in current_poses:
-                    visualize_agent_goal(env, pose, goal_pose)
+            logger.debug(f"ERROR, start_distance {start_distance}, explain_action_info: {action_explanations}")
+            #if visualise:
+            #    visualize_agent_goal(env, np.concatenate([start_pos, start_rot]), goal_pose)
+            #    for pose in current_poses:
+            #        visualize_agent_goal(env, pose, goal_pose)
 
         # Curriculum promote check (after episode)
         if _use_curriculum and "train" in cfg["mode"]:
@@ -262,6 +264,10 @@ def train(
                         _curr_level_successes / max(_curr_level_episodes, 1)
                     )
                     _curr_level_idx += 1
+                    if _curr_level_idx < len(GOAL_THRESHOLD_PER_LEVEL):
+                        new_threshold = GOAL_THRESHOLD_PER_LEVEL[_curr_level_idx]
+                        controller.config["goal_threshold"] = new_threshold
+                        logger.info(f"  [Curriculum] goal_threshold → {new_threshold}mm")
                     _curr_window = collections.deque(maxlen=_promote_window)  # сброс окна
                     _curr_level_episodes = 0
                     _curr_level_successes = 0

@@ -233,7 +233,7 @@ class RLGoalApproachController:
 
         # Build state
         state = self._compute_state(current_pose, sensor_data)
-        logger.info(
+        logger.debug(
             f"STEP {self._steps}: action={self._last_action}, "
             f"dist={state[11]:.1f}, on={state[9]:.0f}, "
             f"depth={sensor_data.get('depth',0):.1f}, "
@@ -243,7 +243,7 @@ class RLGoalApproachController:
         # Detect collision
         collision = self._detect_collision(sensor_data)
         if collision:
-            logger.info(f"COLLISION: {collision} at step {self._steps}")
+            logger.debug(f"COLLISION: {collision} at step {self._steps}")
 
         # Learn from previous step
         done = False
@@ -645,32 +645,112 @@ class RLGoalApproachController:
             f"Q рекомендует: {q_action_name} - {q_recommends}; Эвристика: {h_action_name} - {h_recommends}. "
         )
     
-        if action_index == q_recommends and action_index == h_recommends:
-            return (
-                f"Действие {action_name} поддерживается и Q-значениями, "
-                f"и эвристикой — высокая согласованность."
-            )
+    def _choose_action(self,
+        state: np.ndarray,
+        current_pose: np.ndarray,
+        sensor_data: Dict[str, Any],
+        explain: bool = False
+    ):
+        store = self._select_store(state)
+        q_values = store.get_q_values(state)
 
-        if action_index == q_recommends:
-            return (
-                f"Действие {action_name} выбрано в основном по Q-значениям. "
-                f"Эвристика предпочтёт {h_action_name}, но Q сильнее."
-            )
-
-        if action_index == h_recommends:
-            return (
-                f"Действие {action_name} выбрано в основном по эвристике "
-                f"({dominant_heuristic}). Q предложил {q_action_name}, "
-                f"но при высоком epsilon эвристика доминирует."
-            )
-
-        return (
-            f"Действие {action_name} выбрано вероятностно (softmax, уверенность {confidence:.0%}). "
-            f"Q рекомендует {q_action_name}, эвристика — {h_action_name}. "
-            f"Доминирует эвристика: {dominant_heuristic}."
+        heuristic, heuristic_components = self._compute_heuristic_bias(
+            state=state,
+            current_pose=current_pose,
+            sensor_data=sensor_data,
+            prev_action=self._last_action,
         )
 
-    def _choose_action(self,
+        q_norm = self._normalize_values(q_values)
+        h_norm = self._normalize_values(heuristic)
+
+        best_q_action = int(np.argmax(q_values))
+        best_h_action = int(np.argmax(heuristic))
+
+        eps = self._get_current_epsilon()
+
+        has_q_data = store.next_id > 0 and np.max(np.abs(q_values)) > 1e-6
+
+        if has_q_data:
+            combined = (1 - eps) * q_norm + eps * h_norm
+            temperature = np.clip(0.5 * eps, 0.01, 0.5)
+        else:
+            combined = h_norm.copy()
+            temperature = 0.05
+
+        is_random_override = False
+        is_heuristic_override = False
+        action_index = None
+
+        v = combined / temperature
+        v = v - np.max(v)
+        exp_v = np.exp(v)
+        probs = exp_v / exp_v.sum()
+
+        p_random = 0.02 * eps
+        if np.random.random() < p_random:
+            is_random_override = True
+            action_index = np.random.randint(self.num_actions)
+            probs = np.zeros(self.num_actions)
+            probs[action_index] = 1.0
+        else:
+            action_index = int(np.random.choice(len(probs), p=probs))
+
+        if not explain:
+            return action_index, None
+
+        contributions = {
+            name: float(np.max(bias)) for name, bias in heuristic_components.items()
+        }
+        dominant_heuristic = max(contributions, key=contributions.get) if contributions else "none"
+
+        confidence = float(probs[action_index])
+
+        explanation = {
+            "chosen_action": {
+                "index": action_index,
+                "name": self.action_space.get_info(action_index).name,
+                "probability": confidence,
+            },
+            "sampling_method": "random_exploration" if is_random_override else "softmax_sampling",
+            "temperature": temperature,
+            "epsilon": eps,
+            "has_q_data": has_q_data,
+            "blend": f"{(1-eps)*100:.0f}% Q + {eps*100:.0f}% heuristic" if has_q_data else "100% heuristic",
+            "is_random_override": is_random_override,
+            "action_probabilities": {
+                self.action_space.get_info(i).name: float(probs[i])
+                for i in range(self.num_actions)
+            },
+            "advice": {
+                "q_recommends": {
+                    "index": best_q_action,
+                    "name": self.action_space.get_info(best_q_action).name,
+                },
+                "heuristic_recommends": {
+                    "index": best_h_action,
+                    "name": self.action_space.get_info(best_h_action).name,
+                },
+            },
+            "dominant_heuristic": dominant_heuristic,
+            "heuristic_contributions": contributions,
+            "confidence": confidence,
+            "is_confident": confidence > 0.7,
+            "interpretation": self._generate_choice_interpretation(
+                action_index=action_index,
+                is_random=is_random_override,
+                q_recommends=best_q_action,
+                h_recommends=best_h_action,
+                dominant_heuristic=dominant_heuristic,
+                eps=eps,
+                confidence=confidence,
+                blend=f"{(1-eps)*100:.0f}% Q + {eps*100:.0f}% heuristic" if has_q_data else "100% heuristic",
+                is_heuristic_override=is_heuristic_override,
+            ),
+        }
+        return action_index, explanation
+
+    def _choose_action_old(self,
         state: np.ndarray,
         current_pose: np.ndarray,
         sensor_data: Dict[str, Any],
@@ -806,8 +886,8 @@ class RLGoalApproachController:
             bias: [NUM_ACTIONS]
             components: dict of component biases
         """
-        logger.info("HEURISTIC_V2_ACTIVE")
-        logger.info(
+        logger.debug("HEURISTIC_V2_ACTIVE")
+        logger.debug(
             "MODEDBG on=%s depth=%.3f normal_is_none=%s align=%.3f",
             float(state[9]),
             float(sensor_data.get("depth", -1.0)),
@@ -876,7 +956,7 @@ class RLGoalApproachController:
                 if n_len > eps:
                     n_hat = n_world / n_len
 
-                    logger.info(
+                    logger.debug(
                         "FDBG forward_world=%s  -normal=%s  dot=%+.3f",
                         np.array2string(forward_world, precision=3),
                         np.array2string(-n_hat, precision=3),
@@ -941,14 +1021,14 @@ class RLGoalApproachController:
                         if best is not None:
                             surface_move[best] = SURFACE_STRENGTH
 
-                        logger.info(
+                        logger.debug(
                             "SDBG e_t=%s scores=%s best=%s prev=%s",
                             np.array2string(e_t, precision=3),
                             np.array2string(scores, precision=3),
                             str(best),
                             str(prev_action),
                         )
-                        logger.info(
+                        logger.debug(
                             "HDBG on=%s depth=%.3f align=%.3f dist=%.3f "
                             "n_world=%s e_world=%s tb1=%s tb2=%s best=%s prev=%s",
                             on_object,
@@ -962,9 +1042,9 @@ class RLGoalApproachController:
                             str(best),
                             str(prev_action),
                         )
-                        logger.info(f"current_pose {current_pose}")
+                        logger.debug(f"current_pose {current_pose}")
                     else:
-                        logger.info(
+                        logger.debug(
                             "SKIP_CRAWL normal_dist=%.3f tangential_dist=%.3f dist=%.3f",
                             normal_dist,
                             tangential_dist,
