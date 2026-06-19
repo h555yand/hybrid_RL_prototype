@@ -409,33 +409,33 @@ class RLGoalApproachController:
     # ══════════════════════════════════════════════════════════
     def _detect_collision(self, sensor_data):
         depth = sensor_data.get("depth", self.config["max_sensor_range"])
-        
-        was_on = (self._prev_sensor_data is not None 
-                and self._prev_sensor_data.get("on_object", False))
-        
-        # Проверка 1: внутри объекта — ТОЛЬКО если были на поверхности
-        if was_on and depth < self.config["min_valid_depth"]:
+
+        was_on = (self._prev_sensor_data is not None
+                  and self._prev_sensor_data.get("on_object", False))
+        now_on = sensor_data.get("on_object", False)
+
+        prev_depth = (self._prev_sensor_data.get("depth", self.config["max_sensor_range"])
+                      if self._prev_sensor_data is not None
+                      else self.config["max_sensor_range"])
+
+        if was_on and prev_depth > 1.5 and depth < self.config["min_valid_depth"]:
             return "surface_violation"
-        
-        # Проверка 2: пролетели сквозь — ТОЛЬКО если оба шага на поверхности
+
         if (self._prev_sensor_data is not None
                 and was_on
-                and sensor_data.get("on_object", False)):
+                and now_on):
             prev_normal = self._prev_sensor_data.get("point_normal")
             curr_normal = sensor_data.get("point_normal")
             if prev_normal is not None and curr_normal is not None:
                 dot = np.dot(np.array(prev_normal), np.array(curr_normal))
                 if dot < self.config["normal_flip_threshold"]:
                     return "surface_violation"
-        
-        # Проверка 3: потеряли объект
+
         if self._prev_sensor_data is not None:
-            now_on = sensor_data.get("on_object", False)
             if was_on and not now_on:
                 return "lost_object"
-        
-        return None
-    
+
+        return None    
     # ══════════════════════════════════════════════════════════
     # REWARD
     # ══════════════════════════════════════════════════════════
@@ -824,16 +824,6 @@ class RLGoalApproachController:
         # 1) Surface move-to-goal (world tangent projection + dot argmax)
         # ------------------------------------------------------------
         surface_move = np.zeros(self.num_actions, dtype=float)
-
-        # Precompute the same 8 local directions as in LightweightEnv._move_tangentially:
-        # 0° forward -> -Z, 90° right -> +X
-        dirs_local = []
-        for deg in self.action_space.SURFACE_DIRECTIONS:  # [0,45,...,315]
-            a = np.radians(deg)
-            v = np.array([np.sin(a), 0.0, -np.cos(a)], dtype=float)
-            v /= (np.linalg.norm(v) + eps)
-            dirs_local.append(v)
-        dirs_local = np.stack(dirs_local, axis=0)  # [8,3]
 
         # Detach threshold (keep from previous heuristic)
         DETACH_ALIGN_THR = -0.3
