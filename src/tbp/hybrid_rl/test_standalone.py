@@ -317,7 +317,7 @@ class TestStandaloneTraining:
             save_dir=save_dir,
             num_episodes=10,
             config={
-                "state_dim": 13,
+                "state_dim": 15,
                 "max_points": 1000,
                 "max_steps_per_goal": 15,
                 "epsilon_start": 0.8,
@@ -341,7 +341,7 @@ class TestStandaloneTraining:
             save_dir=save_dir,
             num_episodes=50,
             config={
-                "state_dim": 13,
+                "state_dim": 15,
                 "max_points": 5000,
                 "max_steps_per_goal": 20,
                 "adaptive_sigma": False,
@@ -367,7 +367,7 @@ class TestStandaloneTraining:
             save_dir=save_dir,
             num_episodes=100,
             config={
-                "state_dim": 13,
+                "state_dim": 15,
                 "max_points": 5000,
                 "max_steps_per_goal": 20,
                 "goal_threshold": 5.0,

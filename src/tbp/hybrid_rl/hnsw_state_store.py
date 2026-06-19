@@ -451,7 +451,7 @@ class HNSWStateStore:
             q_values=q_init,
             visit_count=1,
             last_step=self.global_step,
-            on_object=int(raw_state[9] > 0.5),
+            on_object=int(raw_state[11] > 0.5),
         )
 
         do_replace = self._deleted_count > 0
@@ -1040,7 +1040,7 @@ class HNSWStateStore:
                     q_values=q_values[i],
                     visit_count=int(visit_counts[i]),
                     last_step=int(last_steps[i]),
-                    on_object=int((raw_states[i][9] if raw_states is not None else 0.0) > 0.5)
+                    on_object=int((raw_states[i][11] if raw_states is not None else 0.0) > 0.5)
                 )
             store.next_id = next_id
             store._norm_frozen = True
@@ -1127,7 +1127,7 @@ class HNSWStateStore:
                     q_values=q_values[i],
                     visit_count=int(visit_counts[i]),
                     last_step=int(last_steps[i]),
-                    on_object=int((raw_states[i][9] if raw_states is not None else 0.0) > 0.5)
+                    on_object=int((raw_states[i][11] if raw_states is not None else 0.0) > 0.5)
                 )
 
                 store._index.add_items(

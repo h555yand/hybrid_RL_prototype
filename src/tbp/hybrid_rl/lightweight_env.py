@@ -216,8 +216,32 @@ class LightweightEnv:
         return np.concatenate([position, rotation])
 
     def _estimate_curvature(self):
-        """Rough estimate of curvature."""
-        return [0.0, 0.0]  # simplification for start
+        rot = R.from_euler("xyz", self.agent_rot, degrees=True)
+        ray_direction = rot.apply([0, 0, -1])
+        locations, index_ray, index_tri = self.mesh.ray.intersects_location(
+            ray_origins=[self.agent_pos],
+            ray_directions=[ray_direction],
+        )
+        if len(locations) == 0:
+            return [0.0, 0.0]
+
+        distances = np.linalg.norm(locations - self.agent_pos, axis=1)
+        nearest_idx = np.argmin(distances)
+        face_idx = index_tri[nearest_idx]
+        vertex_indices = self.mesh.faces[face_idx]
+
+        if not hasattr(self, '_vertex_mean_curvature'):
+            self._vertex_mean_curvature = trimesh.curvature.discrete_mean_curvature_measure(
+                self.mesh, self.mesh.vertices, radius=5.0
+            )
+            self._vertex_gaussian_curvature = trimesh.curvature.discrete_gaussian_curvature_measure(
+                self.mesh, self.mesh.vertices, radius=5.0
+            )
+
+        mean_curv = float(np.mean(self._vertex_mean_curvature[vertex_indices]))
+        gauss_curv = float(np.mean(self._vertex_gaussian_curvature[vertex_indices]))
+
+        return [mean_curv, gauss_curv]
     
     def _look_at_direction(self, direction):
         """
@@ -505,91 +529,3 @@ def is_on_same_cube_side(pos_a, pos_b, cube_side=42.0, atol=1e-5):
                 return True
     
     return False
-
-"""
-Да, симулятора хватает для всех 13 компонент
-Проверим каждую компоненту — откуда берётся:
-
-Разбор state vector по источникам
-scss
-Копировать код
-State [13D]          Откуда              Источник в LightweightEnv
-─────────────────────────────────────────────────────────────────
-local_pos_error [3D] pose + goal         ✅ env.get_pose() + goal
-rot_error       [3D] pose + goal         ✅ env.get_pose() + goal  
-local_normal    [3D] sensor_data         ✅ env.get_sensor_data()["point_normal"]
-on_object       [1D] sensor_data         ✅ env.get_sensor_data()["on_object"]
-alignment       [1D] вычисляется         ✅ dot(goal_dir, normal)
-distance        [1D] pose + goal         ✅ norm(pos - goal_pos)
-norm_depth      [1D] sensor_data         ✅ env.get_sensor_data()["depth"]
-Что нужно от симулятора
-Данные	Метод	Есть?
-Позиция агента [x,y,z]	env.get_pose()[:3]	✅
-Ориентация агента [rx,ry,rz]	env.get_pose()[3:6]	✅
-Нормаль поверхности	env.get_sensor_data()["point_normal"]	✅
-Глубина	env.get_sensor_data()["depth"]	✅
-Флаг на объекте	env.get_sensor_data()["on_object"]	✅
-Точка цели	env.get_random_surface_point()	✅
-Вычисление state в контроллере
-python
-Копировать код
-def _build_state(self, pose, sensor_data, goal):
-    pos = pose[:3]
-    rot_euler = pose[3:6]
-    
-    rot = R.from_euler("xyz", rot_euler, degrees=True)
-    rot_inv = rot.inv()
-    
-    # [0:3] local_pos_error — направление к цели в локальной СК агента
-    goal_vec = goal[:3] - pos
-    local_pos_error = rot_inv.apply(goal_vec)
-    
-    # [3:6] rot_error — разница ориентации
-    goal_rot = R.from_euler("xyz", goal[3:6], degrees=True)
-    rot_diff = (rot.inv() * goal_rot).as_rotvec() / np.pi  # normalized
-    
-    # [6:9] local_normal — нормаль в локальной СК
-    normal = np.array(sensor_data["point_normal"] or [0, 0, 0])
-    local_normal = rot_inv.apply(normal)
-    
-    # [9] on_object
-    on_object = 1.0 if sensor_data["on_object"] else 0.0
-    
-    # [10] alignment — dot(направление к цели, нормаль)
-    dist = np.linalg.norm(goal_vec) + 1e-12
-    alignment = np.dot(goal_vec / dist, normal)
-    
-    # [11] distance
-    distance = dist
-    
-    # [12] norm_depth — нормализованная глубина
-    norm_depth = min(sensor_data["depth"] / 100.0, 1.0)
-    
-    return np.array([
-        *local_pos_error,   # 3
-        *rot_diff,          # 3
-        *local_normal,      # 3
-        on_object,          # 1
-        alignment,          # 1
-        distance,           # 1
-        norm_depth,         # 1
-    ])                      # = 13
-Вывод
-Habitat не нужен для обучения. Всё что нужно для 13D state:
-
-scss
-Копировать код
-LightweightEnv (trimesh)
-    ├── get_pose()              → позиция + ориентация
-    ├── get_sensor_data()       → нормаль + глубина + on_object
-    └── get_random_surface_point() → цель
-
-Контроллер сам вычисляет:
-    ├── local_pos_error         из pose + goal
-    ├── rot_error               из pose + goal
-    ├── local_normal            из normal + pose
-    ├── alignment               из goal_dir + normal
-    ├── distance                из pose + goal
-    └── norm_depth              из depth
-Habitat понадобится только для inference в реальной среде Monty, но обучение полностью standalone.
-"""

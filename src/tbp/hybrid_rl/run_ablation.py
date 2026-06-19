@@ -518,7 +518,6 @@ def main() -> None:
     base_config = {
         "mode": "train_adapt_epsilon",
         "goal_threshold": 5.0, # mm
-        "state_dim": 13,
         "max_points": 500_000,
         "k_neighbors": 7,
         "max_steps_per_goal": 50,

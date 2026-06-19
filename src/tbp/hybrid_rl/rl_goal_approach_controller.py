@@ -154,8 +154,7 @@ class RLGoalApproachController:
         )
 
     def _select_store(self, state: np.ndarray) -> HNSWStateStore:
-        # state[9] = on_object float
-        return self.q_store_surface if state[9] > 0.5 else self.q_store_free
+        return self.q_store_surface if state[11] > 0.5 else self.q_store_free
 
     # ══════════════════════════════════════════════════════════
     # PUBLIC API
@@ -235,7 +234,7 @@ class RLGoalApproachController:
         state = self._compute_state(current_pose, sensor_data)
         logger.debug(
             f"STEP {self._steps}: action={self._last_action}, "
-            f"dist={state[11]:.1f}, on={state[9]:.0f}, "
+            f"dist={state[13]:.1f}, on={state[11]:.0f}, "
             f"depth={sensor_data.get('depth',0):.1f}, "
             f"pos={current_pose[:3]}"
         )
@@ -336,33 +335,13 @@ class RLGoalApproachController:
     # STATE COMPUTATION
     # ══════════════════════════════════════════════════════════
     def _compute_state(self, current_pose, sensor_data):
-        """Build 13D state vector from pose and sensor data.
-
-        All spatial quantities are converted to agent's LOCAL coordinate
-        frame. This is critical because:
-            - MoveTangentially(90°) always means "right relative to me"
-            - State must be consistent with action semantics
-            - Same relative situation → same state → same Q-values
-              regardless of absolute position/orientation
-
-        Args:
-            current_pose: [x, y, z, pitch, yaw, roll]  # degrees
-            goal_pose:    [x, y, z, pitch, yaw, roll]  # degrees
-            sensor_data: Sensor observations dict.
-
-        Returns:
-            State vector [13D].
-        """
         goal = self._current_goal
 
-        # ── Position error (local frame, мм) ──
         pos_error_world = goal[:3] - current_pose[:3]
         local_pos_error = self._world_to_local(pos_error_world, current_pose)
 
-        # ── Rotation error (градусы) ──
         rot_error_deg = self._normalize_angles_deg(goal[3:] - current_pose[3:])
 
-        # ── Surface normal (local frame) ──
         raw_normal = sensor_data.get("point_normal", None)
         if raw_normal is not None:
             local_normal = self._world_to_local(
@@ -371,13 +350,10 @@ class RLGoalApproachController:
         else:
             local_normal = np.zeros(3)
 
-        # ── On object ──
         on_object = float(sensor_data.get("on_object", False))
 
-        # ── Distance ──
         distance = np.linalg.norm(local_pos_error)
 
-        # ── Alignment ──
         normal_len = np.linalg.norm(local_normal)
         if distance > 1e-8 and normal_len > 1e-8:
             goal_dir = local_pos_error / distance
@@ -385,25 +361,28 @@ class RLGoalApproachController:
         else:
             alignment = 0.0
 
-        # ── Depth ──
         depth = sensor_data.get(
             "depth", self.config["max_sensor_range"]
         )
         norm_depth = min(depth / self.config["max_sensor_range"], 1.0)
 
-        # ── Assemble (13D) ──
+        curvatures = sensor_data.get("principal_curvatures", [0.0, 0.0])
+        mean_curv = float(curvatures[0])
+        gauss_curv = float(curvatures[1])
+
         state = np.concatenate([
-            local_pos_error,        # [0:3]   3D  мм
-            rot_error_deg,          # [3:6]   3D  градусы
-            local_normal,           # [6:9]   3D  unitless
-            [on_object],            # [9]     1D  binary
-            [alignment],            # [10]    1D  [-1, +1]
-            [distance],             # [11]    1D  мм
-            [norm_depth],           # [12]    1D  [0, 1]
+            local_pos_error,        # [0:3]   3D
+            rot_error_deg,          # [3:6]   3D
+            local_normal,           # [6:9]   3D
+            [mean_curv],            # [9]     1D
+            [gauss_curv],           # [10]    1D
+            [on_object],            # [11]    1D
+            [alignment],            # [12]    1D
+            [distance],             # [13]    1D
+            [norm_depth],           # [14]    1D
         ])
 
-        return state  # 13D
-
+        return state
     # ══════════════════════════════════════════════════════════
     # COLLISION DETECTION
     # ══════════════════════════════════════════════════════════
@@ -469,11 +448,11 @@ class RLGoalApproachController:
         done = False
         termination_reason = None
         
-        distance = state[11]       # обновлённый индекс (13D state)
-        prev_distance = prev_state[11]
-        on_object = state[9]
-        prev_alignment = prev_state[10]
-        prev_on_object = prev_state[9]
+        distance = state[13]
+        prev_distance = prev_state[13]
+        on_object = state[11]
+        prev_alignment = prev_state[12]
+        prev_on_object = prev_state[11]
         
         surface_step = self.action_space.surface_step
         
@@ -780,7 +759,6 @@ class RLGoalApproachController:
             bias: [NUM_ACTIONS]
             components: dict of component biases
         """
-        logger.debug("HEURISTIC_V2_ACTIVE")
         logger.debug(
             "MODEDBG on=%s depth=%.3f normal_is_none=%s align=%.3f",
             float(state[9]),
@@ -796,9 +774,9 @@ class RLGoalApproachController:
         local_pos_error = state[0:3]
         rot_error_deg = state[3:6]
         local_normal = state[6:9]
-        on_object = float(state[9])
-        alignment = float(state[10])
-        distance = float(state[11])
+        on_object = float(state[11])
+        alignment = float(state[12])
+        distance = float(state[13])
 
         eps = 1e-8
 
@@ -943,7 +921,7 @@ class RLGoalApproachController:
         if on_object > 0.5 and alignment >= DETACH_ALIGN_THR:
             if len(self._episode_transitions) >= 5:
                 recent_dists = [
-                    float(tr["state"][11])
+                    float(tr["state"][13])
                     for tr in self._episode_transitions[-5:]
                 ]
                 dist_reduction = recent_dists[0] - recent_dists[-1]
@@ -972,7 +950,7 @@ class RLGoalApproachController:
         # ------------------------------------------------------------
         steer = np.zeros(self.num_actions, dtype=float)
         if on_object <= 0.5:
-            norm_depth = float(state[12])  # depth / max_sensor_range
+            norm_depth = float(state[14])
             
             if norm_depth < 0.1:  # ещё близко к поверхности (depth < 10mm)
                 # Приоритет: отлететь

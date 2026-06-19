@@ -350,19 +350,18 @@ def main() -> None:
     TRAIN_EPISODES_PER_LEVEL = 5_000
     EVAL_EPISODES_PER_LEVEL = 500
     REGENERATE_SCRIPTS = True
-    IS_LOAD = False
+    IS_LOAD = True
     RUN_TRAIN = True
     RUN_EVAL = False
 
     if IS_LOAD:
-        epsilon_start = 0.15
+        epsilon_start = 0.5
     else:
         epsilon_start = 1.0
 
     base_config = {
         "mode": "train_adapt_epsilon",
         "goal_threshold": 5.0,
-        "state_dim": 13,
         "max_points": 500_000,
         "k_neighbors": 7,
         # "max_steps_per_goal": 50, # cube
