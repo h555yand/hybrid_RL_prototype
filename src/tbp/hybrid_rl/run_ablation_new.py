@@ -24,6 +24,102 @@ TRAIN_SEEDS = [11, 22, 33]
 EVAL_SEEDS = [44, 55, 66]
 
 
+def create_mug(
+    body_radius=30.0,
+    body_height=80.0,
+    wall_thickness=3.0,
+    bottom_thickness=3.0,
+    handle_radius_major=15.0,
+    handle_radius_minor=4.0,
+    handle_angle_deg=180.0,
+    handle_segments=32,
+    body_segments=64,
+    circle_points=8,
+):
+    outer = trimesh.primitives.Cylinder(
+        radius=body_radius,
+        height=body_height,
+        sections=body_segments,
+    )
+
+    inner_radius = body_radius - wall_thickness
+    inner_height = body_height - bottom_thickness
+    inner = trimesh.primitives.Cylinder(
+        radius=inner_radius,
+        height=inner_height,
+        sections=body_segments,
+    )
+    inner_shift = bottom_thickness / 2.0
+    inner.apply_translation([0, 0, inner_shift])
+
+    body = outer.difference(inner)
+
+    angles = np.linspace(
+        -np.radians(handle_angle_deg) / 2,
+        np.radians(handle_angle_deg) / 2,
+        handle_segments,
+    )
+
+    handle_center_x = body_radius
+    handle_center_z = 0.0
+
+    vertices_all = []
+
+    for i, angle in enumerate(angles):
+        center = np.array([
+            handle_center_x + handle_radius_major * np.cos(angle),
+            0.0,
+            handle_center_z + handle_radius_major * np.sin(angle),
+        ])
+
+        radial = center - np.array([handle_center_x, 0.0, handle_center_z])
+        radial_len = np.linalg.norm(radial)
+        if radial_len > 1e-12:
+            radial /= radial_len
+        else:
+            radial = np.array([1.0, 0.0, 0.0])
+
+        tangent = np.array([
+            -handle_radius_major * np.sin(angle),
+            0.0,
+            handle_radius_major * np.cos(angle),
+        ])
+        tangent /= np.linalg.norm(tangent) + 1e-12
+
+        binormal = np.cross(tangent, radial)
+        binormal /= np.linalg.norm(binormal) + 1e-12
+
+        for j in range(circle_points):
+            theta = 2.0 * np.pi * j / circle_points
+            point = (
+                center
+                + handle_radius_minor * np.cos(theta) * radial
+                + handle_radius_minor * np.sin(theta) * binormal
+            )
+            vertices_all.append(point)
+
+    vertices_all = np.array(vertices_all)
+
+    faces_all = []
+    for i in range(handle_segments - 1):
+        for j in range(circle_points):
+            j_next = (j + 1) % circle_points
+            v0 = i * circle_points + j
+            v1 = i * circle_points + j_next
+            v2 = (i + 1) * circle_points + j
+            v3 = (i + 1) * circle_points + j_next
+            faces_all.append([v0, v2, v1])
+            faces_all.append([v1, v2, v3])
+
+    faces_all = np.array(faces_all)
+    handle = trimesh.Trimesh(vertices=vertices_all, faces=faces_all)
+    handle.fix_normals()
+
+    mug = trimesh.util.concatenate([body, handle])
+
+    return mug
+
+
 def generate_episode_pools(
     mesh_path: str,
     episodes_per_level: int,
@@ -157,6 +253,8 @@ def _prepare_demo_meshes(data_dir: Path) -> None:
     sphere.export(str(data_dir / "sphere.stl"))
     cylinder = trimesh.primitives.Cylinder(radius=35, height=100)
     cylinder.export(str(data_dir / "cylinder.stl"))
+    mug = create_mug()
+    mug.export(str(data_dir / "mug.stl"))
 
 
 def _run_eval_per_level(
@@ -251,7 +349,7 @@ def _print_eval_results(eval_results: Dict[str, Any]) -> None:
 def main() -> None:
     TRAIN_EPISODES_PER_LEVEL = 5_000
     EVAL_EPISODES_PER_LEVEL = 500
-    REGENERATE_SCRIPTS = False
+    REGENERATE_SCRIPTS = True
     IS_LOAD = False
     RUN_TRAIN = True
     RUN_EVAL = False
@@ -289,7 +387,8 @@ def main() -> None:
 
     _prepare_demo_meshes(data_dir)
     # mesh_path = str(data_dir / "cube.stl")
-    mesh_path = str(data_dir / "cylinder.stl")
+    # mesh_path = str(data_dir / "cylinder.stl")
+    mesh_path = str(data_dir / "mug.stl")
 
     print("\n" + "=" * 60)
     print("STEP 1: Prepare episode pools (train + eval)")
