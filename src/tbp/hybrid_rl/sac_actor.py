@@ -64,7 +64,11 @@ class SACActorNetwork(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         type_logits, param_mus, param_log_stds = self.forward(state)
 
+        type_logits = type_logits - type_logits.max(dim=-1, keepdim=True)[0]
         type_probs = F.softmax(type_logits, dim=-1)
+        type_probs = type_probs.clamp(min=1e-8)
+        type_probs = type_probs / type_probs.sum(dim=-1, keepdim=True)
+
         type_dist = torch.distributions.Categorical(type_probs)
         action_type = type_dist.sample()
         type_log_prob = type_dist.log_prob(action_type)
@@ -84,7 +88,7 @@ class SACActorNetwork(nn.Module):
             dim = self.param_dims[type_id]
             mu = param_mus[type_id][mask]
             log_std = param_log_stds[type_id][mask]
-            std = log_std.exp()
+            std = log_std.exp().clamp(min=1e-6)
 
             normal = torch.distributions.Normal(mu, std)
             params_sample = normal.rsample()

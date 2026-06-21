@@ -277,6 +277,7 @@ def _run_eval_per_level(
     overrides: Dict[str, Any],
     eval_pools: Dict[int, Dict[str, Any]],
     collect_bc: bool = False,
+    EPISODES_PER_LEVEL=None
 ) -> Tuple[Dict[str, Any], List]:
     results_per_level = {}
     bc_transitions = []
@@ -309,14 +310,21 @@ def _run_eval_per_level(
                 return_metrics=True,
                 agent_id=f"eval_L{level_idx}_{variant}_t{train_seed}_e{eval_seed}",
                 episode_script=level_pool,
+                EPISODES_PER_LEVEL=EPISODES_PER_LEVEL
             )
 
             if collect_bc:
                 trails = metrics.get("success_trails", [])
+                #print(f"  BC collect: {len(trails)} trails found")
                 if trails:
+                    #print(f"  First trail length: {len(trails[0])}")
+                    #print(f"  First trail type: {type(trails[0])}")
+                    #if trails[0]:
+                    #    print(f"  First item type: {type(trails[0][0])}")
                     extractor = ExperienceExtractor(config=eval_cfg)
                     for trail in trails:
                         bc_transitions.extend(extractor.convert_trajectory(trail))
+                    #print(f"  BC transitions so far: {len(bc_transitions)}")
 
             rates = metrics.get("stats", {}).get("termination_rates", {})
             level_results.append({
@@ -380,7 +388,7 @@ def main() -> None:
     REGENERATE_SCRIPTS = False
     IS_LOAD = True
     RUN_TRAIN = False
-    RUN_EVAL = True
+    RUN_EVAL = False
 
     if IS_LOAD:
         epsilon_start = 0.25
@@ -508,6 +516,7 @@ def main() -> None:
             overrides=eval_overrides,
             eval_pools=eval_pools,
             collect_bc=True,
+            EPISODES_PER_LEVEL=EVAL_EPISODES_PER_LEVEL
         )
 
         print(f"\n=== Eval Results (variant={best_variant}) ===")
@@ -547,199 +556,197 @@ def main() -> None:
             print(f"Batch types: {batch['action_types'][:5]}")
             print(f"Batch params: {batch['action_params'][:5]}")
         
-        RUN_BC_TRAIN = True
+    RUN_BC_TRAIN = False
+    if RUN_BC_TRAIN:
+        print("\n" + "=" * 60)
+        print("STEP 5: BC Training")
+        print("=" * 60)
 
-        if RUN_BC_TRAIN:
-            print("\n" + "=" * 60)
-            print("STEP 5: BC Training")
-            print("=" * 60)
+        bc_data_path = data_dir / "bc_data.pkl"
+        with open(bc_data_path, "rb") as f:
+            bc_transitions = pickle.load(f)
 
-            bc_data_path = data_dir / "bc_data.pkl"
-            with open(bc_data_path, "rb") as f:
-                bc_transitions = pickle.load(f)
+        print(f"Loaded {len(bc_transitions)} BC transitions")
 
-            print(f"Loaded {len(bc_transitions)} BC transitions")
+        trainer = BCTrainer(
+            state_dim=cfg.get("state_dim", 15),
+            num_types=8,
+            lr=3e-4,
+            batch_size=64,
+            param_loss_weight=1.0,
+            val_split=0.1,
+            patience=20,
+        )
 
-            trainer = BCTrainer(
-                state_dim=cfg.get("state_dim", 15),
-                num_types=8,
-                lr=3e-4,
-                batch_size=64,
-                param_loss_weight=1.0,
-                val_split=0.1,
-                patience=20,
+        trainer.train(bc_transitions, num_epochs=200)
+
+        bc_model_dir = str(runs_dir / "bc_model")
+        trainer.save(bc_model_dir)
+        print(f"BC model saved to {bc_model_dir}")
+
+        print("\n=== BC Test Predictions ===")
+        type_names = ExperienceExtractor.get_type_names()
+        for i in range(min(5, len(bc_transitions))):
+            tr = bc_transitions[i]
+            action_type, action_params = trainer.predict(tr.state)
+            print(
+                f"  Expert: {type_names[tr.action_type]} {tr.action_params} | "
+                f"Predicted: {type_names[action_type]} {action_params}"
             )
+    
+    RUN_SAC_TRAIN = True
+    if RUN_SAC_TRAIN:
+        print("\n" + "=" * 60)
+        print("STEP 6: P-SAC Training")
+        print("=" * 60)
 
-            trainer.train(bc_transitions, num_epochs=200)
+        env = LightweightEnv(mesh_path)
+        controller = RLGoalApproachController(
+            agent_id="sac_state_helper",
+            config={**cfg, "mode": "eval"},
+        )
 
-            bc_model_dir = str(runs_dir / "bc_model")
-            trainer.save(bc_model_dir)
-            print(f"BC model saved to {bc_model_dir}")
+        trainer = PSACTrainer(
+            state_dim=cfg.get("state_dim", 15),
+            num_types=8,
+            max_params=3,
+            gamma=0.99,
+            tau=0.005,
+            batch_size=256,
+            buffer_capacity=100_000,
+            bc_lambda_init=1.0,
+            bc_lambda_decay=0.999999,
+            max_steps_per_goal=150,
+            goal_threshold=cfg.get("goal_threshold", 5.0),
+        )
 
-            print("\n=== BC Test Predictions ===")
-            type_names = ExperienceExtractor.get_type_names()
-            for i in range(min(5, len(bc_transitions))):
-                tr = bc_transitions[i]
-                action_type, action_params = trainer.predict(tr.state)
-                print(
-                    f"  Expert: {type_names[tr.action_type]} {tr.action_params} | "
-                    f"Predicted: {type_names[action_type]} {action_params}"
+        trainer.load_bc(
+            bc_model_dir=str(runs_dir / "bc_model"),
+            bc_data_path=str(data_dir / "bc_data.pkl"),
+        )
+
+        sac_model_dir = str(runs_dir / "sac_model")
+
+        trainer.train(
+            env=env,
+            controller=controller,
+            num_episodes=10000,
+            warmup_steps=5000,
+            log_interval=100,
+            save_dir=sac_model_dir,
+            curriculum_levels=CURRICULUM_LEVELS,
+        )
+
+        print(f"\nP-SAC training complete:")
+        print(f"  Episodes: {trainer.total_episodes}")
+        print(f"  Goals reached: {trainer.total_goals_reached}")
+        print(f"  Success rate: {trainer.total_goals_reached / max(trainer.total_episodes, 1):.3f}")
+        print(f"  Saved to {sac_model_dir}")
+
+    RUN_SAC_EVAL = True
+    if RUN_SAC_EVAL:
+        print("\n" + "=" * 60)
+        print("STEP 7: P-SAC Eval")
+        print("=" * 60)
+
+        sac_model_dir = str(runs_dir / "sac_model")
+        sac_trainer = PSACTrainer(state_dim=cfg.get("state_dim", 15))
+        sac_trainer.load(sac_model_dir)
+
+        results_per_level = {}
+        sample_seed = SAC_EVAL_SEEDS[0]
+        num_levels = len(sac_eval_pools[sample_seed].get("levels", []))
+
+        for level_idx in range(num_levels):
+            level_successes = 0
+            level_timeouts = 0
+            level_collisions = 0
+            level_total = 0
+
+            for eval_seed in SAC_EVAL_SEEDS:
+                level_pool = sac_eval_pools[eval_seed]["levels"][level_idx]
+
+                np.random.seed(eval_seed)
+                env = LightweightEnv(mesh_path, seed=eval_seed)
+                controller = RLGoalApproachController(
+                    agent_id=f"sac_eval_L{level_idx}_{eval_seed}",
+                    config={**cfg, "mode": "eval"},
                 )
-        
-        RUN_SAC_TRAIN = True
+                interpreter = ActionInterpreter(env)
 
-        if RUN_SAC_TRAIN:
-            print("\n" + "=" * 60)
-            print("STEP 6: P-SAC Training")
-            print("=" * 60)
+                for ep_data in level_pool:
+                    start_pos = np.array(ep_data["start_pos"])
+                    start_rot = np.array(ep_data["start_rot"])
+                    env.reset(position=start_pos, rotation=start_rot)
+                    goal_pose = np.concatenate([
+                        np.array(ep_data["goal_pos"]),
+                        np.array(ep_data["goal_rot"]),
+                    ])
+                    controller.set_new_goal(goal_pose, start_pos)
 
-            env = LightweightEnv(mesh_path)
-            controller = RLGoalApproachController(
-                agent_id="sac_state_helper",
-                config={**cfg, "mode": "eval"},
+                    success = False
+                    collision = False
+
+                    for step in range(sac_trainer.max_steps_per_goal):
+                        current_pose = env.get_pose()
+                        sensor_data = env.get_sensor_data()
+                        state_raw = controller._compute_state(
+                            current_pose, sensor_data
+                        )
+                        state = sac_trainer.normalize_state(state_raw)
+
+                        action_type, action_params = sac_trainer.actor.predict(
+                            state.astype(np.float32)
+                        )
+                        sensor_data = interpreter.execute(
+                            action_type, action_params
+                        )
+
+                        current_pose = env.get_pose()
+                        distance = float(np.linalg.norm(
+                            goal_pose[:3] - current_pose[:3]
+                        ))
+
+                        if distance < sac_trainer.goal_threshold:
+                            success = True
+                            break
+
+                        depth = sensor_data.get("depth", 100.0)
+                        if depth < 0.5:
+                            collision = True
+                            break
+
+                    level_total += 1
+                    if success:
+                        level_successes += 1
+                    elif collision:
+                        level_collisions += 1
+                    else:
+                        level_timeouts += 1
+
+            count = max(level_total, 1)
+            bounds = CURRICULUM_LEVELS[level_idx]
+            results_per_level[f"level_{level_idx}"] = {
+                "bounds_mm": list(bounds),
+                "success_rate": level_successes / count,
+                "timeout_rate": level_timeouts / count,
+                "collision_rate": level_collisions / count,
+            }
+
+        print(f"\n=== P-SAC Eval Results ===")
+        for key in sorted(results_per_level.keys()):
+            data = results_per_level[key]
+            print(
+                f"  {key} ({data.get('bounds_mm', [])}mm): "
+                f"success={data['success_rate']:.4f}, "
+                f"timeout={data['timeout_rate']:.4f}, "
+                f"collision={data['collision_rate']:.4f}"
             )
 
-            trainer = PSACTrainer(
-                state_dim=cfg.get("state_dim", 15),
-                num_types=8,
-                max_params=3,
-                gamma=0.99,
-                tau=0.005,
-                batch_size=256,
-                buffer_capacity=100_000,
-                bc_lambda_init=1.0,
-                bc_lambda_decay=0.9999,
-                max_steps_per_goal=150,
-                goal_threshold=cfg.get("goal_threshold", 5.0),
-            )
-
-            trainer.load_bc(
-                bc_model_dir=str(runs_dir / "bc_model"),
-                bc_data_path=str(data_dir / "bc_data.pkl"),
-            )
-
-            sac_model_dir = str(runs_dir / "sac_model")
-
-            trainer.train(
-                env=env,
-                controller=controller,
-                num_episodes=10000,
-                warmup_steps=1000,
-                log_interval=100,
-                save_dir=sac_model_dir,
-            )
-
-            print(f"\nP-SAC training complete:")
-            print(f"  Episodes: {trainer.total_episodes}")
-            print(f"  Goals reached: {trainer.total_goals_reached}")
-            print(f"  Success rate: {trainer.total_goals_reached / max(trainer.total_episodes, 1):.3f}")
-            print(f"  Saved to {sac_model_dir}")
-
-        RUN_SAC_EVAL = True
-
-        if RUN_SAC_EVAL:
-            print("\n" + "=" * 60)
-            print("STEP 7: P-SAC Eval")
-            print("=" * 60)
-
-            sac_model_dir = str(runs_dir / "sac_model")
-            sac_trainer = PSACTrainer(state_dim=cfg.get("state_dim", 15))
-            sac_trainer.load(sac_model_dir)
-
-            results_per_level = {}
-            sample_seed = SAC_EVAL_SEEDS[0]
-            num_levels = len(sac_eval_pools[sample_seed].get("levels", []))
-
-            for level_idx in range(num_levels):
-                level_successes = 0
-                level_timeouts = 0
-                level_collisions = 0
-                level_total = 0
-
-                for eval_seed in SAC_EVAL_SEEDS:
-                    level_pool = sac_eval_pools[eval_seed]["levels"][level_idx]
-
-                    np.random.seed(eval_seed)
-                    env = LightweightEnv(mesh_path, seed=eval_seed)
-                    controller = RLGoalApproachController(
-                        agent_id=f"sac_eval_L{level_idx}_{eval_seed}",
-                        config={**cfg, "mode": "eval"},
-                    )
-                    interpreter = ActionInterpreter(env)
-
-                    for ep_data in level_pool:
-                        start_pos = np.array(ep_data["start_pos"])
-                        start_rot = np.array(ep_data["start_rot"])
-                        env.reset(position=start_pos, rotation=start_rot)
-                        goal_pose = np.concatenate([
-                            np.array(ep_data["goal_pos"]),
-                            np.array(ep_data["goal_rot"]),
-                        ])
-                        controller.set_new_goal(goal_pose, start_pos)
-
-                        success = False
-                        collision = False
-
-                        for step in range(sac_trainer.max_steps_per_goal):
-                            current_pose = env.get_pose()
-                            sensor_data = env.get_sensor_data()
-                            state_raw = controller._compute_state(
-                                current_pose, sensor_data
-                            )
-                            state = sac_trainer.normalize_state(state_raw)
-
-                            action_type, action_params = sac_trainer.actor.predict(
-                                state.astype(np.float32)
-                            )
-                            sensor_data = interpreter.execute(
-                                action_type, action_params
-                            )
-
-                            current_pose = env.get_pose()
-                            distance = float(np.linalg.norm(
-                                goal_pose[:3] - current_pose[:3]
-                            ))
-
-                            if distance < sac_trainer.goal_threshold:
-                                success = True
-                                break
-
-                            depth = sensor_data.get("depth", 100.0)
-                            if depth < 0.5:
-                                collision = True
-                                break
-
-                        level_total += 1
-                        if success:
-                            level_successes += 1
-                        elif collision:
-                            level_collisions += 1
-                        else:
-                            level_timeouts += 1
-
-                count = max(level_total, 1)
-                bounds = CURRICULUM_LEVELS[level_idx]
-                results_per_level[f"level_{level_idx}"] = {
-                    "bounds_mm": list(bounds),
-                    "success_rate": level_successes / count,
-                    "timeout_rate": level_timeouts / count,
-                    "collision_rate": level_collisions / count,
-                }
-
-            print(f"\n=== P-SAC Eval Results ===")
-            for key in sorted(results_per_level.keys()):
-                data = results_per_level[key]
-                print(
-                    f"  {key} ({data.get('bounds_mm', [])}mm): "
-                    f"success={data['success_rate']:.4f}, "
-                    f"timeout={data['timeout_rate']:.4f}, "
-                    f"collision={data['collision_rate']:.4f}"
-                )
-
-            eval_output = data_dir / "sac_eval_result.json"
-            with open(eval_output, "w", encoding="utf-8") as f:
-                json.dump(results_per_level, f, indent=2)
-            print(f"\nSaved to {eval_output}")
+        eval_output = data_dir / "sac_eval_result.json"
+        with open(eval_output, "w", encoding="utf-8") as f:
+            json.dump(results_per_level, f, indent=2)
+        print(f"\nSaved to {eval_output}")
 
 if __name__ == "__main__":
     main()

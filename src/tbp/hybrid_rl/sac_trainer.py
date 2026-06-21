@@ -161,6 +161,7 @@ class PSACTrainer:
 
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
         self.critic_optimizer.step()
 
         return critic_loss.item()
@@ -214,6 +215,7 @@ class PSACTrainer:
 
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
         self.actor_optimizer.step()
 
         self.bc_lambda *= self.bc_lambda_decay
@@ -224,6 +226,8 @@ class PSACTrainer:
         states = torch.FloatTensor(batch["states"])
 
         with torch.no_grad():
+            self.log_alpha_type.clamp_(min=-5.0, max=2.0)
+            self.log_alpha_param.clamp_(min=-2.0, max=0.0)
             _, _, log_prob, type_probs = self.actor.sample(states)
             type_entropy = -(type_probs * torch.log(type_probs + 1e-8)).sum(dim=-1).mean()
 
@@ -257,16 +261,28 @@ class PSACTrainer:
         warmup_steps: int = 1000,
         log_interval: int = 100,
         save_dir: Optional[str] = None,
+        curriculum_levels: Optional[List] = None,
+        promote_threshold: float = 0.5,
+        promote_window: int = 100,
     ):
         interpreter = ActionInterpreter(env)
 
+        curr_level = 0
+        success_window = []
+
         for episode in range(num_episodes):
+
+            if curriculum_levels:
+                min_dist, max_dist = curriculum_levels[curr_level]
+            else:
+                min_dist, max_dist = 10.0, 120.0
+
             env.reset()
             start_pos = env.get_pose()[:3]
             goal_pose = env.get_random_surface_point(
                 reference_pos=start_pos,
-                min_dist=10.0,
-                max_dist=120.0,
+                min_dist=min_dist,
+                max_dist=max_dist,
                 max_attempts=2000,
                 mesh_sample=True,
             )
@@ -279,6 +295,7 @@ class PSACTrainer:
             prev_distance = float(np.linalg.norm(goal_pose[:3] - current_pose[:3]))
 
             episode_reward = 0.0
+            episode_success = False
 
             for step in range(self.max_steps_per_goal):
                 self.total_steps += 1
@@ -325,19 +342,37 @@ class PSACTrainer:
                     for _ in range(updates_per_step):
                         batch = self.buffer.sample(self.batch_size)
                         critic_loss = self.update_critic(batch)
-                        sac_loss, bc_loss = self.update_actor(batch)
+                        if self.total_episodes > 3000 and self.total_steps % 4 == 0:
+                            sac_loss, bc_loss = self.update_actor(batch)
                         self.update_alpha(batch)
                         self.soft_update_target()
 
                 if done:
                     if distance < self.goal_threshold:
                         self.total_goals_reached += 1
+                        episode_success = True
                     break
 
             self.total_episodes += 1
 
+            if curriculum_levels:
+                success_window.append(episode_success)
+                if len(success_window) > promote_window:
+                    success_window.pop(0)
+                if (len(success_window) == promote_window
+                        and curr_level < len(curriculum_levels) - 1):
+                    rate = sum(success_window) / promote_window
+                    if rate >= promote_threshold:
+                        curr_level += 1
+                        success_window = []
+                        logger.info(
+                            f"SAC Curriculum: promoted to level {curr_level} "
+                            f"({curriculum_levels[curr_level]}mm)"
+                        )
+
             if (episode + 1) % log_interval == 0:
                 success_rate = self.total_goals_reached / max(self.total_episodes, 1)
+                level_info = f", level={curr_level}" if curriculum_levels else ""
                 logger.info(
                     f"Episode {episode+1}/{num_episodes}: "
                     f"reward={episode_reward:.1f}, "
@@ -348,6 +383,7 @@ class PSACTrainer:
                     f"alpha_type={self.alpha_type:.3f}, "
                     f"alpha_param={self.alpha_param:.3f}, "
                     f"buffer={len(self.buffer)}"
+                    f"{level_info}"
                 )
 
         if save_dir:

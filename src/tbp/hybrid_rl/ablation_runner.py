@@ -33,7 +33,8 @@ def train(
     curriculum_config=None,
     episode_script: Optional[List[Dict[str, Any]]] = None,
     episode_pools: Optional[List[List[Dict[str, Any]]]] = None,
-    visualise=False
+    visualise=False,
+    EPISODES_PER_LEVEL=None
 ):
     """
     curriculum_config (optional):
@@ -143,6 +144,8 @@ def train(
     success_actions = []
 
     for episode in range(num_episodes):
+        if EPISODES_PER_LEVEL is not None and episode >= EPISODES_PER_LEVEL:
+            break
         episode_mesh_path = mesh_path
         if episode_mesh_path is None:
             # Случайный объект
@@ -232,6 +235,8 @@ def train(
         if _episode_success:
             success_trails.append(controller.success_trails)
             success_actions.append(action_explanations)
+            #print(f"  SUCCESS trail length: {len(controller.success_trails)}")
+            #success_trails.append(list(controller.success_trails))
             logger.debug(f"SUCCESS, start_distance {start_distance}, explain_action_info: {action_explanations}")
             #if visualise:
             #    visualize_agent_goal(env, np.concatenate([start_pos, start_rot]), goal_pose)

@@ -284,8 +284,9 @@ class RLGoalApproachController:
             prev_store.update_q_value(self._prev_state, self._last_action, td_target, self._get_learning_rate())
 
             if done:
-                if self.is_training and termination_reason == "goal_reached":
-                    self._apply_success_backup_updates()
+                if termination_reason == "goal_reached":
+                    if self.is_training:
+                        self._apply_success_backup_updates()
                     self.success_trails = self._episode_transitions.copy()
                 self._on_episode_done(state, termination_reason)
                 return None, None
