@@ -398,7 +398,7 @@ class RLGoalApproachController:
                       if self._prev_sensor_data is not None
                       else self.config["max_sensor_range"])
 
-        logger.info(
+        logger.debug(
             f"COLLISION_CHECK: was_on={was_on}, now_on={now_on}, "
             f"depth={depth:.3f}, prev_depth={prev_depth:.3f}"
         )
