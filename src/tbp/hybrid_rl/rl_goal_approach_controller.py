@@ -398,6 +398,11 @@ class RLGoalApproachController:
                       if self._prev_sensor_data is not None
                       else self.config["max_sensor_range"])
 
+        logger.info(
+            f"COLLISION_CHECK: was_on={was_on}, now_on={now_on}, "
+            f"depth={depth:.3f}, prev_depth={prev_depth:.3f}"
+        )
+
         if was_on and prev_depth > 1.5 and depth < self.config["min_valid_depth"]:
             return "surface_violation"
 
@@ -415,7 +420,7 @@ class RLGoalApproachController:
             if was_on and not now_on:
                 return "lost_object"
 
-        return None    
+        return None
     # ══════════════════════════════════════════════════════════
     # REWARD
     # ══════════════════════════════════════════════════════════
@@ -480,6 +485,9 @@ class RLGoalApproachController:
         
         # ═══ 3. Step penalty ═══
         reward += cfg["reward_step_penalty"]
+        if action == self.action_space.IDX_DETACH:
+            sub_steps = getattr(self, '_last_detach_sub_steps', 1)
+            reward += cfg["reward_step_penalty"] * (sub_steps - 1)
         
         # ═══ 4. Collisions ═══
         # Reward: один штраф вместо двух
@@ -740,38 +748,17 @@ class RLGoalApproachController:
         sensor_data: dict,
         prev_action: Optional[int] = None,
     ) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
-        """
-        Heuristic bias for action selection.
-
-        Args:
-            state: 13D state vector:
-                [0:3] local_pos_error (mm) in agent local frame
-                [3:6] rot_error_deg = [pitch_err, yaw_err, roll_err] degrees
-                [6:9] local_normal (unit-ish) in agent local frame
-                [9]   on_object (float 0/1)
-                [10]  alignment
-                [11]  distance (mm)
-                [12]  norm_depth
-            current_pose: [x, y, z, pitch, yaw, roll] degrees
-            sensor_data: dict with "point_normal" in WORLD coords (or None), "depth", "on_object"
-            prev_action: previous chosen action index (last step)
-
-        Returns:
-            bias: [NUM_ACTIONS]
-            components: dict of component biases
-        """
         logger.debug(
             "MODEDBG on=%s depth=%.3f normal_is_none=%s align=%.3f",
-            float(state[9]),
+            float(state[11]),
             float(sensor_data.get("depth", -1.0)),
             sensor_data.get("point_normal") is None,
-            float(state[10]),
+            float(state[12]),
         )
 
         bias = np.zeros(self.num_actions, dtype=float)
         components: Dict[str, np.ndarray] = {}
 
-        # Unpack state
         local_pos_error = state[0:3]
         rot_error_deg = state[3:6]
         local_normal = state[6:9]
@@ -781,33 +768,29 @@ class RLGoalApproachController:
 
         eps = 1e-8
 
-        # Rotation: local -> world
         rot = R.from_euler("xyz", current_pose[3:6], degrees=True)
 
-        # ------------------------------------------------------------
-        # 0) Suppress actions that waste steps for point-reaching
-        # ------------------------------------------------------------
+        curvature = abs(float(state[9])) + abs(float(state[10]))
+        DETACH_ALIGN_THR = -0.3 + min(curvature * 5.0, 0.2)
+        SURFACE_STRENGTH = 2.0
+
+        close_to_goal = (
+            distance < 3.0 * self.action_space.surface_step
+            and alignment > DETACH_ALIGN_THR
+        )
+
         suppress = np.zeros(self.num_actions, dtype=float)
         suppress[self.action_space.IDX_ROTATE_POS] -= 2.0
         suppress[self.action_space.IDX_ROTATE_NEG] -= 2.0
 
-        near_goal = (distance < 3.0 * self.action_space.surface_step)
-        if not (on_object > 0.5 and near_goal):
+        if not (on_object > 0.5 and close_to_goal):
             suppress[self.action_space.IDX_ORIENT_HOR] -= 2.0
             suppress[self.action_space.IDX_ORIENT_VERT] -= 2.0
 
         bias += suppress
         components["suppress"] = suppress
 
-        # ------------------------------------------------------------
-        # 1) Surface move-to-goal (world tangent projection + dot argmax)
-        # ------------------------------------------------------------
         surface_move = np.zeros(self.num_actions, dtype=float)
-
-        # Detach threshold (keep from previous heuristic)
-        DETACH_ALIGN_THR = -0.3
-
-        SURFACE_STRENGTH = 2.0
 
         if on_object > 0.5 and alignment >= DETACH_ALIGN_THR:
             n_world = sensor_data.get("point_normal", None)
@@ -913,11 +896,11 @@ class RLGoalApproachController:
                             tangential_dist,
                             distance,
                         )
+                        surface_move[self.action_space.IDX_FREE_FORWARD] += 2.0
 
         bias += surface_move
         components["surface_move"] = surface_move
 
-        # If no progres 5 steps on surface - detach
         stagnation_override = np.zeros(self.num_actions, dtype=float)
         if on_object > 0.5 and alignment >= DETACH_ALIGN_THR:
             if len(self._episode_transitions) >= 5:
@@ -933,54 +916,69 @@ class RLGoalApproachController:
         bias += stagnation_override
         components["stagnation_override"] = stagnation_override
 
-
-        # ------------------------------------------------------------
-        # 2) Detach heuristic (goal "through" surface)
-        # ------------------------------------------------------------
         detach = np.zeros(self.num_actions, dtype=float)
-        if on_object > 0.5 and alignment < DETACH_ALIGN_THR:
-            detach_urgency = min(1.0, abs(alignment))
-            detach[self.action_space.IDX_LOOK_UP] += 3.0 * detach_urgency
-            detach[self.action_space.IDX_FREE_FORWARD] -= 1.0
-            detach[self.action_space.IDX_FREE_BACKWARD] -= 1.0
+        if on_object > 0.5:
+            need_detach = False
+
+            if alignment < DETACH_ALIGN_THR:
+                need_detach = True
+
+            n_world = sensor_data.get("point_normal", None)
+            if n_world is not None:
+                n_world = np.asarray(n_world, dtype=float)
+                n_len = float(np.linalg.norm(n_world))
+                if n_len > eps:
+                    n_hat = n_world / n_len
+                    e_world = rot.apply(local_pos_error)
+                    e_t = e_world - np.dot(e_world, n_hat) * n_hat
+                    tangential_dist = float(np.linalg.norm(e_t))
+                    normal_dist = abs(float(np.dot(e_world, n_hat)))
+
+                    if normal_dist > tangential_dist * 2.0 and distance > 3.0 * self.action_space.surface_step:
+                        need_detach = True
+
+            if need_detach:
+                recent_detach_count = sum(
+                    1 for tr in self._episode_transitions[-5:]
+                    if tr["action"] == self.action_space.IDX_DETACH
+                )
+                if recent_detach_count < 1 and not close_to_goal:
+                    detach[self.action_space.IDX_DETACH] += 5.0
+                    for idx in range(8):
+                        detach[idx] -= 2.0
+                    detach[self.action_space.IDX_FREE_FORWARD] -= 2.0
+                    detach[self.action_space.IDX_FREE_BACKWARD] -= 2.0
+                    detach[self.action_space.IDX_LOOK_UP] -= 1.0
+                    detach[self.action_space.IDX_LOOK_DOWN] -= 1.0
         bias += detach
         components["detach"] = detach
 
-        # ------------------------------------------------------------
-        # 3) Free-space steering (when off surface)
-        # ------------------------------------------------------------
         steer = np.zeros(self.num_actions, dtype=float)
         if on_object <= 0.5:
             norm_depth = float(state[14])
-            
-            if norm_depth < 0.1:  # ещё близко к поверхности (depth < 10mm)
-                # Приоритет: отлететь
+
+            if norm_depth < 0.1:
                 steer[self.action_space.IDX_FREE_FORWARD] += 3.0
-                # Подавить повороты
                 steer[self.action_space.IDX_LOOK_UP] -= 1.0
                 steer[self.action_space.IDX_LOOK_DOWN] -= 1.0
                 steer[self.action_space.IDX_TURN_LEFT] -= 1.0
                 steer[self.action_space.IDX_TURN_RIGHT] -= 1.0
-            else:  # norm_depth >= 0.1 — отлетели, рулим к цели
-                # Направление на ПОЗИЦИЮ цели в локальной СК
-                goal_dir_local = local_pos_error.copy()  # state[0:3]
+            else:
+                goal_dir_local = local_pos_error.copy()
                 goal_dist = np.linalg.norm(goal_dir_local)
                 if goal_dist > 1e-8:
                     goal_dir_local /= goal_dist
-                
+
                 gx, gy, gz = goal_dir_local
-                
-                # Yaw: отклонение в горизонтальной плоскости
-                # forward = [0,0,-1], цель впереди когда gz < 0
+
                 yaw_to_goal = np.degrees(np.arctan2(-gx, -gz))
-                
-                # Pitch: отклонение по вертикали
+
                 horiz_dist = np.sqrt(gx**2 + gz**2)
                 pitch_to_goal = np.degrees(np.arctan2(gy, horiz_dist))
-                
+
                 yaw_thr = 5.0
                 pitch_thr = 5.0
-                
+
                 if abs(yaw_to_goal) > yaw_thr:
                     if yaw_to_goal > 0:
                         steer[self.action_space.IDX_TURN_LEFT] += 2.0
@@ -993,15 +991,12 @@ class RLGoalApproachController:
                         steer[self.action_space.IDX_LOOK_DOWN] += 2.0
                 else:
                     steer[self.action_space.IDX_FREE_FORWARD] += 2.0
-                
+
                 steer[self.action_space.IDX_FREE_BACKWARD] -= 0.5
-                    
+
         bias += steer
         components["steer_in_air"] = steer
 
-        # ------------------------------------------------------------
-        # 4) Extra damping: if on surface and not detaching, discourage free moves
-        # ------------------------------------------------------------
         damp_free = np.zeros(self.num_actions, dtype=float)
         if on_object > 0.5 and alignment >= DETACH_ALIGN_THR:
             damp_free[self.action_space.IDX_FREE_FORWARD] -= 2.0

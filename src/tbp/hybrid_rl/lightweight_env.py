@@ -58,6 +58,9 @@ class LightweightEnv:
 
         return self.get_sensor_data()    
     
+    def set_goal(self, goal_pose):
+        self._current_goal = goal_pose
+        
     def step(self, action_index, action_space):
         """
         Perform an action, return new sensor data.
@@ -105,6 +108,14 @@ class LightweightEnv:
                 forward_distance=action_info.forward_distance,
                 down_distance=action_info.down_distance,
             )
+        elif action_info.name == "detach":
+            if hasattr(self, '_current_goal') and self._current_goal is not None:
+                self._detach_and_fly_to_goal(
+                    goal_pose=self._current_goal,
+                    rotation_step=action_space.rotation_step,
+                    free_step=action_space.free_step,
+                    max_sub_steps=2
+                )
         
         return self.get_sensor_data()
     
@@ -500,8 +511,65 @@ class LightweightEnv:
         
         # Apply pitch rotation (around X axis)
         self.agent_rot[0] += rotation_degrees  # X-axis = pitch
+    
+    def _detach_and_fly_to_goal(self, goal_pose, rotation_step=5.0, free_step=8.0, max_sub_steps=3):
+        sub_steps = 1
 
+        sensor = self.get_sensor_data()
+        normal = None
+        if sensor.get("point_normal") is not None:
+            normal = np.array(sensor["point_normal"], dtype=float)
+            normal /= (np.linalg.norm(normal) + 1e-12)
+            self.agent_rot = self._look_at_direction(normal)
 
+        total_fly = free_step * max_sub_steps
+        flown = 0.0
+        while flown < total_fly:
+            sensor = self.get_sensor_data()
+            depth = sensor.get("depth", 100.0)
+            step = min(free_step, total_fly - flown)
+            if depth < step:
+                step = max(depth - 2.0, 0.5)
+                self._move_forward(step)
+                flown += step
+                break
+            self._move_forward(step)
+            flown += step
+
+        goal_pos = goal_pose[:3]
+        direction = goal_pos - self.agent_pos
+        dist = np.linalg.norm(direction)
+        if dist > 1e-8:
+            direction /= dist
+
+        if normal is not None:
+            fly_direction = direction + normal * 0.5
+            fly_direction /= (np.linalg.norm(fly_direction) + 1e-12)
+        else:
+            fly_direction = direction
+
+        self.agent_rot = self._look_at_direction(fly_direction)
+
+        for _ in range(max_sub_steps):
+            sub_steps += 1
+
+            sensor = self.get_sensor_data()
+            depth = sensor.get("depth", 100.0)
+
+            if depth < free_step:
+                step = max(depth - 2.0, 0.5)
+                self._move_forward(step)
+                break
+
+            self._move_forward(free_step)
+
+            sensor = self.get_sensor_data()
+            if sensor.get("on_object", False):
+                break
+
+        self._last_detach_sub_steps = sub_steps
+        return self.get_sensor_data()
+    
 def is_on_same_cube_side(pos_a, pos_b, cube_side=42.0, atol=1e-5):
     """
     Проверяет, лежат ли две точки на одной стороне куба (например, обе на +X при x = +42).

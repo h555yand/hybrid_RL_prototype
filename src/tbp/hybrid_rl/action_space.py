@@ -33,7 +33,7 @@ class ActionInfo:
 class ActionSpace:
     """Maps discrete action indices to Monty Action objects.
 
-    Action layout (18 actions total):
+    Action layout (19 actions total):
 
         SURFACE (8): Crawl along object surface
             0: MoveTangentially 0°   (forward on surface)
@@ -64,7 +64,7 @@ class ActionSpace:
         rotation_step: Step size for LookUp/Down/Rotation (degrees).
     """
 
-    NUM_ACTIONS = 18
+    NUM_ACTIONS = 19
 
     # Surface action directions (8 evenly spaced)
     SURFACE_DIRECTIONS = [0, 45, 90, 135, 180, 225, 270, 315]
@@ -81,6 +81,7 @@ class ActionSpace:
     IDX_ROTATE_NEG = 15
     IDX_ORIENT_HOR = 16
     IDX_ORIENT_VERT = 17
+    IDX_DETACH = 18
 
     def __init__(
         self,
@@ -193,6 +194,12 @@ class ActionSpace:
             forward_distance=0.05,
             down_distance=0.02,
             category="surface",
+        ))
+
+        info.append(ActionInfo(
+            index=self.IDX_DETACH,
+            name="detach",
+            category="macro",
         ))
 
         return info

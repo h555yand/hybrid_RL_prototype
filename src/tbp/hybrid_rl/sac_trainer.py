@@ -287,6 +287,7 @@ class PSACTrainer:
                 mesh_sample=True,
             )
             controller.set_new_goal(goal_pose, start_pos)
+            env.set_goal(goal_pose)
 
             current_pose = env.get_pose()
             sensor_data = env.get_sensor_data()

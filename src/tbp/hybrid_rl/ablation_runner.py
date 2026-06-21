@@ -206,6 +206,7 @@ def train(
                 goal_pose = env.get_random_surface_point()
         
         controller.set_new_goal(goal_pose, start_pos)
+        env.set_goal(goal_pose)
         
         # Навигация
         action_explanations = []
@@ -229,6 +230,8 @@ def train(
             # Выполнить действие
             action_index = controller._last_action
             env.step(action_index, action_space)
+            if action_index == action_space.IDX_DETACH:
+                controller._last_detach_sub_steps = getattr(env, '_last_detach_sub_steps', 1)
         
         _episode_success = controller._total_goals_reached > _goals_before_episode
         start_distance = float(np.linalg.norm(goal_pose[:3] - start_pos))

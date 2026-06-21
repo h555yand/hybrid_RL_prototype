@@ -345,6 +345,11 @@ def _run_eval_per_level(
             "mean_collision_rate": sum(r["collision_rate"] for r in level_results) / count,
         }
 
+        eval_output = data_dir / f"eval_result_{level_idx}.json"
+        with open(eval_output, "w", encoding="utf-8") as f:
+            json.dump(results_per_level, f, indent=2)
+        print(f"\nSaved eval result to {eval_output}")
+
     all_success = []
     all_timeout = []
     all_collision = []
@@ -386,12 +391,12 @@ def main() -> None:
     TRAIN_EPISODES_PER_LEVEL = 5_000
     EVAL_EPISODES_PER_LEVEL = 500
     REGENERATE_SCRIPTS = False
-    IS_LOAD = True
-    RUN_TRAIN = False
-    RUN_EVAL = False
+    IS_LOAD = False
+    RUN_TRAIN = True
+    RUN_EVAL = True
 
     if IS_LOAD:
-        epsilon_start = 0.25
+        epsilon_start = 0.3
     else:
         epsilon_start = 1.0
 
@@ -420,6 +425,8 @@ def main() -> None:
     scripts_dir = data_dir / "episode_scripts"
     runs_dir.mkdir(parents=True, exist_ok=True)
 
+    #####################################################
+    # Choose Mesh
     _prepare_demo_meshes(data_dir)
     # mesh_path = str(data_dir / "cube.stl")
     # mesh_path = str(data_dir / "cylinder.stl")
@@ -683,6 +690,7 @@ def main() -> None:
                         np.array(ep_data["goal_rot"]),
                     ])
                     controller.set_new_goal(goal_pose, start_pos)
+                    env.set_goal(goal_pose)
 
                     success = False
                     collision = False

@@ -49,6 +49,9 @@ class ActionInterpreter:
             self.env._orient_vertical(rotation, fwd_dist, down_dist)
 
         elif action_type == 7:
-            pass
+            if hasattr(self.env, '_current_goal') and self.env._current_goal is not None:
+                self.env._detach_and_fly_to_goal(
+                    goal_pose=self.env._current_goal,
+                )
 
         return self.env.get_sensor_data()
