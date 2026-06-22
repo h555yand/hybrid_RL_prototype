@@ -231,7 +231,7 @@ class PSACTrainer:
 
         with torch.no_grad():
             self.log_alpha_type.clamp_(min=-5.0, max=2.0)
-            self.log_alpha_param.clamp_(min=-2.0, max=0.0)
+            self.log_alpha_param.clamp_(min=-2.0, max=-1.0)
             _, _, log_prob, type_probs = self.actor.sample(states)
             type_entropy = -(type_probs * torch.log(type_probs + 1e-8)).sum(dim=-1).mean()
 
@@ -377,6 +377,16 @@ class PSACTrainer:
 
             if (episode + 1) % log_interval == 0:
                 success_rate = self.total_goals_reached / max(self.total_episodes, 1)
+                
+                if not hasattr(self, '_best_success_rate'):
+                    self._best_success_rate = 0.0
+                    self._best_state_dict = None
+                if success_rate > self._best_success_rate:
+                    self._best_success_rate = success_rate
+                    self._best_state_dict = {
+                        k: v.clone() for k, v in self.actor.state_dict().items()
+                    }
+                
                 level_info = f", level={curr_level}" if curriculum_levels else ""
                 logger.info(
                     f"Episode {episode+1}/{num_episodes}: "
@@ -384,6 +394,7 @@ class PSACTrainer:
                     f"steps={step+1}, "
                     f"success_rate={self.total_goals_reached}/{self.total_episodes} "
                     f"({success_rate:.3f}), "
+                    f"best={self._best_success_rate:.3f}, "
                     f"bc_lambda={self.bc_lambda:.4f}, "
                     f"alpha_type={self.alpha_type:.3f}, "
                     f"alpha_param={self.alpha_param:.3f}, "
@@ -391,6 +402,9 @@ class PSACTrainer:
                     f"{level_info}"
                 )
 
+        if hasattr(self, '_best_state_dict') and self._best_state_dict is not None:
+            self.actor.load_state_dict(self._best_state_dict)
+            logger.info(f"Restored best actor (success_rate={self._best_success_rate:.3f})")
         if save_dir:
             self.save(save_dir)
 
