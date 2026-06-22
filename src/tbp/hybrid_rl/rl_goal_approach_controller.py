@@ -388,6 +388,9 @@ class RLGoalApproachController:
     # COLLISION DETECTION
     # ══════════════════════════════════════════════════════════
     def _detect_collision(self, sensor_data):
+        if sensor_data.get("passed_through", False):
+            return "surface_violation"
+
         depth = sensor_data.get("depth", self.config["max_sensor_range"])
 
         was_on = (self._prev_sensor_data is not None
@@ -426,46 +429,20 @@ class RLGoalApproachController:
     # ══════════════════════════════════════════════════════════
     
     def _compute_reward(self, state, prev_state, action, collision):
-        """Compute reward and done flag.
-
-        Dense reward based on:
-            - Progress toward goal (main signal)
-            - Goal reached bonus
-            - Collision penalties
-            - Efficiency incentives (step penalty, anti-oscillation)
-
-        Args:
-            state: Current state [18D].
-            prev_state: Previous state [18D].
-            action: Action taken.
-            collision: Collision type or None.
-
-        Returns:
-            Tuple of (reward, done, termination_reason).
-            termination_reason ∈ {
-                "goal_reached",
-                "collision_surface_violation",
-                "timeout",
-                None,
-            }
-        """
         cfg = self.config
         reward = 0.0
         done = False
         termination_reason = None
-        
+
         distance = state[13]
         prev_distance = prev_state[13]
         on_object = state[11]
         prev_alignment = prev_state[12]
         prev_on_object = prev_state[11]
-        
+
         surface_step = self.action_space.surface_step
-        
+
         # ═══ 1. Progress toward goal ═══
-        # Нормализован по step size: всегда ~5.0 за идеальный шаг.
-        # В detour-режиме (цель через поверхность) клипуем отрицательный прогресс,
-        # чтобы не наказывать за вынужденный обход между гранями.
         progress_raw = prev_distance - distance
         progress = progress_raw
         detour_mode = (
@@ -475,55 +452,46 @@ class RLGoalApproachController:
         if detour_mode and progress_raw < 0.0:
             min_progress = -surface_step * cfg["detour_negative_progress_clip_steps"]
             progress = max(progress_raw, min_progress)
-        reward += progress / surface_step * cfg["reward_progress"]
-        
+
+        if action == self.action_space.IDX_DETACH:
+            sub_steps = max(getattr(self, '_last_detach_sub_steps', 1), 1)
+            reward += progress / (self.action_space.free_step * sub_steps) * cfg["reward_progress"]
+        else:
+            reward += progress / surface_step * cfg["reward_progress"]
+
         # ═══ 2. Goal reached ═══
         if distance < cfg["goal_threshold"]:
             reward += cfg["reward_goal_reached"]
             done = True
             termination_reason = "goal_reached"
-        
+
         # ═══ 3. Step penalty ═══
         reward += cfg["reward_step_penalty"]
         if action == self.action_space.IDX_DETACH:
-            sub_steps = getattr(self, '_last_detach_sub_steps', 1)
+            sub_steps = max(getattr(self, '_last_detach_sub_steps', 1), 1)
             reward += cfg["reward_step_penalty"] * (sub_steps - 1)
-        
+
         # ═══ 4. Collisions ═══
-        # Reward: один штраф вместо двух
         if collision == "surface_violation":
-            reward += cfg["reward_surface_violation"]  # -5.0
+            reward += cfg["reward_surface_violation"]
             done = True
             termination_reason = "collision_surface_violation"
         elif collision == "lost_object":
-            if prev_alignment < -0.3 and progress > 0:
-                # Smart detach: цель через поверхность, приблизились
-                reward += cfg["reward_smart_detach"]   # БОНУС за умное решение
-            #elif progress > 0:
-            #    # Приблизились, но причина неясна
-            #    reward += cfg[""]
-            else:
-                # Улетели от цели
+            if action != self.action_space.IDX_DETACH:
                 reward += cfg["reward_drifted_away"]
-        
+
         # ═══ 5. Near goal on surface ═══
-        near_radius = surface_step * 3  # 3 шага от цели
+        near_radius = surface_step * 3
         if distance < near_radius and on_object > 0.5:
             reward += cfg["reward_near_goal_on_surface"]
-        
-        # ═══ 6. Oscillation (safety net) ═══
-        # Пока убирвем, соишком грубо
-        #if (self._prev_action is not None
-        #        and self.action_space.are_opposite(action, self._prev_action)):
-        #    reward += cfg["reward_oscillation"]
-        
-        # ═══ 7. Timeout ═══
+
+        # ═══ 6. Timeout ═══
         if self._steps >= cfg["max_steps_per_goal"]:
             reward += cfg["reward_timeout"]
             done = True
             if termination_reason is None:
                 termination_reason = "timeout"
-        
+
         return reward, done, termination_reason
 
     # ══════════════════════════════════════════════════════════

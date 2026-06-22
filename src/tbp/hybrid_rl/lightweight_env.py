@@ -31,12 +31,13 @@ class LightweightEnv:
         # Roll - turn head to shoulder - rotation around the Z axis
         # self.agent_rot = [Pitch, Yaw, Roll]
         #self.agent_rot = [X-angle, Y-angle, Z-angle]
-
         # Note: seed is set globally in train() => np.random.seed()
         # trimesh.sample() uses global np.random
+        self._passed_through = False
     
     def reset(self, position=None, rotation=None):
         """Place the agent in the starting position."""
+        self._passed_through = False
         if position is not None:
             self.agent_pos = np.array(position, dtype=float)
         else:
@@ -149,6 +150,7 @@ class LightweightEnv:
             "principal_curvatures": self._estimate_curvature(),
             "on_object": on_object,
             "depth": depth,
+            "passed_through": getattr(self, '_passed_through', False),
         }
     
     def get_pose(self):
@@ -351,86 +353,22 @@ class LightweightEnv:
             else:
                 self.agent_pos = old_pos
 
-    def _move_tangentially_old(self, direction_degrees, step_size, snap_to_surface: bool = True):
-        """
-        Movement tangent to the surface using a tangent basis (t1, t2).
-
-        This fixes degeneracy where local XZ directions, after rotation+projection,
-        collapse to ~1D on some faces/poses.
-
-        direction_degrees:
-            angle in the tangent plane:
-            0°   -> +t1
-            90°  -> +t2
-            180° -> -t1
-            270° -> -t2
-        """
-        rot = R.from_euler("xyz", self.agent_rot, degrees=True)
-
-        sensor_data = self.get_sensor_data()
-        if sensor_data["point_normal"] is None:
-            # Fallback: keep old behavior if no normal
-            angle_rad = np.radians(direction_degrees)
-            local_dir = np.array([np.sin(angle_rad), 0.0, -np.cos(angle_rad)], dtype=float)
-            local_dir /= (np.linalg.norm(local_dir) + 1e-12)
-            world_dir = rot.apply(local_dir)
-            self.agent_pos += world_dir * step_size
-            return
-
-        n = np.array(sensor_data["point_normal"], dtype=float)
-        n /= (np.linalg.norm(n) + 1e-12)
-
-        # Build tangent basis.
-        # Try sensor's right axis as primary tangent direction.
-        right_world = rot.apply([1.0, 0.0, 0.0])
-        t1 = right_world - np.dot(right_world, n) * n
-        t1_norm = np.linalg.norm(t1)
-
-        if t1_norm < 1e-8:
-            # If right is parallel to normal, try sensor up axis
-            up_world = rot.apply([0.0, 1.0, 0.0])
-            t1 = up_world - np.dot(up_world, n) * n
-            t1_norm = np.linalg.norm(t1)
-
-        if t1_norm < 1e-8:
-            # Pathological fallback: pick any vector not parallel to n
-            tmp = np.array([0.0, 1.0, 0.0])
-            if abs(np.dot(tmp, n)) > 0.9:
-                tmp = np.array([0.0, 0.0, 1.0])
-            t1 = np.cross(n, tmp)
-            t1_norm = np.linalg.norm(t1)
-
-        t1 /= (t1_norm + 1e-12)
-
-        # Second tangent axis
-        t2 = np.cross(n, t1)
-        t2 /= (np.linalg.norm(t2) + 1e-12)
-
-        a = np.radians(direction_degrees)
-        world_dir = np.cos(a) * t1 + np.sin(a) * t2
-        world_dir /= (np.linalg.norm(world_dir) + 1e-12)
-
-        # Move
-        self.agent_pos += world_dir * step_size
-
-        # Optional: snap back to surface at +2mm along normal for stability
-        if snap_to_surface:
-            closest, dist_to_mesh, face_id = self.mesh.nearest.on_surface([self.agent_pos])
-            hit_n = self.mesh.face_normals[face_id[0]]
-            hit_n = hit_n / (np.linalg.norm(hit_n) + 1e-12)
-            if np.dot(hit_n, n) < 0:
-                hit_n = -hit_n
-            self.agent_pos = closest[0] + hit_n * 2.0
-            # ← ДОБАВИТЬ ЭТУ СТРОКУ:
-            self.agent_rot = self._look_at_direction(-hit_n)
-        else:
-            logger.warning(f"SNAP FAILED: ray_origin={self.agent_pos}, n={n}")
-
     def _move_forward(self, step_size):
-        """Forward movement (where the sensor is looking)."""
         rot = R.from_euler("xyz", self.agent_rot, degrees=True)
         forward = rot.apply([0, 0, -1])
+        old_pos = self.agent_pos.copy()
         self.agent_pos += forward * step_size
+        self._passed_through = False
+
+        if abs(step_size) > 0.5:
+            locations, _, _ = self.mesh.ray.intersects_location(
+                ray_origins=[old_pos],
+                ray_directions=[forward * np.sign(step_size)],
+            )
+            if len(locations) > 0:
+                distances = np.linalg.norm(locations - old_pos, axis=1)
+                if np.min(distances) < abs(step_size):
+                    self._passed_through = True
     
     def _orient_horizontal(self, rotation_degrees, forward_distance, left_distance):
         """Moves the agent forward and sideways (left/right), projects onto surface, and yaws.

@@ -82,6 +82,9 @@ class PSACTrainer:
         self.total_episodes = 0
         self.total_goals_reached = 0
 
+        self.param_mean = None
+        self.param_std = None
+
     @property
     def alpha_type(self):
         return self.log_alpha_type.exp().item()
@@ -99,6 +102,8 @@ class PSACTrainer:
         norm = np.load(Path(bc_model_dir) / "bc_normalization.npz")
         self.state_mean = norm["state_mean"]
         self.state_std = norm["state_std"]
+        self.param_mean = norm["param_mean"]
+        self.param_std = norm["param_std"]
 
         with open(bc_data_path, "rb") as f:
             bc_transitions = pickle.load(f)
@@ -189,9 +194,8 @@ class PSACTrainer:
             bc_types = torch.LongTensor(
                 [self.bc_data[i].action_type for i in bc_indices]
             )
-            bc_params = torch.FloatTensor(
-                np.array([self.bc_data[i].action_params for i in bc_indices])
-            )
+            bc_params_raw = np.array([self.bc_data[i].action_params for i in bc_indices])
+            bc_params = torch.FloatTensor((bc_params_raw - self.param_mean) / self.param_std)
 
             type_logits, param_mus, _ = self.actor(bc_states)
             type_loss = F.cross_entropy(type_logits, bc_types)
@@ -215,7 +219,7 @@ class PSACTrainer:
 
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.1)
         self.actor_optimizer.step()
 
         self.bc_lambda *= self.bc_lambda_decay
@@ -309,7 +313,7 @@ class PSACTrainer:
                     with torch.no_grad():
                         at, ap, _, _ = self.actor.sample(state_t)
                     action_type = at[0].item()
-                    action_params = ap[0].numpy()
+                    action_params = ap[0].numpy() * self.param_std + self.param_mean
 
                 sensor_data = interpreter.execute(action_type, action_params)
                 current_pose = env.get_pose()
@@ -343,9 +347,9 @@ class PSACTrainer:
                     for _ in range(updates_per_step):
                         batch = self.buffer.sample(self.batch_size)
                         critic_loss = self.update_critic(batch)
-                        if self.total_episodes > 3000 and self.total_steps % 4 == 0:
+                        if self.total_steps % 10 == 0:
                             sac_loss, bc_loss = self.update_actor(batch)
-                        self.update_alpha(batch)
+                            self.update_alpha(batch)
                         self.soft_update_target()
 
                 if done:
@@ -402,6 +406,8 @@ class PSACTrainer:
             dirpath / "sac_state.npz",
             state_mean=self.state_mean if self.state_mean is not None else np.zeros(self.state_dim),
             state_std=self.state_std if self.state_std is not None else np.ones(self.state_dim),
+            param_mean=self.param_mean if self.param_mean is not None else np.zeros(3),
+            param_std=self.param_std if self.param_std is not None else np.ones(3),
             total_steps=self.total_steps,
             total_episodes=self.total_episodes,
             total_goals_reached=self.total_goals_reached,
@@ -438,5 +444,7 @@ class PSACTrainer:
         self.log_alpha_param = torch.tensor(
             float(data["log_alpha_param"]), requires_grad=True
         )
+        self.param_mean = data["param_mean"]
+        self.param_std = data["param_std"]
 
         logger.info(f"P-SAC model loaded from {dirpath}")

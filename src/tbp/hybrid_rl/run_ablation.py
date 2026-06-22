@@ -392,8 +392,10 @@ def main() -> None:
     EVAL_EPISODES_PER_LEVEL = 500
     REGENERATE_SCRIPTS = False
     IS_LOAD = False
-    RUN_TRAIN = True
-    RUN_EVAL = True
+    RUN_TRAIN = False
+    RUN_EVAL = False
+    RUN_BC_TRAIN = False
+    RUN_SAC_TRAIN = True
 
     if IS_LOAD:
         epsilon_start = 0.3
@@ -563,7 +565,6 @@ def main() -> None:
             print(f"Batch types: {batch['action_types'][:5]}")
             print(f"Batch params: {batch['action_params'][:5]}")
         
-    RUN_BC_TRAIN = False
     if RUN_BC_TRAIN:
         print("\n" + "=" * 60)
         print("STEP 5: BC Training")
@@ -601,7 +602,6 @@ def main() -> None:
                 f"Predicted: {type_names[action_type]} {action_params}"
             )
     
-    RUN_SAC_TRAIN = True
     if RUN_SAC_TRAIN:
         print("\n" + "=" * 60)
         print("STEP 6: P-SAC Training")
@@ -619,9 +619,11 @@ def main() -> None:
             max_params=3,
             gamma=0.99,
             tau=0.005,
+            lr_actor=1e-5,
+            lr_critic=3e-4,
             batch_size=256,
             buffer_capacity=100_000,
-            bc_lambda_init=1.0,
+            bc_lambda_init=5.0,
             bc_lambda_decay=0.999999,
             max_steps_per_goal=150,
             goal_threshold=cfg.get("goal_threshold", 5.0),

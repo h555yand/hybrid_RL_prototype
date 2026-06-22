@@ -97,6 +97,10 @@ class BCTrainer:
         self.state_std = np.maximum(states.std(axis=0), 1e-6)
         states = (states - self.state_mean) / self.state_std
 
+        self.param_mean = params.mean(axis=0)
+        self.param_std = np.maximum(params.std(axis=0), 1e-6)
+        params = (params - self.param_mean) / self.param_std
+
         n = len(states)
         n_val = max(1, int(n * self.val_split))
         indices = np.random.permutation(n)
@@ -244,6 +248,8 @@ class BCTrainer:
             dirpath / "bc_normalization.npz",
             state_mean=self.state_mean,
             state_std=self.state_std,
+            param_mean=self.param_mean,
+            param_std=self.param_std,
         )
         logger.info(f"BC model saved to {dirpath}")
 
@@ -256,8 +262,13 @@ class BCTrainer:
         norm = np.load(dirpath / "bc_normalization.npz")
         self.state_mean = norm["state_mean"]
         self.state_std = norm["state_std"]
+        self.param_mean = norm["param_mean"]
+        self.param_std = norm["param_std"]
         logger.info(f"BC model loaded from {dirpath}")
 
     def predict(self, state: np.ndarray) -> Tuple[int, np.ndarray]:
         state_norm = (state - self.state_mean) / self.state_std
-        return self.actor.predict(state_norm.astype(np.float32))
+        action_type, action_params_norm = self.actor.predict(state_norm.astype(np.float32))
+        param_dim = len(action_params_norm)
+        action_params = action_params_norm * self.param_std[:param_dim] + self.param_mean[:param_dim]
+        return action_type, action_params
