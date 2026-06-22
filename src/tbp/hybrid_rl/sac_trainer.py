@@ -386,6 +386,20 @@ class PSACTrainer:
                     self._best_state_dict = {
                         k: v.clone() for k, v in self.actor.state_dict().items()
                     }
+                    self._best_critic_dict = {
+                        k: v.clone() for k, v in self.critic.state_dict().items()
+                    }
+                    self._best_critic_target_dict = {
+                        k: v.clone() for k, v in self.critic_target.state_dict().items()
+                    }
+                    self._best_extra = {
+                        "total_steps": self.total_steps,
+                        "total_episodes": self.total_episodes,
+                        "total_goals_reached": self.total_goals_reached,
+                        "bc_lambda": self.bc_lambda,
+                        "log_alpha_type": self.log_alpha_type.detach().clone(),
+                        "log_alpha_param": self.log_alpha_param.detach().clone(),
+                    }
                 
                 level_info = f", level={curr_level}" if curriculum_levels else ""
                 logger.info(
@@ -404,7 +418,20 @@ class PSACTrainer:
 
         if hasattr(self, '_best_state_dict') and self._best_state_dict is not None:
             self.actor.load_state_dict(self._best_state_dict)
-            logger.info(f"Restored best actor (success_rate={self._best_success_rate:.3f})")
+            self.critic.load_state_dict(self._best_critic_dict)
+            self.critic_target.load_state_dict(self._best_critic_target_dict)
+            self.total_steps = self._best_extra["total_steps"]
+            self.total_episodes = self._best_extra["total_episodes"]
+            self.total_goals_reached = self._best_extra["total_goals_reached"]
+            self.bc_lambda = self._best_extra["bc_lambda"]
+            self.log_alpha_type = torch.tensor(
+                self._best_extra["log_alpha_type"].item(), requires_grad=True
+            )
+            self.log_alpha_param = torch.tensor(
+                self._best_extra["log_alpha_param"].item(), requires_grad=True
+            )
+            logger.info(f"Restored best model (success_rate={self._best_success_rate:.3f})")
+
         if save_dir:
             self.save(save_dir)
 
@@ -458,7 +485,7 @@ class PSACTrainer:
         self.log_alpha_param = torch.tensor(
             float(data["log_alpha_param"]), requires_grad=True
         )
-        self.param_mean = data["param_mean"]
-        self.param_std = data["param_std"]
+        self.param_mean = data["param_mean"] if "param_mean" in data else np.zeros(3)
+        self.param_std = data["param_std"] if "param_std" in data else np.ones(3)
 
         logger.info(f"P-SAC model loaded from {dirpath}")

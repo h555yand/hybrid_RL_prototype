@@ -17,6 +17,8 @@ from tbp.hybrid_rl.replay_buffer import ReplayBuffer
 from tbp.hybrid_rl.sac_trainer import PSACTrainer
 from tbp.hybrid_rl.rl_goal_approach_controller import RLGoalApproachController
 from tbp.hybrid_rl.action_interpreter import ActionInterpreter
+from tbp.hybrid_rl.adaptive_manager import AdaptiveTrainingManager
+
 
 
 logging.basicConfig(level=logging.INFO)
@@ -32,6 +34,102 @@ CURRICULUM_LEVELS = [
 TRAIN_SEEDS = [11, 22, 33]
 EVAL_SEEDS = [44, 55, 66]
 SAC_EVAL_SEEDS = [77, 88, 99]
+
+
+def create_cup(
+    body_radius=28.0,
+    body_height=70.0,
+    wall_thickness=2.5,
+    bottom_thickness=3.0,
+    handle_radius_major=12.0,
+    handle_radius_minor=3.0,
+    handle_angle_deg=160.0,
+    handle_segments=24,
+    body_segments=64,
+    circle_points=8,
+):
+    outer = trimesh.primitives.Cylinder(
+        radius=body_radius,
+        height=body_height,
+        sections=body_segments,
+    )
+
+    inner_radius = body_radius - wall_thickness
+    inner_height = body_height - bottom_thickness
+    inner = trimesh.primitives.Cylinder(
+        radius=inner_radius,
+        height=inner_height,
+        sections=body_segments,
+    )
+    inner_shift = bottom_thickness / 2.0
+    inner.apply_translation([0, 0, inner_shift])
+
+    body = outer.difference(inner)
+
+    angles = np.linspace(
+        -np.radians(handle_angle_deg) / 2,
+        np.radians(handle_angle_deg) / 2,
+        handle_segments,
+    )
+
+    handle_center_x = body_radius
+    handle_center_z = 0.0
+
+    vertices_all = []
+
+    for i, angle in enumerate(angles):
+        center = np.array([
+            handle_center_x + handle_radius_major * np.cos(angle),
+            0.0,
+            handle_center_z + handle_radius_major * np.sin(angle),
+        ])
+
+        radial = center - np.array([handle_center_x, 0.0, handle_center_z])
+        radial_len = np.linalg.norm(radial)
+        if radial_len > 1e-12:
+            radial /= radial_len
+        else:
+            radial = np.array([1.0, 0.0, 0.0])
+
+        tangent = np.array([
+            -handle_radius_major * np.sin(angle),
+            0.0,
+            handle_radius_major * np.cos(angle),
+        ])
+        tangent /= np.linalg.norm(tangent) + 1e-12
+
+        binormal = np.cross(tangent, radial)
+        binormal /= np.linalg.norm(binormal) + 1e-12
+
+        for j in range(circle_points):
+            theta = 2.0 * np.pi * j / circle_points
+            point = (
+                center
+                + handle_radius_minor * np.cos(theta) * radial
+                + handle_radius_minor * np.sin(theta) * binormal
+            )
+            vertices_all.append(point)
+
+    vertices_all = np.array(vertices_all)
+
+    faces_all = []
+    for i in range(handle_segments - 1):
+        for j in range(circle_points):
+            j_next = (j + 1) % circle_points
+            v0 = i * circle_points + j
+            v1 = i * circle_points + j_next
+            v2 = (i + 1) * circle_points + j
+            v3 = (i + 1) * circle_points + j_next
+            faces_all.append([v0, v2, v1])
+            faces_all.append([v1, v2, v3])
+
+    faces_all = np.array(faces_all)
+    handle = trimesh.Trimesh(vertices=vertices_all, faces=faces_all)
+    handle.fix_normals()
+
+    cup = trimesh.util.concatenate([body, handle])
+
+    return cup
 
 
 def create_mug(
@@ -388,6 +486,7 @@ def _print_eval_results(eval_results: Dict[str, Any]) -> None:
 
 
 def main() -> None:
+
     TRAIN_EPISODES_PER_LEVEL = 5_000
     EVAL_EPISODES_PER_LEVEL = 500
     REGENERATE_SCRIPTS = False
@@ -396,6 +495,8 @@ def main() -> None:
     RUN_EVAL = False
     RUN_BC_TRAIN = False
     RUN_SAC_TRAIN = True
+    RUN_SAC_EVAL = True
+    RUN_ADAPTIVE = False
 
     if IS_LOAD:
         epsilon_start = 0.3
@@ -639,7 +740,7 @@ def main() -> None:
         trainer.train(
             env=env,
             controller=controller,
-            num_episodes=10000,
+            num_episodes=2000,
             warmup_steps=5000,
             log_interval=100,
             save_dir=sac_model_dir,
@@ -652,7 +753,6 @@ def main() -> None:
         print(f"  Success rate: {trainer.total_goals_reached / max(trainer.total_episodes, 1):.3f}")
         print(f"  Saved to {sac_model_dir}")
 
-    RUN_SAC_EVAL = True
     if RUN_SAC_EVAL:
         print("\n" + "=" * 60)
         print("STEP 7: P-SAC Eval")
@@ -757,6 +857,64 @@ def main() -> None:
         with open(eval_output, "w", encoding="utf-8") as f:
             json.dump(results_per_level, f, indent=2)
         print(f"\nSaved to {eval_output}")
+
+    if RUN_ADAPTIVE:
+        print("\n" + "=" * 60)
+        print("STEP 8: Adaptive Training")
+        print("=" * 60)
+
+        env = LightweightEnv(mesh_path)
+        controller = RLGoalApproachController.load(
+            str(runs_dir / f"{best_variant.lower()}_seed_{TRAIN_SEEDS[0]}"),
+            agent_id="adaptive",
+            config={**cfg, "mode": "eval"},
+        )
+
+        manager = AdaptiveTrainingManager(
+            controller=controller,
+            env=env,
+            config=cfg,
+            runs_dir=str(runs_dir),
+            mesh_path=mesh_path,
+        )
+
+        for episode in range(1000):
+            env.reset()
+            start_pos = env.get_pose()[:3]
+            goal_pose = env.get_random_surface_point(
+                reference_pos=start_pos,
+                min_dist=10.0,
+                max_dist=120.0,
+                max_attempts=2000,
+                mesh_sample=True,
+            )
+            controller.set_new_goal(goal_pose, start_pos)
+            env.set_goal(goal_pose)
+
+            for step in range(150):
+                current_pose = env.get_pose()
+                sensor_data = env.get_sensor_data()
+                action, _ = controller.step(current_pose, sensor_data)
+
+                if controller._current_goal is None:
+                    break
+
+                action_index = controller._last_action
+                env.step(action_index, controller.action_space)
+
+            success = controller._total_goals_reached > (controller._total_episodes - 1)
+            manager.on_episode_complete(
+                success=success,
+                transitions=controller.success_trails if success else [],
+            )
+
+            if (episode + 1) % 100 == 0:
+                stats = manager.get_stats()
+                print(
+                    f"  Episode {episode+1}: mode={stats['mode']}, "
+                    f"success_rate={stats['success_rate']:.3f}"
+                )
+
 
 if __name__ == "__main__":
     main()
