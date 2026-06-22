@@ -11,6 +11,7 @@ import pickle
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 from copy import deepcopy
+from collections import deque
 
 from .sac_actor import SACActorNetwork
 from .twin_critic import TwinCritic
@@ -273,6 +274,12 @@ class PSACTrainer:
 
         curr_level = 0
         success_window = []
+        rolling_history = deque(maxlen=200)
+        best_rolling_rate = 0.0
+        best_state_dict = None
+        best_critic_dict = None
+        best_critic_target_dict = None
+        best_extra = None
 
         for episode in range(num_episodes):
 
@@ -360,6 +367,31 @@ class PSACTrainer:
 
             self.total_episodes += 1
 
+            rolling_history.append(episode_success)
+            if len(rolling_history) >= 50:
+                rolling_rate = sum(rolling_history) / len(rolling_history)
+                if rolling_rate > best_rolling_rate:
+                    best_rolling_rate = rolling_rate
+                    best_state_dict = {
+                        k: v.clone() for k, v in self.actor.state_dict().items()
+                    }
+                    best_critic_dict = {
+                        k: v.clone() for k, v in self.critic.state_dict().items()
+                    }
+                    best_critic_target_dict = {
+                        k: v.clone() for k, v in self.critic_target.state_dict().items()
+                    }
+                    best_extra = {
+                        "total_steps": self.total_steps,
+                        "total_episodes": self.total_episodes,
+                        "total_goals_reached": self.total_goals_reached,
+                        "bc_lambda": self.bc_lambda,
+                        "log_alpha_type": self.log_alpha_type.detach().clone(),
+                        "log_alpha_param": self.log_alpha_param.detach().clone(),
+                    }
+            else:
+                rolling_rate = 0.0
+
             if curriculum_levels:
                 success_window.append(episode_success)
                 if len(success_window) > promote_window:
@@ -377,30 +409,6 @@ class PSACTrainer:
 
             if (episode + 1) % log_interval == 0:
                 success_rate = self.total_goals_reached / max(self.total_episodes, 1)
-                
-                if not hasattr(self, '_best_success_rate'):
-                    self._best_success_rate = 0.0
-                    self._best_state_dict = None
-                if success_rate > self._best_success_rate:
-                    self._best_success_rate = success_rate
-                    self._best_state_dict = {
-                        k: v.clone() for k, v in self.actor.state_dict().items()
-                    }
-                    self._best_critic_dict = {
-                        k: v.clone() for k, v in self.critic.state_dict().items()
-                    }
-                    self._best_critic_target_dict = {
-                        k: v.clone() for k, v in self.critic_target.state_dict().items()
-                    }
-                    self._best_extra = {
-                        "total_steps": self.total_steps,
-                        "total_episodes": self.total_episodes,
-                        "total_goals_reached": self.total_goals_reached,
-                        "bc_lambda": self.bc_lambda,
-                        "log_alpha_type": self.log_alpha_type.detach().clone(),
-                        "log_alpha_param": self.log_alpha_param.detach().clone(),
-                    }
-                
                 level_info = f", level={curr_level}" if curriculum_levels else ""
                 logger.info(
                     f"Episode {episode+1}/{num_episodes}: "
@@ -408,7 +416,8 @@ class PSACTrainer:
                     f"steps={step+1}, "
                     f"success_rate={self.total_goals_reached}/{self.total_episodes} "
                     f"({success_rate:.3f}), "
-                    f"best={self._best_success_rate:.3f}, "
+                    f"rolling={rolling_rate:.3f}, "
+                    f"best_rolling={best_rolling_rate:.3f}, "
                     f"bc_lambda={self.bc_lambda:.4f}, "
                     f"alpha_type={self.alpha_type:.3f}, "
                     f"alpha_param={self.alpha_param:.3f}, "
@@ -416,21 +425,21 @@ class PSACTrainer:
                     f"{level_info}"
                 )
 
-        if hasattr(self, '_best_state_dict') and self._best_state_dict is not None:
-            self.actor.load_state_dict(self._best_state_dict)
-            self.critic.load_state_dict(self._best_critic_dict)
-            self.critic_target.load_state_dict(self._best_critic_target_dict)
-            self.total_steps = self._best_extra["total_steps"]
-            self.total_episodes = self._best_extra["total_episodes"]
-            self.total_goals_reached = self._best_extra["total_goals_reached"]
-            self.bc_lambda = self._best_extra["bc_lambda"]
+        if best_state_dict is not None:
+            self.actor.load_state_dict(best_state_dict)
+            self.critic.load_state_dict(best_critic_dict)
+            self.critic_target.load_state_dict(best_critic_target_dict)
+            self.total_steps = best_extra["total_steps"]
+            self.total_episodes = best_extra["total_episodes"]
+            self.total_goals_reached = best_extra["total_goals_reached"]
+            self.bc_lambda = best_extra["bc_lambda"]
             self.log_alpha_type = torch.tensor(
-                self._best_extra["log_alpha_type"].item(), requires_grad=True
+                best_extra["log_alpha_type"].item(), requires_grad=True
             )
             self.log_alpha_param = torch.tensor(
-                self._best_extra["log_alpha_param"].item(), requires_grad=True
+                best_extra["log_alpha_param"].item(), requires_grad=True
             )
-            logger.info(f"Restored best model (success_rate={self._best_success_rate:.3f})")
+            logger.info(f"Restored best model (rolling_rate={best_rolling_rate:.3f})")
 
         if save_dir:
             self.save(save_dir)

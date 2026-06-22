@@ -772,7 +772,8 @@ def main() -> None:
             level_collisions = 0
             level_total = 0
 
-            for eval_seed in SAC_EVAL_SEEDS:
+            SAC_EVAL_SEEDS_test = [77]
+            for eval_seed in SAC_EVAL_SEEDS_test:
                 level_pool = sac_eval_pools[eval_seed]["levels"][level_idx]
 
                 np.random.seed(eval_seed)
@@ -783,6 +784,7 @@ def main() -> None:
                 )
                 interpreter = ActionInterpreter(env)
 
+                episode = 0
                 for ep_data in level_pool:
                     start_pos = np.array(ep_data["start_pos"])
                     start_rot = np.array(ep_data["start_rot"])
@@ -805,9 +807,12 @@ def main() -> None:
                         )
                         state = sac_trainer.normalize_state(state_raw)
 
-                        action_type, action_params = sac_trainer.actor.predict(
+                        action_type, action_params_norm = sac_trainer.actor.predict(
                             state.astype(np.float32)
                         )
+                        param_dim = len(action_params_norm)
+                        action_params = action_params_norm * sac_trainer.param_std[:param_dim] + sac_trainer.param_mean[:param_dim]
+
                         sensor_data = interpreter.execute(
                             action_type, action_params
                         )
@@ -816,6 +821,18 @@ def main() -> None:
                         distance = float(np.linalg.norm(
                             goal_pose[:3] - current_pose[:3]
                         ))
+
+                        if step < 3 and episode < 5:
+                            type_names = ExperienceExtractor.get_type_names()
+                            print(
+                                f"  ep={episode} step={step}: "
+                                f"type={type_names.get(action_type, action_type)}, "
+                                f"params_norm={action_params_norm}, "
+                                f"params={action_params}, "
+                                f"dist={distance:.1f}"
+                            )
+                            print(sac_trainer.param_mean, sac_trainer.param_std)
+                        episode = episode + 1
 
                         if distance < sac_trainer.goal_threshold:
                             success = True
@@ -842,6 +859,7 @@ def main() -> None:
                 "timeout_rate": level_timeouts / count,
                 "collision_rate": level_collisions / count,
             }
+            print("SAC EVAL results_per_level", results_per_level[f"level_{level_idx}"])
 
         print(f"\n=== P-SAC Eval Results ===")
         for key in sorted(results_per_level.keys()):
