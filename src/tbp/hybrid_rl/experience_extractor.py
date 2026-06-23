@@ -44,6 +44,7 @@ class ExperienceExtractor:
         16: (5, lambda cfg: [cfg["rotation_step"], cfg.get("orient_left_distance", 0.02), cfg.get("orient_forward_distance", 0.05)]),
         17: (6, lambda cfg: [cfg["rotation_step"], cfg.get("orient_down_distance", 0.02), cfg.get("orient_forward_distance", 0.05)]),
         18: (7, lambda cfg: []),
+        19: (7, lambda cfg: []),
     }
 
     def __init__(self, config: Dict[str, Any]):

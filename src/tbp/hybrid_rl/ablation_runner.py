@@ -251,6 +251,9 @@ def train(
                 env.step(action_index, action_space)
                 if action_index == action_space.IDX_DETACH:
                     controller._last_detach_sub_steps = getattr(env, '_last_detach_sub_steps', 1)
+                if action_index == action_space.IDX_DETACH_EDGE:
+                    controller._last_detach_sub_steps = getattr(env, '_last_detach_sub_steps', 1)
+                
             
             _episode_success = controller._total_goals_reached > _goals_before_episode
             if _episode_success:
@@ -316,7 +319,7 @@ def train(
                     )
 
         # Логирование
-        if (episode + 1) % 10000 == 0:
+        if (episode + 1) % 1000 == 0:
             stats = controller.get_stats()
             print(
                 f"Episode {episode+1}/{num_episodes}: "

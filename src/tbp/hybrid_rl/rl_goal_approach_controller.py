@@ -146,6 +146,7 @@ class RLGoalApproachController:
             "collision_other": 0,
         }
         self.temperature_override = None
+        self._collision_stats = {}
 
         logger.info(
             f"RLGoalApproachController initialized: "
@@ -454,7 +455,7 @@ class RLGoalApproachController:
             min_progress = -surface_step * cfg["detour_negative_progress_clip_steps"]
             progress = max(progress_raw, min_progress)
 
-        if action == self.action_space.IDX_DETACH:
+        if action == self.action_space.IDX_DETACH or action == self.action_space.IDX_DETACH_EDGE:
             sub_steps = max(getattr(self, '_last_detach_sub_steps', 1), 1)
             reward += progress / (self.action_space.free_step * sub_steps) * cfg["reward_progress"]
         else:
@@ -468,7 +469,7 @@ class RLGoalApproachController:
 
         # ═══ 3. Step penalty ═══
         reward += cfg["reward_step_penalty"]
-        if action == self.action_space.IDX_DETACH:
+        if action == self.action_space.IDX_DETACH or action == self.action_space.IDX_DETACH_EDGE:
             sub_steps = max(getattr(self, '_last_detach_sub_steps', 1), 1)
             reward += cfg["reward_step_penalty"] * (sub_steps - 1)
 
@@ -477,8 +478,10 @@ class RLGoalApproachController:
             reward += cfg["reward_surface_violation"]
             done = True
             termination_reason = "collision_surface_violation"
+            action_name = self.action_space.get_info(action).name if action is not None else "unknown"
+            self._collision_stats[action_name] = self._collision_stats.get(action_name, 0) + 1
         elif collision == "lost_object":
-            if action != self.action_space.IDX_DETACH:
+            if action != self.action_space.IDX_DETACH and action != self.action_space.IDX_DETACH_EDGE:
                 reward += cfg["reward_drifted_away"]
 
         # ═══ 5. Near goal on surface ═══
@@ -634,7 +637,7 @@ class RLGoalApproachController:
         else:
             combined = h_norm.copy()
             temperature = 0.05
-            
+
         if self.temperature_override is not None:
             temperature = self.temperature_override
 
@@ -888,14 +891,15 @@ class RLGoalApproachController:
         bias += stagnation_override
         components["stagnation_override"] = stagnation_override
 
+        ####################################################
         detach = np.zeros(self.num_actions, dtype=float)
         if on_object > 0.5:
             need_detach = False
-
-            if alignment < DETACH_ALIGN_THR:
-                need_detach = True
+            need_edge_detach = False
 
             n_world = sensor_data.get("point_normal", None)
+            goal_normal = sensor_data.get("goal_normal", None)
+
             if n_world is not None:
                 n_world = np.asarray(n_world, dtype=float)
                 n_len = float(np.linalg.norm(n_world))
@@ -909,13 +913,31 @@ class RLGoalApproachController:
                     if normal_dist > tangential_dist * 2.0 and distance > 3.0 * self.action_space.surface_step:
                         need_detach = True
 
-            if need_detach:
+                    if (alignment < DETACH_ALIGN_THR
+                            and goal_normal is not None):
+                        goal_n = np.array(goal_normal, dtype=float)
+                        goal_n /= (np.linalg.norm(goal_n) + 1e-12)
+                        normals_dot = float(np.dot(n_hat, goal_n))
+
+                        if normals_dot < -0.5 and tangential_dist > normal_dist * 3.0:
+                            need_edge_detach = True
+                            need_detach = False
+
+            if alignment < DETACH_ALIGN_THR and not need_edge_detach:
+                need_detach = True
+
+            if need_detach or need_edge_detach:
                 recent_detach_count = sum(
                     1 for tr in self._episode_transitions[-5:]
-                    if tr["action"] == self.action_space.IDX_DETACH
+                    if tr["action"] in (self.action_space.IDX_DETACH, self.action_space.IDX_DETACH_EDGE)
                 )
-                if recent_detach_count < 1 and not close_to_goal:
-                    detach[self.action_space.IDX_DETACH] += 5.0
+                last_was_detach = self._last_action in (self.action_space.IDX_DETACH, self.action_space.IDX_DETACH_EDGE)
+
+                if recent_detach_count < 1 and not last_was_detach and not close_to_goal:
+                    if need_edge_detach:
+                        detach[self.action_space.IDX_DETACH_EDGE] += 5.0
+                    else:
+                        detach[self.action_space.IDX_DETACH] += 5.0
                     for idx in range(8):
                         detach[idx] -= 2.0
                     detach[self.action_space.IDX_FREE_FORWARD] -= 2.0
@@ -925,6 +947,7 @@ class RLGoalApproachController:
         bias += detach
         components["detach"] = detach
 
+        ##############################################################
         steer = np.zeros(self.num_actions, dtype=float)
         if on_object <= 0.5:
             norm_depth = float(state[14])
@@ -1170,6 +1193,7 @@ class RLGoalApproachController:
             # "q_store": self.q_store.get_stats(),
             "q_store_free": self.q_store_free.get_stats(),
             "q_store_surface": self.q_store_surface.get_stats(),
+            "collision_stats": dict(self._collision_stats),
         }
 
         return stats

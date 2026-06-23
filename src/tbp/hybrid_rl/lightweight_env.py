@@ -117,33 +117,42 @@ class LightweightEnv:
                     free_step=action_space.free_step,
                     max_sub_steps=2
                 )
+        elif action_info.name == "detach_edge":
+            if hasattr(self, '_current_goal') and self._current_goal is not None:
+                self._detach_and_fly_to_edge(
+                    goal_pose=self._current_goal,
+                    rotation_step=action_space.rotation_step,
+                    free_step=action_space.free_step,
+                )
         
         return self.get_sensor_data()
     
     def get_sensor_data(self):
-        """Get sensory data from the current position."""
-        # Ray casting
         rot = R.from_euler("xyz", self.agent_rot, degrees=True)
         ray_direction = rot.apply([0, 0, -1])
-        # Intersect ray with mesh
         locations, index_ray, index_tri = self.mesh.ray.intersects_location(
             ray_origins=[self.agent_pos],
             ray_directions=[ray_direction],
         )
         
         if len(locations) > 0:
-            # Nearest intersection
             distances = np.linalg.norm(locations - self.agent_pos, axis=1)
             nearest_idx = np.argmin(distances)
             
             depth = distances[nearest_idx]
             face_idx = index_tri[nearest_idx]
             point_normal = self.mesh.face_normals[face_idx].tolist()
-            on_object = bool(depth < 3.0)  # было 10mm
+            on_object = bool(depth < 3.0)
         else:
             depth = 100.0
             point_normal = None
             on_object = False
+
+        goal_normal = None
+        if hasattr(self, '_current_goal') and self._current_goal is not None:
+            goal_pos = self._current_goal[:3]
+            _, _, gf_id = self.mesh.nearest.on_surface([goal_pos])
+            goal_normal = self.mesh.face_normals[gf_id[0]].tolist()
         
         return {
             "point_normal": point_normal,
@@ -151,6 +160,7 @@ class LightweightEnv:
             "on_object": on_object,
             "depth": depth,
             "passed_through": getattr(self, '_passed_through', False),
+            "goal_normal": goal_normal,
         }
     
     def get_pose(self):
@@ -513,7 +523,7 @@ class LightweightEnv:
         # Обнуляем компоненту по оси кружки → направление горизонтальное (параллельно дну), в сторону цели.
 
         # возвращаемся обрато к стене и пролетаем грань
-        self._move_forward(free_step * max_sub_steps)
+        self._move_forward(free_step)
         sub_steps += max_sub_steps
 
         self._last_detach_sub_steps = sub_steps
@@ -533,16 +543,19 @@ class LightweightEnv:
         total_fly = free_step * max_sub_steps
         flown = 0.0
         while flown < total_fly:
+            old_pos = self.agent_pos.copy()
             sensor = self.get_sensor_data()
             depth = sensor.get("depth", 100.0)
             step = min(free_step, total_fly - flown)
             if depth < step:
                 step = max(depth - 2.0, 0.5)
-                self._move_forward(step)
-                flown += step
-                break
             self._move_forward(step)
             flown += step
+
+            closest, dist_to_mesh, _ = self.mesh.nearest.on_surface([self.agent_pos])
+            if dist_to_mesh[0] < 1.0:
+                self.agent_pos = old_pos
+                break
 
         goal_pos = goal_pose[:3]
         direction = goal_pos - self.agent_pos
@@ -561,15 +574,21 @@ class LightweightEnv:
         for _ in range(max_sub_steps):
             sub_steps += 1
 
+            old_pos = self.agent_pos.copy()
+
             sensor = self.get_sensor_data()
             depth = sensor.get("depth", 100.0)
 
             if depth < free_step:
                 step = max(depth - 2.0, 0.5)
                 self._move_forward(step)
-                break
+            else:
+                self._move_forward(free_step)
 
-            self._move_forward(free_step)
+            closest, dist_to_mesh, _ = self.mesh.nearest.on_surface([self.agent_pos])
+            if dist_to_mesh[0] < 1.0:
+                self.agent_pos = old_pos
+                break
 
             sensor = self.get_sensor_data()
             if sensor.get("on_object", False):

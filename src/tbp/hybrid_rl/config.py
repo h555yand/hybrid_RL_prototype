@@ -18,7 +18,7 @@ DEFAULT_CONFIG = {
     "norm_min_std": 1e-4,               # защита от нулевой дисперсии
     "rebuild_on_freeze": True,          # rebuild индекса после freeze
     # Actions
-    "num_actions": 19,
+    "num_actions": 20,
     "surface_step": 5.0,   # mm
     "free_step": 10.0,     # mm
     "rotation_step": 10.0, # degrees

@@ -492,7 +492,7 @@ def main() -> None:
     REGENERATE_SCRIPTS = False
     IS_LOAD = False
     RUN_TRAIN = True
-    RUN_EVAL = True
+    RUN_EVAL = False
     RUN_BC_TRAIN = False
     RUN_SAC_TRAIN = False
     RUN_SAC_EVAL = False
@@ -532,8 +532,8 @@ def main() -> None:
     # Choose Mesh
     _prepare_demo_meshes(data_dir)
     # mesh_path = str(data_dir / "cube.stl")
-    # mesh_path = str(data_dir / "cylinder.stl")
-    mesh_path = str(data_dir / "mug.stl")
+    mesh_path = str(data_dir / "cylinder.stl")
+    # mesh_path = str(data_dir / "mug.stl")
 
     print("\n" + "=" * 60)
     print("STEP 1: Prepare episode pools (train + eval)")
