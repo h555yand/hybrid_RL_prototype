@@ -450,6 +450,76 @@ class LightweightEnv:
         # Apply pitch rotation (around X axis)
         self.agent_rot[0] += rotation_degrees  # X-axis = pitch
     
+    def _detach_and_fly_to_edge(self, goal_pose, rotation_step=5.0, free_step=8.0, max_sub_steps=3):
+        sub_steps = 0
+        detach_step = 2.0
+
+        sensor = self.get_sensor_data()
+        if sensor.get("point_normal") is None:
+            return self.get_sensor_data()
+
+        normal = np.array(sensor["point_normal"], dtype=float)
+        normal /= (np.linalg.norm(normal) + 1e-12)
+
+        # 1) Отлетаем от стенки по нормали
+        self.agent_rot = self._look_at_direction(normal)
+        self._move_forward(detach_step)
+        sub_steps += 1
+
+        # 2) Направление от дна к краю (всегда от min к max по оси кружки)
+        bbox_min = self.mesh.bounds[0]
+        bbox_max = self.mesh.bounds[1]
+
+        extents = bbox_max - bbox_min
+        axis_idx = np.argmax(extents)
+
+        up_dir = np.zeros(3)
+        up_dir[axis_idx] = 1.0  # всегда от дна (min) к краю (max)
+
+        tangent = up_dir - np.dot(up_dir, normal) * normal
+        tangent_len = np.linalg.norm(tangent)
+        if tangent_len > 1e-8:
+            tangent /= tangent_len
+        else:
+            tangent = np.cross(normal, np.array([0, 0, 1]))
+            if np.linalg.norm(tangent) < 1e-8:
+                tangent = np.cross(normal, np.array([1, 0, 0]))
+            tangent /= (np.linalg.norm(tangent) + 1e-12)
+
+        self.agent_rot = self._look_at_direction(tangent)
+
+        # 3) Расстояние до грани + 1 шаг запаса
+        dist_to_edge = bbox_max[axis_idx] - self.agent_pos[axis_idx]
+        num_steps = int(dist_to_edge / free_step) + max_sub_steps
+        sub_steps += num_steps
+
+        for _ in range(num_steps):
+            sub_steps += 1
+            self._move_forward(free_step)
+
+        # Разворачиваемся к цели перпендикулярно стене параллельно дну
+        goal_pos = goal_pose[:3]
+        direction = goal_pos - self.agent_pos
+        
+        # Убираем компоненту вдоль оси кружки (параллельно дну)
+        direction[axis_idx] = 0.0
+        dist = np.linalg.norm(direction)
+        if dist > 1e-8:
+            direction /= dist
+        else:
+            direction = -normal
+
+        self.agent_rot = self._look_at_direction(direction)
+        # Обнуляем компоненту по оси кружки → направление горизонтальное (параллельно дну), в сторону цели.
+
+        # возвращаемся обрато к стене и пролетаем грань
+        self._move_forward(free_step * max_sub_steps)
+        sub_steps += max_sub_steps
+
+        self._last_detach_sub_steps = sub_steps
+
+        return self.get_sensor_data()
+
     def _detach_and_fly_to_goal(self, goal_pose, rotation_step=5.0, free_step=8.0, max_sub_steps=3):
         sub_steps = 1
 

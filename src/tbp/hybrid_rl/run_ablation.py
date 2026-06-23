@@ -491,11 +491,11 @@ def main() -> None:
     EVAL_EPISODES_PER_LEVEL = 500
     REGENERATE_SCRIPTS = False
     IS_LOAD = False
-    RUN_TRAIN = False
-    RUN_EVAL = False
+    RUN_TRAIN = True
+    RUN_EVAL = True
     RUN_BC_TRAIN = False
-    RUN_SAC_TRAIN = True
-    RUN_SAC_EVAL = True
+    RUN_SAC_TRAIN = False
+    RUN_SAC_EVAL = False
     RUN_ADAPTIVE = False
 
     if IS_LOAD:

@@ -207,34 +207,61 @@ def train(
         
         controller.set_new_goal(goal_pose, start_pos)
         env.set_goal(goal_pose)
+
+        retry_strategies = [
+            {"eval_epsilon": cfg.get("eval_epsilon", 0.02), "temperature_override": None},
+            {"eval_epsilon": 1.0, "temperature_override": 0.01},
+            {"eval_epsilon": 0.5, "temperature_override": 0.01},
+        ]
         
-        # Навигация
+        max_retries = 3 if cfg.get("mode") == "eval" else 1
+        
         action_explanations = []
         current_poses = []
-        for step in range(controller.config["max_steps_per_goal"]):
-            current_pose = env.get_pose()
-            sensor_data = env.get_sensor_data()
-            
-            action, explanation = controller.step(current_pose, sensor_data)
-            # logger.debug(f"explain_action_info: {explanation}")
-            if explanation is not None:
-                action_explanations.append(explanation["interpretation"])
-            current_poses.append(env.get_pose())
-            
-            if controller._current_goal is None:
-                # Эпизод завершён
-                if controller._total_goals_reached > goals_reached:
-                    goals_reached = controller._total_goals_reached
-                break
-            
-            # Выполнить действие
-            action_index = controller._last_action
-            env.step(action_index, action_space)
-            if action_index == action_space.IDX_DETACH:
-                controller._last_detach_sub_steps = getattr(env, '_last_detach_sub_steps', 1)
         
-        _episode_success = controller._total_goals_reached > _goals_before_episode
+        for retry in range(max_retries):
+            if retry > 0:
+                if use_fixed_episode_script or use_fixed_episode_pools:
+                    env.reset(position=start_pos, rotation=start_rot)
+                else:
+                    env.reset(position=start_pos)
+                controller.set_new_goal(goal_pose, start_pos)
+                env.set_goal(goal_pose)
+                strategy = retry_strategies[min(retry, len(retry_strategies)-1)]
+                controller.eval_epsilon = strategy["eval_epsilon"]
+                controller.temperature_override = strategy["temperature_override"]
+                action_explanations = []
+                current_poses = []
+            
+            for step in range(controller.config["max_steps_per_goal"]):
+                current_pose = env.get_pose()
+                sensor_data = env.get_sensor_data()
+                
+                action, explanation = controller.step(current_pose, sensor_data)
+                if explanation is not None:
+                    action_explanations.append(explanation["interpretation"])
+                current_poses.append(env.get_pose())
+                
+                if controller._current_goal is None:
+                    if controller._total_goals_reached > goals_reached:
+                        goals_reached = controller._total_goals_reached
+                    break
+                
+                action_index = controller._last_action
+                env.step(action_index, action_space)
+                if action_index == action_space.IDX_DETACH:
+                    controller._last_detach_sub_steps = getattr(env, '_last_detach_sub_steps', 1)
+            
+            _episode_success = controller._total_goals_reached > _goals_before_episode
+            if _episode_success:
+                break
+        
+        if max_retries > 1:
+            controller.eval_epsilon = cfg.get("eval_epsilon", 0.02)
+            controller.temperature_override = None
+        
         start_distance = float(np.linalg.norm(goal_pose[:3] - start_pos))
+
         if _episode_success:
             success_trails.append(controller.success_trails)
             success_actions.append(action_explanations)

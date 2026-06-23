@@ -145,6 +145,7 @@ class RLGoalApproachController:
             "collision_lost_object": 0,
             "collision_other": 0,
         }
+        self.temperature_override = None
 
         logger.info(
             f"RLGoalApproachController initialized: "
@@ -633,6 +634,9 @@ class RLGoalApproachController:
         else:
             combined = h_norm.copy()
             temperature = 0.05
+            
+        if self.temperature_override is not None:
+            temperature = self.temperature_override
 
         is_random_override = False
         is_heuristic_override = False
