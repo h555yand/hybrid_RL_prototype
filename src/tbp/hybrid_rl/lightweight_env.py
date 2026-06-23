@@ -379,6 +379,10 @@ class LightweightEnv:
                 distances = np.linalg.norm(locations - old_pos, axis=1)
                 if np.min(distances) < abs(step_size):
                     self._passed_through = True
+
+            closest, dist_to_mesh, _ = self.mesh.nearest.on_surface([self.agent_pos])
+            if dist_to_mesh[0] < 1.0:
+                self._passed_through = True
     
     def _orient_horizontal(self, rotation_degrees, forward_distance, left_distance):
         """Moves the agent forward and sideways (left/right), projects onto surface, and yaws.
@@ -471,12 +475,16 @@ class LightweightEnv:
         normal = np.array(sensor["point_normal"], dtype=float)
         normal /= (np.linalg.norm(normal) + 1e-12)
 
-        # 1) Отлетаем от стенки по нормали
         self.agent_rot = self._look_at_direction(normal)
         self._move_forward(detach_step)
         sub_steps += 1
 
-        # 2) Направление от дна к краю (всегда от min к max по оси кружки)
+        if self._passed_through:
+            self.agent_pos = self.agent_pos - normal * detach_step
+            self._passed_through = False
+            self._last_detach_sub_steps = sub_steps
+            return self.get_sensor_data()
+
         bbox_min = self.mesh.bounds[0]
         bbox_max = self.mesh.bounds[1]
 
@@ -484,7 +492,7 @@ class LightweightEnv:
         axis_idx = np.argmax(extents)
 
         up_dir = np.zeros(3)
-        up_dir[axis_idx] = 1.0  # всегда от дна (min) к краю (max)
+        up_dir[axis_idx] = 1.0
 
         tangent = up_dir - np.dot(up_dir, normal) * normal
         tangent_len = np.linalg.norm(tangent)
@@ -498,20 +506,21 @@ class LightweightEnv:
 
         self.agent_rot = self._look_at_direction(tangent)
 
-        # 3) Расстояние до грани + 1 шаг запаса
         dist_to_edge = bbox_max[axis_idx] - self.agent_pos[axis_idx]
         num_steps = int(dist_to_edge / free_step) + max_sub_steps
-        sub_steps += num_steps
 
         for _ in range(num_steps):
             sub_steps += 1
+            old_pos = self.agent_pos.copy()
             self._move_forward(free_step)
 
-        # Разворачиваемся к цели перпендикулярно стене параллельно дну
+            if self._passed_through:
+                self.agent_pos = old_pos
+                self._passed_through = False
+                break
+
         goal_pos = goal_pose[:3]
         direction = goal_pos - self.agent_pos
-        
-        # Убираем компоненту вдоль оси кружки (параллельно дну)
         direction[axis_idx] = 0.0
         dist = np.linalg.norm(direction)
         if dist > 1e-8:
@@ -520,14 +529,13 @@ class LightweightEnv:
             direction = -normal
 
         self.agent_rot = self._look_at_direction(direction)
-        # Обнуляем компоненту по оси кружки → направление горизонтальное (параллельно дну), в сторону цели.
 
-        # возвращаемся обрато к стене и пролетаем грань
-        self._move_forward(free_step)
+        self._move_forward(free_step * max_sub_steps)
+        if self._passed_through:
+            self._passed_through = False
         sub_steps += max_sub_steps
 
         self._last_detach_sub_steps = sub_steps
-
         return self.get_sensor_data()
 
     def _detach_and_fly_to_goal(self, goal_pose, rotation_step=5.0, free_step=8.0, max_sub_steps=3):
@@ -552,9 +560,9 @@ class LightweightEnv:
             self._move_forward(step)
             flown += step
 
-            closest, dist_to_mesh, _ = self.mesh.nearest.on_surface([self.agent_pos])
-            if dist_to_mesh[0] < 1.0:
+            if self._passed_through:
                 self.agent_pos = old_pos
+                self._passed_through = False
                 break
 
         goal_pos = goal_pose[:3]
@@ -573,7 +581,6 @@ class LightweightEnv:
 
         for _ in range(max_sub_steps):
             sub_steps += 1
-
             old_pos = self.agent_pos.copy()
 
             sensor = self.get_sensor_data()
@@ -585,9 +592,9 @@ class LightweightEnv:
             else:
                 self._move_forward(free_step)
 
-            closest, dist_to_mesh, _ = self.mesh.nearest.on_surface([self.agent_pos])
-            if dist_to_mesh[0] < 1.0:
+            if self._passed_through:
                 self.agent_pos = old_pos
+                self._passed_through = False
                 break
 
             sensor = self.get_sensor_data()
