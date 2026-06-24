@@ -532,8 +532,8 @@ def main() -> None:
     # Choose Mesh
     _prepare_demo_meshes(data_dir)
     # mesh_path = str(data_dir / "cube.stl")
-    mesh_path = str(data_dir / "cylinder.stl")
-    # mesh_path = str(data_dir / "mug.stl")
+    # mesh_path = str(data_dir / "cylinder.stl")
+    mesh_path = str(data_dir / "mug.stl")
 
     print("\n" + "=" * 60)
     print("STEP 1: Prepare episode pools (train + eval)")

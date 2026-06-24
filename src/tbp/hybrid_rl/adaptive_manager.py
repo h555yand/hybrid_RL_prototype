@@ -98,13 +98,19 @@ class AdaptiveTrainingManager:
             )
 
         if self.mode == "inference_only":
+            self.controller.mode = "eval"
+            self.controller.epsilon = self.controller.eval_epsilon
             return
 
         if self.mode == "online":
+            self.controller.mode = "train"
+            self.controller.epsilon = 0.1
             self._online_update(success, transitions)
 
         if self.mode == "offline":
             self._trigger_offline()
+            self.controller.mode = "train"
+            self.controller.epsilon = 0.1
             self.mode = "online"
 
     def _online_update(self, success: bool, transitions: List[Dict[str, Any]]):

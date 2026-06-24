@@ -480,6 +480,13 @@ class RLGoalApproachController:
             termination_reason = "collision_surface_violation"
             action_name = self.action_space.get_info(action).name if action is not None else "unknown"
             self._collision_stats[action_name] = self._collision_stats.get(action_name, 0) + 1
+            logger.info(
+                f"COLLISION_DETAIL: action={action_name}, "
+                f"depth={state[14]*100:.1f}mm, "
+                f"on_object={state[11]:.0f}, "
+                f"alignment={state[12]:.3f}, "
+                f"distance={state[13]:.1f}, "
+            )
         elif collision == "lost_object":
             if action != self.action_space.IDX_DETACH and action != self.action_space.IDX_DETACH_EDGE:
                 reward += cfg["reward_drifted_away"]
@@ -980,9 +987,9 @@ class RLGoalApproachController:
         # на поверхности, free_forward может вызвать коллизию со стенкой
         # ────────────────────────────────────────────────────
         damp_free = np.zeros(self.num_actions, dtype=float)
-        if on_object > 0.5 and alignment >= DETACH_ALIGN_THR:
-            damp_free[self.action_space.IDX_FREE_FORWARD] -= 2.0
-            damp_free[self.action_space.IDX_FREE_BACKWARD] -= 1.0
+        if on_object > 0.5:
+            damp_free[self.action_space.IDX_FREE_FORWARD] -= 3.0
+            damp_free[self.action_space.IDX_FREE_BACKWARD] -= 3.0
         bias += damp_free
         components["damp_free_on_surface"] = damp_free
 
