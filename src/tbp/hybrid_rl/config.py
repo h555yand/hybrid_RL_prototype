@@ -33,7 +33,7 @@ DEFAULT_CONFIG = {
     "reward_progress": 3.0,
     "reward_goal_reached": 60.0,
     "reward_step_penalty": -0.2,
-    "reward_surface_violation": -5.0,
+    "reward_surface_violation": -15.0,
     "reward_smart_detach": 1.5,
     "reward_drifted_away": -1.0,
     "reward_near_goal_on_surface": 0.5,

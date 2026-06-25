@@ -465,6 +465,7 @@ class LightweightEnv:
         self.agent_rot[0] += rotation_degrees  # X-axis = pitch
     
     def _detach_and_fly_to_edge(self, goal_pose, rotation_step=5.0, free_step=8.0, max_sub_steps=3):
+        detach_fly_step = 8.0
         sub_steps = 0
         detach_step = 2.0
 
@@ -507,12 +508,12 @@ class LightweightEnv:
         self.agent_rot = self._look_at_direction(tangent)
 
         dist_to_edge = bbox_max[axis_idx] - self.agent_pos[axis_idx]
-        num_steps = int(dist_to_edge / free_step) + max_sub_steps
+        num_steps = int(dist_to_edge / detach_fly_step) + max_sub_steps
 
         for _ in range(num_steps):
             sub_steps += 1
             old_pos = self.agent_pos.copy()
-            self._move_forward(free_step)
+            self._move_forward(detach_fly_step)
 
             if self._passed_through:
                 self.agent_pos = old_pos
@@ -530,7 +531,7 @@ class LightweightEnv:
 
         self.agent_rot = self._look_at_direction(direction)
 
-        self._move_forward(free_step * max_sub_steps)
+        self._move_forward(detach_fly_step * max_sub_steps)
         if self._passed_through:
             self._passed_through = False
         sub_steps += max_sub_steps
@@ -539,6 +540,7 @@ class LightweightEnv:
         return self.get_sensor_data()
 
     def _detach_and_fly_to_goal(self, goal_pose, rotation_step=5.0, free_step=8.0, max_sub_steps=3):
+        detach_fly_step = 8.0
         sub_steps = 1
 
         sensor = self.get_sensor_data()
@@ -548,13 +550,13 @@ class LightweightEnv:
             normal /= (np.linalg.norm(normal) + 1e-12)
             self.agent_rot = self._look_at_direction(normal)
 
-        total_fly = free_step * max_sub_steps
+        total_fly = detach_fly_step * max_sub_steps
         flown = 0.0
         while flown < total_fly:
             old_pos = self.agent_pos.copy()
             sensor = self.get_sensor_data()
             depth = sensor.get("depth", 100.0)
-            step = min(free_step, total_fly - flown)
+            step = min(detach_fly_step, total_fly - flown)
             if depth < step:
                 step = max(depth - 2.0, 0.5)
             self._move_forward(step)
@@ -586,11 +588,11 @@ class LightweightEnv:
             sensor = self.get_sensor_data()
             depth = sensor.get("depth", 100.0)
 
-            if depth < free_step:
+            if depth < detach_fly_step:
                 step = max(depth - 2.0, 0.5)
                 self._move_forward(step)
             else:
-                self._move_forward(free_step)
+                self._move_forward(detach_fly_step)
 
             if self._passed_through:
                 self.agent_pos = old_pos
@@ -603,7 +605,7 @@ class LightweightEnv:
 
         self._last_detach_sub_steps = sub_steps
         return self.get_sensor_data()
-    
+        
 def is_on_same_cube_side(pos_a, pos_b, cube_side=42.0, atol=1e-5):
     """
     Проверяет, лежат ли две точки на одной стороне куба (например, обе на +X при x = +42).

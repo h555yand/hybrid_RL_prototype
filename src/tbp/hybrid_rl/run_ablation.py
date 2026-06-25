@@ -365,6 +365,119 @@ def _prepare_demo_meshes(data_dir: Path) -> None:
     mug.export(str(data_dir / "mug.stl"))
 
 
+def _run_eval_per_seed(
+    data_dir: Path,
+    runs_dir: Path,
+    mesh_path: str,
+    train_seeds: List[int],
+    eval_seeds: List[int],
+    variant: str,
+    eval_cfg: Dict[str, Any],
+    eval_pools: Dict[int, Dict[str, Any]],
+    collect_bc: bool = False,
+    EPISODES_PER_LEVEL=None
+) -> Tuple[Dict[str, Any], List]:
+    results_per_seed = {}
+    results_per_level = {}
+    bc_transitions = []
+
+    sample_seed = eval_seeds[0]
+    num_levels = len(eval_pools[sample_seed].get("levels", []))
+
+    for train_seed, eval_seed in zip(train_seeds, eval_seeds):
+        seed_results = {}
+        load_dir = str(runs_dir / f"{variant.lower()}_seed_{train_seed}")
+
+        for level_idx in range(num_levels):
+            level_pool = eval_pools[eval_seed]["levels"][level_idx]
+
+            metrics = train(
+                mesh_dir=str(data_dir),
+                save_dir=load_dir,
+                num_episodes=len(level_pool),
+                config=eval_cfg,
+                mesh_path=mesh_path,
+                load_dir=load_dir,
+                seed=eval_seed,
+                return_metrics=True,
+                agent_id=f"eval_L{level_idx}_{variant}_t{train_seed}_e{eval_seed}",
+                episode_script=level_pool,
+                EPISODES_PER_LEVEL=EPISODES_PER_LEVEL
+            )
+
+            if collect_bc:
+                trails = metrics.get("success_trails", [])
+                if trails:
+                    extractor = ExperienceExtractor(config=eval_cfg)
+                    for trail in trails:
+                        bc_transitions.extend(extractor.convert_trajectory(trail))
+
+            rates = metrics.get("stats", {}).get("termination_rates", {})
+            collision_stats = metrics.get("stats", {}).get("collision_stats", {})
+            seed_results[f"level_{level_idx}"] = {
+                "success_rate": float(metrics.get("success_rate", 0.0)),
+                "timeout_rate": float(rates.get("timeout", 0.0)),
+                "collision_rate": float(rates.get("collision_surface_violation", 0.0)),
+                "collision_stats": collision_stats,
+            }
+
+        results_per_seed[f"train_{train_seed}_eval_{eval_seed}"] = seed_results
+
+        seed_output = data_dir / f"eval_result_seed_{train_seed}_{eval_seed}.json"
+        with open(seed_output, "w", encoding="utf-8") as f:
+            json.dump(seed_results, f, indent=2)
+        print(f"\nSaved seed eval to {seed_output}")
+
+        print(f"\n  Seed train={train_seed} eval={eval_seed}:")
+        for level_key, level_data in seed_results.items():
+            print(
+                f"    {level_key}: success={level_data['success_rate']:.4f}, "
+                f"timeout={level_data['timeout_rate']:.4f}, "
+                f"collision={level_data['collision_rate']:.4f}, "
+                f"collision_stats={level_data.get('collision_stats', {})}"
+            )
+
+    for level_idx in range(num_levels):
+        level_results = []
+        for seed_key, seed_data in results_per_seed.items():
+            level_key = f"level_{level_idx}"
+            if level_key in seed_data:
+                level_results.append(seed_data[level_key])
+
+        count = max(len(level_results), 1)
+        bounds = CURRICULUM_LEVELS[level_idx] if level_idx < len(CURRICULUM_LEVELS) else (0, 0)
+        results_per_level[f"level_{level_idx}"] = {
+            "bounds_mm": list(bounds),
+            "per_seed": level_results,
+            "mean_success_rate": sum(r["success_rate"] for r in level_results) / count,
+            "mean_timeout_rate": sum(r["timeout_rate"] for r in level_results) / count,
+            "mean_collision_rate": sum(r["collision_rate"] for r in level_results) / count,
+        }
+
+    all_success = []
+    all_timeout = []
+    all_collision = []
+    for key, level_data in results_per_level.items():
+        if key == "overall":
+            continue
+        all_success.append(level_data["mean_success_rate"])
+        all_timeout.append(level_data["mean_timeout_rate"])
+        all_collision.append(level_data["mean_collision_rate"])
+
+    n = max(len(all_success), 1)
+    results_per_level["overall"] = {
+        "mean_success_rate": sum(all_success) / n,
+        "mean_timeout_rate": sum(all_timeout) / n,
+        "mean_collision_rate": sum(all_collision) / n,
+    }
+
+    eval_output = data_dir / "eval_result.json"
+    with open(eval_output, "w", encoding="utf-8") as f:
+        json.dump({"per_seed": results_per_seed, "per_level": results_per_level}, f, indent=2)
+    print(f"\nSaved eval result to {eval_output}")
+
+    return results_per_level, bc_transitions
+
 def _run_eval_per_level(
     data_dir: Path,
     runs_dir: Path,
@@ -372,7 +485,7 @@ def _run_eval_per_level(
     train_seeds: List[int],
     eval_seeds: List[int],
     variant: str,
-    overrides: Dict[str, Any],
+    eval_cfg: Dict[str, Any],
     eval_pools: Dict[int, Dict[str, Any]],
     collect_bc: bool = False,
     EPISODES_PER_LEVEL=None
@@ -389,13 +502,6 @@ def _run_eval_per_level(
         for train_seed, eval_seed in zip(train_seeds, eval_seeds):
             level_pool = eval_pools[eval_seed]["levels"][level_idx]
             load_dir = str(runs_dir / f"{variant.lower()}_seed_{train_seed}")
-
-            eval_cfg = {
-                **overrides,
-                "mode": "eval",
-                "eval_epsilon": 0.02,
-                "goal_threshold": GOAL_THRESHOLD_PER_LEVEL[0]
-            }
 
             metrics = train(
                 mesh_dir=str(data_dir),
@@ -490,16 +596,16 @@ def main() -> None:
     TRAIN_EPISODES_PER_LEVEL = 5_000
     EVAL_EPISODES_PER_LEVEL = 500
     REGENERATE_SCRIPTS = False
-    IS_LOAD = False
-    RUN_TRAIN = True
+    IS_LOAD = True
+    RUN_TRAIN = False
     RUN_EVAL = False
     RUN_BC_TRAIN = False
     RUN_SAC_TRAIN = False
-    RUN_SAC_EVAL = False
+    RUN_SAC_EVAL = True
     RUN_ADAPTIVE = False
 
     if IS_LOAD:
-        epsilon_start = 0.3
+        epsilon_start = 0.15
     else:
         epsilon_start = 1.0
 
@@ -518,7 +624,7 @@ def main() -> None:
         "reward_goal_reached": 60.0,
         "reward_timeout": -8.0,
         "surface_step": 3.0,
-        "free_step": 8.0,
+        "free_step": 5.0,
         "rotation_step": 5.0,
     }
     cfg = {**DEFAULT_CONFIG, **base_config}
@@ -571,7 +677,6 @@ def main() -> None:
     print(f"Eval pools:  {len(EVAL_SEEDS)} seeds x {EVAL_EPISODES_PER_LEVEL} episodes/level")
 
     best_variant = "CL3"
-    best_overrides = {}
 
     if RUN_TRAIN:
         print("\n" + "=" * 60)
@@ -593,8 +698,8 @@ def main() -> None:
             levels=CURRICULUM_LEVELS,
         )
         result = runner.run(variants=variants, visualise=True)
-        best_variant = str(result["best_variant"])
-        best_overrides = dict(variants.get(best_variant, {}))
+        # best_variant = str(result["best_variant"])
+        # best_overrides = dict(variants.get(best_variant, {}))
 
         print("\n=== Train Summaries ===")
         for name, s in result["summaries"].items():
@@ -615,8 +720,13 @@ def main() -> None:
         print("STEP 3: Eval per level (separate eval pools)")
         print("=" * 60)
 
-        eval_overrides = {**cfg, **best_overrides}
-        eval_results, bc_transitions = _run_eval_per_level(
+        eval_cfg = {
+            "mode": "eval",
+            "eval_epsilon": 0.02,
+            "goal_threshold": GOAL_THRESHOLD_PER_LEVEL[0]
+        }
+        eval_overrides = {**cfg, **eval_cfg}
+        eval_results, bc_transitions = _run_eval_per_seed(
             data_dir=data_dir,
             runs_dir=runs_dir,
             mesh_path=mesh_path,
@@ -670,6 +780,21 @@ def main() -> None:
         print("\n" + "=" * 60)
         print("STEP 5: BC Training")
         print("=" * 60)
+
+        to_join = True
+        if to_join:
+            with open(data_dir / "bc_data.pkl", "rb") as f:
+                bc_1 = pickle.load(f)
+
+            with open(data_dir / "bc_data_002.pkl", "rb") as f:
+                bc_2 = pickle.load(f)
+
+            bc_combined = bc_1 + bc_2
+
+            with open(data_dir / "bc_data.pkl", "wb") as f:
+                pickle.dump(bc_combined, f)
+
+            print(f"File 1: {len(bc_1)}, File 2: {len(bc_2)}, Combined: {len(bc_combined)}")
 
         bc_data_path = data_dir / "bc_data.pkl"
         with open(bc_data_path, "rb") as f:
@@ -784,7 +909,6 @@ def main() -> None:
                 )
                 interpreter = ActionInterpreter(env)
 
-                episode = 0
                 for ep_data in level_pool:
                     start_pos = np.array(ep_data["start_pos"])
                     start_rot = np.array(ep_data["start_rot"])
@@ -822,17 +946,16 @@ def main() -> None:
                             goal_pose[:3] - current_pose[:3]
                         ))
 
-                        if step < 3 and episode < 5:
+                        if step < 3 and level_total < 5:
                             type_names = ExperienceExtractor.get_type_names()
                             print(
-                                f"  ep={episode} step={step}: "
+                                f"  ep={level_total} step={step}: "
                                 f"type={type_names.get(action_type, action_type)}, "
                                 f"params_norm={action_params_norm}, "
                                 f"params={action_params}, "
                                 f"dist={distance:.1f}"
                             )
                             print(sac_trainer.param_mean, sac_trainer.param_std)
-                        episode = episode + 1
 
                         if distance < sac_trainer.goal_threshold:
                             success = True

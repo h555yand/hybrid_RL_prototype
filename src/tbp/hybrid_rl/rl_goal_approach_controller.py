@@ -473,6 +473,12 @@ class RLGoalApproachController:
             sub_steps = max(getattr(self, '_last_detach_sub_steps', 1), 1)
             reward += cfg["reward_step_penalty"] * (sub_steps - 1)
 
+        # ═══ 3.5 Risky free_forward on surface ═══
+        if action == self.action_space.IDX_FREE_FORWARD and prev_on_object > 0.5:
+            reward += -2.0
+        if action == self.action_space.IDX_FREE_BACKWARD and prev_on_object > 0.5:
+            reward += -2.0
+
         # ═══ 4. Collisions ═══
         if collision == "surface_violation":
             reward += cfg["reward_surface_violation"]

@@ -214,7 +214,7 @@ def train(
             {"eval_epsilon": 0.5, "temperature_override": 0.01},
         ]
         
-        max_retries = 3 if cfg.get("mode") == "eval" else 1
+        max_retries = 3 if cfg.get("mode") == "eval_retries" else 1
         
         action_explanations = []
         current_poses = []
@@ -232,6 +232,9 @@ def train(
                 controller.temperature_override = strategy["temperature_override"]
                 action_explanations = []
                 current_poses = []
+            else:
+                if controller.eval_epsilon == 1.0:
+                    controller.temperature_override = 0.01
             
             for step in range(controller.config["max_steps_per_goal"]):
                 current_pose = env.get_pose()
