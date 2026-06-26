@@ -595,8 +595,8 @@ def main() -> None:
     RUN_EVAL = False
     RUN_BC_TRAIN = False
     RUN_SAC_TRAIN = False
-    RUN_SAC_EVAL = True
-    RUN_ADAPTIVE = False
+    RUN_SAC_EVAL = False
+    RUN_ADAPTIVE = True
 
     if IS_LOAD:
         epsilon_start = 0.15
@@ -1032,13 +1032,22 @@ def main() -> None:
             config={**cfg, "mode": "eval"},
         )
 
+        sac_trainer = PSACTrainer(state_dim=cfg.get("state_dim", 15))
+        sac_trainer.load(str(runs_dir / "sac_model"))
+
         manager = AdaptiveTrainingManager(
             controller=controller,
             env=env,
             config=cfg,
             runs_dir=str(runs_dir),
             mesh_path=mesh_path,
+            offline_threshold=0.0,
+            online_sac_update_every=200,
+            online_sac_update_steps=50,
+            online_bc_update_every=2000,
         )
+
+        manager.sac_trainer = sac_trainer
 
         for episode in range(1000):
             env.reset()
@@ -1053,30 +1062,59 @@ def main() -> None:
             controller.set_new_goal(goal_pose, start_pos)
             env.set_goal(goal_pose)
 
+            goals_before = controller._total_goals_reached
+            episode_transitions = []
+
             for step in range(150):
                 current_pose = env.get_pose()
                 sensor_data = env.get_sensor_data()
-                action, _ = controller.step(current_pose, sensor_data)
 
-                if controller._current_goal is None:
+                state = controller._compute_state(current_pose, sensor_data)
+                action_index, source = manager.get_action(state, current_pose, sensor_data)
+
+                state, done = controller.update_only(current_pose, sensor_data, action_index)
+
+                if done:
+                    episode_transitions = controller.success_trails.copy() if controller._total_goals_reached > goals_before else []
                     break
 
-                action_index = controller._last_action
                 env.step(action_index, controller.action_space)
+                if action_index in (controller.action_space.IDX_DETACH, controller.action_space.IDX_DETACH_EDGE):
+                    controller._last_detach_sub_steps = getattr(env, '_last_detach_sub_steps', 1)
 
-            success = controller._total_goals_reached > (controller._total_episodes - 1)
+            success = controller._total_goals_reached > goals_before
             manager.on_episode_complete(
                 success=success,
-                transitions=controller.success_trails if success else [],
+                transitions=episode_transitions,
             )
 
             if (episode + 1) % 100 == 0:
                 stats = manager.get_stats()
+                arb_stats = manager.arbitrator.get_stats()
                 print(
-                    f"  Episode {episode+1}: mode={stats['mode']}, "
+                    f"\n  Episode {episode+1}: mode={stats['mode']}, "
                     f"success_rate={stats['success_rate']:.3f}"
                 )
+                print(
+                    f"  Sources: q_store={arb_stats['q_store_rate']:.2f}, "
+                    f"q_weak={arb_stats['q_store_weak_rate']:.2f}, "
+                    f"sac={arb_stats['sac_rate']:.2f}, "
+                    f"heuristic={arb_stats['heuristic_rate']:.2f}"
+                )
+                print(
+                    f"  Agreement Q↔SAC: {arb_stats['agreement_rate']:.2f}, "
+                    f"q_conf={arb_stats['q_confidence_mean']:.2f}, "
+                    f"q_spread={arb_stats['q_spread_mean']:.2f}, "
+                    f"sac_conf={arb_stats['sac_confidence_mean']:.2f}"
+                )
+                print(f"  Q proposed:  {arb_stats['q_proposed_top']}")
+                print(f"  SAC proposed: {arb_stats['sac_proposed_top']}")
+                print(f"  Q chosen:    {arb_stats['q_chosen_top']}")
+                print(f"  SAC chosen:   {arb_stats['sac_chosen_top']}")
 
+        print(f"\n=== Adaptive Final Stats ===")
+        print(f"  {manager.get_stats()}")
+        print(f"  {manager.arbitrator.get_stats()}")
 
 if __name__ == "__main__":
     main()

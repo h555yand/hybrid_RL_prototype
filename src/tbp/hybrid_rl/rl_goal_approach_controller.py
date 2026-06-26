@@ -1198,6 +1198,63 @@ class RLGoalApproachController:
 
         return stats
 
+    def update_only(self, current_pose, sensor_data, action_index):
+        if self._current_goal is None:
+            return None, True
+
+        self._steps += 1
+        self._total_steps += 1
+
+        state = self._compute_state(current_pose, sensor_data)
+
+        collision = self._detect_collision(sensor_data)
+
+        done = False
+
+        if self._prev_state is not None:
+            prev_store = self._select_store(self._prev_state)
+            next_store = self._select_store(state)
+
+            reward, done, termination_reason = self._compute_reward(
+                state, self._prev_state, self._last_action, collision
+            )
+            self._episode_reward += reward
+            self._episode_transitions.append({
+                "state": self._prev_state.copy(),
+                "action": int(self._last_action),
+                "reward": float(reward),
+            })
+
+            if done:
+                td_target = reward
+            else:
+                next_q = next_store.get_q_values(state)
+                td_target = reward + self.gamma * np.max(next_q)
+
+            prev_store.update_q_value(
+                self._prev_state, self._last_action, td_target, self._get_learning_rate()
+            )
+
+            if done:
+                if termination_reason == "goal_reached":
+                    if self.is_training:
+                        self._apply_success_backup_updates()
+                    self.success_trails = self._episode_transitions.copy()
+                self._on_episode_done(state, termination_reason)
+                return state, True
+
+        self._prev_state = state
+        self._prev_sensor_data = sensor_data
+        self._prev_action = self._last_action
+        self._last_action = action_index
+
+        if self.is_training:
+            self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+        else:
+            self.epsilon = self.eval_epsilon
+
+        return state, False
+
     # ══════════════════════════════════════════════════════════
     # PERSISTENCE
     # ══════════════════════════════════════════════════════════

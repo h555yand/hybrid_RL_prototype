@@ -36,25 +36,6 @@ def train(
     visualise=False,
     EPISODES_PER_LEVEL=None
 ):
-    """
-    curriculum_config (optional):
-        {
-            "levels": [(min_mm, max_mm), ...],  # e.g. CURRICULUM_LEVELS
-            "promote_threshold": 0.20,           # rolling success rate to advance
-            "promote_window": 50,                # episode window for rolling rate
-        }
-    If None, goals are sampled randomly (original behaviour).
-    
-    episode_script (optional):
-        List of dicts with fixed (start_pose, goal_pose) pairs for reproducibility.
-        Used mainly for eval.
-
-    episode_pools (optional):
-        List of level-specific pools. For curriculum training, the current
-        curriculum level selects which pool to draw the next episode from.
-    """
-    """Обучить RL контроллер на mesh объектах."""
-    # Установить seed для воспроизводимости
     if seed is not None:
         np.random.seed(seed)
         random.seed(seed)
@@ -65,8 +46,7 @@ def train(
         else:
             config["num_episodes"] = int(num_episodes)
     cfg = {**DEFAULT_CONFIG, **(config or {})}
-    
-    # Use provided episode sources or fall back to on-the-fly sampling.
+
     use_fixed_episode_script = episode_script is not None
     use_fixed_episode_pools = episode_pools is not None
     if use_fixed_episode_script and use_fixed_episode_pools:
@@ -85,20 +65,18 @@ def train(
             f"for {num_episodes} scheduled episodes"
         )
 
-    # Найти все mesh файлы
     mesh_files = (
         glob.glob(f"{mesh_dir}/*.obj")
         + glob.glob(f"{mesh_dir}/*.stl")
         + glob.glob(f"{mesh_dir}/*.ply")
     )
-    
+
     if not mesh_files:
         raise FileNotFoundError(f"No mesh files in {mesh_dir}")
-    
+
     print(f"Train Mode: {cfg['mode']}")
-    
+
     if load_dir is None:
-        # Создать контроллер
         controller = RLGoalApproachController(
             agent_id=agent_id,
             config=cfg,
@@ -107,14 +85,11 @@ def train(
         controller = RLGoalApproachController.load(load_dir, agent_id=agent_id, config=config)
 
     action_space = controller.action_space
-    
-    # Curriculum state
+
     _use_curriculum = curriculum_config is not None
     _pool_indices: List[int] = []
     if _use_curriculum and "train" in cfg["mode"]:
         _curr_level_idx = 0
-        # deque с maxlen автоматически выбрасывает старейший элемент при добавлении,
-        # поэтому len(window) всегда <= promote_window без ручного pop(0)
         _curr_window: collections.deque = collections.deque()
         _curr_level_episodes = 0
         _curr_level_successes = 0
@@ -138,7 +113,6 @@ def train(
     if use_fixed_episode_pools:
         _pool_indices = [0 for _ in range(len(episode_pools))]
 
-    # Статистика
     goals_reached = 0
     success_trails = []
     success_actions = []
@@ -148,13 +122,11 @@ def train(
             break
         episode_mesh_path = mesh_path
         if episode_mesh_path is None:
-            # Случайный объект
             episode_mesh_path = np.random.choice(mesh_files)
         env = LightweightEnv(episode_mesh_path, seed=seed)
-        
+
         _goals_before_episode = controller._total_goals_reached
-        
-        # Use fixed episode source or sample on-the-fly.
+
         if use_fixed_episode_script:
             ep_data = episode_script[episode]
             start_pos = np.array(ep_data["start_pos"])
@@ -188,23 +160,23 @@ def train(
             ])
         else:
             env.reset()
-            
+            start_pos = env.get_pose()[:3]
+            start_rot = env.get_pose()[3:]
+
             if _use_curriculum and "train" in cfg["mode"]:
                 _min_d, _max_d = _curr_levels[_curr_level_idx]
-                _start_pos = env.get_pose()[:3]
                 goal_pose = env.get_random_surface_point(
-                    reference_pos=_start_pos,
+                    reference_pos=start_pos,
                     min_dist=_min_d,
                     max_dist=_max_d,
                     max_attempts=2000,
                 )
-                # Detect fallback: goal outside target range
-                _goal_dist = float(np.linalg.norm(goal_pose[:3] - _start_pos))
+                _goal_dist = float(np.linalg.norm(goal_pose[:3] - start_pos))
                 if _goal_dist < _min_d or _goal_dist > _max_d:
                     _curriculum_stats["fallback_episodes"] += 1
             else:
                 goal_pose = env.get_random_surface_point()
-        
+
         controller.set_new_goal(goal_pose, start_pos)
         env.set_goal(goal_pose)
 
@@ -213,12 +185,12 @@ def train(
             {"eval_epsilon": 1.0, "temperature_override": 0.01},
             {"eval_epsilon": 0.5, "temperature_override": 0.01},
         ]
-        
+
         max_retries = 3 if cfg.get("mode") == "eval_retries" else 1
-        
+
         action_explanations = []
         current_poses = []
-        
+
         for retry in range(max_retries):
             if retry > 0:
                 if use_fixed_episode_script or use_fixed_episode_pools:
@@ -235,44 +207,41 @@ def train(
             else:
                 if controller.eval_epsilon == 1.0:
                     controller.temperature_override = 0.01
-            
+
             for step in range(controller.config["max_steps_per_goal"]):
                 current_pose = env.get_pose()
                 sensor_data = env.get_sensor_data()
-                
+
                 action, explanation = controller.step(current_pose, sensor_data)
                 if explanation is not None:
                     action_explanations.append(explanation["interpretation"])
                 current_poses.append(env.get_pose())
-                
+
                 if controller._current_goal is None:
                     if controller._total_goals_reached > goals_reached:
                         goals_reached = controller._total_goals_reached
                     break
-                
+
                 action_index = controller._last_action
                 env.step(action_index, action_space)
                 if action_index == action_space.IDX_DETACH:
                     controller._last_detach_sub_steps = getattr(env, '_last_detach_sub_steps', 1)
                 if action_index == action_space.IDX_DETACH_EDGE:
                     controller._last_detach_sub_steps = getattr(env, '_last_detach_sub_steps', 1)
-                
-            
+
             _episode_success = controller._total_goals_reached > _goals_before_episode
             if _episode_success:
                 break
-        
+
         if max_retries > 1:
             controller.eval_epsilon = cfg.get("eval_epsilon", 0.02)
             controller.temperature_override = None
-        
+
         start_distance = float(np.linalg.norm(goal_pose[:3] - start_pos))
 
         if _episode_success:
             success_trails.append(controller.success_trails)
             success_actions.append(action_explanations)
-            #print(f"  SUCCESS trail length: {len(controller.success_trails)}")
-            #success_trails.append(list(controller.success_trails))
             logger.debug(f"SUCCESS, start_distance {start_distance}, explain_action_info: {action_explanations}")
             #if visualise:
             #    visualize_agent_goal(env, np.concatenate([start_pos, start_rot]), goal_pose)
@@ -280,20 +249,13 @@ def train(
             #        visualize_agent_goal(env, pose, goal_pose)
         else:
             logger.debug(f"ERROR, start_distance {start_distance}, explain_action_info: {action_explanations}")
-            #if visualise:
-            #    visualize_agent_goal(env, np.concatenate([start_pos, start_rot]), goal_pose)
-            #    for pose in current_poses:
-            #        visualize_agent_goal(env, pose, goal_pose)
 
-        # Curriculum promote check (after episode)
         if _use_curriculum and "train" in cfg["mode"]:
             _episode_success = controller._total_goals_reached > _goals_before_episode
-            _curr_window.append(_episode_success)   # старый элемент выбрасывается автоматически
+            _curr_window.append(_episode_success)
             _curr_level_episodes += 1
             if _episode_success:
                 _curr_level_successes += 1
-            # Promote проверяем только когда окно заполнено
-            # и есть ещё уровни выше текущего
             window_full = len(_curr_window) == _promote_window
             not_last_level = _curr_level_idx < len(_curr_levels) - 1
             if window_full and not_last_level:
@@ -309,7 +271,7 @@ def train(
                         new_threshold = GOAL_THRESHOLD_PER_LEVEL[_curr_level_idx]
                         controller.config["goal_threshold"] = new_threshold
                         logger.info(f"  [Curriculum] goal_threshold → {new_threshold}mm")
-                    _curr_window = collections.deque(maxlen=_promote_window)  # сброс окна
+                    _curr_window = collections.deque(maxlen=_promote_window)
                     _curr_level_episodes = 0
                     _curr_level_successes = 0
                     _curriculum_stats["levels_reached"] = _curr_level_idx + 1
@@ -321,15 +283,13 @@ def train(
                         f"(epsilon={controller.epsilon:.3f})"
                     )
 
-        # Логирование
         if (episode + 1) % 1000 == 0:
             stats = controller.get_stats()
             print(
                 f"Episode {episode+1}/{num_episodes}: "
                 f"stats={stats}"
             )
-    
-    # Сохранить
+
     controller.save(save_dir)
     print(f"Saved to {save_dir}")
     print(f"Final: {goals_reached}/{num_episodes} goals reached")
@@ -358,7 +318,6 @@ def train(
         }
 
     return goals_reached
-
 
 @dataclass
 class AblationSummary:
