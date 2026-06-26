@@ -17,7 +17,7 @@ from .sac_actor import SACActorNetwork
 from .twin_critic import TwinCritic
 from .replay_buffer import ReplayBuffer
 from .action_interpreter import ActionInterpreter
-from .experience_extractor import ExperienceExtractor
+from .experience_extractor import ExperienceExtractor, PSACTransition
 from .lightweight_env import LightweightEnv
 from .rl_goal_approach_controller import RLGoalApproachController
 
@@ -25,6 +25,11 @@ logger = logging.getLogger(__name__)
 
 
 class PSACTrainer:
+
+    MIN_LOG_ALPHA_TYPE = -2.0
+    MAX_LOG_ALPHA_TYPE = 1.0
+    MIN_LOG_ALPHA_PARAM = -2.0
+    MAX_LOG_ALPHA_PARAM = 0.0
 
     def __init__(
         self,
@@ -44,6 +49,9 @@ class PSACTrainer:
         bc_lambda_decay: float = 0.9999,
         max_steps_per_goal: int = 150,
         goal_threshold: float = 5.0,
+        eval_interval: int = 200,
+        eval_episodes: int = 100,
+        eval_seed: int = 12345,
     ):
         self.state_dim = state_dim
         self.num_types = num_types
@@ -53,6 +61,9 @@ class PSACTrainer:
         self.batch_size = batch_size
         self.max_steps_per_goal = max_steps_per_goal
         self.goal_threshold = goal_threshold
+        self.eval_interval = eval_interval
+        self.eval_episodes = eval_episodes
+        self.eval_seed = eval_seed
 
         self.actor = SACActorNetwork(state_dim, num_types)
         self.critic = TwinCritic(state_dim, num_types, max_params)
@@ -70,7 +81,10 @@ class PSACTrainer:
         self.target_entropy_type = -np.log(1.0 / num_types) * 0.5
         self.target_entropy_param = -max_params * 0.5
 
-        self.buffer = ReplayBuffer(buffer_capacity, state_dim, max_params)
+        self.buffer = ReplayBuffer(
+            buffer_capacity, state_dim, max_params,
+            bc_reserve_fraction=0.15,
+        )
 
         self.bc_lambda = bc_lambda_init
         self.bc_lambda_decay = bc_lambda_decay
@@ -108,13 +122,35 @@ class PSACTrainer:
 
         with open(bc_data_path, "rb") as f:
             bc_transitions = pickle.load(f)
-        self.buffer.load_bc_data(bc_transitions)
+
+        bc_normalized = self._normalize_bc_transitions(bc_transitions)
+        self.buffer.load_bc_data(bc_normalized)
         self.bc_data = bc_transitions
 
         logger.info(
             f"Loaded BC: actor weights, normalization, "
             f"{len(bc_transitions)} transitions"
         )
+
+    def _normalize_bc_transitions(self, transitions):
+        normalized = []
+        for tr in transitions:
+            norm_state = self.normalize_state(tr.state)
+            norm_next = self.normalize_state(tr.next_state) if tr.next_state is not None else None
+            norm_params = (tr.action_params - self.param_mean[:len(tr.action_params)]) / (
+                self.param_std[:len(tr.action_params)] + 1e-8
+            )
+            padded_params = np.zeros(self.max_params, dtype=np.float32)
+            padded_params[:len(norm_params)] = norm_params
+            normalized.append(PSACTransition(
+                state=norm_state.astype(np.float32),
+                action_type=tr.action_type,
+                action_params=padded_params,
+                reward=tr.reward,
+                next_state=norm_next.astype(np.float32) if norm_next is not None else None,
+                done=tr.done,
+            ))
+        return normalized
 
     def normalize_state(self, state: np.ndarray) -> np.ndarray:
         if self.state_mean is not None:
@@ -196,7 +232,9 @@ class PSACTrainer:
                 [self.bc_data[i].action_type for i in bc_indices]
             )
             bc_params_raw = np.array([self.bc_data[i].action_params for i in bc_indices])
-            bc_params = torch.FloatTensor((bc_params_raw - self.param_mean) / self.param_std)
+            bc_params = torch.FloatTensor(
+                (bc_params_raw - self.param_mean) / (self.param_std + 1e-8)
+            )
 
             type_logits, param_mus, _ = self.actor(bc_states)
             type_loss = F.cross_entropy(type_logits, bc_types)
@@ -220,7 +258,7 @@ class PSACTrainer:
 
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.1)
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
         self.actor_optimizer.step()
 
         self.bc_lambda *= self.bc_lambda_decay
@@ -231,8 +269,6 @@ class PSACTrainer:
         states = torch.FloatTensor(batch["states"])
 
         with torch.no_grad():
-            self.log_alpha_type.clamp_(min=-5.0, max=2.0)
-            self.log_alpha_param.clamp_(min=-2.0, max=-1.0)
             _, _, log_prob, type_probs = self.actor.sample(states)
             type_entropy = -(type_probs * torch.log(type_probs + 1e-8)).sum(dim=-1).mean()
 
@@ -248,6 +284,14 @@ class PSACTrainer:
         alpha_loss.backward()
         self.alpha_optimizer.step()
 
+        with torch.no_grad():
+            self.log_alpha_type.clamp_(
+                min=self.MIN_LOG_ALPHA_TYPE, max=self.MAX_LOG_ALPHA_TYPE
+            )
+            self.log_alpha_param.clamp_(
+                min=self.MIN_LOG_ALPHA_PARAM, max=self.MAX_LOG_ALPHA_PARAM
+            )
+
     def soft_update_target(self):
         for param, target_param in zip(
             self.critic.parameters(), self.critic_target.parameters()
@@ -256,35 +300,28 @@ class PSACTrainer:
                 self.tau * param.data + (1 - self.tau) * target_param.data
             )
 
-    def train(
+    def _run_eval_during_training(
         self,
         env: LightweightEnv,
         controller: RLGoalApproachController,
-        num_episodes: int = 5000,
-        update_every: int = 1,
-        updates_per_step: int = 1,
-        warmup_steps: int = 1000,
-        log_interval: int = 100,
-        save_dir: Optional[str] = None,
+        interpreter: ActionInterpreter,
         curriculum_levels: Optional[List] = None,
-        promote_threshold: float = 0.5,
-        promote_window: int = 100,
-    ):
-        interpreter = ActionInterpreter(env)
+        num_episodes: int = 100,
+    ) -> float:
+        np_state = np.random.get_state()
+        torch_state = torch.random.get_rng_state()
 
-        curr_level = 0
-        success_window = []
-        rolling_history = deque(maxlen=200)
-        best_rolling_rate = 0.0
-        best_state_dict = None
-        best_critic_dict = None
-        best_critic_target_dict = None
-        best_extra = None
+        np.random.seed(self.eval_seed)
+        torch.manual_seed(self.eval_seed)
 
-        for episode in range(num_episodes):
+        successes = 0
+        max_level = len(curriculum_levels) - 1 if curriculum_levels else 0
 
+        self.actor.eval()
+
+        for ep in range(num_episodes):
             if curriculum_levels:
-                min_dist, max_dist = curriculum_levels[curr_level]
+                min_dist, max_dist = curriculum_levels[max_level]
             else:
                 min_dist, max_dist = 10.0, 120.0
 
@@ -300,6 +337,105 @@ class PSACTrainer:
             controller.set_new_goal(goal_pose, start_pos)
             env.set_goal(goal_pose)
 
+            for step in range(self.max_steps_per_goal):
+                current_pose = env.get_pose()
+                sensor_data = env.get_sensor_data()
+                state_raw = self.compute_state(env, controller, current_pose, sensor_data)
+                state = self.normalize_state(state_raw)
+
+                state_t = torch.FloatTensor(state).unsqueeze(0)
+                with torch.no_grad():
+                    at, ap, _, _ = self.actor.sample(state_t)
+                action_type = at[0].item()
+                action_params = ap[0].numpy() * self.param_std + self.param_mean
+
+                sensor_data = interpreter.execute(action_type, action_params)
+                current_pose = env.get_pose()
+                distance = float(np.linalg.norm(goal_pose[:3] - current_pose[:3]))
+
+                if distance < self.goal_threshold:
+                    successes += 1
+                    break
+
+                depth = sensor_data.get("depth", 100.0)
+                if depth < 0.5:
+                    break
+
+        self.actor.train()
+
+        np.random.set_state(np_state)
+        torch.random.set_rng_state(torch_state)
+
+        return successes / max(num_episodes, 1)
+
+    def _get_episode_data(self, episode_pools, curr_level, episode):
+        if episode_pools is None:
+            return None
+        levels = episode_pools.get("levels", [])
+        if curr_level >= len(levels):
+            return None
+        level_pool = levels[curr_level]
+        ep_idx = episode % len(level_pool)
+        return level_pool[ep_idx]
+
+    def train(
+        self,
+        env: LightweightEnv,
+        controller: RLGoalApproachController,
+        num_episodes: int = 5000,
+        update_every: int = 1,
+        updates_per_step: int = 1,
+        warmup_steps: int = 1000,
+        log_interval: int = 100,
+        save_dir: Optional[str] = None,
+        curriculum_levels: Optional[List] = None,
+        promote_threshold: float = 0.5,
+        promote_window: int = 100,
+        episode_pools: Optional[Dict] = None,
+    ):
+        interpreter = ActionInterpreter(env)
+
+        curr_level = 0
+        success_window = []
+        rolling_history = deque(maxlen=200)
+        best_rolling_rate = 0.0
+        best_eval_rate = 0.0
+        best_state_dict = None
+        best_critic_dict = None
+        best_critic_target_dict = None
+        best_extra = None
+
+        for episode in range(num_episodes):
+
+            if curriculum_levels:
+                min_dist, max_dist = curriculum_levels[curr_level]
+            else:
+                min_dist, max_dist = 10.0, 120.0
+
+            ep_data = self._get_episode_data(episode_pools, curr_level, episode)
+
+            if ep_data is not None:
+                start_pos = np.array(ep_data["start_pos"])
+                start_rot = np.array(ep_data["start_rot"])
+                env.reset(position=start_pos, rotation=start_rot)
+                goal_pose = np.concatenate([
+                    np.array(ep_data["goal_pos"]),
+                    np.array(ep_data["goal_rot"]),
+                ])
+            else:
+                env.reset()
+                start_pos = env.get_pose()[:3]
+                goal_pose = env.get_random_surface_point(
+                    reference_pos=start_pos,
+                    min_dist=min_dist,
+                    max_dist=max_dist,
+                    max_attempts=2000,
+                    mesh_sample=True,
+                )
+
+            controller.set_new_goal(goal_pose, env.get_pose()[:3])
+            env.set_goal(goal_pose)
+
             current_pose = env.get_pose()
             sensor_data = env.get_sensor_data()
             state_raw = self.compute_state(env, controller, current_pose, sensor_data)
@@ -312,15 +448,11 @@ class PSACTrainer:
             for step in range(self.max_steps_per_goal):
                 self.total_steps += 1
 
-                if self.total_steps < warmup_steps:
-                    action_type = np.random.randint(0, self.num_types)
-                    action_params = np.random.randn(self.max_params).astype(np.float32) * 5.0
-                else:
-                    state_t = torch.FloatTensor(state).unsqueeze(0)
-                    with torch.no_grad():
-                        at, ap, _, _ = self.actor.sample(state_t)
-                    action_type = at[0].item()
-                    action_params = ap[0].numpy() * self.param_std + self.param_mean
+                state_t = torch.FloatTensor(state).unsqueeze(0)
+                with torch.no_grad():
+                    at, ap, _, _ = self.actor.sample(state_t)
+                action_type = at[0].item()
+                action_params = ap[0].numpy() * self.param_std + self.param_mean
 
                 sensor_data = interpreter.execute(action_type, action_params)
                 current_pose = env.get_pose()
@@ -340,7 +472,10 @@ class PSACTrainer:
                     next_state, state, distance, prev_distance, collision, step + 1
                 )
 
-                self.buffer.add(state, action_type, action_params, reward, next_state, done)
+                action_params_norm = (action_params - self.param_mean) / (self.param_std + 1e-8)
+                self.buffer.add(
+                    state, action_type, action_params_norm, reward, next_state, done
+                )
 
                 episode_reward += reward
                 state = next_state
@@ -372,6 +507,27 @@ class PSACTrainer:
                 rolling_rate = sum(rolling_history) / len(rolling_history)
                 if rolling_rate > best_rolling_rate:
                     best_rolling_rate = rolling_rate
+            else:
+                rolling_rate = 0.0
+
+            if (
+                (episode + 1) % self.eval_interval == 0
+                and self.total_steps >= warmup_steps
+            ):
+                eval_rate = self._run_eval_during_training(
+                    env=env,
+                    controller=controller,
+                    interpreter=interpreter,
+                    curriculum_levels=curriculum_levels,
+                    num_episodes=self.eval_episodes,
+                )
+                logger.info(
+                    f"  EVAL at episode {episode+1}: "
+                    f"success_rate={eval_rate:.3f} "
+                    f"(best={best_eval_rate:.3f})"
+                )
+                if eval_rate > best_eval_rate:
+                    best_eval_rate = eval_rate
                     best_state_dict = {
                         k: v.clone() for k, v in self.actor.state_dict().items()
                     }
@@ -379,7 +535,8 @@ class PSACTrainer:
                         k: v.clone() for k, v in self.critic.state_dict().items()
                     }
                     best_critic_target_dict = {
-                        k: v.clone() for k, v in self.critic_target.state_dict().items()
+                        k: v.clone()
+                        for k, v in self.critic_target.state_dict().items()
                     }
                     best_extra = {
                         "total_steps": self.total_steps,
@@ -388,9 +545,9 @@ class PSACTrainer:
                         "bc_lambda": self.bc_lambda,
                         "log_alpha_type": self.log_alpha_type.detach().clone(),
                         "log_alpha_param": self.log_alpha_param.detach().clone(),
+                        "eval_rate": eval_rate,
                     }
-            else:
-                rolling_rate = 0.0
+                    logger.info(f"  New best eval model! rate={eval_rate:.3f}")
 
             if curriculum_levels:
                 success_window.append(episode_success)
@@ -418,6 +575,7 @@ class PSACTrainer:
                     f"({success_rate:.3f}), "
                     f"rolling={rolling_rate:.3f}, "
                     f"best_rolling={best_rolling_rate:.3f}, "
+                    f"best_eval={best_eval_rate:.3f}, "
                     f"bc_lambda={self.bc_lambda:.4f}, "
                     f"alpha_type={self.alpha_type:.3f}, "
                     f"alpha_param={self.alpha_param:.3f}, "
@@ -439,7 +597,11 @@ class PSACTrainer:
             self.log_alpha_param = torch.tensor(
                 best_extra["log_alpha_param"].item(), requires_grad=True
             )
-            logger.info(f"Restored best model (rolling_rate={best_rolling_rate:.3f})")
+            logger.info(
+                f"Restored best model (eval_rate={best_extra['eval_rate']:.3f})"
+            )
+        else:
+            logger.info("No eval checkpoint was saved")
 
         if save_dir:
             self.save(save_dir)

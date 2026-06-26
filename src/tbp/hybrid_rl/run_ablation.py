@@ -519,16 +519,10 @@ def _run_eval_per_level(
 
             if collect_bc:
                 trails = metrics.get("success_trails", [])
-                #print(f"  BC collect: {len(trails)} trails found")
                 if trails:
-                    #print(f"  First trail length: {len(trails[0])}")
-                    #print(f"  First trail type: {type(trails[0])}")
-                    #if trails[0]:
-                    #    print(f"  First item type: {type(trails[0][0])}")
                     extractor = ExperienceExtractor(config=eval_cfg)
                     for trail in trails:
                         bc_transitions.extend(extractor.convert_trajectory(trail))
-                    #print(f"  BC transitions so far: {len(bc_transitions)}")
 
             rates = metrics.get("stats", {}).get("termination_rates", {})
             level_results.append({
@@ -614,8 +608,7 @@ def main() -> None:
         "goal_threshold": GOAL_THRESHOLD_PER_LEVEL[0],
         "max_points": 500_000,
         "k_neighbors": 7,
-        # "max_steps_per_goal": 50, # cube
-        "max_steps_per_goal": 150, # cylinder
+        "max_steps_per_goal": 150,
         "adaptive_sigma": True,
         "insert_threshold": 0.50,
         "auto_calibrate": False,
@@ -698,8 +691,6 @@ def main() -> None:
             levels=CURRICULUM_LEVELS,
         )
         result = runner.run(variants=variants, visualise=True)
-        # best_variant = str(result["best_variant"])
-        # best_overrides = dict(variants.get(best_variant, {}))
 
         print("\n=== Train Summaries ===")
         for name, s in result["summaries"].items():
@@ -733,7 +724,7 @@ def main() -> None:
             train_seeds=TRAIN_SEEDS,
             eval_seeds=EVAL_SEEDS,
             variant=best_variant,
-            overrides=eval_overrides,
+            eval_cfg=eval_overrides,
             eval_pools=eval_pools,
             collect_bc=True,
             EPISODES_PER_LEVEL=EVAL_EPISODES_PER_LEVEL
@@ -759,14 +750,13 @@ def main() -> None:
             print(f"Action distribution: {type_counts}")
             print(f"Saved to {bc_output}")
 
-            ################# ReplayBuffer #################
             with open(data_dir / "bc_data.pkl", "rb") as f:
                 bc_transitions = pickle.load(f)
 
             buffer = ReplayBuffer(
-            capacity=100_000,
-            state_dim=cfg.get("state_dim", 15),
-            max_params=3,
+                capacity=100_000,
+                state_dim=cfg.get("state_dim", 15),
+                max_params=3,
             )
 
             buffer.load_bc_data(bc_transitions)
@@ -775,7 +765,7 @@ def main() -> None:
             print(f"Batch states shape: {batch['states'].shape}")
             print(f"Batch types: {batch['action_types'][:5]}")
             print(f"Batch params: {batch['action_params'][:5]}")
-        
+
     if RUN_BC_TRAIN:
         print("\n" + "=" * 60)
         print("STEP 5: BC Training")
@@ -827,7 +817,7 @@ def main() -> None:
                 f"  Expert: {type_names[tr.action_type]} {tr.action_params} | "
                 f"Predicted: {type_names[action_type]} {action_params}"
             )
-    
+
     if RUN_SAC_TRAIN:
         print("\n" + "=" * 60)
         print("STEP 6: P-SAC Training")
@@ -848,11 +838,14 @@ def main() -> None:
             lr_actor=1e-5,
             lr_critic=3e-4,
             batch_size=256,
-            buffer_capacity=100_000,
+            buffer_capacity=500_000,
             bc_lambda_init=5.0,
             bc_lambda_decay=0.999999,
             max_steps_per_goal=150,
             goal_threshold=cfg.get("goal_threshold", 5.0),
+            eval_interval=200,
+            eval_episodes=100,
+            eval_seed=12345,
         )
 
         trainer.load_bc(
@@ -870,6 +863,7 @@ def main() -> None:
             log_interval=100,
             save_dir=sac_model_dir,
             curriculum_levels=CURRICULUM_LEVELS,
+            episode_pools=train_pools[TRAIN_SEEDS[1]],
         )
 
         print(f"\nP-SAC training complete:")
@@ -883,121 +877,148 @@ def main() -> None:
         print("STEP 7: P-SAC Eval")
         print("=" * 60)
 
+        SAC_EVAL_MODE = "both"
+
         sac_model_dir = str(runs_dir / "sac_model")
         sac_trainer = PSACTrainer(state_dim=cfg.get("state_dim", 15))
         sac_trainer.load(sac_model_dir)
 
-        results_per_level = {}
-        sample_seed = SAC_EVAL_SEEDS[0]
-        num_levels = len(sac_eval_pools[sample_seed].get("levels", []))
+        def _run_sac_eval(mode, sac_trainer, sac_eval_pools, mesh_path, cfg):
+            results_per_level = {}
+            sample_seed = SAC_EVAL_SEEDS[0]
+            num_levels = len(sac_eval_pools[sample_seed].get("levels", []))
 
-        for level_idx in range(num_levels):
-            level_successes = 0
-            level_timeouts = 0
-            level_collisions = 0
-            level_total = 0
+            for level_idx in range(num_levels):
+                level_successes = 0
+                level_timeouts = 0
+                level_collisions = 0
+                level_total = 0
 
-            SAC_EVAL_SEEDS_test = [77]
-            for eval_seed in SAC_EVAL_SEEDS_test:
-                level_pool = sac_eval_pools[eval_seed]["levels"][level_idx]
+                for eval_seed in [SAC_EVAL_SEEDS[0]]:
+                    level_pool = sac_eval_pools[eval_seed]["levels"][level_idx]
 
-                np.random.seed(eval_seed)
-                env = LightweightEnv(mesh_path, seed=eval_seed)
-                controller = RLGoalApproachController(
-                    agent_id=f"sac_eval_L{level_idx}_{eval_seed}",
-                    config={**cfg, "mode": "eval"},
-                )
-                interpreter = ActionInterpreter(env)
+                    np.random.seed(eval_seed)
+                    torch.manual_seed(eval_seed)
+                    env = LightweightEnv(mesh_path, seed=eval_seed)
+                    controller = RLGoalApproachController(
+                        agent_id=f"sac_eval_L{level_idx}_{eval_seed}",
+                        config={**cfg, "mode": "eval"},
+                    )
+                    interpreter = ActionInterpreter(env)
 
-                for ep_data in level_pool:
-                    start_pos = np.array(ep_data["start_pos"])
-                    start_rot = np.array(ep_data["start_rot"])
-                    env.reset(position=start_pos, rotation=start_rot)
-                    goal_pose = np.concatenate([
-                        np.array(ep_data["goal_pos"]),
-                        np.array(ep_data["goal_rot"]),
-                    ])
-                    controller.set_new_goal(goal_pose, start_pos)
-                    env.set_goal(goal_pose)
+                    for ep_data in level_pool:
+                        start_pos = np.array(ep_data["start_pos"])
+                        start_rot = np.array(ep_data["start_rot"])
+                        env.reset(position=start_pos, rotation=start_rot)
+                        goal_pose = np.concatenate([
+                            np.array(ep_data["goal_pos"]),
+                            np.array(ep_data["goal_rot"]),
+                        ])
+                        controller.set_new_goal(goal_pose, start_pos)
+                        env.set_goal(goal_pose)
 
-                    success = False
-                    collision = False
+                        success = False
+                        collision = False
 
-                    for step in range(sac_trainer.max_steps_per_goal):
-                        current_pose = env.get_pose()
-                        sensor_data = env.get_sensor_data()
-                        state_raw = controller._compute_state(
-                            current_pose, sensor_data
-                        )
-                        state = sac_trainer.normalize_state(state_raw)
-
-                        action_type, action_params_norm = sac_trainer.actor.predict(
-                            state.astype(np.float32)
-                        )
-                        param_dim = len(action_params_norm)
-                        action_params = action_params_norm * sac_trainer.param_std[:param_dim] + sac_trainer.param_mean[:param_dim]
-
-                        sensor_data = interpreter.execute(
-                            action_type, action_params
-                        )
-
-                        current_pose = env.get_pose()
-                        distance = float(np.linalg.norm(
-                            goal_pose[:3] - current_pose[:3]
-                        ))
-
-                        if step < 3 and level_total < 5:
-                            type_names = ExperienceExtractor.get_type_names()
-                            print(
-                                f"  ep={level_total} step={step}: "
-                                f"type={type_names.get(action_type, action_type)}, "
-                                f"params_norm={action_params_norm}, "
-                                f"params={action_params}, "
-                                f"dist={distance:.1f}"
+                        for step in range(sac_trainer.max_steps_per_goal):
+                            current_pose = env.get_pose()
+                            sensor_data = env.get_sensor_data()
+                            state_raw = controller._compute_state(
+                                current_pose, sensor_data
                             )
-                            print(sac_trainer.param_mean, sac_trainer.param_std)
+                            state = sac_trainer.normalize_state(state_raw)
 
-                        if distance < sac_trainer.goal_threshold:
-                            success = True
-                            break
+                            if mode == "sample":
+                                state_t = torch.FloatTensor(
+                                    state.astype(np.float32)
+                                ).unsqueeze(0)
+                                with torch.no_grad():
+                                    at, ap, _, _ = sac_trainer.actor.sample(state_t)
+                                action_type = at[0].item()
+                                action_params = (
+                                    ap[0].numpy() * sac_trainer.param_std
+                                    + sac_trainer.param_mean
+                                )
+                            else:
+                                action_type, action_params_norm = sac_trainer.actor.predict(
+                                    state.astype(np.float32)
+                                )
+                                param_dim = len(action_params_norm)
+                                action_params = (
+                                    action_params_norm
+                                    * sac_trainer.param_std[:param_dim]
+                                    + sac_trainer.param_mean[:param_dim]
+                                )
 
-                        depth = sensor_data.get("depth", 100.0)
-                        if depth < 0.5:
-                            collision = True
-                            break
+                            sensor_data = interpreter.execute(
+                                action_type, action_params
+                            )
 
-                    level_total += 1
-                    if success:
-                        level_successes += 1
-                    elif collision:
-                        level_collisions += 1
-                    else:
-                        level_timeouts += 1
+                            current_pose = env.get_pose()
+                            distance = float(np.linalg.norm(
+                                goal_pose[:3] - current_pose[:3]
+                            ))
 
-            count = max(level_total, 1)
-            bounds = CURRICULUM_LEVELS[level_idx]
-            results_per_level[f"level_{level_idx}"] = {
-                "bounds_mm": list(bounds),
-                "success_rate": level_successes / count,
-                "timeout_rate": level_timeouts / count,
-                "collision_rate": level_collisions / count,
-            }
-            print("SAC EVAL results_per_level", results_per_level[f"level_{level_idx}"])
+                            if step < 3 and level_total < 5:
+                                type_names = ExperienceExtractor.get_type_names()
+                                print(
+                                    f"  ep={level_total} step={step}: "
+                                    f"type={type_names.get(action_type, action_type)}, "
+                                    f"params={action_params}, "
+                                    f"dist={distance:.1f}"
+                                )
 
-        print(f"\n=== P-SAC Eval Results ===")
-        for key in sorted(results_per_level.keys()):
-            data = results_per_level[key]
-            print(
-                f"  {key} ({data.get('bounds_mm', [])}mm): "
-                f"success={data['success_rate']:.4f}, "
-                f"timeout={data['timeout_rate']:.4f}, "
-                f"collision={data['collision_rate']:.4f}"
+                            if distance < sac_trainer.goal_threshold:
+                                success = True
+                                break
+
+                            depth = sensor_data.get("depth", 100.0)
+                            if depth < 0.5:
+                                collision = True
+                                break
+
+                        level_total += 1
+                        if success:
+                            level_successes += 1
+                        elif collision:
+                            level_collisions += 1
+                        else:
+                            level_timeouts += 1
+
+                count = max(level_total, 1)
+                bounds = CURRICULUM_LEVELS[level_idx]
+                results_per_level[f"level_{level_idx}"] = {
+                    "bounds_mm": list(bounds),
+                    "success_rate": level_successes / count,
+                    "timeout_rate": level_timeouts / count,
+                    "collision_rate": level_collisions / count,
+                }
+                logger.info(results_per_level[f"level_{level_idx}"])
+
+            return results_per_level
+
+        modes = ["sample", "predict"] if SAC_EVAL_MODE == "both" else [SAC_EVAL_MODE]
+
+        for mode in modes:
+            print(f"\n--- Eval mode: {mode} ---")
+            results_per_level = _run_sac_eval(
+                mode, sac_trainer, sac_eval_pools, mesh_path, cfg
             )
 
-        eval_output = data_dir / "sac_eval_result.json"
-        with open(eval_output, "w", encoding="utf-8") as f:
-            json.dump(results_per_level, f, indent=2)
-        print(f"\nSaved to {eval_output}")
+            print(f"\n=== P-SAC Eval Results (mode={mode}) ===")
+            for key in sorted(results_per_level.keys()):
+                data = results_per_level[key]
+                print(
+                    f"  {key} ({data.get('bounds_mm', [])}mm): "
+                    f"success={data['success_rate']:.4f}, "
+                    f"timeout={data['timeout_rate']:.4f}, "
+                    f"collision={data['collision_rate']:.4f}"
+                )
+
+            eval_output = data_dir / f"sac_eval_result_{mode}.json"
+            with open(eval_output, "w", encoding="utf-8") as f:
+                json.dump(results_per_level, f, indent=2)
+            print(f"Saved to {eval_output}")
 
     if RUN_ADAPTIVE:
         print("\n" + "=" * 60)

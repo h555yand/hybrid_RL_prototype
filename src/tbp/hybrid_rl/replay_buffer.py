@@ -1,11 +1,11 @@
 """
 Replay Buffer for P-SAC training.
 Stores transitions in P-SAC format (type + continuous params).
-Supports warm-start from BC data.
+Supports warm-start from BC data with protected BC reservoir.
 """
 
 import numpy as np
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any
 from .experience_extractor import PSACTransition
 
 
@@ -16,10 +16,14 @@ class ReplayBuffer:
         capacity: int = 100_000,
         state_dim: int = 15,
         max_params: int = 3,
+        bc_reserve_fraction: float = 0.15,
     ):
         self.capacity = capacity
         self.state_dim = state_dim
         self.max_params = max_params
+
+        self.bc_reserve = int(capacity * bc_reserve_fraction)
+        self.bc_size = 0
 
         self.states = np.zeros((capacity, state_dim), dtype=np.float32)
         self.action_types = np.zeros(capacity, dtype=np.int64)
@@ -28,7 +32,8 @@ class ReplayBuffer:
         self.next_states = np.zeros((capacity, state_dim), dtype=np.float32)
         self.dones = np.zeros(capacity, dtype=np.float32)
 
-        self.pos = 0
+        self.online_pos = 0
+        self.online_capacity = capacity
         self.size = 0
 
     def add(
@@ -40,7 +45,7 @@ class ReplayBuffer:
         next_state: np.ndarray,
         done: bool,
     ):
-        idx = self.pos % self.capacity
+        idx = self.bc_size + (self.online_pos % self.online_capacity)
 
         self.states[idx] = state
         self.action_types[idx] = action_type
@@ -50,8 +55,8 @@ class ReplayBuffer:
         self.next_states[idx] = next_state
         self.dones[idx] = float(done)
 
-        self.pos += 1
-        self.size = min(self.size + 1, self.capacity)
+        self.online_pos += 1
+        self.size = min(self.bc_size + self.online_pos, self.capacity)
 
     def sample(self, batch_size: int) -> Dict[str, np.ndarray]:
         indices = np.random.randint(0, self.size, size=batch_size)
@@ -66,19 +71,29 @@ class ReplayBuffer:
 
     def load_bc_data(self, transitions: List[PSACTransition]):
         count = 0
-        for i, tr in enumerate(transitions):
+        for tr in transitions:
             if tr.next_state is None:
                 continue
-            self.add(
-                state=tr.state,
-                action_type=tr.action_type,
-                action_params=tr.action_params,
-                reward=tr.reward,
-                next_state=tr.next_state,
-                done=tr.done,
-            )
+            if count >= self.bc_reserve:
+                break
+
+            idx = count
+            self.states[idx] = tr.state
+            self.action_types[idx] = tr.action_type
+            self.action_params[idx, :len(tr.action_params)] = tr.action_params
+            self.action_params[idx, len(tr.action_params):] = 0.0
+            self.rewards[idx] = tr.reward
+            self.next_states[idx] = tr.next_state
+            self.dones[idx] = float(tr.done)
             count += 1
-        print(f"ReplayBuffer: loaded {count} BC transitions (size={self.size})")
+
+        self.bc_size = count
+        self.online_capacity = self.capacity - self.bc_size
+        self.size = self.bc_size
+        print(
+            f"ReplayBuffer: loaded {count} BC transitions (protected), "
+            f"online_capacity={self.online_capacity}"
+        )
 
     def __len__(self):
         return self.size
