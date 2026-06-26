@@ -36,48 +36,72 @@ EVAL_SEEDS = [44, 55, 66]
 SAC_EVAL_SEEDS = [77, 88, 99]
 
 
-def create_cup(
-    body_radius=28.0,
-    body_height=70.0,
-    wall_thickness=2.5,
-    bottom_thickness=3.0,
-    handle_radius_major=12.0,
-    handle_radius_minor=3.0,
-    handle_angle_deg=160.0,
-    handle_segments=24,
+def create_tea_cup(
+    bottom_radius=25.0,
+    top_radius=42.0,
+    body_height=60.0,
+    wall_thickness=2.0,
+    bottom_thickness=2.5,
+    handle_radius_major=14.0,
+    handle_radius_minor=2.5,
+    handle_angle_deg=140.0,
+    handle_segments=20,
     body_segments=64,
     circle_points=8,
 ):
-    outer = trimesh.primitives.Cylinder(
-        radius=body_radius,
-        height=body_height,
-        sections=body_segments,
-    )
+    # Внешний усечённый конус через convex_hull двух цилиндров
+    angles = np.linspace(0, 2 * np.pi, body_segments, endpoint=False)
 
-    inner_radius = body_radius - wall_thickness
+    # Нижнее кольцо
+    bottom_z = -body_height / 2
+    top_z = body_height / 2
+    bottom_pts = np.column_stack([
+        bottom_radius * np.cos(angles),
+        bottom_radius * np.sin(angles),
+        np.full(body_segments, bottom_z),
+    ])
+    top_pts = np.column_stack([
+        top_radius * np.cos(angles),
+        top_radius * np.sin(angles),
+        np.full(body_segments, top_z),
+    ])
+    outer_pts = np.vstack([bottom_pts, top_pts])
+    outer = trimesh.convex.convex_hull(outer_pts)
+
+    # Внутренний усечённый конус (полость)
+    inner_bottom_radius = bottom_radius - wall_thickness
+    inner_top_radius = top_radius - wall_thickness
     inner_height = body_height - bottom_thickness
-    inner = trimesh.primitives.Cylinder(
-        radius=inner_radius,
-        height=inner_height,
-        sections=body_segments,
-    )
-    inner_shift = bottom_thickness / 2.0
-    inner.apply_translation([0, 0, inner_shift])
+    inner_bottom_z = bottom_z + bottom_thickness
+    inner_top_z = top_z
+
+    inner_bottom_pts = np.column_stack([
+        inner_bottom_radius * np.cos(angles),
+        inner_bottom_radius * np.sin(angles),
+        np.full(body_segments, inner_bottom_z),
+    ])
+    inner_top_pts = np.column_stack([
+        inner_top_radius * np.cos(angles),
+        inner_top_radius * np.sin(angles),
+        np.full(body_segments, inner_top_z),
+    ])
+    inner_pts = np.vstack([inner_bottom_pts, inner_top_pts])
+    inner = trimesh.convex.convex_hull(inner_pts)
 
     body = outer.difference(inner)
 
-    angles = np.linspace(
+    # Ручка
+    handle_angles = np.linspace(
         -np.radians(handle_angle_deg) / 2,
         np.radians(handle_angle_deg) / 2,
         handle_segments,
     )
 
-    handle_center_x = body_radius
+    handle_center_x = (bottom_radius + top_radius) / 2
     handle_center_z = 0.0
 
     vertices_all = []
-
-    for i, angle in enumerate(angles):
+    for i, angle in enumerate(handle_angles):
         center = np.array([
             handle_center_x + handle_radius_major * np.cos(angle),
             0.0,
@@ -128,9 +152,7 @@ def create_cup(
     handle.fix_normals()
 
     cup = trimesh.util.concatenate([body, handle])
-
     return cup
-
 
 def create_mug(
     body_radius=30.0,
@@ -363,7 +385,7 @@ def _prepare_demo_meshes(data_dir: Path) -> None:
     cylinder.export(str(data_dir / "cylinder.stl"))
     mug = create_mug()
     mug.export(str(data_dir / "mug.stl"))
-    cup = create_cup()
+    cup = create_tea_cup()
     cup.export(str(data_dir / "cup.stl"))
 
 
@@ -598,7 +620,9 @@ def main() -> None:
     RUN_BC_TRAIN = False
     RUN_SAC_TRAIN = False
     RUN_SAC_EVAL = False
-    RUN_ADAPTIVE = False
+    RUN_ADAPTIVE = True
+    RUN_CUP_EVAL = False
+
 
     if IS_LOAD:
         epsilon_start = 0.15
@@ -1045,7 +1069,7 @@ def main() -> None:
             config=cfg,
             runs_dir=str(runs_dir),
             mesh_path=mesh_path,
-            offline_threshold=0.0,
+            offline_threshold=0.60,
             online_sac_update_every=200,
             online_sac_update_steps=50,
             online_bc_update_every=2000,
@@ -1119,8 +1143,6 @@ def main() -> None:
         print(f"\n=== Adaptive Final Stats ===")
         print(f"  {manager.get_stats()}")
         print(f"  {manager.arbitrator.get_stats()}")
-
-    RUN_CUP_EVAL = True
 
     if RUN_CUP_EVAL:
         print("\n" + "=" * 60)
