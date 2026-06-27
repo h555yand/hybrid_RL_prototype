@@ -1050,37 +1050,56 @@ def main() -> None:
 
     if RUN_ADAPTIVE:
         print("\n" + "=" * 60)
-        print("STEP 8: Adaptive Training")
+        print("STEP 10: Adaptive on Cup (transfer + online learning)")
         print("=" * 60)
 
-        env = LightweightEnv(mesh_path)
+        cup_mesh_path = str(data_dir / "cup.stl")
+        cup_env = LightweightEnv(cup_mesh_path)
+
+        # Q-store: загружаем adaptive если есть, иначе от кружки
+        adaptive_q_dir = runs_dir / "adaptive_q"
+        if (adaptive_q_dir / "config.json").exists():
+            q_load_dir = str(adaptive_q_dir)
+            print(f"[Adaptive] Loading Q-store from adaptive: {q_load_dir}")
+        else:
+            q_load_dir = str(runs_dir / f"{best_variant.lower()}_seed_{TRAIN_SEEDS[0]}")
+            print(f"[Adaptive] Loading Q-store from mug (transfer): {q_load_dir}")
+
         controller = RLGoalApproachController.load(
-            str(runs_dir / f"{best_variant.lower()}_seed_{TRAIN_SEEDS[0]}"),
-            agent_id="adaptive",
+            q_load_dir,
+            agent_id="cup_adaptive",
             config={**cfg, "mode": "eval"},
         )
 
+        # SAC: загружаем adaptive если есть, иначе от кружки
+        adaptive_sac_dir = runs_dir / "adaptive_sac"
+        if (adaptive_sac_dir / "sac_actor.pt").exists():
+            sac_load_dir = str(adaptive_sac_dir)
+            print(f"[Adaptive] Loading SAC from adaptive: {sac_load_dir}")
+        else:
+            sac_load_dir = str(runs_dir / "sac_model")
+            print(f"[Adaptive] Loading SAC from mug (transfer): {sac_load_dir}")
+
         sac_trainer = PSACTrainer(state_dim=cfg.get("state_dim", 15))
-        sac_trainer.load(str(runs_dir / "sac_model"))
+        sac_trainer.load(sac_load_dir)
 
         manager = AdaptiveTrainingManager(
             controller=controller,
-            env=env,
+            env=cup_env,
             config=cfg,
             runs_dir=str(runs_dir),
-            mesh_path=mesh_path,
-            offline_threshold=0.60,
+            mesh_path=cup_mesh_path,
+            offline_threshold=0.50,
             online_sac_update_every=200,
             online_sac_update_steps=50,
             online_bc_update_every=2000,
         )
-
         manager.sac_trainer = sac_trainer
 
-        for episode in range(1000):
-            env.reset()
-            start_pos = env.get_pose()[:3]
-            goal_pose = env.get_random_surface_point(
+        for episode in range(3000):
+            cup_env.reset()
+            start_pos = cup_env.get_pose()[:3]
+            goal_pose = cup_env.get_random_surface_point(
                 reference_pos=start_pos,
                 min_dist=10.0,
                 max_dist=120.0,
@@ -1088,14 +1107,14 @@ def main() -> None:
                 mesh_sample=True,
             )
             controller.set_new_goal(goal_pose, start_pos)
-            env.set_goal(goal_pose)
+            cup_env.set_goal(goal_pose)
 
             goals_before = controller._total_goals_reached
             episode_transitions = []
 
             for step in range(150):
-                current_pose = env.get_pose()
-                sensor_data = env.get_sensor_data()
+                current_pose = cup_env.get_pose()
+                sensor_data = cup_env.get_sensor_data()
 
                 state = controller._compute_state(current_pose, sensor_data)
                 action_index, source = manager.get_action(state, current_pose, sensor_data)
@@ -1103,12 +1122,21 @@ def main() -> None:
                 state, done = controller.update_only(current_pose, sensor_data, action_index)
 
                 if done:
-                    episode_transitions = controller.success_trails.copy() if controller._total_goals_reached > goals_before else []
+                    episode_transitions = (
+                        controller.success_trails.copy()
+                        if controller._total_goals_reached > goals_before
+                        else []
+                    )
                     break
 
-                env.step(action_index, controller.action_space)
-                if action_index in (controller.action_space.IDX_DETACH, controller.action_space.IDX_DETACH_EDGE):
-                    controller._last_detach_sub_steps = getattr(env, '_last_detach_sub_steps', 1)
+                cup_env.step(action_index, controller.action_space)
+                if action_index in (
+                    controller.action_space.IDX_DETACH,
+                    controller.action_space.IDX_DETACH_EDGE,
+                ):
+                    controller._last_detach_sub_steps = getattr(
+                        cup_env, '_last_detach_sub_steps', 1
+                    )
 
             success = controller._total_goals_reached > goals_before
             manager.on_episode_complete(
@@ -1121,17 +1149,18 @@ def main() -> None:
                 arb_stats = manager.arbitrator.get_stats()
                 print(
                     f"\n  Episode {episode+1}: mode={stats['mode']}, "
-                    f"success_rate={stats['success_rate']:.3f}"
+                    f"success_rate={stats['success_rate']:.3f}, "
+                    f"sac_updates={stats['total_sac_updates']}, "
+                    f"offline_iters={stats['total_offline_iterations']}"
                 )
                 print(
                     f"  Sources: q_store={arb_stats['q_store_rate']:.2f}, "
-                    f"q_weak={arb_stats['q_store_weak_rate']:.2f}, "
+                    f"q_weak={arb_stats.get('q_store_weak_rate', 0):.2f}, "
                     f"sac={arb_stats['sac_rate']:.2f}, "
                     f"heuristic={arb_stats['heuristic_rate']:.2f}"
                 )
                 print(
-                    f"  Agreement Q↔SAC: {arb_stats['agreement_rate']:.2f}, "
-                    f"q_conf={arb_stats['q_confidence_mean']:.2f}, "
+                    f"  Agreement: {arb_stats['agreement_rate']:.2f}, "
                     f"q_spread={arb_stats['q_spread_mean']:.2f}, "
                     f"sac_conf={arb_stats['sac_confidence_mean']:.2f}"
                 )
@@ -1140,7 +1169,18 @@ def main() -> None:
                 print(f"  Q chosen:    {arb_stats['q_chosen_top']}")
                 print(f"  SAC chosen:   {arb_stats['sac_chosen_top']}")
 
-        print(f"\n=== Adaptive Final Stats ===")
+        # Сохранить online-обновлённый Q-store
+        adaptive_q_save = str(runs_dir / "adaptive_q")
+        controller.save(adaptive_q_save)
+        print(f"[Adaptive] Q-store saved to {adaptive_q_save}")
+
+        # Сохранить online-обновлённый SAC
+        if manager.sac_trainer is not None:
+            adaptive_sac_save = str(runs_dir / "adaptive_sac")
+            manager.sac_trainer.save(adaptive_sac_save)
+            print(f"[Adaptive] SAC saved to {adaptive_sac_save}")
+
+        print(f"\n=== Cup Adaptive Final Stats ===")
         print(f"  {manager.get_stats()}")
         print(f"  {manager.arbitrator.get_stats()}")
 

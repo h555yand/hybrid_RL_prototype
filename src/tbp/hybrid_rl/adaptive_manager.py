@@ -1,3 +1,15 @@
+"""
+AdaptiveTrainingManager: monitors performance and decides
+when/how to train for new objects.
+
+Modes:
+  - inference_only: success_rate > 80%, no training needed
+  - online: 60-80%, update Q-store + accumulate for SAC
+  - offline: < 60%, selective retraining:
+      - Q-store: always retrain with decreasing epsilon (0.6 → 0.3 → 0.1 → 0.05)
+      - SAC: retrain only if SAC rate is below threshold
+"""
+
 import numpy as np
 import logging
 from collections import deque
@@ -211,7 +223,6 @@ class AdaptiveTrainingManager:
     def _trigger_offline(self):
         self.total_offline_iterations += 1
 
-        # Epsilon по расписанию: 0.6 → 0.3 → 0.1 → 0.05
         eps_idx = min(
             self.total_offline_iterations - 1,
             len(self.OFFLINE_Q_EPSILON_SCHEDULE) - 1
@@ -254,11 +265,10 @@ class AdaptiveTrainingManager:
             f"(success_rate={q_success_rate:.3f})"
         )
 
-        # === SAC: обучаем только если SAC ниже порога ===
+        # === SAC: обучаем только если SAC rate ниже порога ===
         arb_stats = self.arbitrator.get_stats()
         sac_rate = arb_stats.get("sac_rate", 0.0)
-        # Оценка SAC success rate: если SAC принимает мало решений,
-        # считаем что его нужно обучить
+
         need_sac_retrain = (
             self.sac_trainer is None
             or sac_rate < self.sac_offline_threshold
@@ -267,7 +277,7 @@ class AdaptiveTrainingManager:
         if need_sac_retrain:
             logger.info(
                 f"AdaptiveTraining: OFFLINE SAC retraining "
-                f"(overall_rate={self.success_rate:.3f}, "
+                f"(sac_rate={sac_rate:.3f}, "
                 f"threshold={self.sac_offline_threshold})"
             )
 
@@ -315,16 +325,21 @@ class AdaptiveTrainingManager:
                     )
             else:
                 logger.info(
-                    "AdaptiveTraining: OFFLINE SAC skipped — no success trails from Q-learning"
+                    "AdaptiveTraining: OFFLINE SAC skipped — "
+                    "no success trails from Q-learning"
                 )
         else:
             logger.info(
                 f"AdaptiveTraining: OFFLINE SAC skipped — "
-                f"overall rate {sac_rate:.3f} >= threshold {self.sac_offline_threshold}"
+                f"sac_rate {sac_rate:.3f} >= threshold {self.sac_offline_threshold}"
             )
 
+        # Сбросить историю — дать новой модели шанс накопить свою статистику
+        self.success_history.clear()
+
         logger.info(
-            f"AdaptiveTraining: OFFLINE iteration #{self.total_offline_iterations} complete"
+            f"AdaptiveTraining: OFFLINE iteration #{self.total_offline_iterations} complete, "
+            f"history cleared for next evaluation window"
         )
 
     def get_stats(self) -> Dict[str, Any]:
