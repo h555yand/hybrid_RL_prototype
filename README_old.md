@@ -56,99 +56,9 @@ During the learning process, the agent stores experience in a graph and then use
 I'm not opposed to deep learning. I agree that it's well suited for approximation, embedding, and many other tasks.  
 I'm not suggesting replacing neural networks, I'm suggesting supplementing it and improving the learning process.
 
-## You can read README_old.md for details and questions before POC was implemented
-
 # Guide-level explanation
 
-##  Main Proof of Concept Results
-
-The prototype has been implemented and tested on the Lightweight Environment (Trimesh-based). Below are the key results that I hope validate the ideas from the RFC.
-
-### Training Pipeline Validated
-
-The full pipeline works end-to-end: **Q-learning → Behavioral Cloning → SAC → Arbitrage**
-
-| Stage | Method | Success Rate | Object |
-|-------|--------|-------------|--------|
-| Q-learning (episodic memory) | HNSW + kNN + Heuristic-Guided Exploration | 65–70% | Mug |
-| SAC (skill, softmax policy) | BC warm-start → SAC | 71–77% | Mug |
-| Arbitrage (memory + skill) | Q-store + SAC + Heuristic | **78%** | Mug |
-| SAC zero-shot transfer | No retraining | **73%** | Cup (new object) |
-
-### Key Findings
-
-**1. Episodic Memory (HNSW State Store) works as proposed.** One-shot/few-shot learning through Q-update is effective. Update hit rate 0.84–0.95 confirms that kNN + Gaussian Kernel interpolation correctly finds and updates similar states. The store grows organically — dense where the agent visits often, sparse where it rarely goes.
-
-**2. Heuristic-Guided Exploration significantly outperforms ε-greedy.** This confirms the hypothesis from the RFC. Pure geometric heuristics (move toward goal, detach when stuck, steer in air) provide reasonable behavior from step 1, and Q-values gradually take over as experience accumulates.
-
-**4. Arbitrage between episodic memory and skills works.** On familiar objects, Q-store handles 59% of decisions (precise, local knowledge), SAC handles 41% (general strategy). Agreement rate 31% shows they provide complementary information.
-
-**5. On new objects transfer limitation discovered.** Q-store from one object can hurt performance on a new object (arbitrage zero-shot: 52% vs pure SAC: 73%).  This is expected — episodic memory is local by nature.  SAC generalizes better on new objects. This validates the skill-based approach — the neural network learns general navigation patterns that transfer across similar geometries. One more SAC advantage is continues parameters.
-The solution can be:
-- Start with pure SAC on new objects and let Q-store accumulate fresh experience.
-- Use Online / Offline learning approach during working with new objects. If success rate below online threshold during 100 episodes to start online learning in parallel, if below offline threshold to start offline and after finish to continue working with new object.
----
-
-## Answers to Open Questions
-
-### Q1: Optimal State Dimensionality
-
-I started with 13D and expanded to **15D** during testing. The additional features (mean curvature, Gaussian curvature) improved surface navigation.
-The state vector is action-space independent — it describes the agent's situation relative to the goal, not the specific actions available.
-
-### Q2: Hyperparameter Sensitivity
-
-Extensive empirical testing was performed. Key findings:
-- **Split the HNSW Q store** into two different graphs:
-`q_store_free` — airborne state (on_object = 0). Navigation: turns, forward, landing
-` q_store_surface` — surface state (on_object = 1). Crawling, detaching, orientation
-The same position in space requires **opposite strategies** depending on whether the agent is touching the surface
-- **Reward weights:** Increase penalty for collision from -5 to -15 
-- **Action steps:** `surface_step=3mm`, `free_step=5mm`, `rotation_step=5°` — smaller steps reduce collisions but increase episode length.
-- **SAC alpha bounds:** Critical for stability. `alpha_type ≥ 0.135` prevents policy collapse, `alpha_param ≤ 1.0` prevents parameter noise explosion.
-- **Replay buffer:** BC-protected reservoir (15%) prevents catastrophic forgetting of expert demonstrations.
-- **At the beginning I used 18 actions and then 2 macro actions were added**
-| Index | Action | Category | Description |
-|-------|--------|----------|-------------|
-| 18 | Detach | macro | Detach from surface along normal, then fly toward goal (blending goal direction with surface normal to avoid collision). Multi-step action: lift off along normal → turn toward goal → series of forward steps with depth checking and collision avoidance → land on contact with surface. Each sub-step incurs a step penalty. Collisions during flight are penalized but do not terminate the episode — the agent is repositioned to pre-collision location and the macro action terminates early |
-| 19 | DetachEdge | macro | Detach from surface along normal, then fly upward along the object's longest bounding-box axis until reaching the edge, turn toward goal and fly over to the other side. Used when the goal is through a thin wall (agent and goal normals are opposite). Same penalty and collision handling as Detach |
-
-The Lightweight Environment (Trimesh) proved essential for rapid iteration — each experiment takes ~ 30-60 minutes on my laptop)
-
----
-
-### On action space independence
-
-> "Try and make the solution one that is action space independent"
-
-**Status: Partially addressed.**
-- `ActionSpace` is a configurable input parameter — adding or removing actions does not require architectural changes to Q-learning or SAC
-- HNSW and SAC work with any number of discrete actions
-- The system was tested with 18 actions (without detach) and 20 actions (with detach), confirming that the core learning pipeline adapts
-
-**Limitation:** Heuristic biases currently reference specific action indices (e.g., `IDX_DETACH`, `IDX_FREE_FORWARD`). For a different action space, heuristics would need to be adapted. This is by design — heuristics encode domain-specific geometric reasoning that depends on what actions are available. A fully action-space independent heuristic system would require a mapping layer between geometric intentions (e.g., "move toward goal") and available actions.
-
-### On the need for HNSW if good heuristics exist
-
-> "If we have good heuristics to generate initial action sequences, what is the additional need for storing and retrieving them?"
-
-**Answer from experiments:** Heuristics alone achieve ~48% success rate. 
-Of course they can be improved, but it's continues effort to tune them for new cases.. HNSW stores the **learned corrections** — situations where heuristics were wrong and Q-learning motivated to discovery better actions. After training, Q-store + heuristics achieve 65–70%, and with SAC added, 78%.
-
-The key insight: heuristics provide the **starting point**, episodic memory stores **exceptions and refinements**, and SAC learns **general patterns**. Each layer adds value.
-
-
-Of course it's not enough to understand all things, I will prepare and share details later together with the source code. Now it works but it needs to review, comment, check one more time etc.
-After that we can discuss details and next steps.
-
-## Training strategy
-### You can read files train.md in ./docs folder
-
 ## Architecture Overview
-
-### You can read files design.md, HNSW_store.md in ./docs folder
-
-#### Below old materails that will be updated based on POC results
 
 Evidence LM's Goal-State Generator proposes the goal-state from the hypothesis-testing policy.
 **goal_pose** = [x, y, z, pitch, yaw, roll]  

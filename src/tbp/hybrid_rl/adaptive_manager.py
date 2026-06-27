@@ -1,13 +1,3 @@
-"""
-AdaptiveTrainingManager: monitors performance and decides
-when/how to train for new objects.
-
-Modes:
-  - inference_only: success_rate > 80%, no training needed
-  - online: 60-80%, update Q-store + accumulate for SAC
-  - offline: < 60%, full Q-learning → BC → SAC cycle
-"""
-
 import numpy as np
 import logging
 from collections import deque
@@ -29,6 +19,8 @@ logger = logging.getLogger(__name__)
 
 class AdaptiveTrainingManager:
 
+    OFFLINE_Q_EPSILON_SCHEDULE = [0.6, 0.3, 0.1, 0.05]
+
     def __init__(
         self,
         controller: RLGoalApproachController,
@@ -38,12 +30,13 @@ class AdaptiveTrainingManager:
         mesh_path: str,
         online_threshold: float = 0.80,
         offline_threshold: float = 0.60,
+        sac_offline_threshold: float = 0.60,
         monitor_window: int = 100,
         online_sac_update_every: int = 200,
         online_sac_update_steps: int = 50,
         online_bc_update_every: int = 2000,
         offline_q_episodes: int = 5000,
-        offline_sac_episodes: int = 10000,
+        offline_sac_episodes: int = 2000,
     ):
         self.controller = controller
         self.env = env
@@ -53,6 +46,7 @@ class AdaptiveTrainingManager:
 
         self.online_threshold = online_threshold
         self.offline_threshold = offline_threshold
+        self.sac_offline_threshold = sac_offline_threshold
         self.monitor_window = monitor_window
         self.online_sac_update_every = online_sac_update_every
         self.online_sac_update_steps = online_sac_update_steps
@@ -67,6 +61,7 @@ class AdaptiveTrainingManager:
         self.total_episodes = 0
         self.total_sac_updates = 0
         self.total_bc_updates = 0
+        self.total_offline_iterations = 0
         self.mode = "inference_only"
 
         self.sac_trainer = None
@@ -138,13 +133,11 @@ class AdaptiveTrainingManager:
             self.mode = "online"
 
     def _collect_transitions(self, success: bool, transitions: List[Dict[str, Any]]):
-        """Собираем transitions из всех эпизодов (успешных и нет)."""
         if transitions:
             psac_transitions = self.extractor.convert_trajectory(transitions)
             self.online_transitions_raw.extend(psac_transitions)
 
     def _maybe_online_sac_update(self):
-        """Периодически обновляем SAC на собранных данных."""
         if self.sac_trainer is None:
             return
 
@@ -154,7 +147,6 @@ class AdaptiveTrainingManager:
         if len(self.online_transitions_raw) < self.sac_trainer.batch_size:
             return
 
-        # Нормализуем и добавляем в буфер
         added = 0
         for tr in self.online_transitions_raw:
             if tr.next_state is None:
@@ -179,7 +171,6 @@ class AdaptiveTrainingManager:
             )
             added += 1
 
-        # Обновляем сети
         if len(self.sac_trainer.buffer) >= self.sac_trainer.batch_size:
             for _ in range(self.online_sac_update_steps):
                 batch = self.sac_trainer.buffer.sample(self.sac_trainer.batch_size)
@@ -198,16 +189,12 @@ class AdaptiveTrainingManager:
         )
 
     def _maybe_online_bc_update(self):
-        """Периодически дообучаем BC на накопленных успешных траекториях."""
         if self.sac_trainer is None:
             return
 
         if self.online_episodes_since_bc_update < self.online_bc_update_every:
             return
 
-        # Собираем BC данные из успешных траекторий в буфере
-        # BC использует только protected BC зону буфера — она уже есть
-        # Дополнительно можно дообучить actor на текущих BC данных
         if self.sac_trainer.bc_data is not None and len(self.sac_trainer.bc_data) > 100:
             for _ in range(20):
                 batch = self.sac_trainer.buffer.sample(self.sac_trainer.batch_size)
@@ -222,57 +209,123 @@ class AdaptiveTrainingManager:
             )
 
     def _trigger_offline(self):
+        self.total_offline_iterations += 1
+
+        # Epsilon по расписанию: 0.6 → 0.3 → 0.1 → 0.05
+        eps_idx = min(
+            self.total_offline_iterations - 1,
+            len(self.OFFLINE_Q_EPSILON_SCHEDULE) - 1
+        )
+        q_epsilon = self.OFFLINE_Q_EPSILON_SCHEDULE[eps_idx]
+
         logger.info(
-            f"AdaptiveTraining: triggering OFFLINE training "
-            f"(success_rate={self.success_rate:.3f})"
+            f"AdaptiveTraining: triggering OFFLINE iteration #{self.total_offline_iterations} "
+            f"(success_rate={self.success_rate:.3f}, q_epsilon={q_epsilon})"
         )
 
+        # === Q-learning: всегда обучаем ===
         q_save_dir = str(self.runs_dir / "adaptive_q")
+        q_load_dir = q_save_dir if (Path(q_save_dir) / "config.json").exists() else None
+
+        logger.info(
+            f"AdaptiveTraining: OFFLINE Q-learning "
+            f"(episodes={self.offline_q_episodes}, epsilon={q_epsilon}, "
+            f"load={'yes' if q_load_dir else 'no'})"
+        )
+
         train_result = train(
             mesh_dir=str(self.runs_dir.parent),
             save_dir=q_save_dir,
             num_episodes=self.offline_q_episodes,
-            config={**self.config, "mode": "train_adapt_epsilon", "epsilon_start": 0.3},
+            config={
+                **self.config,
+                "mode": "train_adapt_epsilon",
+                "epsilon_start": q_epsilon,
+            },
             mesh_path=self.mesh_path,
-            load_dir=q_save_dir if (Path(q_save_dir) / "config.json").exists() else None,
+            load_dir=q_load_dir,
             seed=42,
             return_metrics=True,
         )
 
-        success_trails = train_result.get("success_trails", [])
-        if success_trails:
-            bc_transitions = self.extractor.convert_all_trajectories(success_trails)
+        q_success_rate = train_result.get("success_rate", 0.0)
+        logger.info(
+            f"AdaptiveTraining: OFFLINE Q-learning complete "
+            f"(success_rate={q_success_rate:.3f})"
+        )
 
-            if len(bc_transitions) > 100:
-                bc_trainer = BCTrainer(state_dim=self.config.get("state_dim", 15))
-                bc_trainer.train(bc_transitions, num_epochs=200)
-                bc_model_dir = str(self.runs_dir / "adaptive_bc")
-                bc_trainer.save(bc_model_dir)
+        # === SAC: обучаем только если SAC ниже порога ===
+        arb_stats = self.arbitrator.get_stats()
+        sac_rate = arb_stats.get("sac_rate", 0.0)
+        # Оценка SAC success rate: если SAC принимает мало решений,
+        # считаем что его нужно обучить
+        need_sac_retrain = (
+            self.sac_trainer is None
+            or sac_rate < self.sac_offline_threshold
+        )
 
-                import pickle
-                bc_data_path = str(self.runs_dir / "adaptive_bc_data.pkl")
-                with open(bc_data_path, "wb") as f:
-                    pickle.dump(bc_transitions, f)
+        if need_sac_retrain:
+            logger.info(
+                f"AdaptiveTraining: OFFLINE SAC retraining "
+                f"(overall_rate={self.success_rate:.3f}, "
+                f"threshold={self.sac_offline_threshold})"
+            )
 
-                sac_trainer = PSACTrainer(
-                    state_dim=self.config.get("state_dim", 15),
-                    lr_actor=1e-5,
-                    bc_lambda_init=5.0,
-                    bc_lambda_decay=0.999999,
+            success_trails = train_result.get("success_trails", [])
+            if success_trails:
+                bc_transitions = self.extractor.convert_all_trajectories(success_trails)
+
+                if len(bc_transitions) > 100:
+                    bc_trainer = BCTrainer(state_dim=self.config.get("state_dim", 15))
+                    bc_trainer.train(bc_transitions, num_epochs=200)
+                    bc_model_dir = str(self.runs_dir / "adaptive_bc")
+                    bc_trainer.save(bc_model_dir)
+
+                    import pickle
+                    bc_data_path = str(self.runs_dir / "adaptive_bc_data.pkl")
+                    with open(bc_data_path, "wb") as f:
+                        pickle.dump(bc_transitions, f)
+
+                    sac_trainer = PSACTrainer(
+                        state_dim=self.config.get("state_dim", 15),
+                        lr_actor=1e-5,
+                        bc_lambda_init=5.0,
+                        bc_lambda_decay=0.999999,
+                    )
+                    sac_trainer.load_bc(bc_model_dir, bc_data_path)
+
+                    sac_trainer.train(
+                        env=self.env,
+                        controller=self.controller,
+                        num_episodes=self.offline_sac_episodes,
+                        save_dir=str(self.runs_dir / "adaptive_sac"),
+                        curriculum_levels=[
+                            (10.0, 40.0),
+                            (20.0, 80.0),
+                            (40.0, 120.0),
+                        ],
+                    )
+
+                    self.sac_trainer = sac_trainer
+                    logger.info("AdaptiveTraining: OFFLINE SAC retraining complete")
+                else:
+                    logger.info(
+                        f"AdaptiveTraining: OFFLINE SAC skipped — "
+                        f"insufficient BC data ({len(bc_transitions)} transitions)"
+                    )
+            else:
+                logger.info(
+                    "AdaptiveTraining: OFFLINE SAC skipped — no success trails from Q-learning"
                 )
-                sac_trainer.load_bc(bc_model_dir, bc_data_path)
+        else:
+            logger.info(
+                f"AdaptiveTraining: OFFLINE SAC skipped — "
+                f"overall rate {self.success_rate:.3f} >= threshold {self.sac_offline_threshold}"
+            )
 
-                sac_trainer.train(
-                    env=self.env,
-                    controller=self.controller,
-                    num_episodes=self.offline_sac_episodes,
-                    save_dir=str(self.runs_dir / "adaptive_sac"),
-                    curriculum_levels=[(10.0, 40.0), (20.0, 80.0), (40.0, 120.0)],
-                )
-
-                self.sac_trainer = sac_trainer
-
-        logger.info("AdaptiveTraining: offline training complete")
+        logger.info(
+            f"AdaptiveTraining: OFFLINE iteration #{self.total_offline_iterations} complete"
+        )
 
     def get_stats(self) -> Dict[str, Any]:
         return {
@@ -284,6 +337,7 @@ class AdaptiveTrainingManager:
             "sac_loaded": self.sac_trainer is not None,
             "total_sac_updates": self.total_sac_updates,
             "total_bc_updates": self.total_bc_updates,
+            "total_offline_iterations": self.total_offline_iterations,
             "episodes_since_sac_update": self.online_episodes_since_sac_update,
             "episodes_since_bc_update": self.online_episodes_since_bc_update,
         }
