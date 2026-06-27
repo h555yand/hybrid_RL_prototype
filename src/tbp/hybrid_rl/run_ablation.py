@@ -1089,10 +1089,10 @@ def main() -> None:
             config=cfg,
             runs_dir=str(runs_dir),
             mesh_path=cup_mesh_path,
-            offline_threshold=0.50,
-            online_sac_update_every=200,
-            online_sac_update_steps=50,
-            online_bc_update_every=2000,
+            #offline_threshold=0.60,
+            #online_sac_update_every=200,
+            #online_sac_update_steps=50,
+            #online_bc_update_every=2000,
         )
         manager.sac_trainer = sac_trainer
 
@@ -1143,6 +1143,7 @@ def main() -> None:
                 success=success,
                 transitions=episode_transitions,
             )
+            manager.arbitrator.on_episode_end(success)
 
             if (episode + 1) % 100 == 0:
                 stats = manager.get_stats()
@@ -1151,13 +1152,20 @@ def main() -> None:
                     f"\n  Episode {episode+1}: mode={stats['mode']}, "
                     f"success_rate={stats['success_rate']:.3f}, "
                     f"sac_updates={stats['total_sac_updates']}, "
-                    f"offline_iters={stats['total_offline_iterations']}"
+                    f"offline_iters={stats['total_offline_iterations']}, "
+                    f"sac_priority={stats['sac_priority_active']}"
                 )
                 print(
                     f"  Sources: q_store={arb_stats['q_store_rate']:.2f}, "
                     f"q_weak={arb_stats.get('q_store_weak_rate', 0):.2f}, "
                     f"sac={arb_stats['sac_rate']:.2f}, "
                     f"heuristic={arb_stats['heuristic_rate']:.2f}"
+                )
+                print(
+                    f"  Source success: q={arb_stats['q_success_rate']:.2f} "
+                    f"({arb_stats['q_episodes']} ep), "
+                    f"sac={arb_stats['sac_success_rate']:.2f} "
+                    f"({arb_stats['sac_episodes']} ep)"
                 )
                 print(
                     f"  Agreement: {arb_stats['agreement_rate']:.2f}, "

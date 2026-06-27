@@ -14,7 +14,7 @@ import numpy as np
 import torch
 import logging
 from typing import Dict, Any, Optional, Tuple
-from collections import defaultdict
+from collections import defaultdict, deque
 
 from .rl_goal_approach_controller import RLGoalApproachController
 from .sac_actor import SACActorNetwork
@@ -75,6 +75,7 @@ class Arbitrator:
         q_spread_threshold: float = 1.0,
         sac_confidence_threshold: float = 0.3,
         q_weak_threshold: float = 0.2,
+        source_success_window: int = 100,
     ):
         self.controller = controller
         self.sac_actor = sac_actor
@@ -95,30 +96,32 @@ class Arbitrator:
             "total_decisions": 0,
         }
 
-        # Статистика предложенных действий (что каждый источник хотел)
+        # Статистика предложенных действий
         self.q_proposed_actions = defaultdict(int)
         self.sac_proposed_actions = defaultdict(int)
 
-        # Статистика выбранных действий (что реально выполнилось)
+        # Статистика выбранных действий
         self.q_chosen_actions = defaultdict(int)
         self.sac_chosen_actions = defaultdict(int)
         self.heuristic_chosen_actions = defaultdict(int)
 
-        # Согласованность: как часто Q и SAC предлагают одно и то же
+        # Согласованность
         self.agreement_count = 0
         self.both_proposed_count = 0
 
-        # Q-store диагностика
+        # Диагностика
         self.q_confidence_history = []
         self.q_spread_history = []
         self.sac_confidence_history = []
 
-    def decide(
-        self,
-        state: np.ndarray,
-        current_pose: np.ndarray,
-        sensor_data: Dict[str, Any],
-    ) -> Tuple[int, str]:
+        # Success rate по источникам (per episode)
+        self._current_episode_sources = []
+        self._q_episode_results = deque(maxlen=source_success_window)
+        self._sac_episode_results = deque(maxlen=source_success_window)
+        self._heuristic_episode_results = deque(maxlen=source_success_window)
+        self.boost_sac = False  # управляется из AdaptiveTrainingManager
+
+    def decide(self, state, current_pose, sensor_data):
         self.stats["total_decisions"] += 1
 
         q_action, q_confidence, q_spread = self._get_q_action(state)
@@ -128,40 +131,45 @@ class Arbitrator:
         q_name = action_space.get_info(q_action).name
         sac_name = action_space.get_info(sac_action).name
 
-        # Записываем что каждый предложил
         self.q_proposed_actions[q_name] += 1
         if self.sac_actor is not None:
             self.sac_proposed_actions[sac_name] += 1
 
-        # Согласованность
         if self.sac_actor is not None:
             self.both_proposed_count += 1
             if q_action == sac_action:
                 self.agreement_count += 1
 
-        # Диагностика (храним последние 1000)
         if len(self.q_confidence_history) < 1000:
             self.q_confidence_history.append(q_confidence)
             self.q_spread_history.append(q_spread)
             if self.sac_actor is not None:
                 self.sac_confidence_history.append(sac_confidence)
 
+        # Порог Q-store: повышен если SAC приоритет активен
+        q_spread_thr = self.q_spread_threshold
+        if self.boost_sac:
+            q_spread_thr = self.q_spread_threshold * 3.0
+
         # 1. Q-store уверен И различает действия
-        if q_confidence > self.q_confidence_threshold and q_spread > self.q_spread_threshold:
+        if q_confidence > self.q_confidence_threshold and q_spread > q_spread_thr:
             self.stats["q_store_chosen"] += 1
             self.q_chosen_actions[q_name] += 1
+            self._current_episode_sources.append("q_store")
             return q_action, "q_store"
 
         # 2. SAC уверен
         if self.sac_actor is not None and sac_confidence > self.sac_confidence_threshold:
             self.stats["sac_chosen"] += 1
             self.sac_chosen_actions[sac_name] += 1
+            self._current_episode_sources.append("sac")
             return sac_action, "sac"
 
         # 3. Q-store слабый fallback
         if q_confidence > self.q_weak_threshold:
             self.stats["q_store_weak_chosen"] += 1
             self.q_chosen_actions[q_name] += 1
+            self._current_episode_sources.append("q_store")
             return q_action, "q_store_weak"
 
         # 4. Heuristic
@@ -169,7 +177,59 @@ class Arbitrator:
         h_name = action_space.get_info(heuristic_action).name
         self.stats["heuristic_chosen"] += 1
         self.heuristic_chosen_actions[h_name] += 1
+        self._current_episode_sources.append("heuristic")
         return heuristic_action, "heuristic"
+    
+    def on_episode_end(self, success: bool):
+        """Вызывается после каждого эпизода для подсчёта success rate по источникам."""
+        if not self._current_episode_sources:
+            self._current_episode_sources = []
+            return
+
+        # Определяем доминирующий источник эпизода (>50% решений)
+        from collections import Counter
+        counts = Counter(self._current_episode_sources)
+        total = len(self._current_episode_sources)
+        dominant = counts.most_common(1)[0][0]
+        dominant_ratio = counts[dominant] / total
+
+        # Записываем результат для доминирующего источника
+        if dominant_ratio > 0.5:
+            if dominant == "q_store":
+                self._q_episode_results.append(success)
+            elif dominant == "sac":
+                self._sac_episode_results.append(success)
+            elif dominant == "heuristic":
+                self._heuristic_episode_results.append(success)
+        else:
+            # Смешанный эпизод — записываем для обоих
+            for source in counts:
+                if source == "q_store":
+                    self._q_episode_results.append(success)
+                elif source == "sac":
+                    self._sac_episode_results.append(success)
+                elif source == "heuristic":
+                    self._heuristic_episode_results.append(success)
+
+        self._current_episode_sources = []
+
+    @property
+    def q_success_rate(self) -> float:
+        if len(self._q_episode_results) == 0:
+            return 0.0
+        return sum(self._q_episode_results) / len(self._q_episode_results)
+
+    @property
+    def sac_success_rate(self) -> float:
+        if len(self._sac_episode_results) == 0:
+            return 0.0
+        return sum(self._sac_episode_results) / len(self._sac_episode_results)
+
+    @property
+    def heuristic_success_rate(self) -> float:
+        if len(self._heuristic_episode_results) == 0:
+            return 0.0
+        return sum(self._heuristic_episode_results) / len(self._heuristic_episode_results)
 
     def _get_q_action(self, state: np.ndarray) -> Tuple[int, float, float]:
         store = self.controller._select_store(state)
@@ -259,26 +319,26 @@ class Arbitrator:
             }
 
         return {
-            # Выбор источника
             "total_decisions": self.stats["total_decisions"],
             "q_store_rate": round(self.stats["q_store_chosen"] / total, 3),
             "q_store_weak_rate": round(self.stats["q_store_weak_chosen"] / total, 3),
             "sac_rate": round(self.stats["sac_chosen"] / total, 3),
             "heuristic_rate": round(self.stats["heuristic_chosen"] / total, 3),
 
-            # Согласованность Q и SAC
-            "agreement_rate": round(agreement_rate, 3),
+            # Success rate по источникам
+            "q_success_rate": round(self.q_success_rate, 3),
+            "sac_success_rate": round(self.sac_success_rate, 3),
+            "heuristic_success_rate": round(self.heuristic_success_rate, 3),
+            "q_episodes": len(self._q_episode_results),
+            "sac_episodes": len(self._sac_episode_results),
 
-            # Средние confidence/spread
+            "agreement_rate": round(agreement_rate, 3),
             "q_confidence_mean": round(q_conf_mean, 3),
             "q_spread_mean": round(q_spread_mean, 3),
             "sac_confidence_mean": round(sac_conf_mean, 3),
 
-            # Топ предложенных действий
             "q_proposed_top": _top_actions(self.q_proposed_actions),
             "sac_proposed_top": _top_actions(self.sac_proposed_actions),
-
-            # Топ выбранных действий
             "q_chosen_top": _top_actions(self.q_chosen_actions),
             "sac_chosen_top": _top_actions(self.sac_chosen_actions),
         }
