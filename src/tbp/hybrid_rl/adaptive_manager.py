@@ -320,7 +320,7 @@ class AdaptiveTrainingManager:
         else:
             logger.info(
                 f"AdaptiveTraining: OFFLINE SAC skipped — "
-                f"overall rate {self.success_rate:.3f} >= threshold {self.sac_offline_threshold}"
+                f"overall rate {sac_rate:.3f} >= threshold {self.sac_offline_threshold}"
             )
 
         logger.info(

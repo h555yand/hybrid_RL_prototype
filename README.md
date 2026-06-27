@@ -57,6 +57,7 @@ I'm not opposed to deep learning. I agree that it's well suited for approximatio
 I'm not suggesting replacing neural networks, I'm suggesting supplementing it and improving the learning process.
 
 ## You can read README_old.md for details and questions before POC was implemented
+[LINK](README_old.md)
 
 # Guide-level explanation
 
@@ -143,10 +144,13 @@ After that we can discuss details and next steps.
 
 ## Training strategy
 ### You can read files train.md in ./docs folder
+[LINK train](docs/train.md)
 
 ## Architecture Overview
 
 ### You can read files design.md, HNSW_store.md in ./docs folder
+[LINK design](docs/design.md)  
+[LINK HNSW_store](docs/HNSW_store.md)
 
 #### Below old materails that will be updated based on POC results
 
