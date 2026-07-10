@@ -1,4 +1,4 @@
-# Новый файл: lightweight_env.py
+# lightweight_env.py
 import trimesh
 import numpy as np
 from scipy.spatial.transform import Rotation as R
@@ -34,10 +34,17 @@ class LightweightEnv:
         # Note: seed is set globally in train() => np.random.seed()
         # trimesh.sample() uses global np.random
         self._passed_through = False
+        self._detach_had_collision = False
+        self._compute_up_direction()  # ← ДОБАВИТЬ
     
+    @staticmethod
+    def _normalize_euler(angles):
+        return (np.array(angles, dtype=float) + 180.0) % 360.0 - 180.0
+
     def reset(self, position=None, rotation=None):
         """Place the agent in the starting position."""
         self._passed_through = False
+        self._detach_had_collision = False
         if position is not None:
             self.agent_pos = np.array(position, dtype=float)
         else:
@@ -57,6 +64,7 @@ class LightweightEnv:
             # If the position was set manually, but the rotation was not, you can leave it at 0
             self.agent_rot = np.zeros(3)
 
+        self.agent_rot = self._normalize_euler(self.agent_rot)
         return self.get_sensor_data()    
     
     def set_goal(self, goal_pose):
@@ -73,8 +81,14 @@ class LightweightEnv:
         Returns:
             sensor_data: point_normal, on_object, depth
         """
-
+        # Сбрасываем флаг в начале каждого step
+        self._detach_had_collision = False
+        
         action_info = action_space.get_info(action_index)
+
+        if action_info.name in ("look_up", "look_down"):
+            rot_before = R.from_euler("xyz", self.agent_rot, degrees=True)
+            forward_before = rot_before.apply([0, 0, -1])
         
         if action_info.name == "move_tangentially":
             self._move_tangentially(
@@ -124,7 +138,18 @@ class LightweightEnv:
                     rotation_step=action_space.rotation_step,
                     free_step=action_space.free_step,
                 )
-        
+        if action_info.name in ("look_up", "look_down"):
+            rot_after = R.from_euler("xyz", self.agent_rot, degrees=True)
+            forward_after = rot_after.apply([0, 0, -1])
+            height_axis = getattr(self, 'height_axis', 2)
+            logger.debug(
+                f"LOOK_DEBUG: action={action_info.name}, "
+                f"forward_z_before={forward_before[height_axis]:.3f}, "
+                f"forward_z_after={forward_after[height_axis]:.3f}, "
+                f"agent_rot={self.agent_rot}"
+            )
+        # Нормализовать в конце
+        self.agent_rot = self._normalize_euler(self.agent_rot)
         return self.get_sensor_data()
     
     def get_sensor_data(self):
@@ -153,6 +178,40 @@ class LightweightEnv:
             goal_pos = self._current_goal[:3]
             _, _, gf_id = self.mesh.nearest.on_surface([goal_pos])
             goal_normal = self.mesh.face_normals[gf_id[0]].tolist()
+
+        # ═══ path_blocked: агент и цель на разных сторонах стенки ═══
+        path_blocked = False
+        if hasattr(self, '_current_goal') and self._current_goal is not None:
+            goal_pos = self._current_goal[:3]
+            center = (self.mesh.bounds[0] + self.mesh.bounds[1]) / 2.0
+            h = self.height_axis
+
+            # Вектор от центра (горизонтальная проекция)
+            agent_from_center = self.agent_pos - center
+            agent_from_center[h] = 0.0
+
+            goal_from_center = goal_pos - center
+            goal_from_center[h] = 0.0
+
+            # Определяем inside/outside по нормали агента
+            agent_outside = True  # fallback
+            if point_normal is not None:
+                n = np.array(point_normal)
+                n_horiz = n.copy()
+                n_horiz[h] = 0.0
+                if np.linalg.norm(n_horiz) > 0.1:
+                    agent_outside = np.dot(n_horiz, agent_from_center) > 0
+
+            # Определяем inside/outside по нормали цели
+            goal_outside = True  # fallback
+            if goal_normal is not None:
+                gn = np.array(goal_normal)
+                gn_horiz = gn.copy()
+                gn_horiz[h] = 0.0
+                if np.linalg.norm(gn_horiz) > 0.1:
+                    goal_outside = np.dot(gn_horiz, goal_from_center) > 0
+
+            path_blocked = (agent_outside != goal_outside)
         
         return {
             "point_normal": point_normal,
@@ -161,8 +220,11 @@ class LightweightEnv:
             "depth": depth,
             "passed_through": getattr(self, '_passed_through', False),
             "goal_normal": goal_normal,
+            "detach_had_collision": getattr(self, '_detach_had_collision', False),
+            "detach_sub_steps": getattr(self, '_last_detach_sub_steps', 1),
+            "path_blocked": path_blocked,
         }
-    
+        
     def get_pose(self):
         """The agent's current pose."""
         return np.concatenate([self.agent_pos, self.agent_rot])
@@ -464,77 +526,205 @@ class LightweightEnv:
         # Apply pitch rotation (around X axis)
         self.agent_rot[0] += rotation_degrees  # X-axis = pitch
     
+    def _compute_up_direction(self):
+        bbox_min = self.mesh.bounds[0]
+        bbox_max = self.mesh.bounds[1]
+        center = (bbox_min + bbox_max) / 2.0
+        extents = bbox_max - bbox_min
+        
+        self.height_axis = int(np.argmin(extents))
+        horiz_axes = [i for i in range(3) if i != self.height_axis]
+        
+        # Стреляем лучами вдоль height_axis из центра
+        # в обе стороны и считаем попадания
+        
+        # Генерируем сетку точек в горизонтальной плоскости
+        n_probes = 25  # 5x5 сетка
+        probe_points = []
+        for i in range(5):
+            for j in range(5):
+                pt = center.copy()
+                r0 = min(extents[horiz_axes[0]], extents[horiz_axes[1]]) * 0.3
+                pt[horiz_axes[0]] = center[horiz_axes[0]] + r0 * (i/4 - 0.5)
+                pt[horiz_axes[1]] = center[horiz_axes[1]] + r0 * (j/4 - 0.5)
+                probe_points.append(pt)
+        
+        probe_points = np.array(probe_points)
+        
+        # Лучи вверх (+height_axis)
+        dir_up = np.zeros(3)
+        dir_up[self.height_axis] = 1.0
+        dirs_up = np.tile(dir_up, (n_probes, 1))
+        
+        # Стреляем из точек чуть выше центра
+        origins_up = probe_points.copy()
+        origins_up[:, self.height_axis] = center[self.height_axis] + 1.0
+        
+        hits_up, _, _ = self.mesh.ray.intersects_location(
+            ray_origins=origins_up,
+            ray_directions=dirs_up,
+        )
+        
+        # Лучи вниз (-height_axis)
+        dir_down = np.zeros(3)
+        dir_down[self.height_axis] = -1.0
+        dirs_down = np.tile(dir_down, (n_probes, 1))
+        
+        origins_down = probe_points.copy()
+        origins_down[:, self.height_axis] = center[self.height_axis] - 1.0
+        
+        hits_down, _, _ = self.mesh.ray.intersects_location(
+            ray_origins=origins_down,
+            ray_directions=dirs_down,
+        )
+        
+        # Меньше попаданий = открытая сторона
+        n_hits_up = len(hits_up)
+        n_hits_down = len(hits_down)
+        
+        if n_hits_up < n_hits_down:
+            # Вверх меньше попаданий → верх открыт
+            self.up_sign = 1.0
+        elif n_hits_down < n_hits_up:
+            # Вниз меньше попаданий → низ открыт (перевёрнутая чашка)
+            self.up_sign = -1.0
+        else:
+            # Одинаково → fallback: вверх по оси
+            self.up_sign = 1.0
+        
+        self.up_direction = np.zeros(3)
+        self.up_direction[self.height_axis] = self.up_sign
+        
+        self.open_edge_height = (
+            bbox_max[self.height_axis] if self.up_sign > 0 
+            else bbox_min[self.height_axis]
+        )
+
     def _detach_and_fly_to_edge(self, goal_pose, rotation_step=5.0, free_step=8.0, max_sub_steps=3):
         detach_fly_step = 8.0
+        safe_step = 3.0
         sub_steps = 0
-        detach_step = 2.0
+        detach_step = 8.0
+
+        self._detach_had_collision = False
 
         sensor = self.get_sensor_data()
         if sensor.get("point_normal") is None:
+            self._last_detach_sub_steps = sub_steps
             return self.get_sensor_data()
 
         normal = np.array(sensor["point_normal"], dtype=float)
         normal /= (np.linalg.norm(normal) + 1e-12)
 
+        # ═══ Фаза 1: Отрыв по нормали ═══
         self.agent_rot = self._look_at_direction(normal)
-        self._move_forward(detach_step)
-        sub_steps += 1
+        
+        flown = 0.0
+        while flown < detach_step:
+            old_pos = self.agent_pos.copy()
+            step = min(safe_step, detach_step - flown)
+            sensor_check = self.get_sensor_data()
+            depth = sensor_check.get("depth", 100.0)
+            if depth < step + 1.0:
+                step = max(depth - 1.0, 0.5)
+            self._move_forward(step)
+            flown += step
+            sub_steps += 1
+            if self._passed_through:
+                self.agent_pos = old_pos
+                self._passed_through = False
+                self._detach_had_collision = True
+                self._last_detach_sub_steps = sub_steps
+                return self.get_sensor_data()
 
-        if self._passed_through:
-            self.agent_pos = self.agent_pos - normal * detach_step
-            self._passed_through = False
-            self._last_detach_sub_steps = sub_steps
-            return self.get_sensor_data()
+        # ═══ Фаза 2: Лететь к открытому краю ═══
+        up_dir = self.up_direction
+        height_axis = self.height_axis
+        open_edge_height = self.open_edge_height
 
         bbox_min = self.mesh.bounds[0]
         bbox_max = self.mesh.bounds[1]
+        center = (bbox_min + bbox_max) / 2.0
 
-        extents = bbox_max - bbox_min
-        axis_idx = np.argmax(extents)
+        # Внутри или снаружи?
+        agent_to_center = center - self.agent_pos
+        agent_to_center[height_axis] = 0.0
+        dot_normal_to_center = np.dot(normal, agent_to_center)
+        is_inside = dot_normal_to_center > 0
 
-        up_dir = np.zeros(3)
-        up_dir[axis_idx] = 1.0
-
-        tangent = up_dir - np.dot(up_dir, normal) * normal
-        tangent_len = np.linalg.norm(tangent)
-        if tangent_len > 1e-8:
-            tangent /= tangent_len
+        if is_inside:
+            to_center_horiz = agent_to_center.copy()
+            to_center_len = np.linalg.norm(to_center_horiz)
+            if to_center_len > 1e-8:
+                to_center_horiz /= to_center_len
+            fly_dir = up_dir * 1.0 + to_center_horiz * 0.2
+            overshoot = detach_fly_step
         else:
-            tangent = np.cross(normal, np.array([0, 0, 1]))
-            if np.linalg.norm(tangent) < 1e-8:
-                tangent = np.cross(normal, np.array([1, 0, 0]))
-            tangent /= (np.linalg.norm(tangent) + 1e-12)
+            fly_dir = normal * 1.0 + up_dir * 0.5
+            overshoot = detach_fly_step 
 
-        self.agent_rot = self._look_at_direction(tangent)
+        fly_dir /= (np.linalg.norm(fly_dir) + 1e-12)
+        self.agent_rot = self._look_at_direction(fly_dir)
 
-        dist_to_edge = bbox_max[axis_idx] - self.agent_pos[axis_idx]
-        num_steps = int(dist_to_edge / detach_fly_step) + max_sub_steps
+        target_height = open_edge_height + overshoot * self.up_sign
 
-        for _ in range(num_steps):
+        max_fly_steps = 20
+        for _ in range(max_fly_steps):
             sub_steps += 1
             old_pos = self.agent_pos.copy()
-            self._move_forward(detach_fly_step)
+
+            sensor_check = self.get_sensor_data()
+            depth = sensor_check.get("depth", 100.0)
+            step = detach_fly_step
+            if depth < step + 1.0:
+                step = max(depth - 1.0, 0.5)
+
+            self._move_forward(step)
 
             if self._passed_through:
                 self.agent_pos = old_pos
                 self._passed_through = False
+                self._detach_had_collision = True
                 break
 
+            if self.up_sign > 0:
+                if self.agent_pos[height_axis] > target_height:
+                    break
+            else:
+                if self.agent_pos[height_axis] < target_height:
+                    break
+
+        # ═══ Фаза 3: Горизонтальный перелёт в сторону цели ═══
         goal_pos = goal_pose[:3]
-        direction = goal_pos - self.agent_pos
-        direction[axis_idx] = 0.0
-        dist = np.linalg.norm(direction)
-        if dist > 1e-8:
-            direction /= dist
+        
+        direction_to_goal = goal_pos - self.agent_pos
+        direction_horiz = direction_to_goal.copy()
+        direction_horiz[height_axis] = 0.0
+
+        horiz_dist = np.linalg.norm(direction_horiz)
+        if horiz_dist > 1e-8:
+            direction_horiz /= horiz_dist
         else:
-            direction = -normal
+            direction_horiz = -normal
+            direction_horiz[height_axis] = 0.0
+            direction_horiz /= (np.linalg.norm(direction_horiz) + 1e-12)
 
-        self.agent_rot = self._look_at_direction(direction)
+        self.agent_rot = self._look_at_direction(direction_horiz)
 
-        self._move_forward(detach_fly_step * max_sub_steps)
-        if self._passed_through:
-            self._passed_through = False
-        sub_steps += max_sub_steps
+        total_fly = detach_fly_step * max_sub_steps * 2
+        flown = 0.0
+        while flown < total_fly:
+            old_pos = self.agent_pos.copy()
+            step = min(detach_fly_step, total_fly - flown)
+            self._move_forward(step)
+            flown += step
+            sub_steps += 1
+
+            if self._passed_through:
+                self.agent_pos = old_pos
+                self._passed_through = False
+                self._detach_had_collision = True
+                break
 
         self._last_detach_sub_steps = sub_steps
         return self.get_sensor_data()
@@ -542,6 +732,7 @@ class LightweightEnv:
     def _detach_and_fly_to_goal(self, goal_pose, rotation_step=5.0, free_step=8.0, max_sub_steps=3):
         detach_fly_step = 8.0
         sub_steps = 1
+        self._detach_had_collision = False
 
         sensor = self.get_sensor_data()
         normal = None
@@ -565,6 +756,7 @@ class LightweightEnv:
             if self._passed_through:
                 self.agent_pos = old_pos
                 self._passed_through = False
+                self._detach_had_collision = True
                 break
 
         goal_pos = goal_pose[:3]
@@ -597,6 +789,7 @@ class LightweightEnv:
             if self._passed_through:
                 self.agent_pos = old_pos
                 self._passed_through = False
+                self._detach_had_collision = True
                 break
 
             sensor = self.get_sensor_data()

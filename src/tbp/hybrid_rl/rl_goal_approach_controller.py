@@ -1,3 +1,4 @@
+# rl_goal_approach_controller.py
 """
 RL Goal Approach Controller.
 
@@ -147,6 +148,8 @@ class RLGoalApproachController:
         }
         self.temperature_override = None
         self._collision_stats = {}
+        self._last_detach_sub_steps = 1  # ← ДОБАВИТЬ
+        self._consecutive_detach_count = 0
 
         logger.info(
             f"RLGoalApproachController initialized: "
@@ -191,6 +194,8 @@ class RLGoalApproachController:
         self._episode_transitions = []
         self._total_episodes += 1
         self.start_pos = start_pos.copy()
+        self._last_detach_sub_steps = 1  # ← ДОБАВИТЬ
+        self._consecutive_detach_count = 0
 
         logger.debug(
             f"New goal set (episode {self._total_episodes}): "
@@ -229,6 +234,8 @@ class RLGoalApproachController:
             logger.warning("step() called without goal. Call set_new_goal() first.")
             return None, None
 
+        # ← ДОБАВИТЬ: сохраняем sub_steps из sensor_data
+        self._last_detach_sub_steps = sensor_data.get("detach_sub_steps", 1)
         self._steps += 1
         self._total_steps += 1
 
@@ -393,6 +400,10 @@ class RLGoalApproachController:
         if sensor_data.get("passed_through", False):
             return "surface_violation"
 
+        # ← ДОБАВИТЬ: detach тоже может иметь коллизию
+        if sensor_data.get("detach_had_collision", False):
+            return "detach_collision"               # новый тип коллизии
+
         depth = sensor_data.get("depth", self.config["max_sensor_range"])
 
         was_on = (self._prev_sensor_data is not None
@@ -467,10 +478,12 @@ class RLGoalApproachController:
             done = True
             termination_reason = "goal_reached"
 
-        # ═══ 3. Step penalty ═══
+        # ═══ 3. Step penalty ═══  ← ИЗМЕНЕНО
         reward += cfg["reward_step_penalty"]
         if action == self.action_space.IDX_DETACH or action == self.action_space.IDX_DETACH_EDGE:
-            sub_steps = max(getattr(self, '_last_detach_sub_steps', 1), 1)
+            # Читаем sub_steps из sensor_data через prev_sensor_data
+            # Но проще: сохранять в self при получении sensor_data
+            sub_steps = max(self._last_detach_sub_steps, 1)    # ← ИЗМЕНЕНО
             reward += cfg["reward_step_penalty"] * (sub_steps - 1)
 
         # ═══ 3.5 Risky free_forward on surface ═══
@@ -486,16 +499,32 @@ class RLGoalApproachController:
             termination_reason = "collision_surface_violation"
             action_name = self.action_space.get_info(action).name if action is not None else "unknown"
             self._collision_stats[action_name] = self._collision_stats.get(action_name, 0) + 1
-            logger.info(
+            logger.debug(
                 f"COLLISION_DETAIL: action={action_name}, "
                 f"depth={state[14]*100:.1f}mm, "
                 f"on_object={state[11]:.0f}, "
                 f"alignment={state[12]:.3f}, "
                 f"distance={state[13]:.1f}, "
             )
+        # ═══ 4.5 Detach collision ═══  ← ДОБАВИТЬ НОВУЮ СЕКЦИЮ
+        elif collision == "detach_collision":
+            reward += cfg["reward_surface_violation"]   # -15.0, как обычная коллизия
+            done = True
+            termination_reason = "collision_surface_violation"
+            action_name = self.action_space.get_info(action).name if action is not None else "unknown"
+            self._collision_stats[action_name] = self._collision_stats.get(action_name, 0) + 1
+            logger.debug(
+                f"DETACH_COLLISION: action={action_name}, "
+                f"distance={state[13]:.1f}, progress={progress_raw:.2f}"
+            )
         elif collision == "lost_object":
             if action != self.action_space.IDX_DETACH and action != self.action_space.IDX_DETACH_EDGE:
                 reward += cfg["reward_drifted_away"]
+
+        # ═══ 4.6 Detach while not on surface ═══
+        if action in (self.action_space.IDX_DETACH, self.action_space.IDX_DETACH_EDGE):
+            if prev_on_object < 0.5:  # был в воздухе когда вызвал detach
+                reward += -5.0  # жёсткий штраф — это бессмысленное действие
 
         # ═══ 5. Near goal on surface ═══
         near_radius = surface_step * 3
@@ -654,6 +683,11 @@ class RLGoalApproachController:
         if self.temperature_override is not None:
             temperature = self.temperature_override
 
+        # ═══ ACTION MASK: физически невалидные действия ═══
+        if state[11] < 0.5:  # on_object = 0 → агент в воздухе
+            combined[self.action_space.IDX_DETACH] = -1e9
+            combined[self.action_space.IDX_DETACH_EDGE] = -1e9
+
         is_random_override = False
         is_heuristic_override = False
         action_index = None
@@ -724,6 +758,31 @@ class RLGoalApproachController:
                 is_heuristic_override=is_heuristic_override,
             ),
         }
+
+        chosen_name = self.action_space.get_info(action_index).name
+        if chosen_name in ("detach", "detach_edge"):
+            self._consecutive_detach_count += 1
+        else:
+            self._consecutive_detach_count = 0
+
+        if self._consecutive_detach_count > 2:
+            h_best = self.action_space.get_info(best_h_action).name
+            q_best = self.action_space.get_info(best_q_action).name
+            logger.warning(
+                f"DETACH_SPAM x{self._consecutive_detach_count}: "
+                f"step={self._steps}, "
+                f"chosen={chosen_name}, "
+                f"q_recommends={q_best}, h_recommends={h_best}, "
+                f"eps={eps:.3f}, temp={temperature:.4f}, "
+                f"has_q={has_q_data}, "
+                f"random={is_random_override}, "
+                f"transitions={len(self._episode_transitions)}, "
+                f"last_action={self._last_action}, "
+                f"on_object={state[11]:.0f}, "
+                f"distance={state[13]:.1f}, "
+                f"alignment={state[12]:.3f}, "
+                f"depth={state[14]*100:.1f}"
+            )
         return action_index, explanation
 
     # ══════════════════════════════════════════════════════════
@@ -745,6 +804,7 @@ class RLGoalApproachController:
         on_object = float(state[11])
         alignment = float(state[12])
         distance = float(state[13])
+        point_normal = sensor_data.get("point_normal", None)
 
         eps = 1e-8
 
@@ -763,6 +823,23 @@ class RLGoalApproachController:
             and alignment > DETACH_ALIGN_THR
         )
 
+        if on_object > 0.5 and point_normal is None:
+            logger.debug(
+                f"BLIND_ON_SURFACE: step={self._steps}, "
+                f"on_object={on_object}, point_normal=None, "
+                f"depth={sensor_data.get('depth', -1):.2f}, "
+                f"alignment={state[12]:.3f}, "
+                f"distance={state[13]:.1f}"
+            )
+        if self._steps == 1:
+            logger.debug(
+                f"FIRST_STEP_ON_SURFACE: step={self._steps}, "
+                f"on_object={on_object}, point_normal={point_normal}, "
+                f"depth={sensor_data.get('depth', -1):.2f}, "
+                f"alignment={state[12]:.3f}, "
+                f"distance={state[13]:.1f}"
+            )
+
         # ────────────────────────────────────────────────────
         # 0) SUPPRESS: подавить бесполезные действия
         # Ситуация: всегда
@@ -776,6 +853,25 @@ class RLGoalApproachController:
         if not (on_object > 0.5 and close_to_goal):
             suppress[self.action_space.IDX_ORIENT_HOR] -= 2.0
             suppress[self.action_space.IDX_ORIENT_VERT] -= 2.0
+
+        # Подавить detach в воздухе
+        if on_object < 0.5:
+            suppress[self.action_space.IDX_DETACH] -= 5.0
+            suppress[self.action_space.IDX_DETACH_EDGE] -= 5.0
+
+        # Подавить detach подряд
+        if self._last_action in (self.action_space.IDX_DETACH, self.action_space.IDX_DETACH_EDGE):
+            suppress[self.action_space.IDX_DETACH] -= 5.0
+            suppress[self.action_space.IDX_DETACH_EDGE] -= 5.0
+
+        # Подавить detach если был в последних 3 шагах
+        recent_detach = sum(
+            1 for tr in self._episode_transitions[-3:]
+            if tr["action"] in (self.action_space.IDX_DETACH, self.action_space.IDX_DETACH_EDGE)
+        )
+        if recent_detach >= 1:
+            suppress[self.action_space.IDX_DETACH] -= 5.0
+            suppress[self.action_space.IDX_DETACH_EDGE] -= 5.0
 
         bias += suppress
         components["suppress"] = suppress
@@ -883,13 +979,7 @@ class RLGoalApproachController:
         components["stagnation_override"] = stagnation_override
 
         # ────────────────────────────────────────────────────
-        # 3) DETACH: цель недоступна по поверхности — оторваться и перелететь
-        # Два типа:
-        #   detach_goal: цель "за" поверхностью (alignment < порог или
-        #     normal_dist >> tangential_dist). Отлёт по нормали → полёт к цели.
-        #   detach_edge: цель через тонкую стенку (нормали агента и цели
-        #     противоположны). Облёт грани вверх → разворот к цели.
-        # Ограничения: max 1 detach за 5 шагов, не рядом с целью
+        # 3) DETACH: цель недоступна — оторваться и перелететь
         # ────────────────────────────────────────────────────
         detach = np.zeros(self.num_actions, dtype=float)
         if on_object > 0.5:
@@ -898,6 +988,7 @@ class RLGoalApproachController:
 
             n_world = sensor_data.get("point_normal", None)
             goal_normal = sensor_data.get("goal_normal", None)
+            path_blocked = sensor_data.get("path_blocked", False)
 
             if n_world is not None:
                 n_world = np.asarray(n_world, dtype=float)
@@ -909,21 +1000,40 @@ class RLGoalApproachController:
                     tangential_dist = float(np.linalg.norm(e_t))
                     normal_dist = abs(float(np.dot(e_world, n_hat)))
 
-                    if normal_dist > tangential_dist * 2.0 and distance > 3.0 * self.action_space.surface_step:
-                        need_detach = True
+                    # ═══ Когда нужен detach (любой тип) ═══
+                    needs_fly = False
 
-                    if (alignment < DETACH_ALIGN_THR
-                            and goal_normal is not None):
+                    if path_blocked:
+                        needs_fly = True
+                    elif alignment < DETACH_ALIGN_THR:
+                        # alignment отрицательный, но path_blocked=False
+                        # значит прямая видимость есть — ползти по вогнутой поверхности
+                        needs_fly = False
+                    elif normal_dist > tangential_dist * 2.0 and distance > 3.0 * self.action_space.surface_step:
+                        needs_fly = True
+
+                    # ═══ Выбор типа: detach vs detach_edge ═══
+                    if needs_fly and goal_normal is not None:
                         goal_n = np.array(goal_normal, dtype=float)
                         goal_n /= (np.linalg.norm(goal_n) + 1e-12)
                         normals_dot = float(np.dot(n_hat, goal_n))
 
-                        if normals_dot < -0.5 and tangential_dist > normal_dist * 3.0:
+                        if normals_dot < -0.3:
                             need_edge_detach = True
-                            need_detach = False
+                        else:
+                            need_detach = True
+                    elif needs_fly:
+                        need_detach = True
 
-            if alignment < DETACH_ALIGN_THR and not need_edge_detach:
-                need_detach = True
+                    if needs_fly and on_object > 0.5:
+                        logger.debug(
+                            f"NEEDS_FLY_ON_SURFACE: step={self._steps}, "
+                            f"path_blocked={path_blocked}, "
+                            f"alignment={alignment:.3f}, "
+                            f"distance={distance:.1f}, "
+                            f"normal_dist={normal_dist:.1f}, "
+                            f"tangential_dist={tangential_dist:.1f}"
+                        )
 
             if need_detach or need_edge_detach:
                 recent_detach_count = sum(
@@ -949,39 +1059,103 @@ class RLGoalApproachController:
         # ────────────────────────────────────────────────────
         # 4) STEER IN AIR: навигация в воздухе к цели
         # Ситуация: агент не на поверхности (после detach или соскользнул)
-        # Принцип: вычисляем yaw и pitch к позиции цели в локальной СК,
-        # поворачиваемся последовательно (yaw → pitch → forward)
+        # Принцип: симулируем каждый поворот и выбираем тот,
+        # который максимально приближает взгляд к цели (max dot product)
         # ────────────────────────────────────────────────────
         steer = np.zeros(self.num_actions, dtype=float)
         if on_object <= 0.5:
-            goal_dir_local = local_pos_error.copy()
-            goal_dist = np.linalg.norm(goal_dir_local)
-            if goal_dist > 1e-8:
-                goal_dir_local /= goal_dist
+            STEER_STRENGTH = 4.0
+            rotation_step = self.action_space.rotation_step
 
-            gx, gy, gz = goal_dir_local
+            # Направление на цель в мировых координатах
+            goal_dir_world = self._current_goal[:3] - current_pose[:3]
+            goal_dist_world = np.linalg.norm(goal_dir_world)
+            if goal_dist_world > 1e-8:
+                goal_dir_world /= goal_dist_world
 
-            yaw_to_goal = np.degrees(np.arctan2(-gx, -gz))
-            horiz_dist = np.sqrt(gx**2 + gz**2)
-            pitch_to_goal = np.degrees(np.arctan2(gy, horiz_dist))
+            # Текущее направление взгляда
+            rot_current = R.from_euler("xyz", current_pose[3:6], degrees=True)
+            forward_current = rot_current.apply([0, 0, -1])
 
-            yaw_thr = 5.0
-            pitch_thr = 5.0
+            # Текущий dot product (насколько смотрим на цель)
+            dot_current = np.dot(forward_current, goal_dir_world)
 
-            if abs(yaw_to_goal) > yaw_thr:
-                if yaw_to_goal > 0:
-                    steer[self.action_space.IDX_TURN_LEFT] += 2.0
+            # Угол к цели
+            angle_to_goal = np.degrees(np.arccos(np.clip(dot_current, -1, 1)))
+            deviation = min(angle_to_goal / 45.0, 1.0)
+
+            # Симулируем 4 поворота и считаем improvement
+            pose_angles = current_pose[3:6]
+
+            # look_up (pitch += rotation_step)
+            forward_up = R.from_euler(
+                "xyz", pose_angles + np.array([rotation_step, 0, 0]), degrees=True
+            ).apply([0, 0, -1])
+            improvement_up = np.dot(forward_up, goal_dir_world) - dot_current
+
+            # look_down (pitch -= rotation_step)
+            forward_down = R.from_euler(
+                "xyz", pose_angles + np.array([-rotation_step, 0, 0]), degrees=True
+            ).apply([0, 0, -1])
+            improvement_down = np.dot(forward_down, goal_dir_world) - dot_current
+
+            # turn_left (yaw += rotation_step)
+            forward_left = R.from_euler(
+                "xyz", pose_angles + np.array([0, rotation_step, 0]), degrees=True
+            ).apply([0, 0, -1])
+            improvement_left = np.dot(forward_left, goal_dir_world) - dot_current
+
+            # turn_right (yaw -= rotation_step)
+            forward_right = R.from_euler(
+                "xyz", pose_angles + np.array([0, -rotation_step, 0]), degrees=True
+            ).apply([0, 0, -1])
+            improvement_right = np.dot(forward_right, goal_dir_world) - dot_current
+
+            # Pitch: выбираем лучшее направление
+            best_pitch_improvement = max(improvement_up, improvement_down)
+            if best_pitch_improvement > 0.001:
+                pitch_bonus = STEER_STRENGTH * deviation
+                if improvement_up > improvement_down:
+                    steer[self.action_space.IDX_LOOK_UP] += pitch_bonus
                 else:
-                    steer[self.action_space.IDX_TURN_RIGHT] += 2.0
-            elif abs(pitch_to_goal) > pitch_thr:
-                if pitch_to_goal > 0:
-                    steer[self.action_space.IDX_LOOK_UP] += 2.0
-                else:
-                    steer[self.action_space.IDX_LOOK_DOWN] += 2.0
-            else:
-                steer[self.action_space.IDX_FREE_FORWARD] += 2.0
+                    steer[self.action_space.IDX_LOOK_DOWN] += pitch_bonus
 
-            steer[self.action_space.IDX_FREE_BACKWARD] -= 0.5
+            # Yaw: выбираем лучшее направление
+            best_yaw_improvement = max(improvement_left, improvement_right)
+            if best_yaw_improvement > 0.001:
+                # Yaw только если pitch не слишком большой
+                # (когда цель прямо внизу — yaw ненадёжен)
+                height_axis = getattr(self, '_height_axis_cache',
+                    self.action_space.rotation_step)  # fallback
+                if hasattr(self, '_current_goal'):
+                    h_ax = getattr(self, 'height_axis_cache', 2)
+                    horiz_components = [goal_dir_world[i] for i in range(3) if i != h_ax]
+                    abs_horiz = np.sqrt(sum(c**2 for c in horiz_components))
+                else:
+                    abs_horiz = 1.0
+
+                yaw_reliable = abs_horiz > 0.3 and best_pitch_improvement < best_yaw_improvement * 2.0
+
+                if yaw_reliable:
+                    yaw_bonus = STEER_STRENGTH * deviation
+                    if improvement_left > improvement_right:
+                        steer[self.action_space.IDX_TURN_LEFT] += yaw_bonus
+                    else:
+                        steer[self.action_space.IDX_TURN_RIGHT] += yaw_bonus
+
+            # Forward: сила зависит от выравнивания
+            forward_weight = max(1.0 - deviation * 0.5, 0.5)
+            steer[self.action_space.IDX_FREE_FORWARD] += STEER_STRENGTH * forward_weight
+
+            steer[self.action_space.IDX_FREE_BACKWARD] -= 2.0
+
+            # Подавить бесполезные действия в воздухе
+            for idx in range(8):  # move_tangentially 0-7
+                steer[idx] -= 3.0
+            steer[self.action_space.IDX_ORIENT_HOR] -= 3.0
+            steer[self.action_space.IDX_ORIENT_VERT] -= 3.0
+            steer[self.action_space.IDX_ROTATE_POS] -= 3.0
+            steer[self.action_space.IDX_ROTATE_NEG] -= 3.0
 
         bias += steer
         components["steer_in_air"] = steer
@@ -1204,6 +1378,7 @@ class RLGoalApproachController:
 
         self._steps += 1
         self._total_steps += 1
+        self._last_detach_sub_steps = sensor_data.get("detach_sub_steps", 1)
 
         state = self._compute_state(current_pose, sensor_data)
 

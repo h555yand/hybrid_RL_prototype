@@ -1,3 +1,4 @@
+# ablation_runner.py
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -224,10 +225,6 @@ def train(
 
                 action_index = controller._last_action
                 env.step(action_index, action_space)
-                if action_index == action_space.IDX_DETACH:
-                    controller._last_detach_sub_steps = getattr(env, '_last_detach_sub_steps', 1)
-                if action_index == action_space.IDX_DETACH_EDGE:
-                    controller._last_detach_sub_steps = getattr(env, '_last_detach_sub_steps', 1)
 
             _episode_success = controller._total_goals_reached > _goals_before_episode
             if _episode_success:
@@ -333,6 +330,7 @@ class AblationSummary:
     collision_surface_violation_rate: float = 0.0
     levels_reached: float = 0.0
     fallback_rate: float = 0.0
+    collision_stats: Optional[Dict[str, Any]] = None
 
 
 class RLAblationRunner:
@@ -485,6 +483,7 @@ class RLAblationRunner:
                     episode_pools=episode_pools,
                     visualise=visualise
                 )
+                run_result["seed"] = seed
                 raw_results[variant_name].append(run_result)
 
         summaries = {
@@ -564,6 +563,19 @@ class RLAblationRunner:
                 ]
             )
         )
+        # ─── ДОБАВЛЕНО: агрегация collision_stats ───
+        merged_collision_stats: Dict[str, float] = {}
+        for r in runs:
+            cs = r.get("stats", {}).get("collision_stats", {})
+            for action_name, count in cs.items():
+                merged_collision_stats[action_name] = (
+                    merged_collision_stats.get(action_name, 0.0) + float(count)
+                )
+        # Усредняем по количеству seed'ов
+        n_runs = max(len(runs), 1)
+        averaged_collision_stats = {
+            k: v / n_runs for k, v in merged_collision_stats.items()
+        }
 
         return AblationSummary(
             variant=variant,
@@ -578,6 +590,7 @@ class RLAblationRunner:
             collision_surface_violation_rate=collision_surface_violation_rate,
             levels_reached=levels_reached,
             fallback_rate=fallback_rate,
+            collision_stats=averaged_collision_stats,  # ← ДОБАВЛЕНО
         )
 
     @staticmethod

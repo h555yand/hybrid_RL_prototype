@@ -1,3 +1,4 @@
+# run_ablation.py
 import json
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
@@ -31,8 +32,11 @@ CURRICULUM_LEVELS = [
     (40.0, 120.0),
 ]
 
-TRAIN_SEEDS = [11, 22, 33]
-EVAL_SEEDS = [44, 55, 66]
+# TRAIN_SEEDS = [11, 22, 33]
+# EVAL_SEEDS = [44, 55, 66]
+TRAIN_SEEDS = [11]
+EVAL_SEEDS = [44]
+
 SAC_EVAL_SEEDS = [77, 88, 99]
 
 
@@ -614,13 +618,13 @@ def main() -> None:
     TRAIN_EPISODES_PER_LEVEL = 5_000
     EVAL_EPISODES_PER_LEVEL = 500
     REGENERATE_SCRIPTS = False
-    IS_LOAD = True
-    RUN_TRAIN = False
+    IS_LOAD = False
+    RUN_TRAIN = True
     RUN_EVAL = False
     RUN_BC_TRAIN = False
     RUN_SAC_TRAIN = False
     RUN_SAC_EVAL = False
-    RUN_ADAPTIVE = True
+    RUN_ADAPTIVE = False
     RUN_CUP_EVAL = False
 
 
@@ -634,7 +638,7 @@ def main() -> None:
         "goal_threshold": GOAL_THRESHOLD_PER_LEVEL[0],
         "max_points": 500_000,
         "k_neighbors": 7,
-        "max_steps_per_goal": 150,
+        "max_steps_per_goal": 400,
         "adaptive_sigma": True,
         "insert_threshold": 0.50,
         "auto_calibrate": False,
@@ -658,8 +662,8 @@ def main() -> None:
     _prepare_demo_meshes(data_dir)
     # mesh_path = str(data_dir / "cube.stl")
     # mesh_path = str(data_dir / "cylinder.stl")
-    # mesh_path = str(data_dir / "mug.stl")
-    mesh_path = str(data_dir / "cup.stl")
+    mesh_path = str(data_dir / "mug.stl")
+    # mesh_path = str(data_dir / "cup.stl")
 
     print("\n" + "=" * 60)
     print("STEP 1: Prepare episode pools (train + eval)")
@@ -847,6 +851,42 @@ def main() -> None:
         with open(train_output, "w", encoding="utf-8") as f:
             json.dump(result_to_save, f, indent=2)
         print(f"\nSaved train result to {train_output}")
+
+        # ─── Сохранение результатов по каждому seed отдельно ───
+        for variant_name, runs in result["raw_results"].items():
+            for run_result in runs:
+                seed = run_result.get("seed")
+                if seed is None:
+                    continue
+
+                per_seed_data = {
+                    "variant": variant_name,
+                    "seed": seed,
+                    "goals_reached": run_result.get("goals_reached"),
+                    "num_episodes": run_result.get("num_episodes"),
+                    "success_rate": run_result.get("success_rate"),
+                    "curriculum_stats": run_result.get("curriculum_stats"),
+                    "stats": run_result.get("stats"),
+                    "collision_stats": run_result.get("stats", {}).get(
+                        "collision_stats", {}
+                    ),
+                }
+
+                seed_output = (
+                    data_dir
+                    / f"train_result_{variant_name}_seed_{seed}.json"
+                )
+                with open(seed_output, "w", encoding="utf-8") as f:
+                    json.dump(per_seed_data, f, indent=2)
+                print(f"Saved per-seed train result to {seed_output}")
+
+                # Печать collision_stats
+                collision_stats = per_seed_data["collision_stats"]
+                if collision_stats:
+                    print(
+                        f"  {variant_name} seed={seed} "
+                        f"collision_stats: {collision_stats}"
+                    )
 
     if RUN_EVAL:
         print("\n" + "=" * 60)
@@ -1130,13 +1170,6 @@ def main() -> None:
                     break
 
                 cup_env.step(action_index, controller.action_space)
-                if action_index in (
-                    controller.action_space.IDX_DETACH,
-                    controller.action_space.IDX_DETACH_EDGE,
-                ):
-                    controller._last_detach_sub_steps = getattr(
-                        cup_env, '_last_detach_sub_steps', 1
-                    )
 
             success = controller._total_goals_reached > goals_before
             manager.on_episode_complete(

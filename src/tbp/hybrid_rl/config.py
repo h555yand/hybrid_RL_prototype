@@ -1,3 +1,4 @@
+# config.py
 """Default configuration for RL goal-approach controller."""
 
 DEFAULT_CONFIG = {
@@ -39,6 +40,7 @@ DEFAULT_CONFIG = {
     "reward_near_goal_on_surface": 0.5,
     "reward_oscillation": -0.5,
     "reward_timeout": -8.0,
+    "reward_detach_collision": -3.0,    # ← ДОБАВИТЬ
     # Detour shaping: if goal is behind surface, clip negative progress penalty
     # to avoid over-penalizing necessary face-to-face transitions on polyhedra.
     "detour_alignment_threshold": -0.2,
