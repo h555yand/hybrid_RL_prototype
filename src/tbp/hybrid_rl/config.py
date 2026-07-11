@@ -19,13 +19,14 @@ DEFAULT_CONFIG = {
     "norm_min_std": 1e-4,               # защита от нулевой дисперсии
     "rebuild_on_freeze": True,          # rebuild индекса после freeze
     # Actions
-    "num_actions": 20,
-    "surface_step": 5.0,   # mm
-    "free_step": 10.0,     # mm
-    "rotation_step": 10.0, # degrees
+    "num_actions": 21,
+    "free_step_small": 2.0,
+    "surface_step": 3.0,   # mm
+    "free_step": 8.0,     # mm
+    "rotation_step": 5.0, # degrees
     # Episode
     "goal_threshold": 2.0, # mm
-    "max_steps_per_goal": 20,
+    "max_steps_per_goal": 200,
     # Collision detection
     "min_valid_depth": 0.5,    # mm — below = inside object
     "max_sensor_range": 100.0, # mm — max depth reading

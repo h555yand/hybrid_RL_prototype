@@ -65,7 +65,7 @@ class ActionSpace:
         rotation_step: Step size for LookUp/Down/Rotation (degrees).
     """
 
-    NUM_ACTIONS = 20
+    NUM_ACTIONS = 21
 
     # Surface action directions (8 evenly spaced)
     SURFACE_DIRECTIONS = [0, 45, 90, 135, 180, 225, 270, 315]
@@ -84,18 +84,21 @@ class ActionSpace:
     IDX_ORIENT_VERT = 17
     IDX_DETACH = 18
     IDX_DETACH_EDGE = 19
+    IDX_FREE_FORWARD_SMALL = 20
 
     def __init__(
         self,
         agent_id: str,
-        surface_step: float = 5.0,
-        free_step: float = 10.0,
-        rotation_step: float = 10.0,
+        surface_step: float = 3.0,
+        free_step: float = 5.0,
+        rotation_step: float = 5.0,
+        free_step_small=1.5
     ):
         self.agent_id = agent_id
         self.surface_step = surface_step
         self.free_step = free_step
         self.rotation_step = rotation_step
+        self.free_step_small = free_step_small
 
         # Build action info table
         self._action_info = self._build_action_info()
@@ -208,6 +211,13 @@ class ActionSpace:
             index=self.IDX_DETACH_EDGE,
             name="detach_edge",
             category="macro",
+        ))
+
+        info.append(ActionInfo(
+            index=self.IDX_FREE_FORWARD_SMALL,
+            name="free_forward_small",
+            opposite_index=self.IDX_FREE_BACKWARD,
+            category="free",
         ))
 
         return info

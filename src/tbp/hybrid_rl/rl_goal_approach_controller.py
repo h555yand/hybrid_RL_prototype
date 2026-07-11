@@ -495,6 +495,8 @@ class RLGoalApproachController:
             reward += -2.0
         if action == self.action_space.IDX_FREE_BACKWARD and prev_on_object > 0.5:
             reward += -2.0
+        if action == self.action_space.IDX_FREE_FORWARD_SMALL and prev_on_object > 0.5:
+            reward += -2.0
 
         # ═══ 4. Collisions ═══
         if collision == "surface_violation":
@@ -1179,6 +1181,7 @@ class RLGoalApproachController:
             # Forward: сила зависит от выравнивания
             forward_weight = max(1.0 - deviation * 0.5, 0.5)
             steer[self.action_space.IDX_FREE_FORWARD] += STEER_STRENGTH * forward_weight
+            steer[self.action_space.IDX_FREE_FORWARD_SMALL] += STEER_STRENGTH * forward_weight  # ← одинаковый bias
 
             steer[self.action_space.IDX_FREE_BACKWARD] -= 2.0
 
@@ -1203,6 +1206,7 @@ class RLGoalApproachController:
         if on_object > 0.5:
             damp_free[self.action_space.IDX_FREE_FORWARD] -= 3.0
             damp_free[self.action_space.IDX_FREE_BACKWARD] -= 3.0
+            damp_free[self.action_space.IDX_FREE_FORWARD_SMALL] -= 3.0
         bias += damp_free
         components["damp_free_on_surface"] = damp_free
 

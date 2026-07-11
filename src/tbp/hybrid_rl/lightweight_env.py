@@ -138,6 +138,9 @@ class LightweightEnv:
                     rotation_step=action_space.rotation_step,
                     free_step=action_space.free_step,
                 )
+        elif action_info.name == "free_forward_small":
+            self._move_forward(action_space.free_step_small)
+            
         if action_info.name in ("look_up", "look_down"):
             rot_after = R.from_euler("xyz", self.agent_rot, degrees=True)
             forward_after = rot_after.apply([0, 0, -1])

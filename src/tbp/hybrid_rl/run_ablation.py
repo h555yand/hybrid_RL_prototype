@@ -617,7 +617,7 @@ def main() -> None:
 
     TRAIN_EPISODES_PER_LEVEL = 5_000
     EVAL_EPISODES_PER_LEVEL = 500
-    REGENERATE_SCRIPTS = True
+    REGENERATE_SCRIPTS = False
     IS_LOAD = False
     RUN_TRAIN = True
     RUN_EVAL = False
@@ -638,7 +638,7 @@ def main() -> None:
         "goal_threshold": GOAL_THRESHOLD_PER_LEVEL[0],
         "max_points": 500_000,
         "k_neighbors": 7,
-        "max_steps_per_goal": 400,
+        "max_steps_per_goal": 300,
         "adaptive_sigma": True,
         "insert_threshold": 0.50,
         "auto_calibrate": False,
@@ -647,9 +647,10 @@ def main() -> None:
         "reward_goal_reached": 60.0,
         "reward_timeout": -8.0,
         "surface_step": 3.0,
-        "free_step": 5.0,
+        "free_step": 8.0,
         "rotation_step": 5.0,
-        "temperature_override": 0.01
+        "free_step_small": 2.0,
+        "temperature_override": None
     }
     cfg = {**DEFAULT_CONFIG, **base_config}
 
