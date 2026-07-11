@@ -529,75 +529,88 @@ class LightweightEnv:
     def _compute_up_direction(self):
         bbox_min = self.mesh.bounds[0]
         bbox_max = self.mesh.bounds[1]
-        center = (bbox_min + bbox_max) / 2.0
         extents = bbox_max - bbox_min
-        
-        self.height_axis = int(np.argmin(extents))
-        horiz_axes = [i for i in range(3) if i != self.height_axis]
-        
-        # Стреляем лучами вдоль height_axis из центра
-        # в обе стороны и считаем попадания
-        
-        # Генерируем сетку точек в горизонтальной плоскости
-        n_probes = 25  # 5x5 сетка
-        probe_points = []
-        for i in range(5):
-            for j in range(5):
-                pt = center.copy()
-                r0 = min(extents[horiz_axes[0]], extents[horiz_axes[1]]) * 0.3
-                pt[horiz_axes[0]] = center[horiz_axes[0]] + r0 * (i/4 - 0.5)
-                pt[horiz_axes[1]] = center[horiz_axes[1]] + r0 * (j/4 - 0.5)
-                probe_points.append(pt)
-        
-        probe_points = np.array(probe_points)
-        
-        # Лучи вверх (+height_axis)
-        dir_up = np.zeros(3)
-        dir_up[self.height_axis] = 1.0
-        dirs_up = np.tile(dir_up, (n_probes, 1))
-        
-        # Стреляем из точек чуть выше центра
-        origins_up = probe_points.copy()
-        origins_up[:, self.height_axis] = center[self.height_axis] + 1.0
-        
-        hits_up, _, _ = self.mesh.ray.intersects_location(
-            ray_origins=origins_up,
-            ray_directions=dirs_up,
-        )
-        
-        # Лучи вниз (-height_axis)
-        dir_down = np.zeros(3)
-        dir_down[self.height_axis] = -1.0
-        dirs_down = np.tile(dir_down, (n_probes, 1))
-        
-        origins_down = probe_points.copy()
-        origins_down[:, self.height_axis] = center[self.height_axis] - 1.0
-        
-        hits_down, _, _ = self.mesh.ray.intersects_location(
-            ray_origins=origins_down,
-            ray_directions=dirs_down,
-        )
-        
-        # Меньше попаданий = открытая сторона
-        n_hits_up = len(hits_up)
-        n_hits_down = len(hits_down)
-        
-        if n_hits_up < n_hits_down:
-            # Вверх меньше попаданий → верх открыт
-            self.up_sign = 1.0
-        elif n_hits_down < n_hits_up:
-            # Вниз меньше попаданий → низ открыт (перевёрнутая чашка)
-            self.up_sign = -1.0
-        else:
-            # Одинаково → fallback: вверх по оси
-            self.up_sign = 1.0
-        
+
+        # Используем centroid — устойчив к ручкам и другим выступам
+        center = np.array(self.mesh.centroid, dtype=float)
+
+        n_probes = 25
+        best_axis = 0
+        best_asymmetry = -1
+        best_up_sign = 1.0
+        axis_info = {}
+
+        for axis in range(3):
+            horiz_axes = [i for i in range(3) if i != axis]
+
+            probe_points = []
+            for i in range(5):
+                for j in range(5):
+                    pt = center.copy()
+                    r0 = min(extents[horiz_axes[0]], extents[horiz_axes[1]]) * 0.3
+                    pt[horiz_axes[0]] = center[horiz_axes[0]] + r0 * (i / 4 - 0.5)
+                    pt[horiz_axes[1]] = center[horiz_axes[1]] + r0 * (j / 4 - 0.5)
+                    probe_points.append(pt)
+            probe_points = np.array(probe_points)
+
+            # Лучи в + направлении
+            dir_plus = np.zeros(3)
+            dir_plus[axis] = 1.0
+            origins_plus = probe_points.copy()
+            origins_plus[:, axis] = center[axis] + 1.0
+            hits_plus, _, _ = self.mesh.ray.intersects_location(
+                ray_origins=origins_plus,
+                ray_directions=np.tile(dir_plus, (n_probes, 1)),
+            )
+
+            # Лучи в - направлении
+            dir_minus = np.zeros(3)
+            dir_minus[axis] = -1.0
+            origins_minus = probe_points.copy()
+            origins_minus[:, axis] = center[axis] - 1.0
+            hits_minus, _, _ = self.mesh.ray.intersects_location(
+                ray_origins=origins_minus,
+                ray_directions=np.tile(dir_minus, (n_probes, 1)),
+            )
+
+            n_plus = len(hits_plus)
+            n_minus = len(hits_minus)
+            asymmetry = abs(n_plus - n_minus)
+
+            axis_info[axis] = {
+                'plus': n_plus,
+                'minus': n_minus,
+                'asymmetry': asymmetry,
+            }
+
+            if asymmetry > best_asymmetry:
+                best_asymmetry = asymmetry
+                best_axis = axis
+                if n_plus < n_minus:
+                    best_up_sign = 1.0
+                elif n_minus < n_plus:
+                    best_up_sign = -1.0
+                else:
+                    best_up_sign = 1.0
+
+        self.height_axis = best_axis
+        self.up_sign = best_up_sign
         self.up_direction = np.zeros(3)
         self.up_direction[self.height_axis] = self.up_sign
-        
         self.open_edge_height = (
-            bbox_max[self.height_axis] if self.up_sign > 0 
+            bbox_max[self.height_axis] if self.up_sign > 0
             else bbox_min[self.height_axis]
+        )
+
+        logger.debug(
+            f"_compute_up_direction: "
+            f"extents={extents.tolist()}, "
+            f"centroid={center.tolist()}, "
+            f"axis_info={axis_info}, "
+            f"height_axis={self.height_axis}, "
+            f"up_sign={self.up_sign}, "
+            f"up_direction={self.up_direction.tolist()}, "
+            f"open_edge_height={self.open_edge_height}"
         )
 
     def _detach_and_fly_to_edge(self, goal_pose, rotation_step=5.0, free_step=8.0, max_sub_steps=3):
@@ -608,8 +621,22 @@ class LightweightEnv:
 
         self._detach_had_collision = False
 
+        # ═══ DEBUG START ═══
+        logger.debug(
+            f"DETACH_EDGE_START: "
+            f"agent_pos={self.agent_pos.tolist()}, "
+            f"agent_rot={self.agent_rot.tolist()}, "
+            f"goal_pos={goal_pose[:3].tolist()}, "
+            f"height_axis={self.height_axis}, "
+            f"up_direction={self.up_direction.tolist()}, "
+            f"open_edge_height={self.open_edge_height:.1f}, "
+            f"bbox={self.mesh.bounds.tolist()}"
+        )
+        # ═══ DEBUG END ═══
+
         sensor = self.get_sensor_data()
         if sensor.get("point_normal") is None:
+            logger.debug("DETACH_EDGE_ABORT: no point_normal")
             self._last_detach_sub_steps = sub_steps
             return self.get_sensor_data()
 
@@ -618,7 +645,14 @@ class LightweightEnv:
 
         # ═══ Фаза 1: Отрыв по нормали ═══
         self.agent_rot = self._look_at_direction(normal)
-        
+
+        logger.debug(
+            f"DETACH_EDGE_PHASE1_START: "
+            f"normal={normal.tolist()}, "
+            f"agent_rot={self.agent_rot.tolist()}, "
+            f"detach_step={detach_step}"
+        )
+
         flown = 0.0
         while flown < detach_step:
             old_pos = self.agent_pos.copy()
@@ -631,20 +665,35 @@ class LightweightEnv:
             flown += step
             sub_steps += 1
             if self._passed_through:
+                logger.debug(
+                    f"DETACH_EDGE_COLLISION: "
+                    f"phase=1, sub_step={sub_steps}, "
+                    f"pos_before={old_pos.tolist()}, "
+                    f"pos_after={self.agent_pos.tolist()}, "
+                    f"normal={normal.tolist()}, "
+                    f"step={step:.1f}, "
+                    f"depth={depth:.1f}, "
+                    f"flown={flown:.1f}"
+                )
                 self.agent_pos = old_pos
                 self._passed_through = False
                 self._detach_had_collision = True
                 self._last_detach_sub_steps = sub_steps
                 return self.get_sensor_data()
 
+        logger.debug(
+            f"DETACH_EDGE_PHASE1_DONE: "
+            f"pos={self.agent_pos.tolist()}, "
+            f"flown={flown:.1f}, "
+            f"sub_steps={sub_steps}"
+        )
+
         # ═══ Фаза 2: Лететь к открытому краю ═══
         up_dir = self.up_direction
         height_axis = self.height_axis
         open_edge_height = self.open_edge_height
 
-        bbox_min = self.mesh.bounds[0]
-        bbox_max = self.mesh.bounds[1]
-        center = (bbox_min + bbox_max) / 2.0
+        center = np.array(self.mesh.centroid, dtype=float)
 
         # Внутри или снаружи?
         agent_to_center = center - self.agent_pos
@@ -661,15 +710,30 @@ class LightweightEnv:
             overshoot = detach_fly_step
         else:
             fly_dir = normal * 1.0 + up_dir * 0.5
-            overshoot = detach_fly_step 
+            overshoot = detach_fly_step
 
         fly_dir /= (np.linalg.norm(fly_dir) + 1e-12)
         self.agent_rot = self._look_at_direction(fly_dir)
 
         target_height = open_edge_height + overshoot * self.up_sign
 
+        logger.debug(
+            f"DETACH_EDGE_PHASE2_START: "
+            f"is_inside={is_inside}, "
+            f"normal={normal.tolist()}, "
+            f"center={center.tolist()}, "
+            f"agent_to_center_horiz={agent_to_center.tolist()}, "
+            f"dot_normal_to_center={dot_normal_to_center:.3f}, "
+            f"fly_dir={fly_dir.tolist()}, "
+            f"up_dir={up_dir.tolist()}, "
+            f"target_height={target_height:.1f}, "
+            f"current_height={self.agent_pos[height_axis]:.1f}, "
+            f"open_edge_height={open_edge_height:.1f}, "
+            f"agent_rot={self.agent_rot.tolist()}"
+        )
+
         max_fly_steps = 20
-        for _ in range(max_fly_steps):
+        for fly_step_idx in range(max_fly_steps):
             sub_steps += 1
             old_pos = self.agent_pos.copy()
 
@@ -682,6 +746,17 @@ class LightweightEnv:
             self._move_forward(step)
 
             if self._passed_through:
+                logger.debug(
+                    f"DETACH_EDGE_COLLISION: "
+                    f"phase=2, fly_step_idx={fly_step_idx}, sub_step={sub_steps}, "
+                    f"pos_before={old_pos.tolist()}, "
+                    f"pos_after={self.agent_pos.tolist()}, "
+                    f"fly_dir={fly_dir.tolist()}, "
+                    f"step={step:.1f}, "
+                    f"depth={depth:.1f}, "
+                    f"current_height={old_pos[height_axis]:.1f}, "
+                    f"target_height={target_height:.1f}"
+                )
                 self.agent_pos = old_pos
                 self._passed_through = False
                 self._detach_had_collision = True
@@ -689,14 +764,39 @@ class LightweightEnv:
 
             if self.up_sign > 0:
                 if self.agent_pos[height_axis] > target_height:
+                    logger.debug(
+                        f"DETACH_EDGE_PHASE2_REACHED: "
+                        f"fly_step_idx={fly_step_idx}, "
+                        f"height={self.agent_pos[height_axis]:.1f}, "
+                        f"target={target_height:.1f}"
+                    )
                     break
             else:
                 if self.agent_pos[height_axis] < target_height:
+                    logger.debug(
+                        f"DETACH_EDGE_PHASE2_REACHED: "
+                        f"fly_step_idx={fly_step_idx}, "
+                        f"height={self.agent_pos[height_axis]:.1f}, "
+                        f"target={target_height:.1f}"
+                    )
                     break
+
+        logger.debug(
+            f"DETACH_EDGE_PHASE2_DONE: "
+            f"pos={self.agent_pos.tolist()}, "
+            f"height={self.agent_pos[height_axis]:.1f}, "
+            f"had_collision={self._detach_had_collision}, "
+            f"sub_steps={sub_steps}"
+        )
+
+        # Если была коллизия в фазе 2, не продолжаем фазу 3
+        if self._detach_had_collision:
+            self._last_detach_sub_steps = sub_steps
+            return self.get_sensor_data()
 
         # ═══ Фаза 3: Горизонтальный перелёт в сторону цели ═══
         goal_pos = goal_pose[:3]
-        
+
         direction_to_goal = goal_pos - self.agent_pos
         direction_horiz = direction_to_goal.copy()
         direction_horiz[height_axis] = 0.0
@@ -711,22 +811,61 @@ class LightweightEnv:
 
         self.agent_rot = self._look_at_direction(direction_horiz)
 
-        total_fly = detach_fly_step * max_sub_steps * 2
+        # total_fly = detach_fly_step * max_sub_steps * 2
+        total_fly = int(detach_fly_step * max_sub_steps * 1.5)
+
+        logger.debug(
+            f"DETACH_EDGE_PHASE3_START: "
+            f"pos={self.agent_pos.tolist()}, "
+            f"goal_pos={goal_pos.tolist()}, "
+            f"direction_horiz={direction_horiz.tolist()}, "
+            f"horiz_dist_to_goal={horiz_dist:.1f}, "
+            f"total_fly={total_fly:.1f}, "
+            f"agent_rot={self.agent_rot.tolist()}"
+        )
+
         flown = 0.0
+        phase3_step_idx = 0
         while flown < total_fly:
             old_pos = self.agent_pos.copy()
             step = min(detach_fly_step, total_fly - flown)
             self._move_forward(step)
             flown += step
             sub_steps += 1
+            phase3_step_idx += 1
 
             if self._passed_through:
+                logger.debug(
+                    f"DETACH_EDGE_COLLISION: "
+                    f"phase=3, phase3_step_idx={phase3_step_idx}, sub_step={sub_steps}, "
+                    f"pos_before={old_pos.tolist()}, "
+                    f"pos_after={self.agent_pos.tolist()}, "
+                    f"direction_horiz={direction_horiz.tolist()}, "
+                    f"step={step:.1f}, "
+                    f"flown={flown:.1f}, "
+                    f"total_fly={total_fly:.1f}"
+                )
                 self.agent_pos = old_pos
                 self._passed_through = False
                 self._detach_had_collision = True
                 break
 
+        logger.debug(
+            f"DETACH_EDGE_DONE: "
+            f"sub_steps={sub_steps}, "
+            f"had_collision={self._detach_had_collision}, "
+            f"final_pos={self.agent_pos.tolist()}, "
+            f"final_height={self.agent_pos[height_axis]:.1f}, "
+            f"goal_pos={goal_pose[:3].tolist()}, "
+            f"final_dist_to_goal={np.linalg.norm(self.agent_pos - goal_pose[:3]):.1f}"
+        )
+
         self._last_detach_sub_steps = sub_steps
+
+        # Направляем взгляд вниз
+        down_direction = -self.up_direction
+        self.agent_rot = self._look_at_direction(down_direction)
+
         return self.get_sensor_data()
 
     def _detach_and_fly_to_goal(self, goal_pose, rotation_step=5.0, free_step=8.0, max_sub_steps=3):

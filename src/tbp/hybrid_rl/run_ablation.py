@@ -617,7 +617,7 @@ def main() -> None:
 
     TRAIN_EPISODES_PER_LEVEL = 5_000
     EVAL_EPISODES_PER_LEVEL = 500
-    REGENERATE_SCRIPTS = False
+    REGENERATE_SCRIPTS = True
     IS_LOAD = False
     RUN_TRAIN = True
     RUN_EVAL = False
@@ -649,6 +649,7 @@ def main() -> None:
         "surface_step": 3.0,
         "free_step": 5.0,
         "rotation_step": 5.0,
+        "temperature_override": 0.01
     }
     cfg = {**DEFAULT_CONFIG, **base_config}
 
@@ -660,9 +661,9 @@ def main() -> None:
     #####################################################
     # Choose Mesh
     _prepare_demo_meshes(data_dir)
-    # mesh_path = str(data_dir / "cube.stl")
+    mesh_path = str(data_dir / "cube.stl")
     # mesh_path = str(data_dir / "cylinder.stl")
-    mesh_path = str(data_dir / "mug.stl")
+    # mesh_path = str(data_dir / "mug.stl")
     # mesh_path = str(data_dir / "cup.stl")
 
     print("\n" + "=" * 60)

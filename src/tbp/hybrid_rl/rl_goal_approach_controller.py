@@ -150,6 +150,7 @@ class RLGoalApproachController:
         self._collision_stats = {}
         self._last_detach_sub_steps = 1  # ← ДОБАВИТЬ
         self._consecutive_detach_count = 0
+        self._global_action_counts: Dict[str, int] = {}
 
         logger.info(
             f"RLGoalApproachController initialized: "
@@ -313,6 +314,9 @@ class RLGoalApproachController:
         self._prev_sensor_data = sensor_data
         self._prev_action = self._last_action
         self._last_action = action_index
+        # Статистика
+        action_name = self.action_space.get_info(action_index).name
+        self._global_action_counts[action_name] = self._global_action_counts.get(action_name, 0) + 1
 
         # Decay epsilon только в training
         if self.is_training:
@@ -842,9 +846,6 @@ class RLGoalApproachController:
 
         # ────────────────────────────────────────────────────
         # 0) SUPPRESS: подавить бесполезные действия
-        # Ситуация: всегда
-        # Принцип: rotate_sensor не помогает навигации,
-        # orient_hor/vert полезны только рядом с целью на поверхности
         # ────────────────────────────────────────────────────
         suppress = np.zeros(self.num_actions, dtype=float)
         suppress[self.action_space.IDX_ROTATE_POS] -= 2.0
@@ -872,6 +873,11 @@ class RLGoalApproachController:
         if recent_detach >= 1:
             suppress[self.action_space.IDX_DETACH] -= 5.0
             suppress[self.action_space.IDX_DETACH_EDGE] -= 5.0
+
+        # Подавить detach/detach_edge по умолчанию —
+        # они будут разблокированы в секции detach если нужны
+        suppress[self.action_space.IDX_DETACH] -= 3.0
+        suppress[self.action_space.IDX_DETACH_EDGE] -= 3.0
 
         bias += suppress
         components["suppress"] = suppress
@@ -1035,6 +1041,7 @@ class RLGoalApproachController:
                             f"tangential_dist={tangential_dist:.1f}"
                         )
 
+            # ═══ Применение detach bias ═══
             if need_detach or need_edge_detach:
                 recent_detach_count = sum(
                     1 for tr in self._episode_transitions[-5:]
@@ -1044,15 +1051,41 @@ class RLGoalApproachController:
 
                 if recent_detach_count < 1 and not last_was_detach and not close_to_goal:
                     if need_edge_detach:
-                        detach[self.action_space.IDX_DETACH_EDGE] += 5.0
+                        # +8.0 = компенсировать suppress (-3.0) + сильный bias (+5.0)
+                        detach[self.action_space.IDX_DETACH_EDGE] += 8.0
                     else:
-                        detach[self.action_space.IDX_DETACH] += 5.0
+                        # +8.0 = компенсировать suppress (-3.0) + сильный bias (+5.0)
+                        detach[self.action_space.IDX_DETACH] += 8.0
                     for idx in range(8):
                         detach[idx] -= 2.0
                     detach[self.action_space.IDX_FREE_FORWARD] -= 2.0
                     detach[self.action_space.IDX_FREE_BACKWARD] -= 2.0
                     detach[self.action_space.IDX_LOOK_UP] -= 1.0
                     detach[self.action_space.IDX_LOOK_DOWN] -= 1.0
+
+            # ═══ Alignment отрицательный — рекомендовать обычный detach ═══
+            # Ситуация: агент на поверхности, цель "за" поверхностью
+            # (например на дне, а цель на боковой стенке)
+            # surface_move не работает при отрицательном alignment,
+            # нужен detach чтобы оторваться и полететь к цели
+            if not need_detach and not need_edge_detach:
+                if alignment < DETACH_ALIGN_THR and distance > 3.0 * self.action_space.surface_step:
+                    recent_detach_count = sum(
+                        1 for tr in self._episode_transitions[-5:]
+                        if tr["action"] in (self.action_space.IDX_DETACH, self.action_space.IDX_DETACH_EDGE)
+                    )
+                    last_was_detach = self._last_action in (self.action_space.IDX_DETACH, self.action_space.IDX_DETACH_EDGE)
+
+                    if recent_detach_count < 1 and not last_was_detach:
+                        # Обычный detach, НЕ edge — цель не за стенкой,
+                        # а просто на другой грани
+                        # +6.0 = компенсировать suppress (-3.0) + bias (+3.0)
+                        detach[self.action_space.IDX_DETACH] += 6.0
+                        for idx in range(8):
+                            detach[idx] -= 2.0
+                        detach[self.action_space.IDX_FREE_FORWARD] -= 2.0
+                        detach[self.action_space.IDX_FREE_BACKWARD] -= 2.0
+
         bias += detach
         components["detach"] = detach
 
@@ -1368,6 +1401,7 @@ class RLGoalApproachController:
             "q_store_free": self.q_store_free.get_stats(),
             "q_store_surface": self.q_store_surface.get_stats(),
             "collision_stats": dict(self._collision_stats),
+            "global_action_counts": dict(self._global_action_counts),
         }
 
         return stats

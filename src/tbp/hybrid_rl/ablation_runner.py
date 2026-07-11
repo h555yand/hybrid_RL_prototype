@@ -206,8 +206,7 @@ def train(
                 action_explanations = []
                 current_poses = []
             else:
-                if controller.eval_epsilon == 1.0:
-                    controller.temperature_override = 0.01
+                controller.temperature_override = cfg.get("temperature_override", None)
 
             for step in range(controller.config["max_steps_per_goal"]):
                 current_pose = env.get_pose()

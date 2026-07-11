@@ -64,4 +64,5 @@ DEFAULT_CONFIG = {
     "eval_epsilon": 0.02,
     # Eval learning rate multiplier
     "eval_alpha_multiplier": 0.1,  # alpha × 0.1 в eval режиме
+    "temperature_override": None
 }
