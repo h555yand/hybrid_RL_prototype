@@ -1,13 +1,12 @@
+# experience_extractor.py
 """
-ExperienceExtractor: converts Q-learning 18D discrete trajectories
-to P-SAC 8-type parameterized format for Behavioral Cloning.
+ExperienceExtractor: converts Q-learning 21D discrete trajectories
+to P-SAC 9-type parameterized format for Behavioral Cloning.
 """
 
 import numpy as np
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional
-from .rl_goal_approach_controller import RLGoalApproachController
-from .lightweight_env import LightweightEnv
 
 
 @dataclass
@@ -18,6 +17,7 @@ class PSACTransition:
     reward: float
     next_state: Optional[np.ndarray] = None
     done: bool = False
+    mesh_id: int = 0
 
 
 class ExperienceExtractor:
@@ -44,11 +44,21 @@ class ExperienceExtractor:
         16: (5, lambda cfg: [cfg["rotation_step"], cfg.get("orient_left_distance", 0.02), cfg.get("orient_forward_distance", 0.05)]),
         17: (6, lambda cfg: [cfg["rotation_step"], cfg.get("orient_down_distance", 0.02), cfg.get("orient_forward_distance", 0.05)]),
         18: (7, lambda cfg: []),
-        19: (7, lambda cfg: []),
+        19: (8, lambda cfg: []),
+        20: (1, lambda cfg: [cfg.get("free_step_small", 2.0)]),
     }
 
-    def __init__(self, config: Dict[str, Any]):
+    MESH_NAME_TO_ID = {
+        "cube": 0,
+        "cylinder": 1,
+        "mug": 2,
+        "cup": 3,
+    }
+
+    def __init__(self, config: Dict[str, Any], mesh_name: str = ""):
         self.config = config
+        self.mesh_name = mesh_name
+        self.mesh_id = self.MESH_NAME_TO_ID.get(mesh_name, -1)
 
     def convert_action(self, discrete_action: int):
         action_type, params_fn = self.DISCRETE_TO_PSAC[discrete_action]
@@ -73,6 +83,7 @@ class ExperienceExtractor:
                 reward=float(tr["reward"]),
                 next_state=np.array(next_state, dtype=np.float32) if next_state is not None else None,
                 done=done,
+                mesh_id=self.mesh_id,
             ))
         return result
 
@@ -96,6 +107,7 @@ class ExperienceExtractor:
             5: 3,
             6: 3,
             7: 0,
+            8: 0,
         }
 
     @staticmethod
@@ -109,4 +121,5 @@ class ExperienceExtractor:
             5: "OrientHorizontal",
             6: "OrientVertical",
             7: "Detach",
+            8: "DetachEdge",
         }

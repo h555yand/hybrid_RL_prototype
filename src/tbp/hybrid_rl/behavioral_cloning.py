@@ -1,3 +1,4 @@
+# behavioral_cloning.py
 """
 BC Actor Network for Parameterized SAC.
 Behavioral Cloning: learns to copy Q-learning expert from successful trajectories.
@@ -18,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 class BCActorNetwork(nn.Module):
 
-    def __init__(self, state_dim: int = 15, num_types: int = 8):
+    def __init__(self, state_dim: int = 15, num_types: int = 9):
         super().__init__()
         self.state_dim = state_dim
         self.num_types = num_types

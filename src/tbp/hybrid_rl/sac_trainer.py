@@ -1,3 +1,4 @@
+# sac_trainer.py
 """
 P-SAC Training Loop.
 Combines Actor, Twin Critic, Replay Buffer, ActionInterpreter.
@@ -34,7 +35,7 @@ class PSACTrainer:
     def __init__(
         self,
         state_dim: int = 15,
-        num_types: int = 8,
+        num_types: int = 9,
         max_params: int = 3,
         gamma: float = 0.99,
         tau: float = 0.005,
@@ -160,26 +161,39 @@ class PSACTrainer:
     def compute_state(self, env, controller, current_pose, sensor_data):
         return controller._compute_state(current_pose, sensor_data)
 
-    def compute_reward(self, state, prev_state, distance, prev_distance, collision, steps):
+    def compute_reward(self, state, prev_state, distance, prev_distance, 
+    collision, steps, config=None, sensor_data=None):
+        cfg = config or {}
+        surface_step = cfg.get("surface_step", 3.0)
+        reward_progress = cfg.get("reward_progress", 3.0)
+        reward_goal = cfg.get("reward_goal_reached", 60.0)
+        reward_step = cfg.get("reward_step_penalty", -0.5)
+        reward_collision = cfg.get("reward_surface_violation", -12.0)
+        reward_timeout = cfg.get("reward_timeout", -12.0)
+        max_steps = cfg.get("max_steps_per_goal", self.max_steps_per_goal)
+
         reward = 0.0
         done = False
 
-        surface_step = 3.0
         progress = prev_distance - distance
-        reward += progress / surface_step * 3.0
+        reward += progress / surface_step * reward_progress
 
         if distance < self.goal_threshold:
-            reward += 60.0
+            reward += reward_goal
             done = True
 
-        reward += -0.2
+        # SMDP: step penalty пропорционален sub_steps
+        sub_steps = 1
+        if sensor_data is not None:
+            sub_steps = max(sensor_data.get("detach_sub_steps", 1), 1)
+        reward += reward_step * sub_steps
 
         if collision == "surface_violation":
-            reward += -5.0
+            reward += reward_collision
             done = True
 
-        if steps >= self.max_steps_per_goal:
-            reward += -8.0
+        if steps >= max_steps:
+            reward += reward_timeout
             done = True
 
         return reward, done
@@ -345,7 +359,7 @@ class PSACTrainer:
 
                 state_t = torch.FloatTensor(state).unsqueeze(0)
                 with torch.no_grad():
-                    at, ap, _, _ = self.actor.sample(state_t)
+                    at, ap, _, _ = self.actor.sample_eval(state_t)
                 action_type = at[0].item()
                 action_params = ap[0].numpy() * self.param_std + self.param_mean
 

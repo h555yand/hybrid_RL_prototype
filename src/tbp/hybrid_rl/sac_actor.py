@@ -1,3 +1,4 @@
+# sac_actor.py
 """
 SAC Actor Network for Parameterized Action Space.
 Stochastic policy: Categorical(types) + Gaussian(params|type).
@@ -101,18 +102,44 @@ class SACActorNetwork(nn.Module):
 
         return action_type, action_params, total_log_prob, type_probs
 
-    def predict(self, state: np.ndarray) -> Tuple[int, np.ndarray]:
-        self.eval()
-        with torch.no_grad():
-            state_t = torch.FloatTensor(state).unsqueeze(0)
-            type_logits, param_mus, _ = self.forward(state_t)
-            action_type = int(torch.argmax(type_logits, dim=1).item())
-            if action_type in param_mus:
-                action_params = param_mus[action_type][0].numpy()
-            else:
-                action_params = np.zeros(0)
-        return action_type, action_params
+    def sample_eval(
+        self, state: torch.Tensor, temperature: float = 0.3
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Low-noise sampling for evaluation."""
+        type_logits, param_mus, param_log_stds = self.forward(state)
 
+        # Тип: softmax с пониженной температурой (почти greedy, но не argmax)
+        type_probs = F.softmax(type_logits / temperature, dim=-1)
+        type_probs = type_probs.clamp(min=1e-8)
+        type_probs = type_probs / type_probs.sum(dim=-1, keepdim=True)
+        type_dist = torch.distributions.Categorical(type_probs)
+        action_type = type_dist.sample()
+
+        batch_size = state.shape[0]
+        max_params = 3
+        action_params = torch.zeros(batch_size, max_params)
+        param_log_prob = torch.zeros(batch_size)
+
+        for type_id in range(self.num_types):
+            mask = (action_type == type_id)
+            if mask.sum() == 0 or type_id not in param_mus:
+                continue
+            dim = self.param_dims[type_id]
+            mu = param_mus[type_id][mask]
+            log_std = param_log_stds[type_id][mask]
+            # Уменьшенный шум: std * temperature
+            std = (log_std.exp() * temperature).clamp(min=1e-6)
+
+            normal = torch.distributions.Normal(mu, std)
+            params_sample = normal.rsample()
+
+            action_params[mask, :dim] = params_sample
+
+        type_log_prob = type_dist.log_prob(action_type)
+        total_log_prob = type_log_prob + param_log_prob
+
+        return action_type, action_params, total_log_prob, type_probs
+        
     def load_bc_weights(self, bc_actor_state_dict: dict):
         own_state = self.state_dict()
         loaded = 0

@@ -1,3 +1,4 @@
+# arbitrator.py
 """
 Arbitrator: decides which action source to use per step.
 Switches between Q-store (episodic memory), SAC (skill),
@@ -38,7 +39,13 @@ def sac_to_discrete(action_type: int, action_params: np.ndarray) -> int:
         return best_idx
 
     elif action_type == 1:
-        return 8 if float(action_params[0]) >= 0 else 9
+        step = float(action_params[0])
+        if step < 0:
+            return 9   # free_backward
+        elif abs(step) <= 3.0:
+            return 20  # free_forward_small
+        else:
+            return 8   # free_forward
 
     elif action_type == 2:
         return 10 if float(action_params[0]) >= 0 else 11
@@ -56,7 +63,10 @@ def sac_to_discrete(action_type: int, action_params: np.ndarray) -> int:
         return 17
 
     elif action_type == 7:
-        return 18
+        return 18  # detach
+
+    elif action_type == 8:
+        return 19  # detach_edge
 
     return 0
 

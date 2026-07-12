@@ -1,20 +1,17 @@
 # ablation_runner.py
-from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-import json
-from pathlib import Path
-import trimesh
 import logging
 import collections
 import numpy as np
 import random
 import glob
+from pathlib import Path
+
 
 from tbp.hybrid_rl.rl_goal_approach_controller import RLGoalApproachController
 from tbp.hybrid_rl.lightweight_env import LightweightEnv
 from tbp.hybrid_rl.config import DEFAULT_CONFIG
-from tbp.hybrid_rl.visualize_env import visualize_agent_goal
 
 GOAL_THRESHOLD_PER_LEVEL = [5.0, 3.0, 2.0]
 
@@ -35,7 +32,7 @@ def train(
     episode_script: Optional[List[Dict[str, Any]]] = None,
     episode_pools: Optional[List[List[Dict[str, Any]]]] = None,
     visualise=False,
-    EPISODES_PER_LEVEL=None
+    EPISODES_PER_LEVEL=None,
 ):
     if seed is not None:
         np.random.seed(seed)
@@ -47,6 +44,19 @@ def train(
         else:
             config["num_episodes"] = int(num_episodes)
     cfg = {**DEFAULT_CONFIG, **(config or {})}
+
+    # Визуализация: сбор эпизодов
+    _vis_counts = {"success": 0, "collision": 0, "timeout": 0}
+    _vis_dir = None
+    _vis_filter = None
+    if visualise:
+        _vis_dir = Path(save_dir) / "visualizations"
+        _vis_filter = (config or {}).get("visualise_filter", {
+            "actions": ["detach", "detach_edge"],
+            "max_success": 5,
+            "max_collision": 5,
+            "max_timeout": 5,
+        })
 
     use_fixed_episode_script = episode_script is not None
     use_fixed_episode_pools = episode_pools is not None
@@ -84,7 +94,6 @@ def train(
         )
     else:
         controller = RLGoalApproachController.load(load_dir, agent_id=agent_id, config=config)
-        # Разморозить нормализацию для адаптации к новому мешу
         if cfg.get("unfreeze_normalization", False):
             controller.q_store_free._norm_frozen = False
             controller.q_store_free._freeze_done = False
@@ -207,7 +216,7 @@ def train(
                     env.reset(position=start_pos)
                 controller.set_new_goal(goal_pose, start_pos)
                 env.set_goal(goal_pose)
-                strategy = retry_strategies[min(retry, len(retry_strategies)-1)]
+                strategy = retry_strategies[min(retry, len(retry_strategies) - 1)]
                 controller.eval_epsilon = strategy["eval_epsilon"]
                 controller.temperature_override = strategy["temperature_override"]
                 action_explanations = []
@@ -245,13 +254,52 @@ def train(
         if _episode_success:
             success_trails.append(controller.success_trails)
             success_actions.append(action_explanations)
-            logger.debug(f"SUCCESS, start_distance {start_distance}, explain_action_info: {action_explanations}")
-            #if visualise:
-            #    visualize_agent_goal(env, np.concatenate([start_pos, start_rot]), goal_pose)
-            #    for pose in current_poses:
-            #        visualize_agent_goal(env, pose, goal_pose)
+            logger.debug(f"SUCCESS, start_distance {start_distance}")
         else:
-            logger.debug(f"ERROR, start_distance {start_distance}, explain_action_info: {action_explanations}")
+            logger.debug(f"ERROR, start_distance {start_distance}")
+
+        # Визуализация: сохранить эпизод если подходит под фильтр
+        if visualise and _vis_dir and _vis_filter:
+            from tbp.hybrid_rl.visualize_env import save_episode_frames
+
+            # Определить результат
+            last_termination = max(
+                controller._termination_counts.items(), key=lambda x: x[1]
+            )
+            if _episode_success:
+                ep_result = "success"
+            elif "collision" in str(last_termination[0]):
+                ep_result = "collision"
+            else:
+                ep_result = "timeout"
+
+            # Проверить фильтр: ВСЕ указанные действия должны присутствовать
+            filter_actions = _vis_filter.get("actions", [])
+            has_all_actions = all(
+                any(act_name in expl for expl in action_explanations)
+                for act_name in filter_actions
+            ) if filter_actions else True
+
+            # Проверить лимит
+            max_count = _vis_filter.get(f"max_{ep_result}", 5)
+            under_limit = _vis_counts[ep_result] < max_count
+
+            if has_all_actions and under_limit:
+                episode_id = f"ep_{episode:05d}_{ep_result}"
+                save_episode_frames(
+                    env=env,
+                    goal_pose=goal_pose,
+                    episode_poses=current_poses,
+                    episode_actions=action_explanations,
+                    output_dir=_vis_dir,
+                    episode_id=episode_id,
+                    result=ep_result,
+                )
+                _vis_counts[ep_result] += 1
+                print(
+                    f"[Vis] Saved {ep_result} episode: {episode_id} "
+                    f"(counts: {_vis_counts})"
+                )
 
         if _use_curriculum and "train" in cfg["mode"]:
             _episode_success = controller._total_goals_reached > _goals_before_episode
@@ -280,7 +328,7 @@ def train(
                     _curriculum_stats["levels_reached"] = _curr_level_idx + 1
                     _new_min, _new_max = _curr_levels[_curr_level_idx]
                     print(
-                        f"  [Curriculum] ep={episode+1}: promoted to level "
+                        f"  [Curriculum] ep={episode + 1}: promoted to level "
                         f"{_curr_level_idx}: dist [{_new_min}, {_new_max}] mm "
                         f"(rolling_rate={_rolling_rate:.3f})"
                         f"(epsilon={controller.epsilon:.3f})"
@@ -289,7 +337,7 @@ def train(
         if (episode + 1) % 1000 == 0:
             stats = controller.get_stats()
             print(
-                f"Episode {episode+1}/{num_episodes}: "
+                f"Episode {episode + 1}/{num_episodes}: "
                 f"stats={stats}"
             )
 
@@ -321,384 +369,3 @@ def train(
         }
 
     return goals_reached
-
-@dataclass
-class AblationSummary:
-    variant: str
-    success_rate: float
-    update_hit_rate_free: float
-    active_to_created_ratio_free: float
-    points_per_update_ratio_free: float
-    update_hit_rate_surface: float
-    active_to_created_ratio_surface: float
-    points_per_update_ratio_surface: float
-    timeout_rate: float = 0.0
-    collision_surface_violation_rate: float = 0.0
-    levels_reached: float = 0.0
-    fallback_rate: float = 0.0
-    collision_stats: Optional[Dict[str, Any]] = None
-
-
-class RLAblationRunner:
-    """Run A/B/C/D ablations across shared seeds and analyze results."""
-
-    def __init__(
-        self,
-        mesh_dir: str,
-        mesh_path: str,
-        save_root_dir: str,
-        num_episodes: int,
-        base_config: Optional[Dict[str, Any]] = None,
-        seeds: Optional[List[int]] = None,
-        episode_pools_by_seed: Optional[Dict[int, Dict[str, Any]]] = None,
-        is_load: bool = False
-    ):
-        self.mesh_dir = mesh_dir
-        self.mesh_path = mesh_path
-        self.save_root_dir = save_root_dir
-        self.num_episodes = num_episodes
-        self.base_config = base_config or {}
-        self.seeds = seeds or [11, 22, 33]
-        self.episode_pools_by_seed = episode_pools_by_seed or {}
-        self.is_load = is_load
-
-    def default_variants(self) -> Dict[str, Dict[str, Any]]:
-        return {
-            "A": {"insert_threshold": 0.50, "auto_calibrate": False}, # A was best
-            "B": {"insert_threshold": 0.60, "auto_calibrate": False},
-            "C": {"insert_threshold": 0.50, "k_neighbors": 11, "auto_calibrate": False},
-            "D": {
-                "insert_threshold": 0.50,
-                "auto_calibrate": False,
-                "mode": "auto",
-                "auto_train_threshold": 3500,
-                "eval_epsilon": 0.02,
-            },
-        }
-
-    def goal_reward_variants(self) -> Dict[str, Dict[str, Any]]:
-        """Stage 1: tune goal/reward pipeline with fixed max_steps_per_goal=20."""
-        return {
-            "G0": {
-                "reward_goal_reached": 50.0,
-                #"goal_threshold": 4.0,
-                "reward_timeout": -10.0,
-            },
-            "G1": {
-                "reward_goal_reached": 60.0,
-                #"goal_threshold": 4.0,
-                "reward_timeout": -8.0,
-            },
-            "G2": {
-                "reward_goal_reached": 70.0,
-                #"goal_threshold": 5.0,
-                "reward_timeout": -6.0,
-            },
-        }
-
-    def max_steps_variants(self, reward_overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Dict[str, Any]]:
-        """Stage 2: compare max_steps_per_goal with fixed reward settings."""
-        reward_overrides = reward_overrides or {}
-        base = {
-            "insert_threshold": 0.50,
-            "auto_calibrate": False,
-            **reward_overrides,
-        }
-        return {
-            "M20": {**base, "max_steps_per_goal": 20},
-            "M30": {**base, "max_steps_per_goal": 30},
-            "M40": {**base, "max_steps_per_goal": 40},
-        }
-
-    def curriculum_variants(
-        self,
-        reward_overrides: Optional[Dict[str, Any]] = None,
-        levels: Optional[List[Any]] = None,
-    ) -> Dict[str, Dict[str, Any]]:
-        """Stage 3: compare curriculum schedules with fixed reward settings."""
-        reward_overrides = reward_overrides or {}
-        levels = levels or [(10.0, 30.0), (10.0, 70.0), (10.0, 120.0)]
-        base = {
-            "insert_threshold": 0.50,
-            "auto_calibrate": False,
-            **reward_overrides,
-        }
-        return {
-            #"CL1": {
-            #    **base,
-            #    "curriculum_config": {
-            #        "levels": levels,
-            #        "promote_threshold": 0.1,
-            #        "promote_window": 50,
-            #    },
-            #},
-            #"CL2": {
-            #    **base,
-            #    "curriculum_config": {
-            #        "levels": levels,
-            #        "promote_threshold": 0.15,
-            #        "promote_window": 50,
-            #    },
-            #},
-            "CL3": {
-                **base,
-                "curriculum_config": {
-                    "levels": levels,
-                    "promote_threshold": 0.8,
-                    "promote_window": 100,
-                },
-            },
-        }
-
-    def run(self, variants: Optional[Dict[str, Dict[str, Any]]] = None, visualise=False) -> Dict[str, Any]:
-        variants = variants or self.default_variants()
-        raw_results: Dict[str, List[Dict[str, Any]]] = {name: [] for name in variants}
-
-        for seed in self.seeds:
-            for variant_name, overrides in variants.items():
-                curriculum_config = overrides.get("curriculum_config")
-                cfg_overrides = {
-                    k: v for k, v in overrides.items() if k != "curriculum_config"
-                }
-                cfg = {**self.base_config, **cfg_overrides}
-                save_dir = f"{self.save_root_dir}/{variant_name.lower()}_seed_{seed}"
-                seed_episode_pools = self.episode_pools_by_seed.get(seed)
-                episode_pools = None
-                if seed_episode_pools is not None:
-                    episode_pools = seed_episode_pools.get("levels")
-                    pool_sizes = [len(pool) for pool in episode_pools]
-                    print(
-                        f"[Ablation] Using fixed episode pools for seed={seed} "
-                        f"(levels={pool_sizes})"
-                    )
-                if self.is_load:
-                    load_dir = save_dir
-                else:
-                    load_dir = None
-
-                run_result = train(
-                    mesh_dir=self.mesh_dir,
-                    save_dir=save_dir,
-                    load_dir=load_dir,
-                    num_episodes=self.num_episodes,
-                    config=cfg,
-                    mesh_path=self.mesh_path,
-                    seed=seed,
-                    return_metrics=True,
-                    curriculum_config=curriculum_config,
-                    episode_pools=episode_pools,
-                    visualise=visualise
-                )
-                run_result["seed"] = seed
-                raw_results[variant_name].append(run_result)
-
-        summaries = {
-            name: self._aggregate_variant(name, runs) for name, runs in raw_results.items()
-        }
-        best_variant = self._pick_best_variant(summaries)
-
-        return {
-            "seeds": self.seeds,
-            "raw_results": raw_results,
-            "summaries": {k: v.__dict__ for k, v in summaries.items()},
-            "best_variant": best_variant,
-        }
-
-    @staticmethod
-    def _pick_best_variant(summaries: Dict[str, AblationSummary]) -> str:
-        ranked = sorted(
-            summaries.values(),
-            key=lambda s: (
-                -s.success_rate,
-                s.timeout_rate,
-                s.collision_surface_violation_rate,
-            ),
-        )
-        return ranked[0].variant
-
-    def _aggregate_variant(self, variant: str, runs: List[Dict[str, Any]]) -> AblationSummary:
-        def _metric(run: Dict[str, Any], key: str, default: float = 0.0, name="not defined") -> float:
-            stats = run.get("stats", {})
-            # Current train() returns controller stats with Q-store metrics nested under q_store.
-            # Keep top-level fallback for compatibility with older synthetic tests.
-            q_store_stats = stats.get(name, {})
-            if key in q_store_stats:
-                return float(q_store_stats.get(key, default))
-            return float(stats.get(key, default))
-
-        def _termination_rate(run: Dict[str, Any], key: str, default: float = 0.0) -> float:
-            stats = run.get("stats", {})
-            rates = stats.get("termination_rates", {})
-            return float(rates.get(key, default))
-
-        success_rate = float(np.mean([float(r["success_rate"]) for r in runs]))
-
-        update_hit_rate_free = float(np.mean([_metric(r, "update_hit_rate", name="q_store_free") for r in runs]))
-        active_to_created_ratio_free = float(
-            np.mean([_metric(r, "active_to_created_ratio", name="q_store_free") for r in runs])
-        )
-        points_per_update_ratio_free = float(
-            np.mean([_metric(r, "points_per_update_ratio", name="q_store_free") for r in runs])
-        )
-
-        update_hit_rate_surface = float(np.mean([_metric(r, "update_hit_rate", name="q_store_surface") for r in runs]))
-        active_to_created_ratio_surface = float(
-            np.mean([_metric(r, "active_to_created_ratio", name="q_store_surface") for r in runs])
-        )
-        points_per_update_ratio_surface = float(
-            np.mean([_metric(r, "points_per_update_ratio", name="q_store_surface") for r in runs])
-        )
-
-        timeout_rate = float(np.mean([_termination_rate(r, "timeout") for r in runs]))
-        collision_surface_violation_rate = float(
-            np.mean([_termination_rate(r, "collision_surface_violation") for r in runs])
-        )
-        levels_reached = float(
-            np.mean(
-                [
-                    float((r.get("curriculum_stats") or {}).get("levels_reached", 0.0))
-                    for r in runs
-                ]
-            )
-        )
-        fallback_rate = float(
-            np.mean(
-                [
-                    float((r.get("curriculum_stats") or {}).get("fallback_rate", 0.0))
-                    for r in runs
-                ]
-            )
-        )
-        # ─── ДОБАВЛЕНО: агрегация collision_stats ───
-        merged_collision_stats: Dict[str, float] = {}
-        for r in runs:
-            cs = r.get("stats", {}).get("collision_stats", {})
-            for action_name, count in cs.items():
-                merged_collision_stats[action_name] = (
-                    merged_collision_stats.get(action_name, 0.0) + float(count)
-                )
-        # Усредняем по количеству seed'ов
-        n_runs = max(len(runs), 1)
-        averaged_collision_stats = {
-            k: v / n_runs for k, v in merged_collision_stats.items()
-        }
-
-        return AblationSummary(
-            variant=variant,
-            success_rate=success_rate,
-            update_hit_rate_free=update_hit_rate_free,
-            active_to_created_ratio_free=active_to_created_ratio_free,
-            points_per_update_ratio_free=points_per_update_ratio_free,
-            update_hit_rate_surface=update_hit_rate_surface,
-            active_to_created_ratio_surface=active_to_created_ratio_surface,
-            points_per_update_ratio_surface=points_per_update_ratio_surface,
-            timeout_rate=timeout_rate,
-            collision_surface_violation_rate=collision_surface_violation_rate,
-            levels_reached=levels_reached,
-            fallback_rate=fallback_rate,
-            collision_stats=averaged_collision_stats,  # ← ДОБАВЛЕНО
-        )
-
-    @staticmethod
-    def choose_next_debug_direction(
-        run_a: AblationSummary,
-        run_b: AblationSummary,
-        run_c: AblationSummary,
-        run_d: AblationSummary,
-        hit_rate_tol: float = 0.03,
-        q_store_tol: float = 0.05,
-    ) -> str:
-        if (
-            run_b.success_rate > run_a.success_rate
-            and run_b.update_hit_rate > run_a.update_hit_rate
-        ):
-            return "threshold_reuse"
-
-        if (
-            run_c.success_rate > max(run_a.success_rate, run_b.success_rate, run_d.success_rate)
-            and abs(run_c.update_hit_rate - run_a.update_hit_rate) <= hit_rate_tol
-        ):
-            return "kernel_smoothing"
-
-        if (
-            run_d.success_rate > max(run_a.success_rate, run_b.success_rate, run_c.success_rate)
-            and abs(run_d.points_per_update_ratio - run_a.points_per_update_ratio)
-            <= q_store_tol
-        ):
-            return "epsilon_reward_dynamics"
-
-        store_good = (
-            run_a.update_hit_rate >= 0.50
-            and run_a.active_to_created_ratio >= 0.80
-            and 0.25 <= run_a.points_per_update_ratio <= 0.50
-        )
-        no_success_help = (
-            run_b.success_rate <= run_a.success_rate
-            and run_c.success_rate <= run_a.success_rate
-            and run_d.success_rate <= run_a.success_rate
-        )
-        if store_good and no_success_help:
-            return "goal_reward_pipeline"
-
-        return "no_clear_winner"
-
-    @staticmethod
-    def suggest_next_changes(direction: str) -> Dict[str, Any]:
-        recommendations = {
-            "threshold_reuse": {
-                "focus": "raise state reuse",
-                "changes": {
-                    "insert_threshold": [0.65, 0.70],
-                    "auto_calibrate": False,
-                },
-                "target": {
-                    "update_hit_rate": ">= 0.55",
-                    "points_per_update_ratio": "<= 0.45",
-                },
-            },
-            "kernel_smoothing": {
-                "focus": "improve interpolation smoothness",
-                "changes": {
-                    "k_neighbors": [11, 13],
-                    "sigma": [1.1, 1.3],
-                    "adaptive_sigma": True,
-                },
-                "target": {
-                    "success_rate": "increase without hit_rate drop",
-                },
-            },
-            "epsilon_reward_dynamics": {
-                "focus": "exploration schedule",
-                "changes": {
-                    "mode": "auto",
-                    "auto_train_threshold": [3000, 4000],
-                    "eval_epsilon": [0.02, 0.05],
-                    "epsilon_decay": [0.9998, 0.9999],
-                },
-                "target": {
-                    "success_rate": "increase with similar q_store stats",
-                },
-            },
-            "goal_reward_pipeline": {
-                "focus": "goal/reward/termination path",
-                "changes": {
-                    "reward_goal_reached": [60.0, 80.0],
-                    "goal_threshold": [3.0, 5.0],
-                    "reward_timeout": [-8.0, -5.0],
-                },
-                "target": {
-                    "success_rate": "increase while store metrics remain stable",
-                },
-            },
-            "no_clear_winner": {
-                "focus": "collect stronger evidence",
-                "changes": {
-                    "seeds": [11, 22, 33, 44, 55],
-                    "num_episodes": "same or +20%",
-                },
-                "target": {
-                    "confidence": "lower run-to-run variance",
-                },
-            },
-        }
-        return recommendations.get(direction, recommendations["no_clear_winner"])

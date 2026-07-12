@@ -1,3 +1,4 @@
+# adaptive_manager.py
 """
 AdaptiveTrainingManager: monitors performance and decides
 when/how to train for new objects.
@@ -87,6 +88,8 @@ class AdaptiveTrainingManager:
         self.extractor = ExperienceExtractor(config=config)
         self.arbitrator = Arbitrator(controller=controller)
         self.bc_transitions = []  # накопитель BC данных от всех offline итераций
+        mesh_name = Path(mesh_path).stem
+        self.extractor = ExperienceExtractor(config=config, mesh_name=mesh_name)
 
     @property
     def success_rate(self):
@@ -309,7 +312,11 @@ class AdaptiveTrainingManager:
             )
 
             if len(self.bc_transitions) > 100:
-                bc_trainer = BCTrainer(state_dim=self.config.get("state_dim", 15))
+                num_action_types = len(ExperienceExtractor.get_type_names())
+                bc_trainer = BCTrainer(
+                    state_dim=self.config.get("state_dim", 15),
+                    num_types=num_action_types,
+                )
                 bc_trainer.train(self.bc_transitions, num_epochs=200)
                 bc_model_dir = str(self.runs_dir / "adaptive_bc")
                 bc_trainer.save(bc_model_dir)
@@ -321,6 +328,7 @@ class AdaptiveTrainingManager:
 
                 sac_trainer = PSACTrainer(
                     state_dim=self.config.get("state_dim", 15),
+                    num_types=num_action_types,
                     lr_actor=1e-5,
                     bc_lambda_init=5.0,
                     bc_lambda_decay=0.999999,
