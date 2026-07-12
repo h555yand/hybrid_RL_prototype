@@ -1,191 +1,184 @@
-## Анализ HNSW State Store
+## HNSW State Store Analysis
 
-### Метрики HNSW и их интерпретация
+### HNSW Metrics and Their Interpretation
 
-HNSW State Store — ключевая новая сущность, реализующая эпизодическую память для Q-learning. Хранит состояния как точки в HNSW графе, интерполирует Q-values через kNN + Gaussian Kernel. Ниже — полное описание метрик и анализ на двух конфигурациях.
+HNSW State Store is a key novel component implementing episodic memory for Q-learning. It stores states as points in an HNSW graph and interpolates Q-values via kNN + Gaussian Kernel. Below is a complete description of metrics and analysis across configurations.
 
-#### Полный список метрик HNSW State Store
+#### Complete HNSW State Store Metrics
 
-| Метрика | Описание | Как считается | Интерпретация |
-|---------|----------|---------------|---------------|
-| **num_points** | Количество точек в графе | Счётчик вставок | Объём накопленного опыта. Растёт при попадании в новые области пространства состояний |
-| **global_step** | Общее число обращений к store | Счётчик get/update вызовов | Общая активность. Соотношение с num_points показывает плотность использования |
-| **updates_existing** | Число обновлений существующих точек | Когда ближайший сосед ближе insert_threshold | Агент возвращается в знакомые состояния и уточняет Q-values |
-| **inserts** | Число вставок новых точек | Когда ближайший сосед дальше insert_threshold | Агент попадает в новую область, расширяет покрытие |
-| **update_hit_rate** | Доля обновлений vs вставок | updates / (updates + inserts) | **Ключевая метрика.** Высокий (> 0.85) → агент работает в знакомых областях, Q-values уточняются. Низкий (< 0.7) → агент постоянно в новых состояниях, Q-values не успевают сходиться |
-| **active_to_created_ratio** | Доля активных точек от созданных | active / created | 1.0 = все точки активны (нет eviction). < 1.0 = часть точек вытеснена из-за лимита памяти |
-| **points_per_update_ratio** | Отношение точек к обновлениям | num_points / global_step | **Скорость роста памяти.** Высокий (> 0.2) → много новых состояний, граф быстро растёт. Низкий (< 0.1) → агент в основном уточняет существующие точки |
-| **visits_mean / visits_median** | Среднее / медиана посещений точки | Счётчик обновлений на точку | Равномерность покрытия. Большой разрыв mean vs median → несколько «горячих» точек посещаются очень часто |
-| **q_magnitude_mean** | Средний абсолютный Q-value | mean(abs(Q)) по всем точкам и действиям | Сила выученных оценок. Растёт с опытом |
-| **q_spread_mean** | Средний разброс Q-values в точке | mean(max(Q) - min(Q)) | Насколько store различает действия. Низкий (< 1.0) → все действия оцениваются одинаково. Высокий (> 5.0) → чёткие предпочтения |
-| **nn_distance_median** | Медиана расстояний до ближайших соседей | Из kNN запросов | Плотность покрытия пространства. Низкий → плотное покрытие, высокий → разреженное |
-| **nn_distance_p10 / p90** | 10-й и 90-й перцентили nn_distance | Из kNN запросов | Разброс плотности. Большой p90 → есть плохо покрытые области |
-| **insert_threshold** | Порог для вставки новой точки | Конфигурационный параметр | Если расстояние до ближайшего соседа > threshold → вставка. Регулирует гранулярность памяти |
-| **adaptive_sigma** | Адаптивная ширина ядра | True/False | Если True — sigma подбирается по расстояниям до соседей. Улучшает интерполяцию в областях с разной плотностью |
+| Metric | Description | How Computed | Interpretation |
+|--------|-------------|--------------|----------------|
+| **num_points** | Number of points in the graph | Insertion counter | Volume of accumulated experience. Grows when agent enters new regions of state space |
+| **global_step** | Total number of store accesses | Counter of get/update calls | Overall activity. Ratio to num_points shows usage density |
+| **updates_existing** | Number of updates to existing points | When nearest neighbor is closer than insert_threshold | Agent returns to familiar states and refines Q-values |
+| **inserts** | Number of new point insertions | When nearest neighbor is farther than insert_threshold | Agent enters a new region, expanding coverage |
+| **update_hit_rate** | Ratio of updates vs insertions | updates / (updates + inserts) | **Key metric.** High (> 0.85) → agent operates in familiar regions, Q-values are being refined. Low (< 0.7) → agent is constantly in new states, Q-values don't converge |
+| **active_to_created_ratio** | Fraction of active points from total created | active / created | 1.0 = all points active (no eviction). < 1.0 = some points evicted due to memory limit |
+| **points_per_update_ratio** | Ratio of points to updates | num_points / global_step | **Memory growth rate.** High (> 0.2) → many new states, graph grows rapidly. Low (< 0.1) → agent mostly refines existing points |
+| **visits_mean / visits_median** | Mean / median visits per point | Update counter per point | Coverage uniformity. Large gap between mean and median → a few "hot" points are visited very frequently |
+| **q_magnitude_mean** | Mean absolute Q-value | mean(abs(Q)) across all points and actions | Strength of learned estimates. Grows with experience |
+| **q_spread_mean** | Mean Q-value spread per point | mean(max(Q) - min(Q)) | How well the store distinguishes actions. Low (< 1.0) → all actions rated equally. High (> 5.0) → clear preferences |
+| **nn_distance_median** | Median distance to nearest neighbors | From kNN queries | Coverage density. Low → dense coverage, high → sparse |
+| **nn_distance_p10 / p90** | 10th and 90th percentiles of nn_distance | From kNN queries | Density variation. Large p90 → poorly covered regions exist |
+| **insert_threshold** | Threshold for new point insertion | Configuration parameter | If distance to nearest neighbor > threshold → insert. Controls memory granularity |
+| **adaptive_sigma** | Adaptive kernel bandwidth | True/False | If True — sigma adapts to neighbor distances. Improves interpolation in regions with varying density |
 
-#### Два store: free и surface
+#### Two Stores: Free and Surface
 
-Store разделён на два независимых графа:
-- **q_store_free** — состояния в воздухе (on_object = 0). Навигация: повороты, forward, приземление
-- **q_store_surface** — состояния на поверхности (on_object = 1). Ползание, detach, ориентация
-
-Разделение необходимо потому что одинаковые позиции в воздухе и на поверхности требуют противоположных стратегий.
-
-Store разделён на два независимых HNSW графа по признаку контакта с поверхностью (`state[11]` — on_object):
+The store is split into two independent graphs based on surface contact (`state[11]` — on_object):
 
 ```python
 def _select_store(self, state: np.ndarray) -> HNSWStateStore:
     return self.q_store_surface if state[11] > 0.5 else self.q_store_free
 ```
 
-**Почему разделение необходимо:**
+**Why separation is necessary:**
 
-Одна и та же позиция в пространстве требует **противоположных стратегий** в зависимости от того, касается ли агент поверхности:
+The same spatial position requires **opposite strategies** depending on whether the agent is touching the surface:
 
-| Ситуация | На поверхности (surface) | В воздухе (free) |
-|----------|------------------------|-----------------|
-| Цель впереди | Ползти по поверхности (MoveTangentially) | Лететь вперёд (MoveForward) |
-| Цель далеко | Detach → перелёт | Повернуться → лететь |
-| Препятствие | Обойти по поверхности | Нет препятствий |
-| Доступные действия | 8 направлений ползания + detach + orient | Повороты + forward/backward |
-| Характер движения | Мелкие шаги (3mm), привязан к геометрии | Крупные шаги (5mm), свободная навигация |
+| Situation | On surface (surface) | In air (free) |
+|-----------|---------------------|---------------|
+| Goal ahead | Crawl along surface (MoveTangentially) | Fly forward (MoveForward) |
+| Goal far away | Detach → fly over | Turn → fly |
+| Obstacle | Navigate around on surface | No obstacles |
+| Available actions | 8 crawl directions + detach + orient | Turns + forward/backward |
+| Movement character | Small steps (3mm), bound to geometry | Large steps (8mm), free navigation |
 
-При хранении в одном графе kNN находил бы «похожие» состояния из другого режима — например, точка в воздухе рядом с поверхностью получала бы Q-values от поверхностных точек, где лучшее действие — ползание. Но в воздухе ползание невозможно.
+With a single graph, kNN would find "similar" states from the wrong mode — e.g., an airborne point near the surface would get Q-values from surface points where the best action is crawling. But crawling is impossible in the air.
 
-**Характеристики каждого store:**
+**Characteristics of each store:**
 
-| Метрика | q_store_free | q_store_surface |
-|---------|-------------|----------------|
-| Типичный размер | ~67K точек | ~38K точек |
+| Metric | q_store_free | q_store_surface |
+|--------|-------------|----------------|
+| Typical size | ~67K points | ~38K points |
 | Update hit rate | 0.75–0.89 | 0.84–0.95 |
 | Points per update ratio | 0.16–0.25 | 0.09–0.16 |
-| Характер | Быстрый рост, разреженное покрытие | Медленный рост, плотное покрытие |
+| Character | Fast growth, sparse coverage | Slow growth, dense coverage |
 
-Surface store плотнее и стабильнее — поверхностная навигация более предсказуема (мелкие шаги, ограниченная геометрия). Free store растёт быстрее — воздушная навигация более разнообразна (повороты, разные высоты, траектории после detach).
-
----
-
-### Тестовые конфигурации
-
-Три запуска Q-learning на кружке (mug.stl), 3 seeds × 5000 эпизодов, curriculum levels (10-40mm, 20-80mm, 40-120mm):
-
-| Конфигурация | goal_threshold | Действия | Описание |
-|-------------|---------------|----------|----------|
-| **A: Mug-5** | 5 mm | 18 (без detach) | Строгий порог, нет макро-действий |
-| **B: Mug-10** | 10 mm | 18 (без detach) | Мягкий порог, нет макро-действий |
-| **C: Mug-5-detach** | 5 mm | 20 (с detach) | Строгий порог, с макро-действиями |
+Surface store is denser and more stable — surface navigation is more predictable (small steps, constrained geometry). Free store grows faster — aerial navigation is more diverse (turns, varying heights, post-detach trajectories).
 
 ---
 
-### Результаты
+### Test Configurations
 
-#### Общие метрики
+Three Q-learning runs on a mug (mug.stl), 3 seeds × 5000 episodes, curriculum levels (10-40mm, 20-80mm, 40-120mm):
 
-| Метрика | A: Mug-5 | B: Mug-10 | C: Mug-5-detach |
-|---------|----------|-----------|-----------------|
+| Configuration | goal_threshold | Actions | Description |
+|--------------|---------------|---------|-------------|
+| **A: Mug-5** | 5 mm | 18 (no detach) | Strict threshold, no macro-actions |
+| **B: Mug-10** | 10 mm | 18 (no detach) | Lenient threshold, no macro-actions |
+| **C: Mug-5-detach** | 5 mm | 20 (with detach) | Strict threshold, with macro-actions |
+
+---
+
+### Results
+
+#### Overall Metrics
+
+| Metric | A: Mug-5 | B: Mug-10 | C: Mug-5-detach |
+|--------|----------|-----------|-----------------|
 | **success_rate** | 40.6% | 56.5% | **74.8%** |
 | **timeout_rate** | 55.3% | 41.8% | **0.0%** |
 | **collision_rate** | 4.1% | 1.7% | 25.2% |
 | **levels_reached** | 1.0 | 1.7 | **3.0** |
 
-#### Метрики HNSW — free store
+#### HNSW Metrics — Free Store
 
-| Метрика | A: Mug-5 | B: Mug-10 | C: Mug-5-detach |
-|---------|----------|-----------|-----------------|
+| Metric | A: Mug-5 | B: Mug-10 | C: Mug-5-detach |
+|--------|----------|-----------|-----------------|
 | **update_hit_rate** | 0.874 | 0.887 | 0.749 |
 | **active_to_created_ratio** | 1.0 | 1.0 | 1.0 |
 | **points_per_update_ratio** | 0.162 | 0.156 | 0.246 |
 
-#### Метрики HNSW — surface store
+#### HNSW Metrics — Surface Store
 
-| Метрика | A: Mug-5 | B: Mug-10 | C: Mug-5-detach |
-|---------|----------|-----------|-----------------|
+| Metric | A: Mug-5 | B: Mug-10 | C: Mug-5-detach |
+|--------|----------|-----------|-----------------|
 | **update_hit_rate** | 0.896 | 0.954 | 0.843 |
 | **active_to_created_ratio** | 1.0 | 1.0 | 1.0 |
 | **points_per_update_ratio** | 0.113 | 0.093 | 0.157 |
 
 ---
 
-### Анализ
+### Analysis
 
-#### 1. Update hit rate — индикатор сходимости
+#### 1. Update Hit Rate — Convergence Indicator
 
-**Конфигурация B (Mug-10)** показывает наивысший update_hit_rate:
+**Configuration B (Mug-10)** shows the highest update_hit_rate:
 - free: 0.887, surface: **0.954**
 
-Это означает что 95.4% обращений к surface store обновляют существующие точки, а не создают новые. Агент работает в хорошо изученных областях, Q-values стабильно уточняются. Мягкий порог (10mm) позволяет чаще достигать цели → больше успешных траекторий → больше повторных посещений тех же областей.
+This means 95.4% of surface store accesses update existing points rather than creating new ones. The agent operates in well-explored regions, Q-values are steadily refined. The lenient threshold (10mm) allows more frequent goal achievement → more successful trajectories → more revisits to the same regions.
 
-**Конфигурация C (detach)** показывает наименьший update_hit_rate:
+**Configuration C (detach)** shows the lowest update_hit_rate:
 - free: **0.749**, surface: 0.843
 
-Detach создаёт новые траектории через воздух → агент попадает в ранее не посещённые состояния → больше вставок. Это ожидаемо и полезно — расширяется покрытие пространства.
+Detach creates new trajectories through the air → the agent reaches previously unvisited states → more insertions. This is expected and beneficial — it expands state space coverage.
 
-#### 2. Points_per_update_ratio — скорость роста памяти
+#### 2. Points_per_update_ratio — Memory Growth Rate
 
-| Конфигурация | Free | Surface | Интерпретация |
-|-------------|------|---------|---------------|
-| A: Mug-5 | 0.162 | 0.113 | Умеренный рост |
-| B: Mug-10 | 0.156 | **0.093** | Медленный рост — агент в знакомых областях |
-| C: Detach | **0.246** | 0.157 | Быстрый рост — detach открывает новые области |
+| Configuration | Free | Surface | Interpretation |
+|--------------|------|---------|----------------|
+| A: Mug-5 | 0.162 | 0.113 | Moderate growth |
+| B: Mug-10 | 0.156 | **0.093** | Slow growth — agent in familiar regions |
+| C: Detach | **0.246** | 0.157 | Fast growth — detach opens new regions |
 
-Surface store растёт медленнее free store во всех конфигурациях. Это логично: на поверхности движения мелкие (3mm шаг), состояния плотно покрывают область. В воздухе движения крупные (5mm + повороты), состояния более разреженные.
+Surface store grows slower than free store across all configurations. This is logical: on the surface, movements are small (3mm step), states densely cover the area. In the air, movements are large (8mm + turns), states are more sparse.
 
-Конфигурация C (detach) имеет самый быстрый рост free store (0.246) — каждый detach создаёт серию новых состояний в воздухе.
+Configuration C (detach) has the fastest free store growth (0.246) — each detach creates a series of new airborne states.
 
-#### 3. Active_to_created_ratio = 1.0 везде
+#### 3. Active_to_created_ratio = 1.0 Everywhere
 
-Ни одна точка не была вытеснена. Это означает что лимит памяти (max_points=500K) не достигнут. Для текущих объёмов обучения (5000 эпизодов) памяти достаточно.
+No points were evicted. This means the memory limit (max_points=500K) was not reached. For current training volumes (5000 episodes), memory is sufficient.
 
-#### 4. Связь HNSW метрик с success rate
+#### 4. Relationship Between HNSW Metrics and Success Rate
 
-| Конфигурация | success_rate | surface hit_rate | surface points_ratio |
-|-------------|-------------|-----------------|---------------------|
+| Configuration | success_rate | surface hit_rate | surface points_ratio |
+|--------------|-------------|-----------------|---------------------|
 | A: Mug-5 | 40.6% | 0.896 | 0.113 |
 | B: Mug-10 | 56.5% | 0.954 | 0.093 |
 | C: Detach | 74.8% | 0.843 | 0.157 |
 
-**Парадокс:** конфигурация C имеет наименьший hit_rate, но наивысший success_rate. Это не противоречие:
-- Высокий hit_rate (B) означает что агент ходит по кругу в знакомых областях — Q-values точные, но покрытие узкое
-- Низкий hit_rate (C) означает что агент исследует новые области — Q-values менее точные, но покрытие широкое
-- Detach даёт доступ к ранее недостижимым целям → success_rate растёт несмотря на менее точные Q-values
+**Paradox:** Configuration C has the lowest hit_rate but the highest success_rate. This is not a contradiction:
+- High hit_rate (B) means the agent circles through familiar regions — Q-values are accurate but coverage is narrow
+- Low hit_rate (C) means the agent explores new regions — Q-values are less accurate but coverage is broad
+- Detach provides access to previously unreachable goals → success_rate increases despite less precise Q-values
 
-#### 5. Collision rate в конфигурации C
+#### 5. Collision Rate in Configuration C
 
-Collision rate 25.2% — значительно выше чем в A (4.1%) и B (1.7%). Detach включает фазу полёта и приземления, где риск коллизии выше. Это было исправлено в последующих итерациях (уменьшение free_step, штрафы за free_forward на поверхности).
+Collision rate of 25.2% — significantly higher than A (4.1%) and B (1.7%). Detach includes flight and landing phases where collision risk is higher. This was addressed in subsequent iterations (reduced free_step, penalties for free_forward on surface).
 
 ---
 
-### Выводы по HNSW State Store
+### HNSW State Store Conclusions
 
-**1. HNSW store эффективно работает как эпизодическая память.**
-Update hit rate 0.84–0.95 показывает что kNN находит релевантные соседние состояния и Q-values корректно обновляются. Механизм insert/update с порогом обеспечивает баланс между точностью (обновление существующих) и покрытием (вставка новых).
+**1. HNSW store works effectively as episodic memory.**
+Update hit rate of 0.84–0.95 shows that kNN finds relevant neighboring states and Q-values are correctly updated. The insert/update mechanism with threshold provides a balance between accuracy (updating existing) and coverage (inserting new).
 
-**2. Разделение на free/surface store оправдано.**
-Surface store имеет более высокий hit_rate и более медленный рост — поверхностная навигация более предсказуема. Free store растёт быстрее — воздушная навигация более разнообразна. Объединение в один store привело бы к путанице между режимами.
+**2. Separation into free/surface stores is justified.**
+Surface store has higher hit_rate and slower growth — surface navigation is more predictable. Free store grows faster — aerial navigation is more diverse. Merging into a single store would cause confusion between modes.
 
-**3. Масштабируемость достаточна.**
-Active_to_created_ratio = 1.0 во всех конфигурациях — лимит памяти не достигнут. Для объектов текущей сложности (кружка, чашка) 500K точек более чем достаточно.
+**3. Scalability is sufficient.**
+Active_to_created_ratio = 1.0 across all configurations — memory limit not reached. For objects of current complexity (mug, cup), 500K points is more than sufficient.
 
-**4. HNSW store хорош для знакомых объектов, плох для transfer.**
-На кружке (знакомый объект) Q-store даёт 59% решений в арбитраже с success rate 78%. На чашке (новый объект) Q-store мешает — арбитраж (55%) хуже чистого SAC (73%). Q-spread падает с 15.1 до 5.8 — store менее уверен, но всё ещё принимает 45% решений.
+**4. HNSW store excels on familiar objects, struggles with transfer.**
+On the mug (familiar object), Q-store provides 59% of decisions in arbitration with 78% success rate. On the cup (new object), Q-store interferes — arbitration (55%) performs worse than pure SAC (73%). Q-spread drops from 15.1 to 5.8 — the store is less confident but still makes 45% of decisions.
 
+### HNSW State Store Recommendations
 
-### Рекомендации по HNSW State Store
+**1. Confirm use of HNSW State Store** for tasks with recurring objects. Update hit rate of 0.84–0.95 confirms that kNN + Gaussian Kernel interpolation works correctly as episodic memory. One-shot/few-shot learning via Q-update is effective — the agent quickly learns on a specific object.
 
-**1. Подтверждаем использование HNSW State Store** для задач с повторяющимися объектами. Update hit rate 0.84–0.95 подтверждает что kNN + Gaussian Kernel интерполяция корректно работает как эпизодическая память. One-shot/few-shot обучение через Q-update эффективно — агент быстро учится на конкретном объекте.
+**2. Eviction mechanism works but hasn't been stress-tested.** In current experiments, `active_to_created_ratio = 1.0` across all configurations — memory limit (500K) was not reached. Eviction via `mark_deleted` + rebuild at ghost ratio > 30% is implemented but requires testing on long sessions (>50K episodes) or on many objects when memory fills up.
 
-**2. Механизм eviction работает, но не тестировался под нагрузкой.** В текущих экспериментах `active_to_created_ratio = 1.0` во всех конфигурациях — лимит памяти (500K) не достигнут. Eviction через `mark_deleted` + rebuild при ghost ratio > 30% реализован, но требует тестирования на длительных сессиях (>50K эпизодов) или на множестве объектов, когда память заполнится.
+**3. For transfer to new objects — use `min_weight_threshold`.** The code implements a "don't know" mechanism: if the total kNN neighbor weight is below `min_weight_threshold`, the store returns zeros. This correctly works as an unfamiliar state detector. Recommendation: in the arbitrator, use this signal for automatic switching to SAC when Q-store returns zeros.
 
-**3. Для transfer на новые объекты — использовать `min_weight_threshold`.** В коде реализован механизм «не знаю»: если суммарный вес kNN соседей ниже `min_weight_threshold`, store возвращает нули. Это корректно работает как детектор незнакомых состояний. Рекомендация: в арбитраторе использовать этот сигнал для автоматического переключения на SAC, когда Q-store возвращает нули.
+**4. Auto-calibration of `insert_threshold` requires validation.** An automatic threshold calibration mechanism based on nearest-neighbor distance percentiles is implemented. In current experiments, `auto_calibrate=False` (fixed threshold=0.5 is used). Recommendation: run a comparative experiment with `auto_calibrate=True` to evaluate impact on points_per_update_ratio and success_rate.
 
-**4. Auto-calibration `insert_threshold` требует валидации.** Реализован механизм автоматической калибровки порога вставки по перцентилю расстояний до ближайших соседей. В текущих экспериментах `auto_calibrate=False` (используется фиксированный threshold=0.5). Рекомендация: провести сравнительный эксперимент с `auto_calibrate=True` для оценки влияния на points_per_update_ratio и success_rate.
+**5. Adaptive sigma is justified.** The `_get_sigma()` mechanism adapts kernel bandwidth to local point density (0.7 × adaptive + 0.3 × base). This is critical for objects with complex geometry (mug handle — dense coverage, body — sparse). Recommendation: keep `adaptive_sigma=True` as default.
 
-**5. Adaptive sigma оправдан.** Механизм `_get_sigma()` адаптирует ширину ядра к локальной плотности точек (0.7 × adaptive + 0.3 × base). Это критично для объектов со сложной геометрией (ручка кружки — плотное покрытие, тело — разреженное). Рекомендация: оставить `adaptive_sigma=True` как default.
+**6. Normalization with freeze is correct.** The `_update_normalization` mechanism accumulates statistics, freezes after `norm_warmup_steps`, and rebuilds the index (`_rebuild_index_with_renorm`). This prevents normalization drift during extended training. Recommendation: ensure `norm_warmup_steps` (5000) is sufficient to cover diverse states — complex objects may require increasing this value.
 
-**6. Нормализация с freeze корректна.** Механизм `_update_normalization` накапливает статистику, замораживает после `norm_warmup_steps` и перестраивает индекс (`_rebuild_index_with_renorm`). Это предотвращает дрейф нормализации при длительном обучении. Рекомендация: убедиться что `norm_warmup_steps` (5000) достаточно для покрытия разнообразных состояний — на сложных объектах может потребоваться увеличение.
-
-**7. Мониторить `points_per_update_ratio` как индикатор здоровья store.**
-- 0.05–0.15: агент в основном уточняет существующие точки (стабильная фаза)
-- 0.15–0.30: активное исследование новых областей (фаза роста)
-- \> 0.30: store растёт слишком быстро, возможно `insert_threshold` слишком низкий
-- < 0.05: store не расширяется, возможно `insert_threshold` слишком высокий
+**7. Monitor `points_per_update_ratio` as a store health indicator.**
+- 0.05–0.15: agent mostly refines existing points (stable phase)
+- 0.15–0.30: active exploration of new regions (growth phase)
+- \> 0.30: store grows too fast, possibly `insert_threshold` is too low
+- < 0.05: store doesn't expand, possibly `insert_threshold` is too high

@@ -1,523 +1,510 @@
-# Отчёт: Обучение RL-агента навигации по поверхности объектов
+# Report: Training an RL Agent for Object Surface Navigation
 
-## 1. Начальные параметры
+## 1. Initial Parameters
 
-### Среда и объект
-- **Объект:** кружка (mug.stl) — цилиндрическое тело + тороидальная ручка
-- **Среда:** LightweightEnv на базе Trimesh (raycast, нормали, depth)
-- **Задача:** из произвольной точки на поверхности добраться до целевой точки
+### Environment and Object
+- **Object:** mug (mug.stl) — cylindrical body + toroidal handle
+- **Environment:** LightweightEnv based on Trimesh (raycast, normals, depth)
+- **Task:** navigate from an arbitrary surface point to a target point
 
-### Конфигурация Q-learning
-| Параметр | Начальное значение | Описание |
-|----------|-------------------|----------|
-| `surface_step` | 3.0 mm | Шаг ползания по поверхности |
-| `free_step` | 5.0 mm | Шаг движения в воздухе |
-| `rotation_step` | 5.0° | Шаг поворота |
-| `goal_threshold` | 5.0 mm | Расстояние до цели для успеха |
-| `max_steps_per_goal` | 150 | Максимум шагов на эпизод |
-| `epsilon_start` | 0.15 (с загрузкой) / 1.0 (с нуля) | Начальная exploration rate |
-| `epsilon_min` | 0.05 | Минимальная exploration rate |
-| `k_neighbors` | 7 | Число соседей для kNN интерполяции |
-| `gamma` | 0.9 | Дисконт-фактор |
+### Q-learning Configuration
+| Parameter | Initial Value | Description |
+|-----------|--------------|-------------|
+| `surface_step` | 3.0 mm | Surface crawling step |
+| `free_step` | 5.0 mm | Aerial movement step |
+| `rotation_step` | 5.0° | Rotation step |
+| `goal_threshold` | 5.0 mm | Distance to goal for success |
+| `max_steps_per_goal` | 150 | Maximum steps per episode |
+| `epsilon_start` | 0.15 (with load) / 1.0 (from scratch) | Initial exploration rate |
+| `epsilon_min` | 0.05 | Minimum exploration rate |
+| `k_neighbors` | 7 | Number of neighbors for kNN interpolation |
+| `gamma` | 0.9 | Discount factor |
 
-### Конфигурация SAC
-| Параметр | Начальное значение | Описание |
-|----------|-------------------|----------|
-| `lr_actor` | 1e-5 | Learning rate актора |
-| `lr_critic` | 3e-4 | Learning rate критика |
-| `batch_size` | 256 | Размер батча |
-| `buffer_capacity` | 100,000 | Размер replay buffer |
-| `bc_lambda_init` | 5.0 | Вес BC-регуляризации |
-| `bc_lambda_decay` | 0.999999 | Затухание BC-регуляризации |
-| `alpha_type_init` | 0.2 | Начальная энтропия типа действия |
-| `alpha_param_init` | 0.2 | Начальная энтропия параметров |
+### SAC Configuration
+| Parameter | Initial Value | Description |
+|-----------|--------------|-------------|
+| `lr_actor` | 1e-5 | Actor learning rate |
+| `lr_critic` | 3e-4 | Critic learning rate |
+| `batch_size` | 256 | Batch size |
+| `buffer_capacity` | 100,000 | Replay buffer size |
+| `bc_lambda_init` | 5.0 | BC regularization weight |
+| `bc_lambda_decay` | 0.999999 | BC regularization decay |
+| `alpha_type_init` | 0.2 | Initial action type entropy |
+| `alpha_param_init` | 0.2 | Initial parameter entropy |
 
-### Curriculum levels
-| Уровень | Диапазон расстояний | Описание |
-|---------|-------------------|----------|
-| Level 0 | 10–40 mm | Близкие цели |
-| Level 1 | 20–80 mm | Средние цели |
-| Level 2 | 40–120 mm | Дальние цели |
+### Curriculum Levels
+| Level | Distance Range | Description |
+|-------|---------------|-------------|
+| Level 0 | 10–40 mm | Close targets |
+| Level 1 | 20–80 mm | Medium targets |
+| Level 2 | 40–120 mm | Far targets |
 
-### Пулы эпизодов
-- **Train:** 3 seeds × 5000 эпизодов × 3 уровня
-- **Eval:** 3 seeds × 500 эпизодов × 3 уровня
-- **SAC Eval:** 3 seeds × 500 эпизодов × 3 уровня
-
----
-
-## 2. Метрики и их интерпретация
-
-### Основные метрики
-
-| Метрика | Описание | Хорошо | Плохо |
-|---------|----------|--------|-------|
-| **success_rate** | Доля эпизодов, где агент достиг цели (distance < 5mm) | > 0.70 | < 0.50 |
-| **timeout_rate** | Доля эпизодов, где агент не дошёл за 150 шагов | < 0.20 | > 0.50 |
-| **collision_rate** | Доля эпизодов, где агент прошёл сквозь поверхность | < 0.05 | > 0.10 |
-| **rolling_rate** | Скользящий success_rate по последним 200 эпизодам | Стабильный или растущий | Падающий |
-
-### Метрики SAC
-
-| Метрика | Описание | Интерпретация |
-|---------|----------|---------------|
-| **alpha_type** | Коэффициент энтропии для типа действия | Регулирует разнообразие выбора типа. Слишком низкий (< 0.01) → зацикливание. Слишком высокий (> 2.0) → хаос |
-| **alpha_param** | Коэффициент энтропии для параметров | Регулирует шум в параметрах. Слишком высокий (> 1.0) → неточные движения |
-| **bc_lambda** | Вес BC-регуляризации | Удерживает политику близко к экспертным демонстрациям. Затухает со временем |
-| **best_eval** | Лучший eval success rate за тренировку | Модель сохраняется по этой метрике |
-
-### Метрики Q-store (HNSWStateStore)
-
-| Метрика | Описание | Интерпретация |
-|---------|----------|---------------|
-| **num_points** | Количество точек в HNSW графе | Объём накопленного опыта. Больше → лучше покрытие пространства состояний |
-| **q_magnitude_mean** | Средний абсолютный Q-value | Насколько сильные оценки. Низкий → мало опыта, высокий → уверенные оценки |
-| **q_spread_mean** | Средняя разница max-min Q-values в точке | Насколько Q-store различает действия. Низкий (< 1.0) → все действия одинаковы, высокий (> 5.0) → чёткие предпочтения |
-| **visits_mean** | Среднее число посещений точки | Как часто агент бывает в похожих состояниях |
-| **visits_median** | Медиана посещений | Более устойчивая оценка. Низкий median при высоком mean → несколько точек посещаются очень часто, остальные редко |
-| **update_hit_rate** | Доля обновлений существующих точек vs вставка новых | Высокий (> 0.8) → агент в знакомых областях. Низкий → постоянно новые состояния |
-| **nn_distance_median** | Медиана расстояний до ближайших соседей | Плотность покрытия. Низкий → плотное, высокий → разреженное |
-
-### Метрики арбитража
-
-| Метрика | Описание | Интерпретация |
-|---------|----------|---------------|
-| **q_store_rate** | Доля решений от Q-store | Высокий → агент в знакомой территории |
-| **sac_rate** | Доля решений от SAC | Высокий → агент в незнакомых состояниях |
-| **heuristic_rate** | Доля решений от эвристик | Высокий → оба источника не уверены |
-| **agreement_rate** | Как часто Q-store и SAC предлагают одно действие | Низкий (< 0.3) → источники дают разную информацию, арбитраж осмыслен |
+### Episode Pools
+- **Train:** 3 seeds × 5000 episodes × 3 levels
+- **Eval:** 3 seeds × 500 episodes × 3 levels
+- **SAC Eval:** 3 seeds × 500 episodes × 3 levels
 
 ---
 
-## 3. Итерации обучения: проблемы и решения
+## 2. Metrics and Their Interpretation
 
-### Итерация 1: HNSW State Store testing
-Описано в отдельном файле
+### Core Metrics
 
-### Итерация 2: Q-learning с curriculum
+| Metric | Description | Good | Bad |
+|--------|-------------|------|-----|
+| **success_rate** | Fraction of episodes where agent reached goal (distance < 5mm) | > 0.70 | < 0.50 |
+| **timeout_rate** | Fraction of episodes where agent didn't reach goal within 150 steps | < 0.20 | > 0.50 |
+| **collision_rate** | Fraction of episodes where agent passed through the surface | < 0.05 | > 0.10 |
+| **rolling_rate** | Rolling success_rate over last 200 episodes | Stable or rising | Falling |
 
-**Что сделали:** Обучили Q-learning контроллер с heuristic-guided exploration на кружке. Curriculum: 3 уровня сложности (10–40mm → 20–80mm → 40–120mm).
+### SAC Metrics
 
-**Результат:** Train 
-- success rate: 41%. 
-- timeout_rate: 55%,
-- collision_surface_violation_rate: 4%,
+| Metric | Description | Interpretation |
+|--------|-------------|----------------|
+| **alpha_type** | Entropy coefficient for action type | Controls type selection diversity. Too low (< 0.01) → cycling. Too high (> 2.0) → chaos |
+| **alpha_param** | Entropy coefficient for parameters | Controls parameter noise. Too high (> 1.0) → imprecise movements |
+| **bc_lambda** | BC regularization weight | Keeps policy close to expert demonstrations. Decays over time |
+| **best_eval** | Best eval success rate during training | Model is saved based on this metric |
 
-Агент научился ползать по поверхности к цели, но застревал когда цель на другой стороне объекта и эпиход заканчивался по лимиту шагов. Зато соблюдал коллизии.
+### Q-store Metrics (HNSWStateStore)
 
-**Проблема: агент не умеет перелетать на другую сторону объекта.**
-Когда цель «за» поверхностью (alignment < 0), агент ползёт в тупик — поверхность ведёт от цели, а не к ней.
+| Metric | Description | Interpretation |
+|--------|-------------|----------------|
+| **num_points** | Number of points in HNSW graph | Volume of accumulated experience. More → better state space coverage |
+| **q_magnitude_mean** | Mean absolute Q-value | Strength of estimates. Low → little experience, high → confident estimates |
+| **q_spread_mean** | Mean max-min Q-value difference per point | How well Q-store distinguishes actions. Low (< 1.0) → all actions equal, high (> 5.0) → clear preferences |
+| **visits_mean** | Mean number of visits per point | How often agent visits similar states |
+| **visits_median** | Median visits | More robust estimate. Low median with high mean → a few points visited very frequently, rest rarely |
+| **update_hit_rate** | Fraction of updates to existing points vs new insertions | High (> 0.8) → agent in familiar regions. Low → constantly new states |
+| **nn_distance_median** | Median distance to nearest neighbors | Coverage density. Low → dense, high → sparse |
 
-**Решение:** Добавлено макро-действие **Detach** — агент отрывается от поверхности, летит по воздуху к цели, приземляется. Два варианта: `detach` (прямой перелёт) и `detach_edge` (облёт грани).
+### Arbitration Metrics
 
-**Эффект:** Success rate вырос с 40% до 60%, НО сильно увеличились коллизиции.
-- "success_rate": 60%,
-- "timeout_rate": 0%,
-- "collision_surface_violation_rate": 40%,
+| Metric | Description | Interpretation |
+|--------|-------------|----------------|
+| **q_store_rate** | Fraction of decisions from Q-store | High → agent in familiar territory |
+| **sac_rate** | Fraction of decisions from SAC | High → agent in unfamiliar states |
+| **heuristic_rate** | Fraction of decisions from heuristics | High → both sources uncertain |
+| **agreement_rate** | How often Q-store and SAC propose the same action | Low (< 0.3) → sources provide different information, arbitration is meaningful |
 
 ---
 
-### Итерация 3: Снижение коллизий
+## 3. Training Iterations: Problems and Solutions
 
-**Проблема: высокий collision_rate (40%).**
+### Iteration 1: HNSW State Store Testing
+Described in a separate document.
 
-Агент часто проходил сквозь поверхность при использовании `free_forward` на поверхности.
+### Iteration 2: Q-learning with Curriculum
 
-**Решение:**
-1. Уменьшен `free_step` с 10mm до 5mm — меньше шаг, меньше вероятность проскочить
-2. Добавлен штраф в reward за `free_forward` на поверхности (`-2.0`) и (`-15.0`) за collision_surface_violation
-3. Добавлена эвристика `damp_free_on_surface` — подавление free_forward/backward когда агент на поверхности (`-3.0`)
+**What we did:** Trained a Q-learning controller with heuristic-guided exploration on the mug. Curriculum: 3 difficulty levels (10–40mm → 20–80mm → 40–120mm).
 
-**Эффект:** Collision rate снизился с 40% до 30% при начальном запуск и до 5% после нескольких итераций обучения. При это success_rate достиг 75%
-Детали внизу:
+**Result:** Training
+- success rate: 41%
+- timeout_rate: 55%
+- collision_surface_violation_rate: 4%
+
+The agent learned to crawl along the surface toward the goal but got stuck when the goal was on the other side of the object, and episodes ended due to step limit. However, it maintained low collision rates.
+
+**Problem: agent cannot fly to the other side of the object.**
+When the goal is "behind" the surface (alignment < 0), the agent crawls into a dead end — the surface leads away from the goal, not toward it.
+
+**Solution:** Added macro-action **Detach** — the agent lifts off the surface, flies through the air toward the goal, and lands. Two variants: `detach` (direct flight) and `detach_edge` (edge traversal).
+
+**Effect:** Success rate increased from 40% to 60%, BUT collisions increased significantly.
+- success_rate: 60%
+- timeout_rate: 0%
+- collision_surface_violation_rate: 40%
+
+---
+
+### Iteration 3: Reducing Collisions
+
+**Problem: high collision_rate (40%).**
+
+The agent frequently passed through the surface when using `free_forward` on the surface.
+
+**Solution:**
+1. Reduced `free_step` from 10mm to 5mm — smaller step, lower probability of passing through
+2. Added reward penalty for `free_forward` on surface (`-2.0`) and (`-15.0`) for collision_surface_violation
+3. Added `damp_free_on_surface` heuristic — suppression of free_forward/backward when agent is on surface (`-3.0`)
+
+**Effect:** Collision rate decreased from 40% to 30% on initial run and down to 5% after several training iterations. Meanwhile success_rate reached 75%.
+Details below:
 
 TRAIN SEED = 11
 start eps=1
-- 'goal_reached': 0.6466,
-- 'timeout': 0.0476,
-- 'collision_surface_violation': 0.3058
+- goal_reached: 0.6466
+- timeout: 0.0476
+- collision_surface_violation: 0.3058
+
 start eps=0.3
-- 'goal_reached': 0.6444, 
-- 'timeout': 0.1062, 
-- 'collision_surface_violation': 0.2494
+- goal_reached: 0.6444
+- timeout: 0.1062
+- collision_surface_violation: 0.2494
+
 start eps=0.15
-- 'goal_reached': 0.6648, 
-- 'timeout': 0.1532, 
-- 'collision_surface_violation': 0.182
+- goal_reached: 0.6648
+- timeout: 0.1532
+- collision_surface_violation: 0.182
 
 EVAL SEED 44
 start eps=0.02
-- 'goal_reached': 0.754, 
-- 'timeout': 0.194, 
-- 'collision_surface_violation': 0.052
+- goal_reached: 0.754
+- timeout: 0.194
+- collision_surface_violation: 0.052
 
-**Проблема:**
-Q рекомендует detach 48% шагов — завышен. Softmax следует Q (98% blend). Q(detach) доминирует из-за большого progress reward.
+**Problem:**
+Q recommends detach 48% of steps — inflated. Softmax follows Q (98% blend). Q(detach) dominates due to large progress reward.
 
-**Решение:**
-75% с частым detach — работает. Detach как основная стратегия "прыгать к цели" эффективна. Неоптимально по шагам но достигает цели. Для прототипа достаточно. Оптимизация frequency — следующий этап.
-
----
-
-### Итерация 4: Сбор BC данных (DAgger-подход)
-
-**Проблема: данные для BC несбалансированы.**
-При `eval_epsilon=0.02` агент почти всегда использует Q-store → данные содержат только то, что Q-store уже умеет. 
-Q рекомендует detach 48% шагов — завышен. Проблема: Q(detach) доминирует из-за большого progress reward.
-
-**Решение:** Применён сбалансированныq подход — Добавление данных при `eval_epsilon=1.0` без уменьшения и с температтурой = 0.01 (чистые эвристики как эксперт). Success rate стал заметно меньше 48%, но эвристики дают более сбалансированные данные: detach когда нужен и без нескольких повторов подряд. Эвристика рекомендует detach 15% — разумнее. 
-
-**Результат:** Объединены данные из двух режимов:
-- `eval_epsilon=0.02`: 5002 transitions (Q-store опыт)
-- `eval_epsilon=1.0`: 6349 transitions (эвристический опыт)
-- **Итого: 11351 transitions**
-
-Распределение действий: MoveTangentially 23%, Detach 25%, Turn 38%, Look 6%, MoveLinear 8%.
+**Solution:**
+75% with frequent detach — works. Detach as the primary "jump to goal" strategy is effective. Suboptimal in step count but reaches the goal. Sufficient for prototype. Frequency optimization — next stage.
 
 ---
 
-### Итерация 5: Behavioral Cloning
+### Iteration 4: BC Data Collection (DAgger Approach)
 
-**Что сделали:** Обучили BC модель (supervised learning) на 11351 transitions.
+**Problem: BC data is imbalanced.**
+With `eval_epsilon=0.02`, the agent almost always uses Q-store → data contains only what Q-store already knows.
+Q recommends detach 48% of steps — inflated. Problem: Q(detach) dominates due to large progress reward.
 
-**Результат:**
+**Solution:** Applied a balanced approach — added data with `eval_epsilon=1.0` without decay and temperature=0.01 (pure heuristics as expert). Success rate dropped noticeably to 48%, but heuristics provide more balanced data: detach when needed and without multiple consecutive repeats. Heuristic recommends detach 15% — more reasonable.
+
+**Result:** Combined data from two modes:
+- `eval_epsilon=0.02`: 5002 transitions (Q-store experience)
+- `eval_epsilon=1.0`: 6349 transitions (heuristic experience)
+- **Total: 11351 transitions**
+
+Action distribution: MoveTangentially 23%, Detach 25%, Turn 38%, Look 6%, MoveLinear 8%.
+
+---
+
+### Iteration 5: Behavioral Cloning
+
+**What we did:** Trained a BC model (supervised learning) on 11351 transitions.
+
+**Result:**
 - Train accuracy: 85.7%
 - Val accuracy: 82.6%
-- Early stopping на эпохе 133 (val_loss=0.6493)
-- Предсказания близки к экспертным: `Expert: 225° → Predicted: 209°`
+- Early stopping at epoch 133 (val_loss=0.6493)
+- Predictions close to expert: `Expert: 225° → Predicted: 209°`
 
-BC модель используется как warm-start для SAC.
+BC model is used as warm-start for SAC.
 
 ---
 
-### Итерация 6: SAC v1 — первый запуск и overfitting
+### Iteration 6: SAC v1 — First Run and Overfitting
 
-**Что сделали:** Запустили SAC с BC warm-start, curriculum, 2000 эпизодов.
+**What we did:** Launched SAC with BC warm-start, curriculum, 2000 episodes.
 
-**Результат тренировки:**
-- Train rolling rate: до 0.715 (пик на эпизоде ~1200)
-- Деградация после эпизода 1200: rolling упал с 0.715 до 0.560
+**Training result:**
+- Train rolling rate: up to 0.715 (peak at episode ~1200)
+- Degradation after episode 1200: rolling dropped from 0.715 to 0.560
 
-**Результат eval (predict/argmax):**
+**Eval result (predict/argmax):**
 
-| Уровень | Success | Timeout | Collision |
-|---------|---------|---------|-----------|
+| Level | Success | Timeout | Collision |
+|-------|---------|---------|-----------|
 | Level 0 (10-40mm) | 33.2% | 66.2% | 0.6% |
 | Level 1 (20-80mm) | 33.6% | 64.8% | 1.6% |
 | Level 2 (40-120mm) | 30.4% | 68.6% | 1.0% |
 
-**Катастрофический overfitting: train 71.5% vs eval 33%.**
+**Catastrophic overfitting: train 71.5% vs eval 33%.**
 
-**Диагностика — причины:**
+**Diagnosis — causes:**
 
-1. **Sample vs predict:** Разрыв 2.5× объясняется тем, что SAC обучался с softmax exploration.  Для Train используется sample (softmax), для Eval - Predict (Argmax). Argmax зацикливается на одном действии, softmax чередует действия пропорционально уверенности сети.
+1. **Sample vs predict:** The 2.5× gap is explained by SAC being trained with softmax exploration. Training uses sample (softmax), Eval uses predict (argmax). Argmax cycles on one action, softmax alternates actions proportional to network confidence.
 
-2. **Коллапс alpha_type (0.199 → 0.007).** Политика стала почти детерминированной. На train это компенсировалось стохастикой `sample()`, но на eval с `predict()` (argmax) агент зацикливался на одном действии.
+2. **Alpha_type collapse (0.199 → 0.007).** Policy became nearly deterministic. During training this was compensated by `sample()` stochasticity, but during eval with `predict()` (argmax) the agent cycled on one action.
 
-3. **Вытеснение BC-транзиций из буфера.** Buffer capacity = 100K. BC-данные (~10.7K) загружены первыми. К эпизоду 1300 буфер заполнился, BC-данные начали вытесняться новым опытом. Агент «забыл» экспертное поведение.
-
-
----
-
-### Итерация 7: Фиксы SAC
-
-**Изменение 1: Сделали две опции Eval: softmax, argmax.**
-
-**Изменение 2: Защита BC-данных в буфере.**
-Replay buffer переписан с BC-резервуаром. 15% буфера (при 500K = 75K слотов) защищено — online-данные пишутся только в зону `[bc_size, capacity)`, BC-зона никогда не перезаписывается.
-
-**Изменение 3: Ограничение alpha снизу.**
-`MIN_LOG_ALPHA_TYPE = -2.0` → alpha_type ≥ 0.135 (было 0.007). Политика сохраняет минимальную стохастичность, не коллапсирует в детерминизм.
-
-**Изменение 4: Увеличение буфера.**
-`buffer_capacity`: 100K → 500K. BC-данные дольше сохраняются, больше разнообразия.
-
-**Изменение 5: Warmup через BC-политику.**
-Первые 5000 шагов используют BC-политику (sample) вместо случайных действий. Буфер не засоряется мусорными транзициями.
+3. **BC transitions evicted from buffer.** Buffer capacity = 100K. BC data (~10.7K) loaded first. By episode 1300 the buffer filled up, BC data began being evicted by new experience. The agent "forgot" expert behavior.
 
 ---
 
-### Итерация 8: SAC финальный запуск
+### Iteration 7: SAC Fixes
 
-**Все фиксы применены.** Тренировка 2000 эпизодов на фиксированных пулах.
-**Eval на фиксированных пулах (500 эпизодов × 3 уровня, seed=77):**
+**Change 1: Created two eval options: softmax, argmax.**
 
-| Уровень | sample (softmax) | predict (argmax) |
-|---------|-----------------|-----------------|
+**Change 2: BC data protection in buffer.**
+Replay buffer rewritten with BC reservoir. 15% of buffer (at 500K = 75K slots) is protected — online data writes only to zone `[bc_size, capacity)`, BC zone is never overwritten.
+
+**Change 3: Alpha floor constraint.**
+`MIN_LOG_ALPHA_TYPE = -2.0` → alpha_type ≥ 0.135 (was 0.007). Policy maintains minimum stochasticity, doesn't collapse to determinism.
+
+**Change 4: Buffer size increase.**
+`buffer_capacity`: 100K → 500K. BC data preserved longer, more diversity.
+
+**Change 5: Warmup via BC policy.**
+First 5000 steps use BC policy (sample) instead of random actions. Buffer isn't polluted with garbage transitions.
+
+---
+
+### Iteration 8: SAC Final Run
+
+**All fixes applied.** Training 2000 episodes on fixed pools.
+**Eval on fixed pools (500 episodes × 3 levels, seed=77):**
+
+| Level | sample (softmax) | predict (argmax) |
+|-------|-----------------|-----------------|
 | Level 0 (10-40mm) | **77.0%** | 32.4% |
 | Level 1 (20-80mm) | **75.0%** | 33.8% |
 | Level 2 (40-120mm) | **71.0%** | 30.8% |
 
-**Sample vs predict:** Eval предсказуемо работает для inference используется sample (softmax). Проблема решена.
+**Sample vs predict:** Eval predictably works — sample (softmax) is used for inference. Problem solved.
 
-**Динамика тренировки:**
+**Training dynamics:**
 ```
-alpha_type:  0.193 → 0.135 (стабильно на floor)
-alpha_param: 0.207 → 1.000 (стабильно на ceiling)
-rolling:     0.670 → 0.715 (стабильно, без деградации)
-best_eval:   0.760 (эпизод 1400)
+alpha_type:  0.193 → 0.135 (stable at floor)
+alpha_param: 0.207 → 1.000 (stable at ceiling)
+rolling:     0.670 → 0.715 (stable, no degradation)
+best_eval:   0.760 (episode 1400)
 ```
-**Модель не деградирует** — rolling rate 0.69–0.74 на протяжении всей тренировки.
+**Model doesn't degrade** — rolling rate 0.69–0.74 throughout training.
 
 ---
-### Итерация 9: Арбитраж Q-store + SAC
 
-**Что сделали:** Объединили Q-store (эпизодическая память) и SAC (навык) через арбитратор. Реализовали три режима работы с автоматическим переключением.
+### Iteration 9: Q-store + SAC Arbitration
 
-**Логика арбитража:**
-1. Q-store уверен **И** различает действия (q_spread > 1.0) → Q-store
-2. SAC уверен → SAC
-3. Q-store слабо уверен → Q-store (fallback)
-4. Никто не уверен → Heuristic
+**What we did:** Combined Q-store (episodic memory) and SAC (skill) through an arbitrator. Implemented three operating modes with automatic switching.
 
-#### Режимы AdaptiveTrainingManager
+**Arbitration logic:**
+1. Q-store confident **AND** distinguishes actions (q_spread > 1.0) → Q-store
+2. SAC confident → SAC
+3. Q-store weakly confident → Q-store (fallback)
+4. Nobody confident → Heuristic
 
-Менеджер автоматически переключает режим по скользящему success_rate (окно 100 эпизодов):
+#### AdaptiveTrainingManager Modes
 
-| Режим | Условие | Что происходит |
-|-------|---------|----------------|
-| **inference_only** | success_rate ≥ 80% | Только работа, без обучения. Epsilon фиксирован на минимуме |
-| **online** | 60% ≤ success_rate < 80% | Работа + фоновое дообучение Q-store и SAC |
-| **offline** | success_rate < 60% | Полный цикл переобучения Q-learning → BC → SAC |
+The manager automatically switches mode based on rolling success_rate (window of 100 episodes):
 
-#### Результат (1000 эпизодов на кружке) с выключенными режимами дообучения
+| Mode | Condition | What Happens |
+|------|-----------|--------------|
+| **inference_only** | success_rate ≥ 80% | Work only, no training. Epsilon fixed at minimum |
+| **online** | 60% ≤ success_rate < 80% | Work + background Q-store and SAC fine-tuning |
+| **offline** | success_rate < 60% | Full retraining cycle: Q-learning → BC → SAC |
 
-| Метрика | Значение |
-|---------|----------|
+#### Result (1000 episodes on mug) with retraining modes disabled
+
+| Metric | Value |
+|--------|-------|
 | Success rate | **78%** |
-| Q-store решений | 59% |
-| SAC решений | 41% |
-| Heuristic решений | 0% |
+| Q-store decisions | 59% |
+| SAC decisions | 41% |
+| Heuristic decisions | 0% |
 | Agreement Q↔SAC | 31.5% |
-| Online SAC updates | 5 (каждые 200 эпизодов) |
+| Online SAC updates | 5 (every 200 episodes) |
 
-**Распределение действий:**
+**Action distribution:**
 
-| Действие | Q предлагает | SAC предлагает | Q выбрано | SAC выбрано |
-|----------|-------------|---------------|-----------|-------------|
+| Action | Q proposes | SAC proposes | Q chosen | SAC chosen |
+|--------|-----------|-------------|----------|------------|
 | detach | 39% | 58% | 29% | 74% |
 | move_tangentially | 32% | 17% | 35% | 12% |
 | turn_left | 10% | 6% | 15% | 2% |
 | turn_right | 9% | 7% | 15% | 2% |
 | free_forward | 5% | 8% | 4% | 5% |
 
-**Наблюдения:**
-- SAC сильно предпочитает detach (58%), Q-store более сбалансирован (39%)
-- Q-store чаще выбирает surface crawl и повороты — тонкая навигация
-- Agreement 31.5% — источники дают разную информацию, арбитраж осмыслен
+**Observations:**
+- SAC strongly prefers detach (58%), Q-store is more balanced (39%)
+- Q-store more often selects surface crawl and turns — fine navigation
+- Agreement 31.5% — sources provide different information, arbitration is meaningful
 
-**«Предлагает» vs «Выбрано»:**
+**"Proposes" vs "Chosen":**
 
-На каждом шаге **оба** источника предлагают действие, но арбитратор выбирает только **один** из них:
+At each step **both** sources propose an action, but the arbitrator selects only **one**:
 
 ```
-Шаг 42:
-  Q-store предлагает: move_tangentially (→ записывается в "Q предлагает")
-  SAC предлагает:     detach            (→ записывается в "SAC предлагает")
+Step 42:
+  Q-store proposes: move_tangentially (→ recorded in "Q proposes")
+  SAC proposes:     detach            (→ recorded in "SAC proposes")
   
-  Арбитратор решает: Q-store уверен + spread высокий → выбираем Q-store
+  Arbitrator decides: Q-store confident + spread high → choose Q-store
   
-  Выполняется: move_tangentially        (→ записывается в "Q выбрано")
-  SAC проигнорирован                    (→ в "SAC выбрано" ничего не пишется)
+  Executed: move_tangentially          (→ recorded in "Q chosen")
+  SAC ignored                          (→ nothing recorded in "SAC chosen")
 ```
 
-Поэтому «предлагает» — это что каждый источник **хотел бы** сделать (100% шагов для каждого), а «выбрано» — что **реально выполнилось** (только когда арбитратор выбрал этот источник).
+Therefore "proposes" is what each source **would like** to do (100% of steps for each), while "chosen" is what **actually executed** (only when the arbitrator selected that source).
 
-**Что показывает разница:**
+**What the difference shows:**
 
-| Действие | Q предлагает | Q выбрано | Сдвиг | Интерпретация |
-|----------|-------------|-----------|-------|---------------|
-| detach | 39% | 29% | −10% | Арбитратор часто отклоняет detach от Q-store в пользу SAC |
-| move_tangentially | 32% | 35% | +3% | Q-store чаще выигрывает арбитраж когда предлагает ползание |
-| turn_left/right | 19% | 30% | +11% | Q-store почти всегда выигрывает на поворотах — SAC их редко предлагает |
+| Action | Q proposes | Q chosen | Shift | Interpretation |
+|--------|-----------|----------|-------|----------------|
+| detach | 39% | 29% | −10% | Arbitrator often rejects Q-store's detach in favor of SAC |
+| move_tangentially | 32% | 35% | +3% | Q-store more often wins arbitration when proposing crawling |
+| turn_left/right | 19% | 30% | +11% | Q-store almost always wins on turns — SAC rarely proposes them |
 
-| Действие | SAC предлагает | SAC выбрано | Сдвиг | Интерпретация |
-|----------|---------------|-------------|-------|---------------|
-| detach | 58% | 74% | +16% | SAC выигрывает арбитраж именно когда предлагает detach |
-| move_tangentially | 17% | 12% | −5% | Когда SAC предлагает ползание, Q-store часто перебивает |
-| turn_left/right | 13% | 4% | −9% | SAC почти никогда не выигрывает на поворотах |
+| Action | SAC proposes | SAC chosen | Shift | Interpretation |
+|--------|-------------|------------|-------|----------------|
+| detach | 58% | 74% | +16% | SAC wins arbitration precisely when proposing detach |
+| move_tangentially | 17% | 12% | −5% | When SAC proposes crawling, Q-store often overrides |
+| turn_left/right | 13% | 4% | −9% | SAC almost never wins on turns |
 
-**Вывод:** арбитраж создаёт специализацию — Q-store отвечает за тонкую навигацию (ползание, повороты), SAC — за стратегические решения (detach, перелёты). Каждый источник выигрывает в том, что умеет лучше.
+**Conclusion:** Arbitration creates specialization — Q-store handles fine navigation (crawling, turns), SAC handles strategic decisions (detach, flights). Each source wins at what it does best.
 
-Текущие пороги арбитража:
+Current arbitration thresholds:
 
-| Порог | Значение | Задан | Описание |
-|-------|----------|-------|----------|
-| `q_confidence_threshold` | 0.5 | Вручную | Минимальная уверенность Q-store для приоритетного выбора |
-| `q_spread_threshold` | 1.0 | Вручную | Минимальный разброс Q-values (различает ли store действия) |
-| `sac_confidence_threshold` | 0.3 | Вручную | Минимальная уверенность SAC (max type probability) |
-| `q_weak_threshold` | 0.2 | Вручную | Порог для слабого fallback на Q-store |
+| Threshold | Value | Set | Description |
+|-----------|-------|-----|-------------|
+| `q_confidence_threshold` | 0.5 | Manually | Minimum Q-store confidence for priority selection |
+| `q_spread_threshold` | 1.0 | Manually | Minimum Q-value spread (does store distinguish actions) |
+| `sac_confidence_threshold` | 0.3 | Manually | Minimum SAC confidence (max type probability) |
+| `q_weak_threshold` | 0.2 | Manually | Threshold for weak Q-store fallback |
 
-Все пороги подобраны эмпирически на основе наблюдаемых распределений confidence и spread в экспериментах на кружке. При переходе на другие объекты или изменении архитектуры сети пороги могут потребовать повторной настройки.
+All thresholds were selected empirically based on observed confidence and spread distributions in mug experiments. When transitioning to other objects or changing network architecture, thresholds may require re-tuning.
 
-В будущем арбитраж можно сделать адаптивным — например, обучить мета-контроллер, который выбирает источник на основе текущего success rate каждого из них, или использовать multi-armed bandit подход для автоматического распределения доверия между Q-store, SAC и heuristic.
+In the future, arbitration can be made adaptive — for example, training a meta-controller that selects the source based on each source's current success rate, or using a multi-armed bandit approach for automatic trust distribution between Q-store, SAC, and heuristic.
 
+#### Online Fine-tuning (Primary Mode)
 
-#### Online дообучение (основной режим)
+In online mode, the system simultaneously operates and learns:
 
-В online режиме система одновременно работает и учится:
-
-**Q-store обновляется каждый шаг:**
+**Q-store updates every step:**
 ```
-Каждый шаг → controller.update_only()
+Every step → controller.update_only()
   → TD-update: Q(s,a) += α × (reward + γ × max Q(s') - Q(s,a))
-  → Если состояние новое → вставка в HNSW граф
-  → Если состояние знакомое → обновление существующей точки
+  → If state is new → insertion into HNSW graph
+  → If state is familiar → update existing point
 ```
 
-**SAC обновляется каждые 200 эпизодов:**
+**SAC updates every 200 episodes:**
 ```
-1. Собранные transitions нормализуются (state, params)
-2. Добавляются в SAC replay buffer (online зона, BC-резервуар не затрагивается)
-3. 50 шагов градиентного спуска:
-   - update_critic: обучение Q-функции на batch из буфера
-   - update_actor: обучение политики + BC-регуляризация
-   - soft_update_target: плавное обновление target сети (τ=0.005)
+1. Collected transitions are normalized (state, params)
+2. Added to SAC replay buffer (online zone, BC reservoir untouched)
+3. 50 gradient descent steps:
+   - update_critic: train Q-function on batch from buffer
+   - update_actor: train policy + BC regularization
+   - soft_update_target: smooth target network update (τ=0.005)
 ```
 
-**BC-регуляризация каждые 2000 эпизодов:**
+**BC regularization every 2000 episodes:**
 
-При длительной online работе SAC actor постепенно дрейфует от исходной обученной политики — каждый `update_actor` сдвигает веса в сторону максимизации Q-value, и со временем actor может «забыть» базовые навыки из BC. Периодическая BC-регуляризация противодействует этому:
+During extended online operation, the SAC actor gradually drifts from the originally trained policy — each `update_actor` shifts weights toward Q-value maximization, and over time the actor may "forget" basic skills from BC. Periodic BC regularization counteracts this:
 
 ```
-1. Берём 20 батчей из replay buffer (включая защищённую BC-зону)
-2. Для каждого батча вызываем update_actor, который содержит:
-   - SAC loss: максимизация Q-value (основная цель)
+1. Take 20 batches from replay buffer (including protected BC zone)
+2. For each batch call update_actor, which contains:
+   - SAC loss: Q-value maximization (primary objective)
    - BC loss: CrossEntropy(predicted_type, expert_type) 
             + MSE(predicted_params, expert_params)
-   - Итого: actor_loss = sac_loss + bc_lambda × bc_loss
-3. BC-зона буфера (15%) гарантирует что в каждом батче 
-   присутствуют экспертные демонстрации
+   - Total: actor_loss = sac_loss + bc_lambda × bc_loss
+3. BC buffer zone (15%) guarantees that each batch 
+   contains expert demonstrations
 ```
-Это мягкое напоминание — 20 шагов не меняют политику радикально, но предотвращают постепенную деградацию базовых навыков (ползание по поверхности, корректные повороты), которые были заложены на этапе Behavioral Cloning.е напоминание экспертного поведения, предотвращает дрейф политики
+This is a gentle reminder — 20 steps don't radically change the policy but prevent gradual degradation of basic skills (surface crawling, correct turns) that were established during the Behavioral Cloning stage.
 
-Данные в BC **не обновляются**. BC-данные — это фиксированный набор экспертных демонстраций, собранный один раз на STEP 3.
+BC data is **not updated**. BC data is a fixed set of expert demonstrations collected once during STEP 3.
 
-Термин «BC-регуляризация» означает не дообучение BC модели, а использование BC-данных как **якоря** при обновлении SAC actor:
+The term "BC regularization" means not retraining the BC model, but using BC data as an **anchor** when updating the SAC actor:
 
 ```
 Replay Buffer (500K):
 ┌─────────────────────────────────────────────────┐
-│ BC-зона (15%, защищённая)                       │
-│ ~10.7K transitions от эксперта                  │
-│ Никогда не перезаписывается                     │
+│ BC zone (15%, protected)                        │
+│ ~10.7K transitions from expert                  │
+│ Never overwritten                               │
 ├─────────────────────────────────────────────────┤
-│ Online-зона (85%)                               │
-│ Новый опыт от арбитража                         │
-│ Перезаписывается циклически                     │
+│ Online zone (85%)                               │
+│ New experience from arbitration                 │
+│ Overwritten cyclically                          │
 └─────────────────────────────────────────────────┘
 ```
 
-Когда вызывается `buffer.sample(batch_size=256)`, в батч попадают транзиции из **обеих зон** — и экспертные (BC), и свежие (online). Actor обучается на этом смешанном батче:
+When `buffer.sample(batch_size=256)` is called, the batch contains transitions from **both zones** — expert (BC) and fresh (online). The actor trains on this mixed batch:
 
-- На экспертных примерах: «не забывай как делал эксперт» (BC loss)
-- На свежих примерах: «улучшай политику по Q-value» (SAC loss)
+- On expert examples: "don't forget how the expert did it" (BC loss)
+- On fresh examples: "improve policy by Q-value" (SAC loss)
 
-Соотношение BC и online данных в батче определяется их долями в буфере. При 10.7K BC и 100K online — примерно 10% батча будут экспертные примеры. Этого достаточно чтобы actor не дрейфовал от базовых навыков.
-```
+The ratio of BC to online data in the batch is determined by their proportions in the buffer. With 10.7K BC and 100K online — approximately 10% of the batch will be expert examples. This is sufficient to prevent actor drift from basic skills.
 
-#### Offline переобучение (аварийный режим)
+#### Offline Retraining (Emergency Mode)
 
-Запускается когда success_rate падает ниже 60% — система не справляется с текущим объектом:
-AdaptiveTrainingManager: monitors performance and decides
-when/how to train for new objects.
-
-Modes:
-  - inference_only: success_rate > 80%, no training needed
-  - online: 60-80%, update Q-store + accumulate for SAC
-  - offline: < 60%, selective retraining:
-      - Q-store: always retrain with decreasing epsilon (0.6 → 0.3 → 0.1 → 0.05)
-      - SAC: retrain only if SAC success rate is also below threshold
-"""
+Triggered when success_rate drops below 60% — the system cannot handle the current object:
 
 ```
-1. Полный Q-learning с нуля (5000 эпизодов)
-   └── Новый контроллер, epsilon_start=0.3, curriculum levels
+1. Full Q-learning from scratch (5000 episodes)
+   └── New controller, epsilon_start=0.3, curriculum levels
    
-2. Сбор успешных траекторий → BC данные
-   └── ExperienceExtractor конвертирует в PSACTransition
+2. Collect successful trajectories → BC data
+   └── ExperienceExtractor converts to PSACTransition
 
-3. Обучение BC модели (200 эпох)
+3. Train BC model (200 epochs)
    └── Supervised learning: state → (action_type, action_params)
 
-4. SAC тренировка с BC warm-start (10000 эпизодов)
-   └── Полный цикл: curriculum, alpha tuning, eval checkpointing
+4. SAC training with BC warm-start (10000 episodes)
+   └── Full cycle: curriculum, alpha tuning, eval checkpointing
 
-5. Замена текущего SAC на новый
-   └── Арбитратор начинает использовать обновлённую модель
+5. Replace current SAC with new one
+   └── Arbitrator begins using updated model
+```
 
+---
 
+## 6. Transfer: Mug → Cup
 
-## 6. Transfer: перенос на чашку (cup)
+### Experiment Conditions
+- **Training:** mug (mug.stl) — cylinder Ø60mm × 80mm + handle R=15mm
+- **Test:** cup (cup.stl) — cylinder Ø56mm × 70mm + handle R=12mm
+- **Fine-tuning:** none (zero-shot transfer)
+- **Eval:** 500 episodes × 3 levels, seed=77
 
-### Условия эксперимента
-- **Обучение:** кружка (mug.stl) — цилиндр Ø60mm × 80mm + ручка R=15mm
-- **Тест:** чашка (cup.stl) — цилиндр Ø56mm × 70mm + ручка R=12mm
-- **Дообучение:** нет (zero-shot transfer)
-- **Eval:** 500 эпизодов × 3 уровня, seed=77
+### Zero-shot Transfer Results
 
-### Результаты zero-shot transfer
-
-| Уровень | SAC zero-shot | Арбитраж zero-shot | Разница |
-|---------|--------------|-------------------|---------|
+| Level | SAC zero-shot | Arbitrage zero-shot | Difference |
+|-------|--------------|-------------------|------------|
 | Level 0 (10-40mm) | **73.4%** | 59.4% | -14.0% |
 | Level 1 (20-80mm) | **74.8%** | 56.6% | -18.2% |
 | Level 2 (40-120mm) | **70.8%** | 51.6% | -19.2% |
 
-### Статистика арбитража на чашке
+### Arbitration Statistics on Cup
 
-| Метрика | Кружка (знакомая) | Чашка (новая) |
-|---------|------------------|---------------|
-| Q-store решений | 59% | 45% |
-| SAC решений | 41% | 55% |
+| Metric | Mug (familiar) | Cup (new) |
+|--------|----------------|-----------|
+| Q-store decisions | 59% | 45% |
+| SAC decisions | 41% | 55% |
 | Agreement Q↔SAC | 31.5% | 39% |
 | Q-spread | 15.1 | 5.8 |
 
-### Выводы
+### Conclusions
 
-**1. SAC обобщает лучше чем Q-store.**
-SAC zero-shot на чашке: 70–75% — лишь на 2–4% ниже чем на кружке (71–77%). Нейросеть выучила общие паттерны навигации (detach, ползти к цели), которые переносятся на похожую геометрию.
+**1. SAC generalizes better than Q-store.**
+SAC zero-shot on cup: 70–75% — only 2–4% lower than on mug (71–77%). The neural network learned general navigation patterns (detach, crawl toward goal) that transfer to similar geometry.
 
-**2. Q-store мешает на новом объекте.**
-Арбитраж (51–59%) хуже чистого SAC (70–75%) на 14–19%. Q-store от кружки уверенно даёт неправильные советы на чашке — он запомнил конкретные состояния кружки, которые не совпадают с геометрией чашки.
+**2. Q-store interferes on new objects.**
+Arbitration (51–59%) is worse than pure SAC (70–75%) on the cup by 14–19%. Q-store from the mug confidently gives incorrect advice on the cup — it memorized specific mug states that don't match cup geometry.
 
-**3. Арбитратор корректно смещается к SAC.**
-На чашке SAC получает 55% решений (vs 41% на кружке), Q-store — 45% (vs 59%). Q-spread упал с 15.1 до 5.8 — Q-store менее уверен на незнакомом объекте. Арбитратор правильно реагирует, но недостаточно агрессивно.
+**3. Arbitrator correctly shifts toward SAC.**
+On the cup, SAC receives 55% of decisions (vs 41% on mug), Q-store — 45% (vs 59%). Q-spread dropped from 15.1 to 5.8 — Q-store is less confident on the unfamiliar object. The arbitrator reacts correctly but not aggressively enough.
 
-**4. Agreement вырос (31.5% → 39%).**
-На чашке Q-store и SAC чаще соглашаются — вероятно, в простых ситуациях (близкая цель, прямой путь) оба дают правильный ответ, а расхождения возникают в сложных случаях, где Q-store ошибается.
+**4. Agreement increased (31.5% → 39%).**
+On the cup, Q-store and SAC agree more often — likely in simple situations (close goal, direct path) both give the correct answer, while disagreements arise in complex cases where Q-store errs.
 
-### Рекомендации для улучшения transfer
+### Recommendations for Improving Transfer
 
-**1. Adaptive режим как целевое решение.** Текущие фиксированные пороги арбитража — экспериментальная проверка концепции. Целевое решение — adaptive режим с online дообучением, где Q-store начинает с нуля на новом объекте и постепенно набирает уверенность через TD-update на каждом шаге. По мере накопления опыта `q_confidence` и `q_spread` растут естественным образом, и арбитратор автоматически начинает доверять Q-store больше — без ручной настройки порогов.
+**1. Adaptive mode as the target solution.** Current fixed arbitration thresholds are an experimental proof of concept. The target solution is adaptive mode with online fine-tuning, where Q-store starts from scratch on a new object and gradually gains confidence through TD-update at each step. As experience accumulates, `q_confidence` and `q_spread` grow naturally, and the arbitrator automatically begins trusting Q-store more — without manual threshold tuning.
 
-**2. SAC как начальный навык на новом объекте.** На старте работы с новым объектом Q-store пуст → `q_confidence ≈ 0` → арбитратор автоматически выбирает SAC. SAC обеспечивает базовый success rate ~70% за счёт обобщённых навыков. По мере того как Q-store накапливает опыт на конкретном объекте, он начинает перехватывать решения в знакомых состояниях, повышая точность.
+**2. SAC as initial skill on new objects.** At the start of working with a new object, Q-store is empty → `q_confidence ≈ 0` → arbitrator automatically selects SAC. SAC provides baseline success rate ~70% through generalized skills. As Q-store accumulates experience on the specific object, it begins intercepting decisions in familiar states, improving accuracy.
 
-**3. Ожидаемая динамика адаптации на новом объекте:**
+**3. Expected adaptation dynamics on a new object:**
 
-| Фаза | Эпизоды | Q-store | SAC | Ожидаемый success rate |
-|------|---------|---------|-----|----------------------|
-| Старт | 1–100 | Пуст, не участвует | 100% решений | ~70% (zero-shot) |
-| Накопление | 100–500 | Набирает точки, низкий spread | Доминирует | 70–75% |
-| Адаптация | 500–1000 | Уверен в знакомых областях | Дополняет в новых | 75–80% |
-| Стабильность | 1000+ | Доминирует на знакомом | Fallback на незнакомом | 80%+ |
+| Phase | Episodes | Q-store | SAC | Expected success rate |
+|-------|---------|---------|-----|----------------------|
+| Start | 1–100 | Empty, not participating | 100% decisions | ~70% (zero-shot) |
+| Accumulation | 100–500 | Gaining points, low spread | Dominates | 70–75% |
+| Adaptation | 500–1000 | Confident in familiar regions | Supplements in new ones | 75–80% |
+| Stability | 1000+ | Dominates on familiar | Fallback on unfamiliar | 80%+ |
 
-**4. Валидация подхода.** Запустить STEP 10 (adaptive на чашке с Q-store от кружки + online дообучение). Q-store от кружки содержит частично релевантный опыт — похожая геометрия, но другие пропорции. Через TD-update на каждом шаге Q-values будут корректироваться под новый объект: точки с неправильными Q-values получат обновления, новые точки вставятся для областей специфичных для чашки. Ожидаемый рост success rate с 55% (zero-shot) до 70–80% за 500–1000 эпизодов — быстрее чем с пустого Q-store, благодаря transfer частично подходящего опыта.
+**4. Approach validation.** Run STEP 10 (adaptive on cup with Q-store from mug + online fine-tuning). Q-store from the mug contains partially relevant experience — similar geometry but different proportions. Through TD-update at each step, Q-values will be corrected for the new object: points with incorrect Q-values will receive updates, new points will be inserted for cup-specific regions. Expected success rate growth from 55% (zero-shot) to 70–80% over 500–1000 episodes — faster than from an empty Q-store, thanks to transfer of partially applicable experience.
 
+### Additional Run on Modified Cup (same dimensions as mug but different shape)
+Cup SAC zero-shot:
+- level_0 ([10.0, 40.0]mm): success=0.7680, timeout=0.1860, collision=0.0460
+- level_1 ([20.0, 80.0]mm): success=0.7180, timeout=0.2280, collision=0.0540
+- level_2 ([40.0, 120.0]mm): success=0.7220, timeout=0.2380, collision=0.0400
 
-### Еще один запуск на измененной чашке (такие же размеры как у кружки, но другая форма)
-Cup SAC zero-shot ===
-  level_0 ([10.0, 40.0]mm): success=0.7680, timeout=0.1860, collision=0.0460
-  level_1 ([20.0, 80.0]mm): success=0.7180, timeout=0.2280, collision=0.0540
-  level_2 ([40.0, 120.0]mm): success=0.7220, timeout=0.2380, collision=0.0400
+Transfer Comparison: Mug → Cup:
 
-  Transfer Comparison: Mug → Cup ===
-Level                     SAC zero-shot      Arbitrage zero-shot
--------------------------------------------------------------
-  level_0 ((10.0, 40.0)mm)    0.768             0.624  (-0.144)
-  level_1 ((20.0, 80.0)mm)    0.718             0.484  (-0.234)
-  level_2 ((40.0, 120.0)mm)    0.722             0.466  (-0.256)
-
-
-
-
+| Level | SAC zero-shot | Arbitrage zero-shot | Difference |
+|-------|--------------|-------------------|------------|
+| level_0 (10.0, 40.0mm) | 0.768 | 0.624 | -0.144 |
+| level_1 (20.0, 80.0mm) | 0.718 | 0.484 | -0.234 |
+| level_2 (40.0, 120.0mm) | 0.722 | 0.466 | -0.256 |
