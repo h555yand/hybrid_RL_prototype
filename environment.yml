@@ -36,3 +36,4 @@ dependencies:
     - hnswlib>=0.7
     - pyglet<2
     - manifold3d
+    - pyrender

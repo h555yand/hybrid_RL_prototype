@@ -7,6 +7,7 @@ experiment:
   _target_: tbp.hybrid_rl.experiment.RLGoalApproachExperiment
   config:
     seed: 42
+    visualise: false
     do_train: true
     do_eval: false
     do_bc_train: false
@@ -16,10 +17,10 @@ experiment:
 
     train_seeds: [11]
     eval_seeds: [44]
-    sac_eval_seeds: [77, 88, 99]
+    sac_eval_seeds: [77]
     eval_episodes_per_level: 500
     regenerate_scripts: true
-    promote_threshold: 0.55
+    promote_threshold: 0.65
     promote_window: 100
 
     curriculum_levels:
@@ -28,24 +29,24 @@ experiment:
       - [40.0, 120.0]
 
     training_stages:
-      - mesh: cube
-        episodes: 3000
-        epsilon_start: 1.0
-        epsilon_min: 0.10
-        is_load: false
-      - mesh: cylinder
-        episodes: 3000
-        epsilon_start: 0.35
-        epsilon_min: 0.08
-        is_load: true
+      #- mesh: cube
+      #  episodes: 3000
+      #  epsilon_start: 1.0
+      #  epsilon_min: 0.10
+      #  is_load: false
+      #- mesh: cylinder
+      #  episodes: 3000
+      #  epsilon_start: 0.35
+      #  epsilon_min: 0.08
+      #  is_load: true
       - mesh: mug
-        episodes: 5000
-        epsilon_start: 0.50
+        episodes: 200
+        epsilon_start: 1.0
         epsilon_min: 0.08
-        is_load: true
+        is_load: False
       - mesh: cup
-        episodes: 3000
-        epsilon_start: 0.20
+        episodes: 200
+        epsilon_start: 0.50
         epsilon_min: 0.05
         is_load: true
 
@@ -94,4 +95,4 @@ experiment:
 
     logging:
       run_name: rl_goal_approach
-      output_dir: ${oc.env:MONTY_LOGS}/rl_goal_approach
+      output_dir: ${oc.env:MONTY_LOGS}

@@ -436,6 +436,7 @@ class LightweightEnv:
         self._passed_through = False
 
         if abs(step_size) > 0.5:
+            # Ray cast: проверяем пересечение с мешем на пути
             locations, _, _ = self.mesh.ray.intersects_location(
                 ray_origins=[old_pos],
                 ray_directions=[forward * np.sign(step_size)],
@@ -445,8 +446,13 @@ class LightweightEnv:
                 if np.min(distances) < abs(step_size):
                     self._passed_through = True
 
+            # Proximity: проверяем не оказались ли внутри меша
             closest, dist_to_mesh, _ = self.mesh.nearest.on_surface([self.agent_pos])
-            if dist_to_mesh[0] < 1.0:
+            # Порог зависит от размера шага
+            # Большой шаг (8mm): порог 1.0mm — строгий
+            # Маленький шаг (2mm): порог 0.5mm — мягче, позволяет посадку
+            proximity_threshold = min(1.0, abs(step_size) * 0.25)
+            if dist_to_mesh[0] < proximity_threshold:
                 self._passed_through = True
     
     def _orient_horizontal(self, rotation_degrees, forward_distance, left_distance):

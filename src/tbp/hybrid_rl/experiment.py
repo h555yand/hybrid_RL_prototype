@@ -52,6 +52,9 @@ class RLGoalApproachExperiment:
         self.seed = self.config.get("seed", 42)
         self.output_dir = Path(self.config["logging"]["output_dir"])
         self.run_name = self.config["logging"]["run_name"]
+        
+        # visualise
+        self.visualise = self.config.get("visualise", False)
 
         # Directories
         self.data_dir = self.output_dir / "data"
@@ -194,6 +197,7 @@ class RLGoalApproachExperiment:
                     return_metrics=True,
                     curriculum_config=curriculum_config,
                     episode_pools=episode_pools,
+                    visualise=self.visualise
                 )
 
                 stage_output = self.data_dir / f"train_result_{mesh_name}_seed_{seed}.json"

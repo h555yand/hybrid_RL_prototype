@@ -126,6 +126,113 @@ def _add_text_to_image(
     img.save(buf, format="PNG")
     return buf.getvalue()
 
+def render_frame_to_file_wrong(
+    env,
+    agent_pose: np.ndarray,
+    goal_pose: np.ndarray,
+    filepath: Path,
+    text: str = "",
+    step_num: int = 0,
+    distance: float = 0.0,
+    result: str = "",
+    trail_poses: Optional[List[np.ndarray]] = None,
+    resolution: Tuple[int, int] = (1024, 768),
+):
+    """Рендерит кадр в PNG через pyrender offscreen."""
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        import pyrender
+        import os
+        os.environ["PYOPENGL_PLATFORM"] = "egl"  # offscreen без окна
+
+        scene = pyrender.Scene(bg_color=[255, 255, 255, 255])
+
+        # Меш
+        mesh_trimesh = env.mesh.copy()
+        #mesh_trimesh.unmerge_vertices()  # убрать smooth, сделать flat
+        #mesh_trimesh.visual.face_colors = [200, 200, 200, 255]
+        #scene.add(pyrender.Mesh.from_trimesh(mesh_trimesh))
+        mesh_trimesh.visual.vertex_colors = [200, 200, 200, 255]
+        scene.add(pyrender.Mesh.from_trimesh(mesh_trimesh, smooth=False))
+
+        # Агент — синяя сфера
+        agent_sphere = trimesh.primitives.Sphere(radius=0.8, center=agent_pose[:3])
+        agent_sphere.visual.face_colors = [0, 0, 255, 255]
+        scene.add(pyrender.Mesh.from_trimesh(agent_sphere))
+
+        # Цель — зелёная сфера
+        goal_sphere = trimesh.primitives.Sphere(radius=1.0, center=goal_pose[:3])
+        goal_sphere.visual.face_colors = [0, 255, 0, 255]
+        scene.add(pyrender.Mesh.from_trimesh(goal_sphere))
+
+        # Стрелка взгляда
+        rot = R.from_euler("xyz", agent_pose[3:], degrees=True)
+        forward_dir = rot.apply([0, 0, -1])
+        arrow_end = agent_pose[:3] + forward_dir * 5
+        arrow_mesh = trimesh.creation.cylinder(radius=0.2, segment=[agent_pose[:3], arrow_end])
+        arrow_mesh.visual.face_colors = [255, 0, 0, 255]
+        scene.add(pyrender.Mesh.from_trimesh(arrow_mesh))
+
+        # Траектория
+        if trail_poses:
+            for pose in trail_poses:
+                t_sphere = trimesh.primitives.Sphere(radius=0.4, center=pose[:3])
+                t_sphere.visual.face_colors = [255, 255, 0, 128]
+                scene.add(pyrender.Mesh.from_trimesh(t_sphere))
+
+        # Камера
+        camera = pyrender.PerspectiveCamera(yfov=np.pi / 3.0)
+        camera_transform = _compute_camera_transform(
+            agent_pose[:3], goal_pose[:3], env.mesh.bounds,
+        )
+        scene.add(camera, pose=camera_transform)
+
+        # Свет
+        light = pyrender.DirectionalLight(color=[1.0, 1.0, 1.0], intensity=3.0)
+        scene.add(light, pose=camera_transform)
+
+        # Рендер
+        renderer = pyrender.OffscreenRenderer(*resolution)
+        color, _ = renderer.render(scene)
+        renderer.delete()
+
+        # Сохранить
+        img = Image.fromarray(color)
+        if text:
+            draw = ImageDraw.Draw(img)
+            try:
+                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 14)
+            except (OSError, IOError):
+                font = ImageFont.load_default()
+
+            header = f"Step {step_num} | dist={distance:.1f}mm | {result}"
+            lines = [header]
+            max_line_len = 120
+            for i in range(0, len(text), max_line_len):
+                lines.append(text[i:i + max_line_len])
+
+            y = 5
+            for line in lines:
+                text_bbox = draw.textbbox((5, y), line, font=font)
+                draw.rectangle(
+                    [text_bbox[0] - 2, text_bbox[1] - 1, text_bbox[2] + 2, text_bbox[3] + 1],
+                    fill=(0, 0, 0, 200),
+                )
+                draw.text((5, y), line, fill="white", font=font)
+                y += text_bbox[3] - text_bbox[1] + 4
+
+        img.save(str(filepath))
+
+    except Exception as e:
+        txt_path = filepath.with_suffix(".txt")
+        with open(txt_path, "w") as f:
+            f.write(f"Render failed: {e}\n")
+            f.write(f"Step: {step_num}, Distance: {distance:.1f}mm\n")
+            f.write(f"Agent: {agent_pose.tolist()}\n")
+            f.write(f"Goal: {goal_pose.tolist()}\n")
+            f.write(f"Action: {text}\n")
+        logger.warning(f"Render failed for {filepath}: {e}")
 
 def render_frame_to_file(
     env,
@@ -137,7 +244,7 @@ def render_frame_to_file(
     distance: float = 0.0,
     result: str = "",
     trail_poses: Optional[List[np.ndarray]] = None,
-    resolution: Tuple[int, int] = (800, 600),
+    resolution: Tuple[int, int] = (1024, 768),
 ):
     """Рендерит кадр в PNG файл с текстовой подписью."""
     scene = _build_scene(env, agent_pose, goal_pose, trail_poses)
@@ -150,21 +257,26 @@ def render_frame_to_file(
     filepath.parent.mkdir(parents=True, exist_ok=True)
 
     try:
-        png_data = scene.save_image(resolution=resolution)
+        # Offscreen рендеринг без окна
+        png_data = scene.save_image(resolution=resolution, visible=False)
+        
+        if png_data is None or len(png_data) < 100:
+            raise RuntimeError("Empty render output")
+        
         if text:
             png_data = _add_text_to_image(png_data, text, step_num, distance, result)
         with open(filepath, "wb") as f:
             f.write(png_data)
     except Exception as e:
+        # Fallback: сохраняем текстовый лог
         txt_path = filepath.with_suffix(".txt")
         with open(txt_path, "w") as f:
             f.write(f"Render failed: {e}\n")
-            f.write(f"Step: {step_num}\n")
+            f.write(f"Step: {step_num}, Distance: {distance:.1f}mm\n")
             f.write(f"Agent: {agent_pose.tolist()}\n")
             f.write(f"Goal: {goal_pose.tolist()}\n")
             f.write(f"Action: {text}\n")
         logger.warning(f"Render failed for {filepath}: {e}")
-
 
 def save_episode_frames(
     env,
