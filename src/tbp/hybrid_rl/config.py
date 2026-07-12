@@ -34,13 +34,13 @@ DEFAULT_CONFIG = {
     # Reward weights
     "reward_progress": 3.0,
     "reward_goal_reached": 60.0,
-    "reward_step_penalty": -0.2,
-    "reward_surface_violation": -15.0,
+    "reward_step_penalty": -0.5,
+    "reward_surface_violation": -12.0,
     "reward_smart_detach": 1.5,
     "reward_drifted_away": -1.0,
     "reward_near_goal_on_surface": 0.5,
     "reward_oscillation": -0.5,
-    "reward_timeout": -8.0,
+    "reward_timeout": -12.0,
     "reward_detach_collision": -3.0,    # ← ДОБАВИТЬ
     # Detour shaping: if goal is behind surface, clip negative progress penalty
     # to avoid over-penalizing necessary face-to-face transitions on polyhedra.

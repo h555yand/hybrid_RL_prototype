@@ -615,10 +615,8 @@ def _print_eval_results(eval_results: Dict[str, Any]) -> None:
 
 def main() -> None:
 
-    TRAIN_EPISODES_PER_LEVEL = 5_000
     EVAL_EPISODES_PER_LEVEL = 500
-    REGENERATE_SCRIPTS = False
-    IS_LOAD = False
+    REGENERATE_SCRIPTS = True
     RUN_TRAIN = True
     RUN_EVAL = False
     RUN_BC_TRAIN = False
@@ -627,30 +625,29 @@ def main() -> None:
     RUN_ADAPTIVE = False
     RUN_CUP_EVAL = False
 
-
-    if IS_LOAD:
-        epsilon_start = 0.15
-    else:
-        epsilon_start = 1.0
+    TRAINING_STAGES = [
+        {"mesh": "cube",     "episodes": 3000, "epsilon_start": 1.0,  "epsilon_min": 0.10, "is_load": False},
+        {"mesh": "cylinder", "episodes": 3000, "epsilon_start": 0.35, "epsilon_min": 0.08, "is_load": True},
+        {"mesh": "mug",      "episodes": 5000, "epsilon_start": 0.50, "epsilon_min": 0.08, "is_load": True},
+        {"mesh": "cup",      "episodes": 3000, "epsilon_start": 0.20, "epsilon_min": 0.05, "is_load": True},
+    ]
 
     base_config = {
         "mode": "train_adapt_epsilon",
         "goal_threshold": GOAL_THRESHOLD_PER_LEVEL[0],
         "max_points": 500_000,
         "k_neighbors": 7,
-        "max_steps_per_goal": 300,
+        "max_steps_per_goal": 400,
         "adaptive_sigma": True,
         "insert_threshold": 0.50,
         "auto_calibrate": False,
-        "epsilon_start": epsilon_start,
         "epsilon_min": 0.05,
         "reward_goal_reached": 60.0,
         "reward_timeout": -8.0,
         "surface_step": 3.0,
         "free_step": 8.0,
-        "rotation_step": 5.0,
         "free_step_small": 2.0,
-        "temperature_override": None
+        "rotation_step": 5.0,
     }
     cfg = {**DEFAULT_CONFIG, **base_config}
 
@@ -659,241 +656,140 @@ def main() -> None:
     scripts_dir = data_dir / "episode_scripts"
     runs_dir.mkdir(parents=True, exist_ok=True)
 
-    #####################################################
-    # Choose Mesh
     _prepare_demo_meshes(data_dir)
-    mesh_path = str(data_dir / "cube.stl")
-    # mesh_path = str(data_dir / "cylinder.stl")
-    # mesh_path = str(data_dir / "mug.stl")
-    # mesh_path = str(data_dir / "cup.stl")
 
-    print("\n" + "=" * 60)
-    print("STEP 1: Prepare episode pools (train + eval)")
-    print("=" * 60)
-
-    train_pools = _get_or_generate_pools(
-        mesh_path=mesh_path,
-        seeds=TRAIN_SEEDS,
-        episodes_per_level=TRAIN_EPISODES_PER_LEVEL,
-        scripts_dir=scripts_dir,
-        curriculum_levels=CURRICULUM_LEVELS,
-        regenerate=REGENERATE_SCRIPTS,
-        prefix="train",
-    )
-    eval_pools = _get_or_generate_pools(
-        mesh_path=mesh_path,
-        seeds=EVAL_SEEDS,
-        episodes_per_level=EVAL_EPISODES_PER_LEVEL,
-        scripts_dir=scripts_dir,
-        curriculum_levels=CURRICULUM_LEVELS,
-        regenerate=REGENERATE_SCRIPTS,
-        prefix="eval",
-    )
-    sac_eval_pools = _get_or_generate_pools(
-        mesh_path=mesh_path,
-        seeds=SAC_EVAL_SEEDS,
-        episodes_per_level=EVAL_EPISODES_PER_LEVEL,
-        scripts_dir=scripts_dir,
-        curriculum_levels=CURRICULUM_LEVELS,
-        regenerate=REGENERATE_SCRIPTS,
-        prefix="sac_eval",
-    )
-
-    print(f"\nTrain pools: {len(TRAIN_SEEDS)} seeds x {TRAIN_EPISODES_PER_LEVEL} episodes/level")
-    print(f"Eval pools:  {len(EVAL_SEEDS)} seeds x {EVAL_EPISODES_PER_LEVEL} episodes/level")
-
-    best_variant = "CL3"
-    
-    def _run_sac_eval(mode, sac_trainer, sac_eval_pools, mesh_path, cfg):
-        results_per_level = {}
-        sample_seed = SAC_EVAL_SEEDS[0]
-        num_levels = len(sac_eval_pools[sample_seed].get("levels", []))
-
-        for level_idx in range(num_levels):
-            level_successes = 0
-            level_timeouts = 0
-            level_collisions = 0
-            level_total = 0
-
-            for eval_seed in [SAC_EVAL_SEEDS[0]]:
-                level_pool = sac_eval_pools[eval_seed]["levels"][level_idx]
-
-                np.random.seed(eval_seed)
-                torch.manual_seed(eval_seed)
-                env = LightweightEnv(mesh_path, seed=eval_seed)
-                controller = RLGoalApproachController(
-                    agent_id=f"sac_eval_L{level_idx}_{eval_seed}",
-                    config={**cfg, "mode": "eval"},
-                )
-                interpreter = ActionInterpreter(env)
-
-                for ep_data in level_pool:
-                    start_pos = np.array(ep_data["start_pos"])
-                    start_rot = np.array(ep_data["start_rot"])
-                    env.reset(position=start_pos, rotation=start_rot)
-                    goal_pose = np.concatenate([
-                        np.array(ep_data["goal_pos"]),
-                        np.array(ep_data["goal_rot"]),
-                    ])
-                    controller.set_new_goal(goal_pose, start_pos)
-                    env.set_goal(goal_pose)
-
-                    success = False
-                    collision = False
-
-                    for step in range(sac_trainer.max_steps_per_goal):
-                        current_pose = env.get_pose()
-                        sensor_data = env.get_sensor_data()
-                        state_raw = controller._compute_state(
-                            current_pose, sensor_data
-                        )
-                        state = sac_trainer.normalize_state(state_raw)
-
-                        if mode == "sample":
-                            state_t = torch.FloatTensor(
-                                state.astype(np.float32)
-                            ).unsqueeze(0)
-                            with torch.no_grad():
-                                at, ap, _, _ = sac_trainer.actor.sample(state_t)
-                            action_type = at[0].item()
-                            action_params = (
-                                ap[0].numpy() * sac_trainer.param_std
-                                + sac_trainer.param_mean
-                            )
-                        else:
-                            action_type, action_params_norm = sac_trainer.actor.predict(
-                                state.astype(np.float32)
-                            )
-                            param_dim = len(action_params_norm)
-                            action_params = (
-                                action_params_norm
-                                * sac_trainer.param_std[:param_dim]
-                                + sac_trainer.param_mean[:param_dim]
-                            )
-
-                        sensor_data = interpreter.execute(
-                            action_type, action_params
-                        )
-
-                        current_pose = env.get_pose()
-                        distance = float(np.linalg.norm(
-                            goal_pose[:3] - current_pose[:3]
-                        ))
-
-                        if step < 3 and level_total < 5:
-                            type_names = ExperienceExtractor.get_type_names()
-                            print(
-                                f"  ep={level_total} step={step}: "
-                                f"type={type_names.get(action_type, action_type)}, "
-                                f"params={action_params}, "
-                                f"dist={distance:.1f}"
-                            )
-
-                        if distance < sac_trainer.goal_threshold:
-                            success = True
-                            break
-
-                        depth = sensor_data.get("depth", 100.0)
-                        if depth < 0.5:
-                            collision = True
-                            break
-
-                    level_total += 1
-                    if success:
-                        level_successes += 1
-                    elif collision:
-                        level_collisions += 1
-                    else:
-                        level_timeouts += 1
-
-            count = max(level_total, 1)
-            bounds = CURRICULUM_LEVELS[level_idx]
-            results_per_level[f"level_{level_idx}"] = {
-                "bounds_mm": list(bounds),
-                "success_rate": level_successes / count,
-                "timeout_rate": level_timeouts / count,
-                "collision_rate": level_collisions / count,
-            }
-            logger.info(results_per_level[f"level_{level_idx}"])
-
-        return results_per_level
-
+    # ═══════════════════════════════════════════════════════
+    # Единая директория для Q-store (один store для всех мешей)
+    # ═══════════════════════════════════════════════════════
+    unified_save_dir = str(runs_dir / "unified_q")
 
     if RUN_TRAIN:
-        print("\n" + "=" * 60)
-        print("STEP 2: Train with curriculum")
-        print("=" * 60 + "\n")
+        for stage_idx, stage in enumerate(TRAINING_STAGES):
+            mesh_name = stage["mesh"]
+            mesh_path = str(data_dir / f"{mesh_name}.stl")
+            episodes_per_level = stage["episodes"]
+            epsilon_start = stage["epsilon_start"]
+            is_load = stage["is_load"]
 
-        runner = RLAblationRunner(
-            mesh_dir=str(data_dir),
-            mesh_path=mesh_path,
-            save_root_dir=str(runs_dir),
-            num_episodes=TRAIN_EPISODES_PER_LEVEL,
-            base_config=cfg,
-            seeds=TRAIN_SEEDS,
-            episode_pools_by_seed=train_pools,
-            is_load=IS_LOAD,
-        )
-        variants = runner.curriculum_variants(
-            reward_overrides={},
-            levels=CURRICULUM_LEVELS,
-        )
-        result = runner.run(variants=variants, visualise=True)
+            print("\n" + "=" * 60)
+            print(f"STAGE {stage_idx + 1}/{len(TRAINING_STAGES)}: "
+                  f"{mesh_name}, episodes={episodes_per_level}, "
+                  f"eps={epsilon_start}, is_load={is_load}")
+            print("=" * 60 + "\n")
 
-        print("\n=== Train Summaries ===")
-        for name, s in result["summaries"].items():
-            print(
-                f"  {name}: success={s['success_rate']:.4f}, "
-                f"timeout={s.get('timeout_rate', 0):.4f}, "
-                f"levels_reached={s.get('levels_reached', 0):.1f}"
+            stage_cfg = {
+                **cfg,
+                "epsilon_start": epsilon_start,
+                "epsilon_min": stage.get("epsilon_min", 0.05),
+                "num_episodes": episodes_per_level,
+                "unfreeze_normalization": is_load,
+            }
+
+            # Генерация пулов для текущего меша
+            train_pools = _get_or_generate_pools(
+                mesh_path=mesh_path,
+                seeds=TRAIN_SEEDS,
+                episodes_per_level=episodes_per_level,
+                scripts_dir=scripts_dir,
+                curriculum_levels=CURRICULUM_LEVELS,
+                regenerate=REGENERATE_SCRIPTS,
+                prefix=f"train_{mesh_name}",
             )
 
-        train_output = data_dir / "train_result.json"
-        result_to_save = {k: v for k, v in result.items() if k != "raw_results"}
-        with open(train_output, "w", encoding="utf-8") as f:
-            json.dump(result_to_save, f, indent=2)
-        print(f"\nSaved train result to {train_output}")
+            for seed in TRAIN_SEEDS:
+                seed_save_dir = f"{unified_save_dir}_seed_{seed}"
 
-        # ─── Сохранение результатов по каждому seed отдельно ───
-        for variant_name, runs in result["raw_results"].items():
-            for run_result in runs:
-                seed = run_result.get("seed")
-                if seed is None:
-                    continue
+                if is_load:
+                    load_dir = seed_save_dir
+                else:
+                    load_dir = None
 
-                per_seed_data = {
-                    "variant": variant_name,
+                seed_pools = train_pools.get(seed)
+                episode_pools = seed_pools.get("levels") if seed_pools else None
+
+                print(f"\n[Stage {stage_idx + 1}] Training {mesh_name}, seed={seed}")
+
+                curriculum_config = {
+                    "levels": CURRICULUM_LEVELS,
+                    "promote_threshold": 0.8,
+                    "promote_window": 100,
+                }
+
+                run_result = train(
+                    mesh_dir=str(data_dir),
+                    save_dir=seed_save_dir,
+                    load_dir=load_dir,
+                    num_episodes=episodes_per_level,
+                    config=stage_cfg,
+                    mesh_path=mesh_path,
+                    seed=seed,
+                    return_metrics=True,
+                    curriculum_config=curriculum_config,
+                    episode_pools=episode_pools,
+                )
+
+                # Сохранить результат этапа
+                stage_output = data_dir / f"train_result_{mesh_name}_seed_{seed}.json"
+                stage_data = {
+                    "stage": stage_idx,
+                    "mesh": mesh_name,
                     "seed": seed,
+                    "epsilon_start": epsilon_start,
+                    "is_load": is_load,
                     "goals_reached": run_result.get("goals_reached"),
                     "num_episodes": run_result.get("num_episodes"),
                     "success_rate": run_result.get("success_rate"),
                     "curriculum_stats": run_result.get("curriculum_stats"),
                     "stats": run_result.get("stats"),
-                    "collision_stats": run_result.get("stats", {}).get(
-                        "collision_stats", {}
-                    ),
+                    "collision_stats": run_result.get("stats", {}).get("collision_stats", {}),
                 }
+                with open(stage_output, "w", encoding="utf-8") as f:
+                    json.dump(stage_data, f, indent=2)
+                print(f"Saved to {stage_output}")
 
-                seed_output = (
-                    data_dir
-                    / f"train_result_{variant_name}_seed_{seed}.json"
+                stats = run_result.get("stats", {})
+                print(
+                    f"  success_rate={run_result.get('success_rate', 0):.4f}, "
+                    f"collision_rate={stats.get('termination_rates', {}).get('collision_surface_violation', 0):.4f}, "
+                    f"collision_stats={stats.get('collision_stats', {})}, "
+                    f"action_counts={stats.get('global_action_counts', {})}"
                 )
-                with open(seed_output, "w", encoding="utf-8") as f:
-                    json.dump(per_seed_data, f, indent=2)
-                print(f"Saved per-seed train result to {seed_output}")
 
-                # Печать collision_stats
-                collision_stats = per_seed_data["collision_stats"]
-                if collision_stats:
-                    print(
-                        f"  {variant_name} seed={seed} "
-                        f"collision_stats: {collision_stats}"
-                    )
+    best_variant = "unified_q"
+
+    # if RUN_EVAL:
+        # ... остальной код eval без изменений,
+        # но заменить runs_dir / f"{best_variant.lower()}_seed_{train_seed}"
+        # на unified_save_dir + f"_seed_{train_seed}"
 
     if RUN_EVAL:
         print("\n" + "=" * 60)
         print("STEP 3: Eval per level (separate eval pools)")
         print("=" * 60)
+
+        eval_pools = _get_or_generate_pools(
+            mesh_path=mesh_path,
+            seeds=EVAL_SEEDS,
+            episodes_per_level=EVAL_EPISODES_PER_LEVEL,
+            scripts_dir=scripts_dir,
+            curriculum_levels=CURRICULUM_LEVELS,
+            regenerate=REGENERATE_SCRIPTS,
+            prefix="eval",
+        )
+        sac_eval_pools = _get_or_generate_pools(
+            mesh_path=mesh_path,
+            seeds=SAC_EVAL_SEEDS,
+            episodes_per_level=EVAL_EPISODES_PER_LEVEL,
+            scripts_dir=scripts_dir,
+            curriculum_levels=CURRICULUM_LEVELS,
+            regenerate=REGENERATE_SCRIPTS,
+            prefix="sac_eval",
+        )
+
+        print(f"\nTrain pools: {len(TRAIN_SEEDS)} seeds x {TRAIN_EPISODES_PER_LEVEL} episodes/level")
+        print(f"Eval pools:  {len(EVAL_SEEDS)} seeds x {EVAL_EPISODES_PER_LEVEL} episodes/level")
+
+        best_variant = "CL3"
 
         eval_cfg = {
             "mode": "eval",
@@ -1060,6 +956,120 @@ def main() -> None:
         print("\n" + "=" * 60)
         print("STEP 7: P-SAC Eval")
         print("=" * 60)
+        def _run_sac_eval(mode, sac_trainer, sac_eval_pools, mesh_path, cfg):
+            results_per_level = {}
+            sample_seed = SAC_EVAL_SEEDS[0]
+            num_levels = len(sac_eval_pools[sample_seed].get("levels", []))
+
+            for level_idx in range(num_levels):
+                level_successes = 0
+                level_timeouts = 0
+                level_collisions = 0
+                level_total = 0
+
+                for eval_seed in [SAC_EVAL_SEEDS[0]]:
+                    level_pool = sac_eval_pools[eval_seed]["levels"][level_idx]
+
+                    np.random.seed(eval_seed)
+                    torch.manual_seed(eval_seed)
+                    env = LightweightEnv(mesh_path, seed=eval_seed)
+                    controller = RLGoalApproachController(
+                        agent_id=f"sac_eval_L{level_idx}_{eval_seed}",
+                        config={**cfg, "mode": "eval"},
+                    )
+                    interpreter = ActionInterpreter(env)
+
+                    for ep_data in level_pool:
+                        start_pos = np.array(ep_data["start_pos"])
+                        start_rot = np.array(ep_data["start_rot"])
+                        env.reset(position=start_pos, rotation=start_rot)
+                        goal_pose = np.concatenate([
+                            np.array(ep_data["goal_pos"]),
+                            np.array(ep_data["goal_rot"]),
+                        ])
+                        controller.set_new_goal(goal_pose, start_pos)
+                        env.set_goal(goal_pose)
+
+                        success = False
+                        collision = False
+
+                        for step in range(sac_trainer.max_steps_per_goal):
+                            current_pose = env.get_pose()
+                            sensor_data = env.get_sensor_data()
+                            state_raw = controller._compute_state(
+                                current_pose, sensor_data
+                            )
+                            state = sac_trainer.normalize_state(state_raw)
+
+                            if mode == "sample":
+                                state_t = torch.FloatTensor(
+                                    state.astype(np.float32)
+                                ).unsqueeze(0)
+                                with torch.no_grad():
+                                    at, ap, _, _ = sac_trainer.actor.sample(state_t)
+                                action_type = at[0].item()
+                                action_params = (
+                                    ap[0].numpy() * sac_trainer.param_std
+                                    + sac_trainer.param_mean
+                                )
+                            else:
+                                action_type, action_params_norm = sac_trainer.actor.predict(
+                                    state.astype(np.float32)
+                                )
+                                param_dim = len(action_params_norm)
+                                action_params = (
+                                    action_params_norm
+                                    * sac_trainer.param_std[:param_dim]
+                                    + sac_trainer.param_mean[:param_dim]
+                                )
+
+                            sensor_data = interpreter.execute(
+                                action_type, action_params
+                            )
+
+                            current_pose = env.get_pose()
+                            distance = float(np.linalg.norm(
+                                goal_pose[:3] - current_pose[:3]
+                            ))
+
+                            if step < 3 and level_total < 5:
+                                type_names = ExperienceExtractor.get_type_names()
+                                print(
+                                    f"  ep={level_total} step={step}: "
+                                    f"type={type_names.get(action_type, action_type)}, "
+                                    f"params={action_params}, "
+                                    f"dist={distance:.1f}"
+                                )
+
+                            if distance < sac_trainer.goal_threshold:
+                                success = True
+                                break
+
+                            depth = sensor_data.get("depth", 100.0)
+                            if depth < 0.5:
+                                collision = True
+                                break
+
+                        level_total += 1
+                        if success:
+                            level_successes += 1
+                        elif collision:
+                            level_collisions += 1
+                        else:
+                            level_timeouts += 1
+
+                count = max(level_total, 1)
+                bounds = CURRICULUM_LEVELS[level_idx]
+                results_per_level[f"level_{level_idx}"] = {
+                    "bounds_mm": list(bounds),
+                    "success_rate": level_successes / count,
+                    "timeout_rate": level_timeouts / count,
+                    "collision_rate": level_collisions / count,
+                }
+                logger.info(results_per_level[f"level_{level_idx}"])
+
+            return results_per_level
+
 
         SAC_EVAL_MODE = "both"
 

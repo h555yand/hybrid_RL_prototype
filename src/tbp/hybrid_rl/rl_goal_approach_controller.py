@@ -73,6 +73,7 @@ class RLGoalApproachController:
             surface_step=self.config["surface_step"],
             free_step=self.config["free_step"],
             rotation_step=self.config["rotation_step"],
+            free_step_small=self.config.get("free_step_small", 2.0),
         )
         self.num_actions = self.action_space.NUM_ACTIONS
 
@@ -109,19 +110,11 @@ class RLGoalApproachController:
             self.config.get("success_backup_alpha_multiplier", 0.5)
         )
         if self.mode == "train_adapt_epsilon":
-            # Choose multiplicative decay so that after all planned training
-            # steps epsilon goes from epsilon_start to epsilon_min:
-            #   eps_T = eps_0 * decay^T = eps_min
-            #   decay = (eps_min / eps_0)^(1 / T)
-            total_steps = max(
-                1,
-                int(self.config.get("num_episodes", 1))
-                * int(self.config.get("max_steps_per_goal", 1)),
-            )
+            total_episodes = max(1, int(self.config.get("num_episodes", 1)))
             eps_start = float(self.config.get("epsilon_start", self.epsilon))
             eps_min = float(self.config.get("epsilon_min", self.epsilon_min))
             if eps_start > eps_min > 0.0:
-                self.epsilon_decay = (eps_min / eps_start) ** (1.0 / total_steps)
+                self.epsilon_decay = (eps_min / eps_start) ** (1.0 / total_episodes)
 
         # Episode state (reset each new goal)
         self._prev_state: Optional[np.ndarray] = None
@@ -197,6 +190,12 @@ class RLGoalApproachController:
         self.start_pos = start_pos.copy()
         self._last_detach_sub_steps = 1  # ← ДОБАВИТЬ
         self._consecutive_detach_count = 0
+        # Epsilon decay per episode
+        if self.is_training:
+            self.epsilon = max(
+                self.epsilon_min,
+                self.epsilon * self.epsilon_decay,
+            )
 
         logger.debug(
             f"New goal set (episode {self._total_episodes}): "
@@ -319,12 +318,7 @@ class RLGoalApproachController:
         self._global_action_counts[action_name] = self._global_action_counts.get(action_name, 0) + 1
 
         # Decay epsilon только в training
-        if self.is_training:
-            self.epsilon = max(
-                self.epsilon_min,
-                self.epsilon * self.epsilon_decay,
-            )
-        else:
+        if not self.is_training:
             self.epsilon = self.eval_epsilon
 
         # Convert to Action
@@ -470,11 +464,7 @@ class RLGoalApproachController:
             min_progress = -surface_step * cfg["detour_negative_progress_clip_steps"]
             progress = max(progress_raw, min_progress)
 
-        if action == self.action_space.IDX_DETACH or action == self.action_space.IDX_DETACH_EDGE:
-            sub_steps = max(getattr(self, '_last_detach_sub_steps', 1), 1)
-            reward += progress / (self.action_space.free_step * sub_steps) * cfg["reward_progress"]
-        else:
-            reward += progress / surface_step * cfg["reward_progress"]
+        reward += progress / surface_step * cfg["reward_progress"]
 
         # ═══ 2. Goal reached ═══
         if distance < cfg["goal_threshold"]:
@@ -482,13 +472,8 @@ class RLGoalApproachController:
             done = True
             termination_reason = "goal_reached"
 
-        # ═══ 3. Step penalty ═══  ← ИЗМЕНЕНО
+        # ═══ 3. Step penalty ═══
         reward += cfg["reward_step_penalty"]
-        if action == self.action_space.IDX_DETACH or action == self.action_space.IDX_DETACH_EDGE:
-            # Читаем sub_steps из sensor_data через prev_sensor_data
-            # Но проще: сохранять в self при получении sensor_data
-            sub_steps = max(self._last_detach_sub_steps, 1)    # ← ИЗМЕНЕНО
-            reward += cfg["reward_step_penalty"] * (sub_steps - 1)
 
         # ═══ 3.5 Risky free_forward on surface ═══
         if action == self.action_space.IDX_FREE_FORWARD and prev_on_object > 0.5:
@@ -512,9 +497,9 @@ class RLGoalApproachController:
                 f"alignment={state[12]:.3f}, "
                 f"distance={state[13]:.1f}, "
             )
-        # ═══ 4.5 Detach collision ═══  ← ДОБАВИТЬ НОВУЮ СЕКЦИЮ
+        # ═══ 4.5 Detach collision ═══
         elif collision == "detach_collision":
-            reward += cfg["reward_surface_violation"]   # -15.0, как обычная коллизия
+            reward += cfg["reward_surface_violation"]
             done = True
             termination_reason = "collision_surface_violation"
             action_name = self.action_space.get_info(action).name if action is not None else "unknown"
@@ -529,8 +514,8 @@ class RLGoalApproachController:
 
         # ═══ 4.6 Detach while not on surface ═══
         if action in (self.action_space.IDX_DETACH, self.action_space.IDX_DETACH_EDGE):
-            if prev_on_object < 0.5:  # был в воздухе когда вызвал detach
-                reward += -5.0  # жёсткий штраф — это бессмысленное действие
+            if prev_on_object < 0.5:
+                reward += -5.0
 
         # ═══ 5. Near goal on surface ═══
         near_radius = surface_step * 3
@@ -545,7 +530,7 @@ class RLGoalApproachController:
                 termination_reason = "timeout"
 
         return reward, done, termination_reason
-
+    
     # ══════════════════════════════════════════════════════════
     # ACTION SELECTION
     # ══════════════════════════════════════════════════════════
@@ -1461,9 +1446,7 @@ class RLGoalApproachController:
         self._prev_action = self._last_action
         self._last_action = action_index
 
-        if self.is_training:
-            self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
-        else:
+        if not self.is_training:
             self.epsilon = self.eval_epsilon
 
         return state, False

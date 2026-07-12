@@ -84,6 +84,13 @@ def train(
         )
     else:
         controller = RLGoalApproachController.load(load_dir, agent_id=agent_id, config=config)
+        # Разморозить нормализацию для адаптации к новому мешу
+        if cfg.get("unfreeze_normalization", False):
+            controller.q_store_free._norm_frozen = False
+            controller.q_store_free._freeze_done = False
+            controller.q_store_surface._norm_frozen = False
+            controller.q_store_surface._freeze_done = False
+            logger.info("Normalization unfrozen for transfer learning")
 
     action_space = controller.action_space
 
