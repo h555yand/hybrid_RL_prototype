@@ -1,0 +1,97 @@
+# @package _global_
+
+defaults:
+  - /logging: silent_warning_train
+
+experiment:
+  _target_: tbp.hybrid_rl.experiment.RLGoalApproachExperiment
+  config:
+    seed: 42
+    do_train: true
+    do_eval: false
+    do_bc_train: false
+    do_sac_train: false
+    do_sac_eval: false
+    do_adaptive: false
+
+    train_seeds: [11]
+    eval_seeds: [44]
+    sac_eval_seeds: [77, 88, 99]
+    eval_episodes_per_level: 500
+    regenerate_scripts: true
+    promote_threshold: 0.55
+    promote_window: 100
+
+    curriculum_levels:
+      - [10.0, 40.0]
+      - [20.0, 80.0]
+      - [40.0, 120.0]
+
+    training_stages:
+      - mesh: cube
+        episodes: 3000
+        epsilon_start: 1.0
+        epsilon_min: 0.10
+        is_load: false
+      - mesh: cylinder
+        episodes: 3000
+        epsilon_start: 0.35
+        epsilon_min: 0.08
+        is_load: true
+      - mesh: mug
+        episodes: 5000
+        epsilon_start: 0.50
+        epsilon_min: 0.08
+        is_load: true
+      - mesh: cup
+        episodes: 3000
+        epsilon_start: 0.20
+        epsilon_min: 0.05
+        is_load: true
+
+    eval_meshes: [cube, cylinder, mug, cup]
+
+    rl_config:
+      mode: train_adapt_epsilon
+      goal_threshold: 5.0
+      max_points: 500000
+      k_neighbors: 7
+      max_steps_per_goal: 400
+      adaptive_sigma: true
+      insert_threshold: 0.50
+      auto_calibrate: false
+      reward_goal_reached: 60.0
+      reward_timeout: -12.0
+      reward_surface_violation: -12.0
+      reward_step_penalty: -0.5
+      surface_step: 3.0
+      free_step: 8.0
+      free_step_small: 2.0
+      rotation_step: 5.0
+
+    sac_config:
+      gamma: 0.99
+      tau: 0.005
+      lr_actor: 0.00001
+      lr_critic: 0.0003
+      batch_size: 256
+      buffer_capacity: 500000
+      bc_lambda_init: 5.0
+      bc_lambda_decay: 0.999999
+      max_steps_per_goal: 150
+      eval_interval: 200
+      eval_episodes: 100
+
+    sac_meshes: [cube, cylinder, mug, cup]
+    sac_episodes_per_mesh:
+      cube: 1000
+      cylinder: 1500
+      mug: 2000
+      cup: 2000
+
+    adaptive_mesh: cup
+    adaptive_episodes: 3000
+
+    logging:
+      run_name: rl_goal_approach
+      output_dir: ${oc.env:MONTY_LOGS}/rl_goal_approach
