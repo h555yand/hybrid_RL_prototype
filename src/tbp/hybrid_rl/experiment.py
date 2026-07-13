@@ -23,6 +23,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+import torch
+import numpy as np
 from omegaconf import DictConfig, OmegaConf
 
 from tbp.hybrid_rl.ablation_runner import (
@@ -39,6 +41,7 @@ from tbp.hybrid_rl.lightweight_env import LightweightEnv
 from tbp.hybrid_rl.mesh_factory import prepare_demo_meshes
 from tbp.hybrid_rl.rl_goal_approach_controller import RLGoalApproachController
 from tbp.hybrid_rl.sac_trainer import PSACTrainer
+from tbp.hybrid_rl.action_interpreter import ActionInterpreter
 
 logger = logging.getLogger(__name__)
 
@@ -141,7 +144,9 @@ class RLGoalApproachExperiment:
         self.eval_meshes: list[str] = self.config.get(
             "eval_meshes", ["cube", "cylinder", "mug", "cup"]
         )
-
+        self.sac_eval_episodes_per_level: int = self.config.get(
+            "sac_eval_episodes_per_level", 500
+        )
         self.unified_save_dir = str(self.runs_dir / "unified_q")
 
     def __enter__(self) -> RLGoalApproachExperiment:
@@ -424,9 +429,171 @@ class RLGoalApproachExperiment:
         )
         sac_trainer.load(str(self.runs_dir / "sac_model"))
 
+        all_sac_eval_results: dict[str, Any] = {}
+
         for mesh_name in self.eval_meshes:
+            mesh_path = str(self.data_dir / f"{mesh_name}.stl")
             logger.info("SAC Eval: %s", mesh_name)
 
+            sac_eval_pools = get_or_generate_pools(
+                mesh_path=mesh_path,
+                seeds=self.sac_eval_seeds,
+                episodes_per_level=self.sac_eval_episodes_per_level,
+                scripts_dir=self.scripts_dir,
+                curriculum_levels=self.curriculum_levels,
+                regenerate=self.regenerate_scripts,
+                prefix=f"sac_eval_{mesh_name}",
+            )
+
+            results = self._eval_sac_on_pools(
+                sac_trainer=sac_trainer,
+                sac_eval_pools=sac_eval_pools,
+                mesh_path=mesh_path,
+            )
+            all_sac_eval_results[mesh_name] = results
+
+            for key in sorted(results.keys()):
+                data = results[key]
+                logger.info(
+                    "  %s (%smm): success=%.4f, timeout=%.4f, "
+                    "collision=%.4f",
+                    key,
+                    data.get("bounds_mm", []),
+                    data["success_rate"],
+                    data["timeout_rate"],
+                    data["collision_rate"],
+                )
+
+            eval_output = (
+                self.data_dir / f"sac_eval_result_{mesh_name}.json"
+            )
+            with eval_output.open("w") as f:
+                json.dump(results, f, indent=2)
+
+        eval_output = self.data_dir / "sac_eval_result_all.json"
+        with eval_output.open("w") as f:
+            json.dump(all_sac_eval_results, f, indent=2)
+        logger.info("Saved all SAC eval results to %s", eval_output)
+
+    def _eval_sac_on_pools(  # noqa: SLF001
+        self,
+        sac_trainer: PSACTrainer,
+        sac_eval_pools: dict[int, dict[str, Any]],
+        mesh_path: str,
+    ) -> dict[str, Any]:
+        """Run SAC evaluation on episode pools.
+
+        Args:
+            sac_trainer: Trained PSACTrainer instance.
+            sac_eval_pools: Episode pools keyed by seed.
+            mesh_path: Path to the mesh file.
+
+        Returns:
+            Dict with per-level evaluation results.
+        """
+
+        results_per_level: dict[str, Any] = {}
+        sample_seed = self.sac_eval_seeds[0]
+        num_levels = len(
+            sac_eval_pools[sample_seed].get("levels", [])
+        )
+
+        for level_idx in range(num_levels):
+            level_successes = 0
+            level_timeouts = 0
+            level_collisions = 0
+            level_total = 0
+
+            for eval_seed in self.sac_eval_seeds:
+                level_pool = sac_eval_pools[eval_seed]["levels"][
+                    level_idx
+                ]
+
+                np.random.seed(eval_seed)  # noqa: NPY002
+                torch.manual_seed(eval_seed)
+                env = LightweightEnv(mesh_path, seed=eval_seed)
+                controller = RLGoalApproachController(
+                    agent_id=f"sac_eval_L{level_idx}_{eval_seed}",
+                    config={**self.rl_config, "mode": "eval"},
+                )
+                interpreter = ActionInterpreter(env)
+
+                for ep_data in level_pool:
+                    start_pos = np.array(ep_data["start_pos"])
+                    start_rot = np.array(ep_data["start_rot"])
+                    env.reset(
+                        position=start_pos, rotation=start_rot
+                    )
+                    goal_pose = np.concatenate([
+                        np.array(ep_data["goal_pos"]),
+                        np.array(ep_data["goal_rot"]),
+                    ])
+                    controller.set_new_goal(goal_pose, start_pos)
+                    env.set_goal(goal_pose)
+
+                    success = False
+                    collision = False
+
+                    for _ in range(sac_trainer.max_steps_per_goal):
+                        current_pose = env.get_pose()
+                        sensor_data = env.get_sensor_data()
+                        state_raw = controller._compute_state(
+                            current_pose, sensor_data
+                        )
+                        state = sac_trainer.normalize_state(state_raw)
+
+                        state_t = torch.FloatTensor(
+                            state.astype(np.float32)
+                        ).unsqueeze(0)
+                        with torch.no_grad():
+                            at, ap, _, _ = (
+                                sac_trainer.actor.sample_eval(state_t)
+                            )
+                        action_type = at[0].item()
+                        action_params = (
+                            ap[0].numpy() * sac_trainer.param_std
+                            + sac_trainer.param_mean
+                        )
+
+                        sensor_data = interpreter.execute(
+                            action_type, action_params
+                        )
+
+                        current_pose = env.get_pose()
+                        distance = float(
+                            np.linalg.norm(
+                                goal_pose[:3] - current_pose[:3]
+                            )
+                        )
+
+                        if distance < sac_trainer.goal_threshold:
+                            success = True
+                            break
+
+                        depth = sensor_data.get("depth", 100.0)
+                        if depth < 0.5:
+                            collision = True
+                            break
+
+                    level_total += 1
+                    if success:
+                        level_successes += 1
+                    elif collision:
+                        level_collisions += 1
+                    else:
+                        level_timeouts += 1
+
+            count = max(level_total, 1)
+            bounds = self.curriculum_levels[level_idx]
+            results_per_level[f"level_{level_idx}"] = {
+                "bounds_mm": list(bounds),
+                "success_rate": level_successes / count,
+                "timeout_rate": level_timeouts / count,
+                "collision_rate": level_collisions / count,
+            }
+
+        return results_per_level
+    
     def _run_adaptive(self) -> None:
         """Run adaptive mode with Q-store + SAC arbitration."""
         logger.info("=" * 60)

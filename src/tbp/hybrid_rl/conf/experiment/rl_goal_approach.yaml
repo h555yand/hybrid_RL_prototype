@@ -18,7 +18,6 @@ experiment:
     train_seeds: [11]
     eval_seeds: [44]
     sac_eval_seeds: [77]
-    eval_episodes_per_level: 20
     regenerate_scripts: true
     promote_threshold: 0.65
     promote_window: 100
@@ -29,28 +28,29 @@ experiment:
       - [40.0, 120.0]
 
     training_stages:
-      #- mesh: cube
-      #  episodes: 3000
-      #  epsilon_start: 1.0
-      #  epsilon_min: 0.10
-      #  is_load: false
-      #- mesh: cylinder
-      #  episodes: 3000
-      #  epsilon_start: 0.35
-      #  epsilon_min: 0.08
-      #  is_load: true
-      - mesh: mug
-        episodes: 100
+      - mesh: cube
+        episodes: 3000
         epsilon_start: 1.0
-        epsilon_min: 0.08
+        epsilon_min: 0.10
+        is_load: false
+      - mesh: cylinder
+        episodes: 5000
+        epsilon_start: 1.0
+        epsilon_min: 0.1
+        is_load: true
+      - mesh: mug
+        episodes: 10000
+        epsilon_start: 1.0
+        epsilon_min: 0.1
         is_load: False
       - mesh: cup
-        episodes: 100
-        epsilon_start: 0.75
-        epsilon_min: 0.05
+        episodes: 10000
+        epsilon_start: 1.0
+        epsilon_min: 0.1
         is_load: true
 
-    eval_meshes: [mug, cup] # [cube, cylinder, mug, cup]
+    eval_meshes: [cube, cylinder, mug, cup]
+    eval_episodes_per_level: 500
 
     rl_config:
       mode: train_adapt_epsilon
@@ -83,12 +83,13 @@ experiment:
       eval_interval: 200
       eval_episodes: 100
 
-    sac_meshes: [mug, cup] # [cube, cylinder, mug, cup]
+    sac_meshes: [cube, cylinder, mug, cup]
     sac_episodes_per_mesh:
-      #cube: 1000
-      #cylinder: 1500
-      mug: 100
-      cup: 100
+      cube: 1000
+      cylinder: 1500
+      mug: 2000
+      cup: 2000
+    sac_eval_episodes_per_level: 500
 
     adaptive_mesh: cup
     adaptive_episodes: 3000
