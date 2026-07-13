@@ -1,12 +1,25 @@
-"""
-Replay Buffer for P-SAC training.
+# Copyright 2025-2026 Thousand Brains Project
+#
+# Copyright may exist in Contributors' modifications
+# and/or contributions to the work.
+#
+# Use of this source code is governed by the MIT
+# license that can be found in the LICENSE file or at
+# https://opensource.org/licenses/MIT.
+
+"""Replay Buffer for P-SAC training.
 Stores transitions in P-SAC format (type + continuous params).
 Supports warm-start from BC data with protected BC reservoir.
 """
 
+from typing import Dict, List
+import logging
+
 import numpy as np
-from typing import List, Optional, Dict, Any
+
 from .experience_extractor import PSACTransition
+
+logger = logging.getLogger(__name__)
 
 
 class ReplayBuffer:
@@ -90,7 +103,7 @@ class ReplayBuffer:
         self.bc_size = count
         self.online_capacity = self.capacity - self.bc_size
         self.size = self.bc_size
-        print(
+        logger.info(
             f"ReplayBuffer: loaded {count} BC transitions (protected), "
             f"online_capacity={self.online_capacity}"
         )

@@ -1,24 +1,71 @@
-# visualize_env.py
-import trimesh
-import numpy as np
-from scipy.spatial.transform import Rotation as R
-from pathlib import Path
-from typing import List, Tuple, Optional, Dict, Any
-from PIL import Image, ImageDraw, ImageFont
+# Copyright 2025-2026 Thousand Brains Project
+#
+# Copyright may exist in Contributors' modifications
+# and/or contributions to the work.
+#
+# Use of this source code is governed by the MIT
+# license that can be found in the LICENSE file or at
+# https://opensource.org/licenses/MIT.
+
+"""Visualization utilities for the RL navigation environment.
+
+Provides functions for rendering agent trajectories, saving episode frames
+as PNG images with action annotations, and interactive scene visualization.
+"""
+
+from __future__ import annotations
+
 import io
 import json
 import logging
+from typing import TYPE_CHECKING
+
+import numpy as np
+import trimesh
+from PIL import Image, ImageDraw, ImageFont
+from scipy.spatial.transform import Rotation
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from tbp.hybrid_rl.lightweight_env import LightweightEnv
 
 logger = logging.getLogger(__name__)
 
+_MIN_RENDER_BYTES = 100
+_FONT_SIZE_OVERLAY = 12
+_MAX_LINE_LENGTH = 100
+_AGENT_SPHERE_RADIUS = 0.5
+_GOAL_SPHERE_RADIUS = 0.7
+_TRAIL_SPHERE_RADIUS = 0.3
+_GAZE_ARROW_LENGTH = 3
+_CAMERA_DISTANCE_MULTIPLIER = 1.8
+_NORM_EPSILON = 1e-12
+_CROSS_PRODUCT_THRESHOLD = 1e-8
+_TEXT_PADDING = 2
+_TEXT_Y_START = 5
+_TEXT_X_START = 5
+_TEXT_LINE_SPACING = 3
+_BG_ALPHA = 200
+
 
 def _build_scene(
-    env,
+    env: LightweightEnv,
     agent_pose: np.ndarray,
     goal_pose: np.ndarray,
-    trail_poses: Optional[List[np.ndarray]] = None,
+    trail_poses: list[np.ndarray] | None = None,
 ) -> trimesh.Scene:
-    """Строит сцену для рендеринга."""
+    """Build a trimesh scene for rendering.
+
+    Args:
+        env: LightweightEnv instance.
+        agent_pose: Agent pose [x, y, z, roll, pitch, yaw].
+        goal_pose: Goal pose [x, y, z, roll, pitch, yaw].
+        trail_poses: Optional list of previous agent poses for trail.
+
+    Returns:
+        Configured trimesh Scene with mesh, agent, goal, and trail.
+    """
     scene = trimesh.Scene()
 
     axis = trimesh.creation.axis(origin_size=2.0, axis_length=10)
@@ -28,23 +75,31 @@ def _build_scene(
     agent_pos = agent_pose[:3]
     agent_rot = agent_pose[3:]
 
-    agent_sphere = trimesh.primitives.Sphere(radius=0.5, center=agent_pos)
+    agent_sphere = trimesh.primitives.Sphere(
+        radius=_AGENT_SPHERE_RADIUS, center=agent_pos
+    )
     agent_sphere.visual.face_colors = [0, 0, 255, 255]
     scene.add_geometry(agent_sphere, geom_name="agent")
 
-    rot = R.from_euler("xyz", agent_rot, degrees=True)
+    rot = Rotation.from_euler("xyz", agent_rot, degrees=True)
     forward_dir = rot.apply([0, 0, -1])
-    line_vertices = np.array([agent_pos, agent_pos + forward_dir * 3])
+    line_vertices = np.array([
+        agent_pos, agent_pos + forward_dir * _GAZE_ARROW_LENGTH
+    ])
     arrow = trimesh.load_path(line_vertices, colors=[[255, 0, 0, 255]])
     scene.add_geometry(arrow, geom_name="gaze")
 
-    goal_sphere = trimesh.primitives.Sphere(radius=0.7, center=goal_pose[:3])
+    goal_sphere = trimesh.primitives.Sphere(
+        radius=_GOAL_SPHERE_RADIUS, center=goal_pose[:3]
+    )
     goal_sphere.visual.face_colors = [0, 255, 0, 255]
     scene.add_geometry(goal_sphere, geom_name="goal")
 
     if trail_poses:
         for i, pose in enumerate(trail_poses):
-            trail_sphere = trimesh.primitives.Sphere(radius=0.3, center=pose[:3])
+            trail_sphere = trimesh.primitives.Sphere(
+                radius=_TRAIL_SPHERE_RADIUS, center=pose[:3]
+            )
             trail_sphere.visual.face_colors = [255, 255, 0, 128]
             scene.add_geometry(trail_sphere, geom_name=f"trail_{i}")
 
@@ -56,11 +111,20 @@ def _compute_camera_transform(
     goal_pos: np.ndarray,
     mesh_bounds: np.ndarray,
 ) -> np.ndarray:
-    """Вычисляет фиксированную позицию камеры сбоку-сверху."""
+    """Compute a fixed camera position from the side and above.
+
+    Args:
+        agent_pos: Agent position [x, y, z].
+        goal_pos: Goal position [x, y, z].
+        mesh_bounds: Mesh bounding box [[min_x, min_y, min_z], [max, max, max]].
+
+    Returns:
+        4x4 camera transformation matrix.
+    """
     center = (agent_pos + goal_pos) / 2.0
-    span = np.linalg.norm(agent_pos - goal_pos)
-    mesh_size = np.linalg.norm(mesh_bounds[1] - mesh_bounds[0])
-    camera_distance = max(span, mesh_size) * 1.8
+    span = float(np.linalg.norm(agent_pos - goal_pos))
+    mesh_size = float(np.linalg.norm(mesh_bounds[1] - mesh_bounds[0]))
+    camera_distance = max(span, mesh_size) * _CAMERA_DISTANCE_MULTIPLIER
 
     camera_pos = center + np.array([
         camera_distance * 0.7,
@@ -69,16 +133,16 @@ def _compute_camera_transform(
     ])
 
     forward = center - camera_pos
-    forward /= (np.linalg.norm(forward) + 1e-12)
+    forward /= np.linalg.norm(forward) + _NORM_EPSILON
 
     world_up = np.array([0.0, 0.0, 1.0])
     right = np.cross(forward, world_up)
-    if np.linalg.norm(right) < 1e-8:
+    if np.linalg.norm(right) < _CROSS_PRODUCT_THRESHOLD:
         world_up = np.array([0.0, 1.0, 0.0])
         right = np.cross(forward, world_up)
-    right /= (np.linalg.norm(right) + 1e-12)
+    right /= np.linalg.norm(right) + _NORM_EPSILON
     up = np.cross(right, forward)
-    up /= (np.linalg.norm(up) + 1e-12)
+    up /= np.linalg.norm(up) + _NORM_EPSILON
 
     transform = np.eye(4)
     transform[:3, 0] = right
@@ -96,146 +160,58 @@ def _add_text_to_image(
     distance: float = 0.0,
     result: str = "",
 ) -> bytes:
-    """Добавляет текст поверх PNG изображения."""
+    """Add text overlay on top of a PNG image.
+
+    Args:
+        png_bytes: Raw PNG image bytes.
+        text: Action description text.
+        step_num: Current step number.
+        distance: Distance to goal in mm.
+        result: Episode result ("success", "collision", "timeout").
+
+    Returns:
+        PNG image bytes with text overlay.
+    """
     img = Image.open(io.BytesIO(png_bytes))
     draw = ImageDraw.Draw(img)
 
     try:
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 12)
-    except (OSError, IOError):
+        font = ImageFont.truetype(
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+            _FONT_SIZE_OVERLAY,
+        )
+    except OSError:
         font = ImageFont.load_default()
 
     header = f"Step {step_num} | dist={distance:.1f}mm | {result}"
-
     lines = [header]
-    max_line_len = 100
-    for i in range(0, len(text), max_line_len):
-        lines.append(text[i:i + max_line_len])
+    lines.extend(
+        text[i:i + _MAX_LINE_LENGTH]
+        for i in range(0, len(text), _MAX_LINE_LENGTH)
+    )
 
-    y = 5
+    y = _TEXT_Y_START
     for line in lines:
-        text_bbox = draw.textbbox((5, y), line, font=font)
+        text_bbox = draw.textbbox((_TEXT_X_START, y), line, font=font)
         draw.rectangle(
-            [text_bbox[0] - 2, text_bbox[1] - 1, text_bbox[2] + 2, text_bbox[3] + 1],
-            fill=(0, 0, 0, 200),
+            [
+                text_bbox[0] - _TEXT_PADDING,
+                text_bbox[1] - 1,
+                text_bbox[2] + _TEXT_PADDING,
+                text_bbox[3] + 1,
+            ],
+            fill=(0, 0, 0, _BG_ALPHA),
         )
-        draw.text((5, y), line, fill="white", font=font)
-        y += text_bbox[3] - text_bbox[1] + 3
+        draw.text((_TEXT_X_START, y), line, fill="white", font=font)
+        y += text_bbox[3] - text_bbox[1] + _TEXT_LINE_SPACING
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
 
-def render_frame_to_file_wrong(
-    env,
-    agent_pose: np.ndarray,
-    goal_pose: np.ndarray,
-    filepath: Path,
-    text: str = "",
-    step_num: int = 0,
-    distance: float = 0.0,
-    result: str = "",
-    trail_poses: Optional[List[np.ndarray]] = None,
-    resolution: Tuple[int, int] = (1024, 768),
-):
-    """Рендерит кадр в PNG через pyrender offscreen."""
-    filepath.parent.mkdir(parents=True, exist_ok=True)
-
-    try:
-        import pyrender
-        import os
-        os.environ["PYOPENGL_PLATFORM"] = "egl"  # offscreen без окна
-
-        scene = pyrender.Scene(bg_color=[255, 255, 255, 255])
-
-        # Меш
-        mesh_trimesh = env.mesh.copy()
-        #mesh_trimesh.unmerge_vertices()  # убрать smooth, сделать flat
-        #mesh_trimesh.visual.face_colors = [200, 200, 200, 255]
-        #scene.add(pyrender.Mesh.from_trimesh(mesh_trimesh))
-        mesh_trimesh.visual.vertex_colors = [200, 200, 200, 255]
-        scene.add(pyrender.Mesh.from_trimesh(mesh_trimesh, smooth=False))
-
-        # Агент — синяя сфера
-        agent_sphere = trimesh.primitives.Sphere(radius=0.8, center=agent_pose[:3])
-        agent_sphere.visual.face_colors = [0, 0, 255, 255]
-        scene.add(pyrender.Mesh.from_trimesh(agent_sphere))
-
-        # Цель — зелёная сфера
-        goal_sphere = trimesh.primitives.Sphere(radius=1.0, center=goal_pose[:3])
-        goal_sphere.visual.face_colors = [0, 255, 0, 255]
-        scene.add(pyrender.Mesh.from_trimesh(goal_sphere))
-
-        # Стрелка взгляда
-        rot = R.from_euler("xyz", agent_pose[3:], degrees=True)
-        forward_dir = rot.apply([0, 0, -1])
-        arrow_end = agent_pose[:3] + forward_dir * 5
-        arrow_mesh = trimesh.creation.cylinder(radius=0.2, segment=[agent_pose[:3], arrow_end])
-        arrow_mesh.visual.face_colors = [255, 0, 0, 255]
-        scene.add(pyrender.Mesh.from_trimesh(arrow_mesh))
-
-        # Траектория
-        if trail_poses:
-            for pose in trail_poses:
-                t_sphere = trimesh.primitives.Sphere(radius=0.4, center=pose[:3])
-                t_sphere.visual.face_colors = [255, 255, 0, 128]
-                scene.add(pyrender.Mesh.from_trimesh(t_sphere))
-
-        # Камера
-        camera = pyrender.PerspectiveCamera(yfov=np.pi / 3.0)
-        camera_transform = _compute_camera_transform(
-            agent_pose[:3], goal_pose[:3], env.mesh.bounds,
-        )
-        scene.add(camera, pose=camera_transform)
-
-        # Свет
-        light = pyrender.DirectionalLight(color=[1.0, 1.0, 1.0], intensity=3.0)
-        scene.add(light, pose=camera_transform)
-
-        # Рендер
-        renderer = pyrender.OffscreenRenderer(*resolution)
-        color, _ = renderer.render(scene)
-        renderer.delete()
-
-        # Сохранить
-        img = Image.fromarray(color)
-        if text:
-            draw = ImageDraw.Draw(img)
-            try:
-                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 14)
-            except (OSError, IOError):
-                font = ImageFont.load_default()
-
-            header = f"Step {step_num} | dist={distance:.1f}mm | {result}"
-            lines = [header]
-            max_line_len = 120
-            for i in range(0, len(text), max_line_len):
-                lines.append(text[i:i + max_line_len])
-
-            y = 5
-            for line in lines:
-                text_bbox = draw.textbbox((5, y), line, font=font)
-                draw.rectangle(
-                    [text_bbox[0] - 2, text_bbox[1] - 1, text_bbox[2] + 2, text_bbox[3] + 1],
-                    fill=(0, 0, 0, 200),
-                )
-                draw.text((5, y), line, fill="white", font=font)
-                y += text_bbox[3] - text_bbox[1] + 4
-
-        img.save(str(filepath))
-
-    except Exception as e:
-        txt_path = filepath.with_suffix(".txt")
-        with open(txt_path, "w") as f:
-            f.write(f"Render failed: {e}\n")
-            f.write(f"Step: {step_num}, Distance: {distance:.1f}mm\n")
-            f.write(f"Agent: {agent_pose.tolist()}\n")
-            f.write(f"Goal: {goal_pose.tolist()}\n")
-            f.write(f"Action: {text}\n")
-        logger.warning(f"Render failed for {filepath}: {e}")
 
 def render_frame_to_file(
-    env,
+    env: LightweightEnv,
     agent_pose: np.ndarray,
     goal_pose: np.ndarray,
     filepath: Path,
@@ -243,10 +219,26 @@ def render_frame_to_file(
     step_num: int = 0,
     distance: float = 0.0,
     result: str = "",
-    trail_poses: Optional[List[np.ndarray]] = None,
-    resolution: Tuple[int, int] = (1024, 768),
-):
-    """Рендерит кадр в PNG файл с текстовой подписью."""
+    trail_poses: list[np.ndarray] | None = None,
+    resolution: tuple[int, int] = (1024, 768),
+) -> None:
+    """Render a frame to a PNG file with text annotation.
+
+    Args:
+        env: LightweightEnv instance.
+        agent_pose: Agent pose [x, y, z, roll, pitch, yaw].
+        goal_pose: Goal pose [x, y, z, roll, pitch, yaw].
+        filepath: Output PNG file path.
+        text: Action description text to overlay.
+        step_num: Current step number.
+        distance: Distance to goal in mm.
+        result: Episode result string.
+        trail_poses: Optional list of previous poses for trail visualization.
+        resolution: Image resolution (width, height).
+
+    Raises:
+        RuntimeError: If the rendered image is empty or too small.
+    """
     scene = _build_scene(env, agent_pose, goal_pose, trail_poses)
 
     camera_transform = _compute_camera_transform(
@@ -257,87 +249,102 @@ def render_frame_to_file(
     filepath.parent.mkdir(parents=True, exist_ok=True)
 
     try:
-        # Offscreen рендеринг без окна
         png_data = scene.save_image(resolution=resolution, visible=False)
-        
-        if png_data is None or len(png_data) < 100:
-            raise RuntimeError("Empty render output")
-        
+
+        if png_data is None or len(png_data) < _MIN_RENDER_BYTES:
+            msg = "Empty render output"
+            raise RuntimeError(msg)
+
         if text:
-            png_data = _add_text_to_image(png_data, text, step_num, distance, result)
-        with open(filepath, "wb") as f:
+            png_data = _add_text_to_image(
+                png_data, text, step_num, distance, result
+            )
+        with filepath.open("wb") as f:
             f.write(png_data)
-    except Exception as e:
-        # Fallback: сохраняем текстовый лог
+    except (RuntimeError, OSError):
         txt_path = filepath.with_suffix(".txt")
-        with open(txt_path, "w") as f:
-            f.write(f"Render failed: {e}\n")
+        with txt_path.open("w") as f:
             f.write(f"Step: {step_num}, Distance: {distance:.1f}mm\n")
             f.write(f"Agent: {agent_pose.tolist()}\n")
             f.write(f"Goal: {goal_pose.tolist()}\n")
             f.write(f"Action: {text}\n")
-        logger.warning(f"Render failed for {filepath}: {e}")
+        logger.warning("Render failed for %s", filepath, exc_info=True)
+
 
 def save_episode_frames(
-    env,
+    env: LightweightEnv,
     goal_pose: np.ndarray,
-    episode_poses: List[np.ndarray],
-    episode_actions: List[str],
+    episode_poses: list[np.ndarray],
+    episode_actions: list[str],
     output_dir: Path,
     episode_id: str,
     result: str = "unknown",
-):
-    """Сохраняет все кадры эпизода с подписями действий.
+) -> None:
+    """Save all frames of an episode with action annotations.
+
+    Creates a directory with PNG frames for each step, an actions log,
+    and a JSON metadata file.
 
     Args:
-        env: LightweightEnv
-        goal_pose: целевая поза [6D]
-        episode_poses: список поз агента на каждом шаге
-        episode_actions: список описаний действий (action_explanations)
-        output_dir: корневая директория для сохранения
-        episode_id: уникальный идентификатор эпизода
-        result: "success", "collision", "timeout"
+        env: LightweightEnv instance.
+        goal_pose: Target pose [6D].
+        episode_poses: List of agent poses at each step.
+        episode_actions: List of action descriptions (action_explanations).
+        output_dir: Root directory for saving.
+        episode_id: Unique episode identifier.
+        result: Episode result ("success", "collision", "timeout").
     """
     ep_dir = output_dir / episode_id
     ep_dir.mkdir(parents=True, exist_ok=True)
 
-    # Сохранить лог действий
     log_path = ep_dir / "actions.txt"
-    with open(log_path, "w") as f:
+    with log_path.open("w") as f:
         f.write(f"Result: {result}\n")
         f.write(f"Goal: {goal_pose.tolist()}\n")
         f.write(f"Steps: {len(episode_actions)}\n")
         if episode_poses:
             f.write(f"Start: {episode_poses[0].tolist()}\n")
             f.write(f"End: {episode_poses[-1].tolist()}\n")
-            start_dist = float(np.linalg.norm(goal_pose[:3] - episode_poses[0][:3]))
-            end_dist = float(np.linalg.norm(goal_pose[:3] - episode_poses[-1][:3]))
+            start_dist = float(
+                np.linalg.norm(goal_pose[:3] - episode_poses[0][:3])
+            )
+            end_dist = float(
+                np.linalg.norm(goal_pose[:3] - episode_poses[-1][:3])
+            )
             f.write(f"Start distance: {start_dist:.1f}mm\n")
             f.write(f"End distance: {end_dist:.1f}mm\n")
         f.write("\n")
         for i, action in enumerate(episode_actions):
-            pose_str = episode_poses[i].tolist() if i < len(episode_poses) else "N/A"
-            dist = float(np.linalg.norm(goal_pose[:3] - episode_poses[i][:3])) if i < len(episode_poses) else 0
+            if i < len(episode_poses):
+                dist = float(
+                    np.linalg.norm(goal_pose[:3] - episode_poses[i][:3])
+                )
+            else:
+                dist = 0.0
             f.write(f"Step {i:03d} (dist={dist:.1f}mm): {action}\n")
 
-    # Сохранить метаданные
     meta = {
         "episode_id": episode_id,
         "result": result,
         "goal_pose": goal_pose.tolist(),
         "num_steps": len(episode_actions),
-        "start_pose": episode_poses[0].tolist() if episode_poses else None,
-        "end_pose": episode_poses[-1].tolist() if episode_poses else None,
+        "start_pose": (
+            episode_poses[0].tolist() if episode_poses else None
+        ),
+        "end_pose": (
+            episode_poses[-1].tolist() if episode_poses else None
+        ),
     }
-    with open(ep_dir / "meta.json", "w") as f:
+    meta_path = ep_dir / "meta.json"
+    with meta_path.open("w") as f:
         json.dump(meta, f, indent=2)
 
-    # Рендерить кадры
-    trail_so_far = []
+    trail_so_far: list[np.ndarray] = []
 
-    # Кадр 0: начальное состояние (до первого действия)
     if episode_poses:
-        distance = float(np.linalg.norm(goal_pose[:3] - episode_poses[0][:3]))
+        distance = float(
+            np.linalg.norm(goal_pose[:3] - episode_poses[0][:3])
+        )
         render_frame_to_file(
             env=env,
             agent_pose=episode_poses[0],
@@ -350,11 +357,16 @@ def save_episode_frames(
         )
         trail_so_far.append(episode_poses[0])
 
-    # Кадры 1..N: после каждого действия
     for i in range(1, len(episode_poses)):
         trail_so_far.append(episode_poses[i])
-        action_text = episode_actions[i - 1] if (i - 1) < len(episode_actions) else "unknown"
-        distance = float(np.linalg.norm(goal_pose[:3] - episode_poses[i][:3]))
+        action_text = (
+            episode_actions[i - 1]
+            if (i - 1) < len(episode_actions)
+            else "unknown"
+        )
+        distance = float(
+            np.linalg.norm(goal_pose[:3] - episode_poses[i][:3])
+        )
 
         render_frame_to_file(
             env=env,
@@ -368,16 +380,34 @@ def save_episode_frames(
             trail_poses=trail_so_far[:-1],
         )
 
-    logger.info(f"Saved {len(episode_poses)} frames to {ep_dir}")
+    logger.info("Saved %d frames to %s", len(episode_poses), ep_dir)
 
 
-def visualize_scene(env, goal_pose: np.ndarray):
-    """Интерактивная визуализация сцены."""
+def visualize_scene(
+    env: LightweightEnv,
+    goal_pose: np.ndarray,
+) -> None:
+    """Show interactive visualization of the scene.
+
+    Args:
+        env: LightweightEnv instance.
+        goal_pose: Goal pose [x, y, z, roll, pitch, yaw].
+    """
     scene = _build_scene(env, env.get_pose(), goal_pose)
     scene.show(smooth=False)
 
 
-def visualize_agent_goal(env, agent_pose: np.ndarray, goal_pose: np.ndarray):
-    """Интерактивная визуализация агента и цели."""
+def visualize_agent_goal(
+    env: LightweightEnv,
+    agent_pose: np.ndarray,
+    goal_pose: np.ndarray,
+) -> None:
+    """Show interactive visualization of agent and goal.
+
+    Args:
+        env: LightweightEnv instance.
+        agent_pose: Agent pose [x, y, z, roll, pitch, yaw].
+        goal_pose: Goal pose [x, y, z, roll, pitch, yaw].
+    """
     scene = _build_scene(env, agent_pose, goal_pose)
     scene.show(smooth=False)

@@ -1,6 +1,13 @@
-# arbitrator.py
-"""
-Arbitrator: decides which action source to use per step.
+# Copyright 2025-2026 Thousand Brains Project
+#
+# Copyright may exist in Contributors' modifications
+# and/or contributions to the work.
+#
+# Use of this source code is governed by the MIT
+# license that can be found in the LICENSE file or at
+# https://opensource.org/licenses/MIT.
+
+"""Arbitrator: decides which action source to use per step.
 Switches between Q-store (episodic memory), SAC (skill),
 and heuristic (fallback).
 
@@ -11,15 +18,17 @@ Logic:
   4. Heuristic (last resort)
 """
 
+import logging
+from collections import defaultdict, deque
+from typing import Any, Dict, Optional, Tuple
+
 import numpy as np
 import torch
-import logging
-from typing import Dict, Any, Optional, Tuple
-from collections import defaultdict, deque
+from collections import Counter
 
+from .experience_extractor import ExperienceExtractor
 from .rl_goal_approach_controller import RLGoalApproachController
 from .sac_actor import SACActorNetwork
-from .experience_extractor import ExperienceExtractor
 
 logger = logging.getLogger(__name__)
 
@@ -38,34 +47,33 @@ def sac_to_discrete(action_type: int, action_params: np.ndarray) -> int:
                 best_idx = i
         return best_idx
 
-    elif action_type == 1:
+    if action_type == 1:
         step = float(action_params[0])
         if step < 0:
             return 9   # free_backward
-        elif abs(step) <= 3.0:
+        if abs(step) <= 3.0:
             return 20  # free_forward_small
-        else:
-            return 8   # free_forward
+        return 8   # free_forward
 
-    elif action_type == 2:
+    if action_type == 2:
         return 10 if float(action_params[0]) >= 0 else 11
 
-    elif action_type == 3:
+    if action_type == 3:
         return 12 if float(action_params[0]) >= 0 else 13
 
-    elif action_type == 4:
+    if action_type == 4:
         return 14 if float(action_params[0]) >= 0 else 15
 
-    elif action_type == 5:
+    if action_type == 5:
         return 16
 
-    elif action_type == 6:
+    if action_type == 6:
         return 17
 
-    elif action_type == 7:
+    if action_type == 7:
         return 18  # detach
 
-    elif action_type == 8:
+    if action_type == 8:
         return 19  # detach_edge
 
     return 0
@@ -106,30 +114,30 @@ class Arbitrator:
             "total_decisions": 0,
         }
 
-        # Статистика предложенных действий
+        # Statistics of proposed actions
         self.q_proposed_actions = defaultdict(int)
         self.sac_proposed_actions = defaultdict(int)
 
-        # Статистика выбранных действий
+        # Statistics of selected actions
         self.q_chosen_actions = defaultdict(int)
         self.sac_chosen_actions = defaultdict(int)
         self.heuristic_chosen_actions = defaultdict(int)
 
-        # Согласованность
+        # Coherence
         self.agreement_count = 0
         self.both_proposed_count = 0
 
-        # Диагностика
+        # Diagnostics
         self.q_confidence_history = []
         self.q_spread_history = []
         self.sac_confidence_history = []
 
-        # Success rate по источникам (per episode)
+        # Success rate by source (per episode)
         self._current_episode_sources = []
         self._q_episode_results = deque(maxlen=source_success_window)
         self._sac_episode_results = deque(maxlen=source_success_window)
         self._heuristic_episode_results = deque(maxlen=source_success_window)
-        self.boost_sac = False  # управляется из AdaptiveTrainingManager
+        self.boost_sac = False  # controlled from AdaptiveTrainingManager
 
     def decide(self, state, current_pose, sensor_data):
         self.stats["total_decisions"] += 1
@@ -156,26 +164,26 @@ class Arbitrator:
             if self.sac_actor is not None:
                 self.sac_confidence_history.append(sac_confidence)
 
-        # Порог Q-store: повышен если SAC приоритет активен
+        # Q-store threshold: increased if SAC priority is active
         q_spread_thr = self.q_spread_threshold
         if self.boost_sac:
             q_spread_thr = self.q_spread_threshold * 3.0
 
-        # 1. Q-store уверен И различает действия
+        # 1. Q-store is confident and differentiates actions
         if q_confidence > self.q_confidence_threshold and q_spread > q_spread_thr:
             self.stats["q_store_chosen"] += 1
             self.q_chosen_actions[q_name] += 1
             self._current_episode_sources.append("q_store")
             return q_action, "q_store"
 
-        # 2. SAC уверен
+        # 2. SAC is confident
         if self.sac_actor is not None and sac_confidence > self.sac_confidence_threshold:
             self.stats["sac_chosen"] += 1
             self.sac_chosen_actions[sac_name] += 1
             self._current_episode_sources.append("sac")
             return sac_action, "sac"
 
-        # 3. Q-store слабый fallback
+        # 3. Q-store weak fallback
         if q_confidence > self.q_weak_threshold:
             self.stats["q_store_weak_chosen"] += 1
             self.q_chosen_actions[q_name] += 1
@@ -189,21 +197,20 @@ class Arbitrator:
         self.heuristic_chosen_actions[h_name] += 1
         self._current_episode_sources.append("heuristic")
         return heuristic_action, "heuristic"
-    
+
     def on_episode_end(self, success: bool):
-        """Вызывается после каждого эпизода для подсчёта success rate по источникам."""
+        """Called after each episode to calculate the success rate by source."""
         if not self._current_episode_sources:
             self._current_episode_sources = []
             return
 
-        # Определяем доминирующий источник эпизода (>50% решений)
-        from collections import Counter
+        # Determine the dominant source of the episode (>50% of solutions)
         counts = Counter(self._current_episode_sources)
         total = len(self._current_episode_sources)
         dominant = counts.most_common(1)[0][0]
         dominant_ratio = counts[dominant] / total
 
-        # Записываем результат для доминирующего источника
+        # Write down the result for the dominant source
         if dominant_ratio > 0.5:
             if dominant == "q_store":
                 self._q_episode_results.append(success)
@@ -212,7 +219,7 @@ class Arbitrator:
             elif dominant == "heuristic":
                 self._heuristic_episode_results.append(success)
         else:
-            # Смешанный эпизод — записываем для обоих
+            # Mixed episode - record for both
             for source in counts:
                 if source == "q_store":
                     self._q_episode_results.append(success)
@@ -335,7 +342,7 @@ class Arbitrator:
             "sac_rate": round(self.stats["sac_chosen"] / total, 3),
             "heuristic_rate": round(self.stats["heuristic_chosen"] / total, 3),
 
-            # Success rate по источникам
+            # Success rate by source
             "q_success_rate": round(self.q_success_rate, 3),
             "sac_success_rate": round(self.sac_success_rate, 3),
             "heuristic_success_rate": round(self.heuristic_success_rate, 3),

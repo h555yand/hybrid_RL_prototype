@@ -1,16 +1,27 @@
-# sac_actor.py
-"""
-SAC Actor Network for Parameterized Action Space.
+# Copyright 2025-2026 Thousand Brains Project
+#
+# Copyright may exist in Contributors' modifications
+# and/or contributions to the work.
+#
+# Use of this source code is governed by the MIT
+# license that can be found in the LICENSE file or at
+# https://opensource.org/licenses/MIT.
+
+"""SAC Actor Network for Parameterized Action Space.
 Stochastic policy: Categorical(types) + Gaussian(params|type).
 Warm-started from BC Actor weights.
 """
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
 from typing import Dict, Tuple
+import logging
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+
 from .experience_extractor import ExperienceExtractor
+
+logger = logging.getLogger(__name__)
 
 
 class SACActorNetwork(nn.Module):
@@ -139,7 +150,7 @@ class SACActorNetwork(nn.Module):
         total_log_prob = type_log_prob + param_log_prob
 
         return action_type, action_params, total_log_prob, type_probs
-        
+
     def load_bc_weights(self, bc_actor_state_dict: dict):
         own_state = self.state_dict()
         loaded = 0
@@ -162,4 +173,4 @@ class SACActorNetwork(nn.Module):
                 skipped += 1
 
         self.load_state_dict(own_state)
-        print(f"BC weights loaded: {loaded} transferred, {skipped} skipped")
+        logger.info(f"BC weights loaded: {loaded} transferred, {skipped} skipped")

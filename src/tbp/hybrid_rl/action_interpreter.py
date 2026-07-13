@@ -1,10 +1,17 @@
-# action_interpreter.py
-"""
-ActionInterpreter: converts P-SAC (type, params) to LightweightEnv commands.
+# Copyright 2025-2026 Thousand Brains Project
+#
+# Copyright may exist in Contributors' modifications
+# and/or contributions to the work.
+#
+# Use of this source code is governed by the MIT
+# license that can be found in the LICENSE file or at
+# https://opensource.org/licenses/MIT.
+
+"""ActionInterpreter: converts P-SAC (type, params) to LightweightEnv commands.
 """
 
 import numpy as np
-from typing import Tuple
+
 from .experience_extractor import ExperienceExtractor
 
 
@@ -50,18 +57,18 @@ class ActionInterpreter:
             self.env._orient_vertical(rotation, fwd_dist, down_dist)
 
         elif action_type == 7:
-            if hasattr(self.env, '_current_goal') and self.env._current_goal is not None:
+            if hasattr(self.env, "_current_goal") and self.env._current_goal is not None:
                 self.env._detach_and_fly_to_goal(
                     goal_pose=self.env._current_goal,
                 )
 
         elif action_type == 8:
-            if hasattr(self.env, '_current_goal') and self.env._current_goal is not None:
+            if hasattr(self.env, "_current_goal") and self.env._current_goal is not None:
                 self.env._detach_and_fly_to_edge(
                     goal_pose=self.env._current_goal,
                 )
 
-        # Нормализовать euler после поворотов
+        # Normalize euler after rotations
         self.env.agent_rot = self.env._normalize_euler(self.env.agent_rot)
 
         return self.env.get_sensor_data()

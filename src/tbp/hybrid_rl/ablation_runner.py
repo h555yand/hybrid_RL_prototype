@@ -1,41 +1,552 @@
-# ablation_runner.py
-from typing import Any, Dict, List, Optional
+# Copyright 2025-2026 Thousand Brains Project
+#
+# Copyright may exist in Contributors' modifications
+# and/or contributions to the work.
+#
+# Use of this source code is governed by the MIT
+# license that can be found in the LICENSE file or at
+# https://opensource.org/licenses/MIT.
 
-import logging
+"""Q-learning training orchestrator with curriculum support.
+
+Provides the main ``run_episodes()`` function that runs Q-learning episodes
+with heuristic-guided exploration, curriculum levels, and optional
+visualization of episode trajectories.
+"""
+
+from __future__ import annotations
+
 import collections
-import numpy as np
+import json
+import logging
 import random
-import glob
 from pathlib import Path
+from typing import Any
 
+import numpy as np
 
-from tbp.hybrid_rl.rl_goal_approach_controller import RLGoalApproachController
-from tbp.hybrid_rl.lightweight_env import LightweightEnv
 from tbp.hybrid_rl.config import DEFAULT_CONFIG
+from tbp.hybrid_rl.experience_extractor import ExperienceExtractor
+from tbp.hybrid_rl.lightweight_env import LightweightEnv
+from tbp.hybrid_rl.rl_goal_approach_controller import RLGoalApproachController
+from tbp.hybrid_rl.visualize_env import save_episode_frames
 
 GOAL_THRESHOLD_PER_LEVEL = [5.0, 3.0, 2.0]
 
+_LOG_INTERVAL = 1000
+
 logger = logging.getLogger(__name__)
 
+CURRICULUM_LEVELS = [
+    (10.0, 40.0),
+    (20.0, 80.0),
+    (40.0, 120.0),
+]
 
-def train(
-    mesh_dir,
-    save_dir,
-    num_episodes=None,
-    config=None,
-    mesh_path=None,
-    load_dir=None,
-    agent_id="standalone",
-    seed=None,
-    return_metrics=False,
-    curriculum_config=None,
-    episode_script: Optional[List[Dict[str, Any]]] = None,
-    episode_pools: Optional[List[List[Dict[str, Any]]]] = None,
-    visualise=False,
-    EPISODES_PER_LEVEL=None,
-):
+
+def run_eval_per_seed(  # noqa: PLR0913
+    data_dir: Path,
+    runs_dir: Path,
+    mesh_path: str,
+    train_seeds: list[int],
+    eval_seeds: list[int],
+    variant: str,
+    eval_cfg: dict[str, Any],
+    eval_pools: dict[int, dict[str, Any]],
+    collect_bc: bool = False,
+    episodes_per_level: int | None = None,
+    mesh_name: str = "",
+) -> tuple[dict[str, Any], list[Any]]:
+    """Run evaluation across seeds and curriculum levels.
+
+    Args:
+        data_dir: Base data directory.
+        runs_dir: Directory containing trained models.
+        mesh_path: Path to the mesh file.
+        train_seeds: List of training seeds.
+        eval_seeds: List of evaluation seeds.
+        variant: Model variant name (used for directory lookup).
+        eval_cfg: Evaluation configuration dict.
+        eval_pools: Episode pools keyed by seed.
+        collect_bc: Whether to collect BC transitions.
+        episodes_per_level: Max episodes per level.
+        mesh_name: Mesh name for BC data tagging.
+
+    Returns:
+        Tuple of (results_per_level dict, bc_transitions list).
+    """
+    results_per_seed: dict[str, Any] = {}
+    bc_transitions: list[Any] = []
+
+    sample_seed = eval_seeds[0]
+    num_levels = len(eval_pools[sample_seed].get("levels", []))
+
+    for train_seed, eval_seed in zip(train_seeds, eval_seeds):
+        seed_results: dict[str, Any] = {}
+        load_dir = str(
+            runs_dir / f"{variant.lower()}_seed_{train_seed}"
+        )
+
+        for level_idx in range(num_levels):
+            level_pool = eval_pools[eval_seed]["levels"][level_idx]
+
+            metrics = run_episodes(
+                mesh_dir=str(data_dir),
+                save_dir=load_dir,
+                num_episodes=len(level_pool),
+                config=eval_cfg,
+                mesh_path=mesh_path,
+                load_dir=load_dir,
+                seed=eval_seed,
+                return_metrics=True,
+                agent_id=(
+                    f"eval_L{level_idx}_{variant}"
+                    f"_t{train_seed}_e{eval_seed}"
+                ),
+                episode_script=level_pool,
+                episodes_per_level=episodes_per_level,
+            )
+
+            if collect_bc:
+                trails = metrics.get("success_trails", [])
+                if trails:
+                    extractor = ExperienceExtractor(
+                        config=eval_cfg, mesh_name=mesh_name
+                    )
+                    for trail in trails:
+                        bc_transitions.extend(
+                            extractor.convert_trajectory(trail)
+                        )
+
+            rates = metrics.get("stats", {}).get(
+                "termination_rates", {}
+            )
+            seed_results[f"level_{level_idx}"] = {
+                "success_rate": float(
+                    metrics.get("success_rate", 0.0)
+                ),
+                "timeout_rate": float(rates.get("timeout", 0.0)),
+                "collision_rate": float(
+                    rates.get("collision_surface_violation", 0.0)
+                ),
+                "collision_stats": metrics.get("stats", {}).get(
+                    "collision_stats", {}
+                ),
+            }
+
+        seed_key = f"train_{train_seed}_eval_{eval_seed}"
+        results_per_seed[seed_key] = seed_results
+
+        seed_output = (
+            data_dir
+            / f"eval_result_{mesh_name}_seed_{train_seed}_{eval_seed}.json"
+        )
+        with seed_output.open("w", encoding="utf-8") as f:
+            json.dump(seed_results, f, indent=2)
+
+    results_per_level = _aggregate_level_results(
+        results_per_seed, num_levels
+    )
+    return results_per_level, bc_transitions
+
+
+def _aggregate_level_results(
+    results_per_seed: dict[str, Any],
+    num_levels: int,
+) -> dict[str, Any]:
+    """Aggregate per-seed results into per-level summary.
+
+    Args:
+        results_per_seed: Results keyed by seed pair string.
+        num_levels: Number of curriculum levels.
+
+    Returns:
+        Dict with per-level and overall aggregated metrics.
+    """
+    results_per_level: dict[str, Any] = {}
+
+    for level_idx in range(num_levels):
+        level_results = []
+        for seed_data in results_per_seed.values():
+            level_key = f"level_{level_idx}"
+            if level_key in seed_data:
+                level_results.append(seed_data[level_key])
+
+        count = max(len(level_results), 1)
+        bounds = (
+            CURRICULUM_LEVELS[level_idx]
+            if level_idx < len(CURRICULUM_LEVELS)
+            else (0, 0)
+        )
+        results_per_level[f"level_{level_idx}"] = {
+            "bounds_mm": list(bounds),
+            "per_seed": level_results,
+            "mean_success_rate": (
+                sum(r["success_rate"] for r in level_results) / count
+            ),
+            "mean_timeout_rate": (
+                sum(r["timeout_rate"] for r in level_results) / count
+            ),
+            "mean_collision_rate": (
+                sum(r["collision_rate"] for r in level_results) / count
+            ),
+        }
+
+    all_success = []
+    all_timeout = []
+    all_collision = []
+    for key, level_data in results_per_level.items():
+        if key != "overall":
+            all_success.append(level_data["mean_success_rate"])
+            all_timeout.append(level_data["mean_timeout_rate"])
+            all_collision.append(level_data["mean_collision_rate"])
+
+    n = max(len(all_success), 1)
+    results_per_level["overall"] = {
+        "mean_success_rate": sum(all_success) / n,
+        "mean_timeout_rate": sum(all_timeout) / n,
+        "mean_collision_rate": sum(all_collision) / n,
+    }
+
+    return results_per_level
+
+
+class _CurriculumTracker:
+    """Tracks curriculum level progression during training.
+
+    Monitors rolling success rate and promotes to the next level
+    when the rate exceeds the threshold.
+    """
+
+    def __init__(
+        self,
+        levels: list[tuple[float, float]],
+        promote_threshold: float = 0.20,
+        promote_window: int = 50,
+    ) -> None:
+        self.levels = list(levels)
+        self.promote_threshold = promote_threshold
+        self.promote_window = promote_window
+
+        self.level_idx = 0
+        self.window: collections.deque[bool] = collections.deque(
+            maxlen=promote_window
+        )
+        self.level_episodes = 0
+        self.level_successes = 0
+        self.stats: dict[str, Any] = {
+            "levels_reached": 1,
+            "episodes_per_level": [],
+            "successes_per_level": [],
+            "success_rate_per_level": [],
+            "fallback_episodes": 0,
+        }
+
+    @property
+    def current_bounds(self) -> tuple[float, float]:
+        """Return (min_dist, max_dist) for current level.
+
+        Returns:
+            Tuple of minimum and maximum distance bounds.
+        """
+        return tuple(self.levels[self.level_idx])
+
+    def on_episode_end(
+        self,
+        success: bool,
+        controller: RLGoalApproachController,
+        episode: int,
+    ) -> None:
+        """Update curriculum state after an episode.
+
+        Args:
+            success: Whether the episode was successful.
+            controller: Controller to update goal_threshold on promotion.
+            episode: Current episode number (for logging).
+        """
+        self.window.append(success)
+        self.level_episodes += 1
+        if success:
+            self.level_successes += 1
+
+        window_full = len(self.window) == self.promote_window
+        not_last_level = self.level_idx < len(self.levels) - 1
+
+        if window_full and not_last_level:
+            rolling_rate = sum(self.window) / self.promote_window
+            if rolling_rate >= self.promote_threshold:
+                self._promote(controller, episode, rolling_rate)
+
+    def _promote(
+        self,
+        controller: RLGoalApproachController,
+        episode: int,
+        rolling_rate: float,
+    ) -> None:
+        self.stats["episodes_per_level"].append(self.level_episodes)
+        self.stats["successes_per_level"].append(self.level_successes)
+        self.stats["success_rate_per_level"].append(
+            self.level_successes / max(self.level_episodes, 1)
+        )
+
+        self.level_idx += 1
+        if self.level_idx < len(GOAL_THRESHOLD_PER_LEVEL):
+            new_threshold = GOAL_THRESHOLD_PER_LEVEL[self.level_idx]
+            controller.config["goal_threshold"] = new_threshold
+            logger.info(
+                "  [Curriculum] goal_threshold → %smm", new_threshold
+            )
+
+        self.window = collections.deque(maxlen=self.promote_window)
+        self.level_episodes = 0
+        self.level_successes = 0
+        self.stats["levels_reached"] = self.level_idx + 1
+
+        new_min, new_max = self.levels[self.level_idx]
+        logger.info(
+            "  [Curriculum] ep=%d: promoted to level %d: "
+            "dist [%s, %s] mm (rolling_rate=%.3f)(epsilon=%.3f)",
+            episode + 1,
+            self.level_idx,
+            new_min,
+            new_max,
+            rolling_rate,
+            controller.epsilon,
+        )
+
+    def finalize(self) -> dict[str, Any]:
+        """Finalize and return curriculum statistics.
+
+        Returns:
+            Dictionary with curriculum training statistics.
+        """
+        self.stats["episodes_per_level"].append(self.level_episodes)
+        self.stats["successes_per_level"].append(self.level_successes)
+        self.stats["success_rate_per_level"].append(
+            self.level_successes / max(self.level_episodes, 1)
+        )
+        self.stats["final_level"] = self.level_idx
+        return self.stats
+
+
+def _init_controller(
+    cfg: dict[str, Any],
+    load_dir: str | None,
+    agent_id: str,
+    config_overrides: dict[str, Any] | None,
+) -> RLGoalApproachController:
+    """Initialize or load the RL controller.
+
+    Args:
+        cfg: Merged configuration dictionary.
+        load_dir: Directory to load from, or None for fresh start.
+        agent_id: Agent identifier.
+        config_overrides: Original config overrides for load.
+
+    Returns:
+        Initialized RLGoalApproachController.
+    """
+    if load_dir is None:
+        return RLGoalApproachController(agent_id=agent_id, config=cfg)
+
+    controller = RLGoalApproachController.load(
+        load_dir, agent_id=agent_id, config=config_overrides
+    )
+    if cfg.get("unfreeze_normalization", False):
+        controller.q_store_free._norm_frozen = False
+        controller.q_store_free._freeze_done = False
+        controller.q_store_surface._norm_frozen = False
+        controller.q_store_surface._freeze_done = False
+        logger.info("Normalization unfrozen for transfer learning")
+    return controller
+
+
+def _setup_episode_from_data(
+    env: LightweightEnv,
+    ep_data: dict[str, Any],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Set up an episode from a fixed data entry.
+
+    Args:
+        env: Environment instance.
+        ep_data: Episode data with start_pos, start_rot, goal_pos, goal_rot.
+
+    Returns:
+        Tuple of (start_pos, goal_pose).
+    """
+    start_pos = np.array(ep_data["start_pos"])
+    start_rot = np.array(ep_data["start_rot"])
+    env.reset(position=start_pos, rotation=start_rot)
+    goal_pose = np.concatenate([
+        np.array(ep_data["goal_pos"]),
+        np.array(ep_data["goal_rot"]),
+    ])
+    return start_pos, goal_pose
+
+
+def _find_mesh_files(mesh_dir: str) -> list[str]:
+    """Find all mesh files in a directory.
+
+    Args:
+        mesh_dir: Directory to search for mesh files.
+
+    Returns:
+        List of mesh file paths as strings.
+
+    Raises:
+        FileNotFoundError: If no mesh files found.
+    """
+    mesh_dir_path = Path(mesh_dir)
+    mesh_files = [
+        str(p)
+        for ext in ("*.obj", "*.stl", "*.ply")
+        for p in mesh_dir_path.glob(ext)
+    ]
+    if not mesh_files:
+        msg = f"No mesh files in {mesh_dir}"
+        raise FileNotFoundError(msg)
+    return mesh_files
+
+
+def _maybe_save_visualization(  # noqa: PLR0913
+    controller: RLGoalApproachController,
+    env: LightweightEnv,
+    episode: int,
+    episode_success: bool,
+    goal_pose: np.ndarray,
+    current_poses: list[np.ndarray],
+    action_explanations: list[str],
+    vis_dir: Path,
+    vis_filter: dict[str, Any],
+    vis_counts: dict[str, int],
+) -> None:
+    """Save episode visualization if it matches the filter criteria.
+
+    Args:
+        controller: RL controller (for termination counts).
+        env: Environment instance.
+        episode: Current episode number.
+        episode_success: Whether the episode was successful.
+        goal_pose: Goal pose array.
+        current_poses: List of agent poses during episode.
+        action_explanations: List of action description strings.
+        vis_dir: Directory for saving visualizations.
+        vis_filter: Filter configuration dict.
+        vis_counts: Mutable counter dict for saved episodes per result.
+    """
+    if episode_success:
+        ep_result = "success"
+    else:
+        last_termination = max(
+            controller._termination_counts.items(),
+            key=lambda x: x[1],
+        )
+        ep_result = (
+            "collision"
+            if "collision" in str(last_termination[0])
+            else "timeout"
+        )
+
+    filter_actions = vis_filter.get("actions", [])
+    has_all_actions = (
+        all(
+            any(act_name in expl for expl in action_explanations)
+            for act_name in filter_actions
+        )
+        if filter_actions
+        else True
+    )
+
+    max_count = vis_filter.get(f"max_{ep_result}", 5)
+    under_limit = vis_counts[ep_result] < max_count
+
+    if has_all_actions and under_limit:
+        episode_id = f"ep_{episode:05d}_{ep_result}"
+        save_episode_frames(
+            env=env,
+            goal_pose=goal_pose,
+            episode_poses=current_poses,
+            episode_actions=action_explanations,
+            output_dir=vis_dir,
+            episode_id=episode_id,
+            result=ep_result,
+        )
+        vis_counts[ep_result] += 1
+        logger.info(
+            "[Vis] Saved %s episode: %s (counts: %s)",
+            ep_result,
+            episode_id,
+            vis_counts,
+        )
+
+
+def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
+    mesh_dir: str,
+    save_dir: str,
+    num_episodes: int | None = None,
+    config: dict[str, Any] | None = None,
+    mesh_path: str | None = None,
+    load_dir: str | None = None,
+    agent_id: str = "standalone",
+    seed: int | None = None,
+    return_metrics: bool = False,
+    curriculum_config: dict[str, Any] | None = None,
+    episode_script: list[dict[str, Any]] | None = None,
+    episode_pools: list[list[dict[str, Any]]] | None = None,
+    visualise: bool = False,
+    episodes_per_level: int | None = None,
+) -> int | dict[str, Any]:
+    """Run Q-learning episodes in train or eval mode.
+
+    Executes episodes where an RL agent navigates on 3D object surfaces
+    toward goal positions. The mode is determined by ``config["mode"]``:
+    - ``"train"`` / ``"train_adapt_epsilon"``: agent learns via Q-updates,
+      epsilon decays over episodes, curriculum promotes to harder levels.
+    - ``"eval"``: agent uses learned Q-values with fixed low epsilon,
+      no Q-updates, collects success trajectories for BC data.
+
+    Episode sourcing:
+    - **Fixed script**: a flat list of (start, goal) pairs executed
+      sequentially. Used for eval on specific episode pools.
+    - **Fixed pools**: per-level lists of episodes. Curriculum tracker
+      selects the current level and advances when success rate exceeds
+      the promotion threshold.
+    - **Random**: start and goal are sampled from the mesh surface.
+      Optional curriculum constrains goal distance range per level.
+
+    Args:
+        mesh_dir: Directory containing mesh files (.obj, .stl, .ply).
+        save_dir: Directory to save the trained controller.
+        num_episodes: Number of episodes to run.
+        config: Configuration overrides merged with DEFAULT_CONFIG.
+        mesh_path: Path to a specific mesh file. If None, a random
+            mesh from mesh_dir is used each episode.
+        load_dir: Directory to load a pretrained controller from.
+        agent_id: Agent identifier string.
+        seed: Random seed for reproducibility.
+        return_metrics: If True, return a dict with detailed metrics
+            instead of just the goal count.
+        curriculum_config: Curriculum configuration dict with keys
+            ``levels`` (list of (min_dist, max_dist) tuples),
+            ``promote_threshold`` (float), ``promote_window`` (int).
+        episode_script: Fixed list of episode dicts, each containing
+            ``start_pos``, ``start_rot``, ``goal_pos``, ``goal_rot``.
+        episode_pools: List of per-level episode lists for curriculum.
+        visualise: If True, save PNG frames for filtered episodes.
+        episodes_per_level: Cap on episodes per curriculum level.
+
+    Returns:
+        Number of goals reached if return_metrics is False,
+        otherwise a dict with keys: ``goals_reached``, ``num_episodes``,
+        ``success_rate``, ``stats``, ``curriculum_stats``,
+        ``success_trails``, ``success_actions``.
+
+    Raises:
+        ValueError: If both episode_script and episode_pools are provided,
+            or if num_episodes is missing when using episode_pools.
+    """
     if seed is not None:
-        np.random.seed(seed)
+        np.random.seed(seed)  # noqa: NPY002
         random.seed(seed)
 
     if num_episodes is not None:
@@ -45,327 +556,205 @@ def train(
             config["num_episodes"] = int(num_episodes)
     cfg = {**DEFAULT_CONFIG, **(config or {})}
 
-    # Визуализация: сбор эпизодов
-    _vis_counts = {"success": 0, "collision": 0, "timeout": 0}
-    _vis_dir = None
-    _vis_filter = None
-    if visualise:
-        _vis_dir = Path(save_dir) / "visualizations"
-        _vis_filter = (config or {}).get("visualise_filter", {
+    # Visualization setup
+    vis_counts = {"success": 0, "collision": 0, "timeout": 0}
+    vis_dir = Path(save_dir) / "visualizations" if visualise else None
+    vis_filter = (
+        (config or {}).get("visualise_filter", {
             "actions": ["detach", "detach_edge"],
             "max_success": 5,
             "max_collision": 5,
             "max_timeout": 5,
         })
-
-    use_fixed_episode_script = episode_script is not None
-    use_fixed_episode_pools = episode_pools is not None
-    if use_fixed_episode_script and use_fixed_episode_pools:
-        raise ValueError("Provide either episode_script or episode_pools, not both")
-
-    if use_fixed_episode_script:
-        num_episodes = len(episode_script)
-        cfg["num_episodes"] = num_episodes
-        print(f"[Train] Using fixed episode script with {num_episodes} episodes")
-    elif use_fixed_episode_pools:
-        if num_episodes is None:
-            raise ValueError("num_episodes is required when using episode_pools")
-        cfg["num_episodes"] = int(num_episodes)
-        print(
-            f"[Train] Using fixed episode pools with {len(episode_pools)} levels "
-            f"for {num_episodes} scheduled episodes"
-        )
-
-    mesh_files = (
-        glob.glob(f"{mesh_dir}/*.obj")
-        + glob.glob(f"{mesh_dir}/*.stl")
-        + glob.glob(f"{mesh_dir}/*.ply")
+        if visualise
+        else None
     )
 
-    if not mesh_files:
-        raise FileNotFoundError(f"No mesh files in {mesh_dir}")
+    # Validate episode sources
+    use_script = episode_script is not None
+    use_pools = episode_pools is not None
+    if use_script and use_pools:
+        msg = "Provide either episode_script or episode_pools, not both"
+        raise ValueError(msg)
 
-    print(f"Train Mode: {cfg['mode']}")
+    if use_script:
+        num_episodes = len(episode_script)
+        cfg["num_episodes"] = num_episodes
+    elif use_pools:
+        if num_episodes is None:
+            msg = "num_episodes is required when using episode_pools"
+            raise ValueError(msg)
+        cfg["num_episodes"] = int(num_episodes)
 
-    if load_dir is None:
-        controller = RLGoalApproachController(
-            agent_id=agent_id,
-            config=cfg,
-        )
-    else:
-        controller = RLGoalApproachController.load(load_dir, agent_id=agent_id, config=config)
-        if cfg.get("unfreeze_normalization", False):
-            controller.q_store_free._norm_frozen = False
-            controller.q_store_free._freeze_done = False
-            controller.q_store_surface._norm_frozen = False
-            controller.q_store_surface._freeze_done = False
-            logger.info("Normalization unfrozen for transfer learning")
-
+    mesh_files = _find_mesh_files(mesh_dir)
+    controller = _init_controller(cfg, load_dir, agent_id, config)
     action_space = controller.action_space
 
-    _use_curriculum = curriculum_config is not None
-    _pool_indices: List[int] = []
-    if _use_curriculum and "train" in cfg["mode"]:
-        _curr_level_idx = 0
-        _curr_window: collections.deque = collections.deque()
-        _curr_level_episodes = 0
-        _curr_level_successes = 0
-        _curriculum_stats: dict = {
-            "levels_reached": 1,
-            "episodes_per_level": [],
-            "successes_per_level": [],
-            "success_rate_per_level": [],
-            "fallback_episodes": 0,
-        }
-        _curr_levels = list(curriculum_config["levels"])
-        _promote_threshold = float(curriculum_config.get("promote_threshold", 0.20))
-        _promote_window = int(curriculum_config.get("promote_window", 50))
-        _curr_window = collections.deque(maxlen=_promote_window)
-        print(
-            f"[Curriculum] Starting level 0: "
-            f"dist [{_curr_levels[0][0]}, {_curr_levels[0][1]}] mm, "
-            f"promote_threshold={_promote_threshold}, window={_promote_window}"
+    # Curriculum setup
+    use_curriculum = curriculum_config is not None
+    curriculum: _CurriculumTracker | None = None
+    if use_curriculum and "train" in cfg["mode"]:
+        curriculum = _CurriculumTracker(
+            levels=curriculum_config["levels"],
+            promote_threshold=float(
+                curriculum_config.get("promote_threshold", 0.20)
+            ),
+            promote_window=int(
+                curriculum_config.get("promote_window", 50)
+            ),
         )
 
-    if use_fixed_episode_pools:
-        _pool_indices = [0 for _ in range(len(episode_pools))]
+    pool_indices = [0] * len(episode_pools) if use_pools else []
 
     goals_reached = 0
-    success_trails = []
-    success_actions = []
+    success_trails: list[Any] = []
+    success_actions: list[list[str]] = []
 
     for episode in range(num_episodes):
-        if EPISODES_PER_LEVEL is not None and episode >= EPISODES_PER_LEVEL:
+        if episodes_per_level is not None and episode >= episodes_per_level:
             break
-        episode_mesh_path = mesh_path
-        if episode_mesh_path is None:
-            episode_mesh_path = np.random.choice(mesh_files)
-        env = LightweightEnv(episode_mesh_path, seed=seed)
 
-        _goals_before_episode = controller._total_goals_reached
+        ep_mesh_path = mesh_path or np.random.choice(mesh_files)  # noqa: NPY002
+        env = LightweightEnv(ep_mesh_path, seed=seed)
+        goals_before = controller._total_goals_reached
 
-        if use_fixed_episode_script:
-            ep_data = episode_script[episode]
-            start_pos = np.array(ep_data["start_pos"])
-            start_rot = np.array(ep_data["start_rot"])
-            env.reset(position=start_pos, rotation=start_rot)
-            goal_pose = np.concatenate([
-                np.array(ep_data["goal_pos"]),
-                np.array(ep_data["goal_rot"]),
-            ])
-        elif use_fixed_episode_pools:
-            pool_level_idx = _curr_level_idx if (_use_curriculum and "train" in cfg["mode"]) else 0
-            if pool_level_idx >= len(episode_pools):
-                raise ValueError(
-                    f"Missing episode pool for level {pool_level_idx}; available={len(episode_pools)}"
+        # Setup episode
+        if use_script:
+            start_pos, goal_pose = _setup_episode_from_data(
+                env, episode_script[episode]
+            )
+        elif use_pools:
+            level_idx = (
+                curriculum.level_idx if curriculum is not None else 0
+            )
+            if level_idx >= len(episode_pools):
+                msg = (
+                    f"Missing episode pool for level {level_idx}; "
+                    f"available={len(episode_pools)}"
                 )
-            level_pool = episode_pools[pool_level_idx]
-            pool_index = _pool_indices[pool_level_idx]
-            if pool_index >= len(level_pool):
-                raise ValueError(
-                    f"Episode pool exhausted for level {pool_level_idx}: "
-                    f"requested index {pool_index}, pool size {len(level_pool)}"
+                raise ValueError(msg)
+            pool = episode_pools[level_idx]
+            if pool_indices[level_idx] >= len(pool):
+                msg = (
+                    f"Episode pool exhausted for level {level_idx}: "
+                    f"index {pool_indices[level_idx]}, size {len(pool)}"
                 )
-            ep_data = level_pool[pool_index]
-            _pool_indices[pool_level_idx] += 1
-            start_pos = np.array(ep_data["start_pos"])
-            start_rot = np.array(ep_data["start_rot"])
-            env.reset(position=start_pos, rotation=start_rot)
-            goal_pose = np.concatenate([
-                np.array(ep_data["goal_pos"]),
-                np.array(ep_data["goal_rot"]),
-            ])
+                raise ValueError(msg)
+            start_pos, goal_pose = _setup_episode_from_data(
+                env, pool[pool_indices[level_idx]]
+            )
+            pool_indices[level_idx] += 1
         else:
             env.reset()
             start_pos = env.get_pose()[:3]
-            start_rot = env.get_pose()[3:]
-
-            if _use_curriculum and "train" in cfg["mode"]:
-                _min_d, _max_d = _curr_levels[_curr_level_idx]
+            if curriculum is not None:
+                min_d, max_d = curriculum.current_bounds
                 goal_pose = env.get_random_surface_point(
                     reference_pos=start_pos,
-                    min_dist=_min_d,
-                    max_dist=_max_d,
+                    min_dist=min_d,
+                    max_dist=max_d,
                     max_attempts=2000,
                 )
-                _goal_dist = float(np.linalg.norm(goal_pose[:3] - start_pos))
-                if _goal_dist < _min_d or _goal_dist > _max_d:
-                    _curriculum_stats["fallback_episodes"] += 1
+                goal_dist = float(
+                    np.linalg.norm(goal_pose[:3] - start_pos)
+                )
+                if goal_dist < min_d or goal_dist > max_d:
+                    curriculum.stats["fallback_episodes"] += 1
             else:
                 goal_pose = env.get_random_surface_point()
 
         controller.set_new_goal(goal_pose, start_pos)
         env.set_goal(goal_pose)
+        controller.temperature_override = cfg.get("temperature_override")
 
-        retry_strategies = [
-            {"eval_epsilon": cfg.get("eval_epsilon", 0.02), "temperature_override": None},
-            {"eval_epsilon": 1.0, "temperature_override": 0.01},
-            {"eval_epsilon": 0.5, "temperature_override": 0.01},
-        ]
+        # Run episode steps
+        action_explanations: list[str] = []
+        current_poses: list[np.ndarray] = []
 
-        max_retries = 3 if cfg.get("mode") == "eval_retries" else 1
+        for _ in range(controller.config["max_steps_per_goal"]):
+            current_pose = env.get_pose()
+            sensor_data = env.get_sensor_data()
+            _, explanation = controller.step(current_pose, sensor_data)
+            if explanation is not None:
+                action_explanations.append(
+                    explanation["interpretation"]
+                )
+            current_poses.append(env.get_pose())
 
-        action_explanations = []
-        current_poses = []
-
-        for retry in range(max_retries):
-            if retry > 0:
-                if use_fixed_episode_script or use_fixed_episode_pools:
-                    env.reset(position=start_pos, rotation=start_rot)
-                else:
-                    env.reset(position=start_pos)
-                controller.set_new_goal(goal_pose, start_pos)
-                env.set_goal(goal_pose)
-                strategy = retry_strategies[min(retry, len(retry_strategies) - 1)]
-                controller.eval_epsilon = strategy["eval_epsilon"]
-                controller.temperature_override = strategy["temperature_override"]
-                action_explanations = []
-                current_poses = []
-            else:
-                controller.temperature_override = cfg.get("temperature_override", None)
-
-            for step in range(controller.config["max_steps_per_goal"]):
-                current_pose = env.get_pose()
-                sensor_data = env.get_sensor_data()
-
-                action, explanation = controller.step(current_pose, sensor_data)
-                if explanation is not None:
-                    action_explanations.append(explanation["interpretation"])
-                current_poses.append(env.get_pose())
-
-                if controller._current_goal is None:
-                    if controller._total_goals_reached > goals_reached:
-                        goals_reached = controller._total_goals_reached
-                    break
-
-                action_index = controller._last_action
-                env.step(action_index, action_space)
-
-            _episode_success = controller._total_goals_reached > _goals_before_episode
-            if _episode_success:
+            if controller._current_goal is None:
+                goals_reached = max(
+                    goals_reached,
+                    controller._total_goals_reached,
+                )
                 break
 
-        if max_retries > 1:
-            controller.eval_epsilon = cfg.get("eval_epsilon", 0.02)
-            controller.temperature_override = None
+            env.step(
+                controller._last_action,
+                action_space,
+            )
 
-        start_distance = float(np.linalg.norm(goal_pose[:3] - start_pos))
+        episode_success = (
+            controller._total_goals_reached > goals_before
+        )
 
-        if _episode_success:
+        if episode_success:
             success_trails.append(controller.success_trails)
             success_actions.append(action_explanations)
-            logger.debug(f"SUCCESS, start_distance {start_distance}")
-        else:
-            logger.debug(f"ERROR, start_distance {start_distance}")
 
-        # Визуализация: сохранить эпизод если подходит под фильтр
-        if visualise and _vis_dir and _vis_filter:
-            from tbp.hybrid_rl.visualize_env import save_episode_frames
-
-            # Определить результат
-            last_termination = max(
-                controller._termination_counts.items(), key=lambda x: x[1]
+        if visualise and vis_dir and vis_filter:
+            _maybe_save_visualization(
+                controller=controller,
+                env=env,
+                episode=episode,
+                episode_success=episode_success,
+                goal_pose=goal_pose,
+                current_poses=current_poses,
+                action_explanations=action_explanations,
+                vis_dir=vis_dir,
+                vis_filter=vis_filter,
+                vis_counts=vis_counts,
             )
-            if _episode_success:
-                ep_result = "success"
-            elif "collision" in str(last_termination[0]):
-                ep_result = "collision"
-            else:
-                ep_result = "timeout"
 
-            # Проверить фильтр: ВСЕ указанные действия должны присутствовать
-            filter_actions = _vis_filter.get("actions", [])
-            has_all_actions = all(
-                any(act_name in expl for expl in action_explanations)
-                for act_name in filter_actions
-            ) if filter_actions else True
+        if curriculum is not None:
+            curriculum.on_episode_end(
+                episode_success, controller, episode
+            )
 
-            # Проверить лимит
-            max_count = _vis_filter.get(f"max_{ep_result}", 5)
-            under_limit = _vis_counts[ep_result] < max_count
-
-            if has_all_actions and under_limit:
-                episode_id = f"ep_{episode:05d}_{ep_result}"
-                save_episode_frames(
-                    env=env,
-                    goal_pose=goal_pose,
-                    episode_poses=current_poses,
-                    episode_actions=action_explanations,
-                    output_dir=_vis_dir,
-                    episode_id=episode_id,
-                    result=ep_result,
-                )
-                _vis_counts[ep_result] += 1
-                print(
-                    f"[Vis] Saved {ep_result} episode: {episode_id} "
-                    f"(counts: {_vis_counts})"
-                )
-
-        if _use_curriculum and "train" in cfg["mode"]:
-            _episode_success = controller._total_goals_reached > _goals_before_episode
-            _curr_window.append(_episode_success)
-            _curr_level_episodes += 1
-            if _episode_success:
-                _curr_level_successes += 1
-            window_full = len(_curr_window) == _promote_window
-            not_last_level = _curr_level_idx < len(_curr_levels) - 1
-            if window_full and not_last_level:
-                _rolling_rate = sum(_curr_window) / _promote_window
-                if _rolling_rate >= _promote_threshold:
-                    _curriculum_stats["episodes_per_level"].append(_curr_level_episodes)
-                    _curriculum_stats["successes_per_level"].append(_curr_level_successes)
-                    _curriculum_stats["success_rate_per_level"].append(
-                        _curr_level_successes / max(_curr_level_episodes, 1)
-                    )
-                    _curr_level_idx += 1
-                    if _curr_level_idx < len(GOAL_THRESHOLD_PER_LEVEL):
-                        new_threshold = GOAL_THRESHOLD_PER_LEVEL[_curr_level_idx]
-                        controller.config["goal_threshold"] = new_threshold
-                        logger.info(f"  [Curriculum] goal_threshold → {new_threshold}mm")
-                    _curr_window = collections.deque(maxlen=_promote_window)
-                    _curr_level_episodes = 0
-                    _curr_level_successes = 0
-                    _curriculum_stats["levels_reached"] = _curr_level_idx + 1
-                    _new_min, _new_max = _curr_levels[_curr_level_idx]
-                    print(
-                        f"  [Curriculum] ep={episode + 1}: promoted to level "
-                        f"{_curr_level_idx}: dist [{_new_min}, {_new_max}] mm "
-                        f"(rolling_rate={_rolling_rate:.3f})"
-                        f"(epsilon={controller.epsilon:.3f})"
-                    )
-
-        if (episode + 1) % 1000 == 0:
-            stats = controller.get_stats()
-            print(
-                f"Episode {episode + 1}/{num_episodes}: "
-                f"stats={stats}"
+        if (episode + 1) % _LOG_INTERVAL == 0:
+            logger.info(
+                "Episode %d/%d: stats=%s",
+                episode + 1,
+                num_episodes,
+                controller.get_stats(),
             )
 
     controller.save(save_dir)
-    print(f"Saved to {save_dir}")
-    print(f"Final: {goals_reached}/{num_episodes} goals reached")
+    logger.info("Saved to %s", save_dir)
+    logger.info("Final: %d/%d goals reached", goals_reached, num_episodes)
 
-    if return_metrics:
-        stats = controller.get_stats()
-        success_rate = goals_reached / max(num_episodes, 1)
-        if _use_curriculum and "train" in cfg["mode"]:
-            _curriculum_stats["episodes_per_level"].append(_curr_level_episodes)
-            _curriculum_stats["successes_per_level"].append(_curr_level_successes)
-            _curriculum_stats["success_rate_per_level"].append(
-                _curr_level_successes / max(_curr_level_episodes, 1)
-            )
-            _curriculum_stats["final_level"] = _curr_level_idx
-            _curriculum_stats["fallback_rate"] = (
-                _curriculum_stats["fallback_episodes"] / max(num_episodes, 1)
-            )
-        return {
-            "goals_reached": goals_reached,
-            "num_episodes": num_episodes,
-            "success_rate": success_rate,
-            "stats": stats,
-            "curriculum_stats": _curriculum_stats if _use_curriculum else None,
-            "success_trails": success_trails,
-            "success_actions": success_actions,
+    if not return_metrics:
+        return goals_reached
+
+    stats = controller.get_stats()
+    success_rate = goals_reached / max(num_episodes, 1)
+    curriculum_stats = (
+        curriculum.finalize() if curriculum is not None else None
+    )
+    if curriculum is None and use_curriculum:
+        curriculum_stats = {
+            "levels_reached": 1,
+            "episodes_per_level": [num_episodes],
+            "successes_per_level": [goals_reached],
+            "success_rate_per_level": [success_rate],
+            "final_level": 0,
+            "fallback_rate": 0.0,
         }
-
-    return goals_reached
+    return {
+        "goals_reached": goals_reached,
+        "num_episodes": num_episodes,
+        "success_rate": success_rate,
+        "stats": stats,
+        "curriculum_stats": curriculum_stats,
+        "success_trails": success_trails,
+        "success_actions": success_actions,
+    }

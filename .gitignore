@@ -77,7 +77,7 @@ venv.bak/
 outputs/
 
 src/tbp/hybrid_rl/data
-src/tbp/hybrid_rl/local
+local
 
 .devtools_codepilot
 

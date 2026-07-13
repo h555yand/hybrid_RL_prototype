@@ -1,6 +1,13 @@
-# adaptive_manager.py
-"""
-AdaptiveTrainingManager: monitors performance and decides
+# Copyright 2025-2026 Thousand Brains Project
+#
+# Copyright may exist in Contributors' modifications
+# and/or contributions to the work.
+#
+# Use of this source code is governed by the MIT
+# license that can be found in the LICENSE file or at
+# https://opensource.org/licenses/MIT.
+
+"""AdaptiveTrainingManager: monitors performance and decides
 when/how to train for new objects.
 
 Modes:
@@ -11,21 +18,20 @@ Modes:
       - SAC: retrain only if SAC success rate is below threshold
 """
 
-import numpy as np
 import logging
 from collections import deque
 from pathlib import Path
-from typing import Dict, Any, Optional, List
+from typing import Any, Dict, List
 
-from .rl_goal_approach_controller import RLGoalApproachController
-from .lightweight_env import LightweightEnv
-from .action_space import ActionSpace
-from .experience_extractor import ExperienceExtractor
-from .ablation_runner import train
-from .behavioral_cloning import BCTrainer
-from .sac_trainer import PSACTrainer
+import numpy as np
+
+from .ablation_runner import run_episodes
 from .arbitrator import Arbitrator
-
+from .behavioral_cloning import BCTrainer
+from .experience_extractor import ExperienceExtractor
+from .lightweight_env import LightweightEnv
+from .rl_goal_approach_controller import RLGoalApproachController
+from .sac_trainer import PSACTrainer
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +111,7 @@ class AdaptiveTrainingManager:
             self.arbitrator.param_mean = self.sac_trainer.param_mean
             self.arbitrator.param_std = self.sac_trainer.param_std
 
-        # SAC приоритет на новом объекте
+        # SAC priority at the new facility
         self.arbitrator.boost_sac = (
             self._sac_priority_active
             and self.total_episodes < self.new_object_sac_priority_episodes
@@ -118,17 +124,16 @@ class AdaptiveTrainingManager:
         if len(self.success_history) < self.monitor_window:
             return "online"
 
-        # Cooldown после offline
+        # Cooldown afer offline
         if self._episodes_since_offline < self.post_offline_cooldown:
             return "online"
 
         rate = self.success_rate
         if rate >= self.online_threshold:
             return "inference_only"
-        elif rate >= self.offline_threshold:
+        if rate >= self.offline_threshold:
             return "online"
-        else:
-            return "offline"
+        return "offline"
 
     def on_episode_complete(self, success: bool, transitions: List[Dict[str, Any]]):
         self.success_history.append(success)
@@ -256,7 +261,7 @@ class AdaptiveTrainingManager:
             f"(success_rate={self.success_rate:.3f}, q_epsilon={q_epsilon})"
         )
 
-        # === Q-learning: всегда обучаем ===
+        # === Q-learning: always train ===
         q_save_dir = str(self.runs_dir / "adaptive_q")
         q_load_dir = q_save_dir if (Path(q_save_dir) / "config.json").exists() else None
 
@@ -266,7 +271,7 @@ class AdaptiveTrainingManager:
             f"load={'yes' if q_load_dir else 'no'})"
         )
 
-        train_result = train(
+        train_result = run_episodes(
             mesh_dir=str(self.runs_dir.parent),
             save_dir=q_save_dir,
             num_episodes=self.offline_q_episodes,
@@ -296,12 +301,12 @@ class AdaptiveTrainingManager:
             f"(success_rate={q_success_rate:.3f})"
         )
 
-        # === SAC: обучаем только если SAC success rate ниже порога ===
+        # === SAC: train only if the SAC success rate is below the threshold. ===
         sac_sr = self.arbitrator.sac_success_rate
         need_sac_retrain = (
             (self.sac_trainer is None
             or sac_sr < self.sac_offline_threshold)
-            and self.total_offline_iterations > 2 # только после двух обучений Q
+            and self.total_offline_iterations > 2  # только после двух обучений Q
         )
 
         if need_sac_retrain:
@@ -323,7 +328,7 @@ class AdaptiveTrainingManager:
 
                 import pickle
                 bc_data_path = str(self.runs_dir / "adaptive_bc_data.pkl")
-                with open(bc_data_path, "wb") as f:
+                with Path(bc_data_path).open("wb") as f:
                     pickle.dump(self.bc_transitions, f)
 
                 sac_trainer = PSACTrainer(
@@ -360,7 +365,7 @@ class AdaptiveTrainingManager:
                 f"sac_success_rate {sac_sr:.3f} >= threshold {self.sac_offline_threshold}"
             )
 
-        # Сбросить состояние после offline
+        # Reset state after offline
         self.success_history.clear()
         self._episodes_since_offline = 0
         self._sac_priority_active = False  # после offline Q-store адаптирован

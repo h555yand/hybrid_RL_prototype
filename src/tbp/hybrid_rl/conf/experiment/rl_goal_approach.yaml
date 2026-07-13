@@ -9,16 +9,16 @@ experiment:
     seed: 42
     visualise: false
     do_train: true
-    do_eval: false
-    do_bc_train: false
-    do_sac_train: false
-    do_sac_eval: false
+    do_eval: true
+    do_bc_train: true
+    do_sac_train: true
+    do_sac_eval: true
     do_adaptive: false
 
     train_seeds: [11]
     eval_seeds: [44]
     sac_eval_seeds: [77]
-    eval_episodes_per_level: 500
+    eval_episodes_per_level: 20
     regenerate_scripts: true
     promote_threshold: 0.65
     promote_window: 100
@@ -40,17 +40,17 @@ experiment:
       #  epsilon_min: 0.08
       #  is_load: true
       - mesh: mug
-        episodes: 200
+        episodes: 100
         epsilon_start: 1.0
         epsilon_min: 0.08
         is_load: False
       - mesh: cup
-        episodes: 200
-        epsilon_start: 0.50
+        episodes: 100
+        epsilon_start: 0.75
         epsilon_min: 0.05
         is_load: true
 
-    eval_meshes: [cube, cylinder, mug, cup]
+    eval_meshes: [mug, cup] # [cube, cylinder, mug, cup]
 
     rl_config:
       mode: train_adapt_epsilon
@@ -83,12 +83,12 @@ experiment:
       eval_interval: 200
       eval_episodes: 100
 
-    sac_meshes: [cube, cylinder, mug, cup]
+    sac_meshes: [mug, cup] # [cube, cylinder, mug, cup]
     sac_episodes_per_mesh:
-      cube: 1000
-      cylinder: 1500
-      mug: 2000
-      cup: 2000
+      #cube: 1000
+      #cylinder: 1500
+      mug: 100
+      cup: 100
 
     adaptive_mesh: cup
     adaptive_episodes: 3000

@@ -1,18 +1,26 @@
-# behavioral_cloning.py
-"""
-BC Actor Network for Parameterized SAC.
+# Copyright 2025-2026 Thousand Brains Project
+#
+# Copyright may exist in Contributors' modifications
+# and/or contributions to the work.
+#
+# Use of this source code is governed by the MIT
+# license that can be found in the LICENSE file or at
+# https://opensource.org/licenses/MIT.
+
+"""BC Actor Network for Parameterized SAC.
 Behavioral Cloning: learns to copy Q-learning expert from successful trajectories.
 """
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
-import pickle
 import logging
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
-from .experience_extractor import PSACTransition, ExperienceExtractor
+from typing import Dict, List, Tuple
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch import nn
+
+from .experience_extractor import ExperienceExtractor, PSACTransition
 
 logger = logging.getLogger(__name__)
 
@@ -252,7 +260,7 @@ class BCTrainer:
             param_mean=self.param_mean,
             param_std=self.param_std,
         )
-        logger.info(f"BC model saved to {dirpath}")
+        logger.info("BC model saved to %s", dirpath)
 
     def load(self, dirpath: str):
         dirpath = Path(dirpath)
@@ -265,7 +273,7 @@ class BCTrainer:
         self.state_std = norm["state_std"]
         self.param_mean = norm["param_mean"]
         self.param_std = norm["param_std"]
-        logger.info(f"BC model loaded from {dirpath}")
+        logger.info("BC model loaded from %s", dirpath)
 
     def predict(self, state: np.ndarray) -> Tuple[int, np.ndarray]:
         state_norm = (state - self.state_mean) / self.state_std

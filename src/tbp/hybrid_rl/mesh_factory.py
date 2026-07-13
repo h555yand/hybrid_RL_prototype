@@ -1,0 +1,258 @@
+# Copyright 2025-2026 Thousand Brains Project
+#
+# Copyright may exist in Contributors' modifications
+# and/or contributions to the work.
+#
+# Use of this source code is governed by the MIT
+# license that can be found in the LICENSE file or at
+# https://opensource.org/licenses/MIT.
+
+"""Factory functions for creating demo 3D meshes.
+
+Provides functions to generate parametric meshes (mug, cup, cube, etc.)
+for training and evaluation of the RL navigation agent.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+import trimesh
+
+
+def create_tea_cup(  # noqa: PLR0913
+    bottom_radius: float = 25.0,
+    top_radius: float = 42.0,
+    body_height: float = 60.0,
+    wall_thickness: float = 2.0,
+    bottom_thickness: float = 2.5,
+    handle_radius_major: float = 14.0,
+    handle_radius_minor: float = 2.5,
+    handle_angle_deg: float = 140.0,
+    handle_segments: int = 20,
+    body_segments: int = 64,
+    circle_points: int = 8,
+) -> trimesh.Trimesh:
+    """Create a tea cup mesh with a conical body and toroidal handle.
+
+    Args:
+        bottom_radius: Bottom radius of the cup body in mm.
+        top_radius: Top radius of the cup body in mm.
+        body_height: Height of the cup body in mm.
+        wall_thickness: Wall thickness in mm.
+        bottom_thickness: Bottom thickness in mm.
+        handle_radius_major: Major radius of the handle arc in mm.
+        handle_radius_minor: Cross-section radius of the handle in mm.
+        handle_angle_deg: Angular span of the handle in degrees.
+        handle_segments: Number of segments along the handle arc.
+        body_segments: Number of segments around the body circumference.
+        circle_points: Number of points in handle cross-section.
+
+    Returns:
+        Combined trimesh of cup body and handle.
+    """
+    angles = np.linspace(0, 2 * np.pi, body_segments, endpoint=False)
+
+    bottom_z = -body_height / 2
+    top_z = body_height / 2
+    bottom_pts = np.column_stack([
+        bottom_radius * np.cos(angles),
+        bottom_radius * np.sin(angles),
+        np.full(body_segments, bottom_z),
+    ])
+    top_pts = np.column_stack([
+        top_radius * np.cos(angles),
+        top_radius * np.sin(angles),
+        np.full(body_segments, top_z),
+    ])
+    outer = trimesh.convex.convex_hull(np.vstack([bottom_pts, top_pts]))
+
+    inner_bottom_radius = bottom_radius - wall_thickness
+    inner_top_radius = top_radius - wall_thickness
+    inner_bottom_z = bottom_z + bottom_thickness
+    inner_bottom_pts = np.column_stack([
+        inner_bottom_radius * np.cos(angles),
+        inner_bottom_radius * np.sin(angles),
+        np.full(body_segments, inner_bottom_z),
+    ])
+    inner_top_pts = np.column_stack([
+        inner_top_radius * np.cos(angles),
+        inner_top_radius * np.sin(angles),
+        np.full(body_segments, top_z),
+    ])
+    inner = trimesh.convex.convex_hull(
+        np.vstack([inner_bottom_pts, inner_top_pts])
+    )
+
+    body = outer.difference(inner)
+    handle = _create_toroidal_handle(
+        center_x=(bottom_radius + top_radius) / 2,
+        center_z=0.0,
+        radius_major=handle_radius_major,
+        radius_minor=handle_radius_minor,
+        angle_deg=handle_angle_deg,
+        segments=handle_segments,
+        circle_points=circle_points,
+    )
+
+    return trimesh.util.concatenate([body, handle])
+
+
+def create_mug(  # noqa: PLR0913
+    body_radius: float = 30.0,
+    body_height: float = 80.0,
+    wall_thickness: float = 3.0,
+    bottom_thickness: float = 3.0,
+    handle_radius_major: float = 15.0,
+    handle_radius_minor: float = 4.0,
+    handle_angle_deg: float = 180.0,
+    handle_segments: int = 32,
+    body_segments: int = 64,
+    circle_points: int = 8,
+) -> trimesh.Trimesh:
+    """Create a mug mesh with a cylindrical body and toroidal handle.
+
+    Args:
+        body_radius: Radius of the mug body in mm.
+        body_height: Height of the mug body in mm.
+        wall_thickness: Wall thickness in mm.
+        bottom_thickness: Bottom thickness in mm.
+        handle_radius_major: Major radius of the handle arc in mm.
+        handle_radius_minor: Cross-section radius of the handle in mm.
+        handle_angle_deg: Angular span of the handle in degrees.
+        handle_segments: Number of segments along the handle arc.
+        body_segments: Number of segments around the body circumference.
+        circle_points: Number of points in handle cross-section.
+
+    Returns:
+        Combined trimesh of mug body and handle.
+    """
+    outer = trimesh.primitives.Cylinder(
+        radius=body_radius, height=body_height, sections=body_segments,
+    )
+    inner = trimesh.primitives.Cylinder(
+        radius=body_radius - wall_thickness,
+        height=body_height - bottom_thickness,
+        sections=body_segments,
+    )
+    inner.apply_translation([0, 0, bottom_thickness / 2.0])
+    body = outer.difference(inner)
+
+    handle = _create_toroidal_handle(
+        center_x=body_radius,
+        center_z=0.0,
+        radius_major=handle_radius_major,
+        radius_minor=handle_radius_minor,
+        angle_deg=handle_angle_deg,
+        segments=handle_segments,
+        circle_points=circle_points,
+    )
+
+    return trimesh.util.concatenate([body, handle])
+
+
+def _create_toroidal_handle(
+    center_x: float,
+    center_z: float,
+    radius_major: float,
+    radius_minor: float,
+    angle_deg: float,
+    segments: int,
+    circle_points: int,
+) -> trimesh.Trimesh:
+    """Create a toroidal handle mesh.
+
+    Args:
+        center_x: X position of the handle arc center.
+        center_z: Z position of the handle arc center.
+        radius_major: Major radius of the arc.
+        radius_minor: Cross-section radius.
+        angle_deg: Angular span in degrees.
+        segments: Number of segments along the arc.
+        circle_points: Number of points in cross-section.
+
+    Returns:
+        Handle trimesh.
+    """
+    handle_angles = np.linspace(
+        -np.radians(angle_deg) / 2,
+        np.radians(angle_deg) / 2,
+        segments,
+    )
+
+    vertices_all = []
+    for angle in handle_angles:
+        center = np.array([
+            center_x + radius_major * np.cos(angle),
+            0.0,
+            center_z + radius_major * np.sin(angle),
+        ])
+
+        radial = center - np.array([center_x, 0.0, center_z])
+        radial_len = np.linalg.norm(radial)
+        if radial_len > 1e-12:
+            radial /= radial_len
+        else:
+            radial = np.array([1.0, 0.0, 0.0])
+
+        tangent = np.array([
+            -radius_major * np.sin(angle),
+            0.0,
+            radius_major * np.cos(angle),
+        ])
+        tangent /= np.linalg.norm(tangent) + 1e-12
+
+        binormal = np.cross(tangent, radial)
+        binormal /= np.linalg.norm(binormal) + 1e-12
+
+        for j in range(circle_points):
+            theta = 2.0 * np.pi * j / circle_points
+            point = (
+                center
+                + radius_minor * np.cos(theta) * radial
+                + radius_minor * np.sin(theta) * binormal
+            )
+            vertices_all.append(point)
+
+    vertices_all = np.array(vertices_all)
+
+    faces_all = []
+    for i in range(segments - 1):
+        for j in range(circle_points):
+            j_next = (j + 1) % circle_points
+            v0 = i * circle_points + j
+            v1 = i * circle_points + j_next
+            v2 = (i + 1) * circle_points + j
+            v3 = (i + 1) * circle_points + j_next
+            faces_all.append([v0, v2, v1])
+            faces_all.append([v1, v2, v3])
+
+    handle = trimesh.Trimesh(
+        vertices=vertices_all, faces=np.array(faces_all)
+    )
+    handle.fix_normals()
+    return handle
+
+
+def prepare_demo_meshes(data_dir: Path) -> None:
+    """Generate and save all demo meshes to a directory.
+
+    Creates cube, sphere, cylinder, mug, and cup STL files.
+
+    Args:
+        data_dir: Directory to save mesh files to.
+    """
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    trimesh.primitives.Box(extents=[80, 80, 80]).export(
+        str(data_dir / "cube.stl")
+    )
+    trimesh.primitives.Sphere(radius=50).export(
+        str(data_dir / "sphere.stl")
+    )
+    trimesh.primitives.Cylinder(radius=35, height=100).export(
+        str(data_dir / "cylinder.stl")
+    )
+    create_mug().export(str(data_dir / "mug.stl"))
+    create_tea_cup().export(str(data_dir / "cup.stl"))

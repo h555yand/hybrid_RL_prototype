@@ -69,7 +69,7 @@ filterwarnings = [
 junit_family = "xunit1"
 
 [tool.ruff]
-line-length = 88
+line-length = 120
 target-version = "py38"
 
 [tool.ruff.format]
@@ -98,6 +98,7 @@ select = [
 ignore = [
     "COM812", # Trailing comma missing; conflicts with ruff format
     "ISC001", # Implicitly concatenated string literals on one line; conflicts with ruff format
+    "TRY301", "G004", "SLF001", "EM101", "EM102", "TRY003", "FBT001", "FBT002"
 ]
 
 [tool.ruff.lint.per-file-ignores]
@@ -107,7 +108,8 @@ ignore = [
 # D101: Missing docstring in public class
 # D102: Missing docstring in public method
 # S101: Use of `assert` detected
-"tests/**.py" = ["D100", "D101", "D102", "S101"]
+"tests/**.py" = ["D100", "D101", "D102", "S101", "SLF001", "PLR2004"]
+"src/tbp/hybrid_rl/visualize_env.py" = ["PLR0913"]
 
 [tool.ruff.lint.flake8-copyright]
 author = "Thousand Brains Project"

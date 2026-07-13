@@ -1,26 +1,34 @@
-# sac_trainer.py
-"""
-P-SAC Training Loop.
+# Copyright 2025-2026 Thousand Brains Project
+#
+# Copyright may exist in Contributors' modifications
+# and/or contributions to the work.
+#
+# Use of this source code is governed by the MIT
+# license that can be found in the LICENSE file or at
+# https://opensource.org/licenses/MIT.
+
+"""P-SAC Training Loop.
 Combines Actor, Twin Critic, Replay Buffer, ActionInterpreter.
 """
 
-import torch
-import torch.nn.functional as F
-import numpy as np
 import logging
 import pickle
-from pathlib import Path
-from typing import Dict, Any, Optional, List
-from copy import deepcopy
 from collections import deque
+from copy import deepcopy
+from pathlib import Path
+from typing import Dict, List, Optional
 
-from .sac_actor import SACActorNetwork
-from .twin_critic import TwinCritic
-from .replay_buffer import ReplayBuffer
+import numpy as np
+import torch
+import torch.nn.functional as F
+
 from .action_interpreter import ActionInterpreter
 from .experience_extractor import ExperienceExtractor, PSACTransition
 from .lightweight_env import LightweightEnv
+from .replay_buffer import ReplayBuffer
 from .rl_goal_approach_controller import RLGoalApproachController
+from .sac_actor import SACActorNetwork
+from .twin_critic import TwinCritic
 
 logger = logging.getLogger(__name__)
 
@@ -121,7 +129,7 @@ class PSACTrainer:
         self.param_mean = norm["param_mean"]
         self.param_std = norm["param_std"]
 
-        with open(bc_data_path, "rb") as f:
+        with Path(bc_data_path).open("rb") as f:
             bc_transitions = pickle.load(f)
 
         bc_normalized = self._normalize_bc_transitions(bc_transitions)
@@ -161,7 +169,7 @@ class PSACTrainer:
     def compute_state(self, env, controller, current_pose, sensor_data):
         return controller._compute_state(current_pose, sensor_data)
 
-    def compute_reward(self, state, prev_state, distance, prev_distance, 
+    def compute_reward(self, state, prev_state, distance, prev_distance,
     collision, steps, config=None, sensor_data=None):
         cfg = config or {}
         surface_step = cfg.get("surface_step", 3.0)
@@ -519,8 +527,7 @@ class PSACTrainer:
             rolling_history.append(episode_success)
             if len(rolling_history) >= 50:
                 rolling_rate = sum(rolling_history) / len(rolling_history)
-                if rolling_rate > best_rolling_rate:
-                    best_rolling_rate = rolling_rate
+                best_rolling_rate = max(best_rolling_rate, rolling_rate)
             else:
                 rolling_rate = 0.0
 
@@ -642,7 +649,7 @@ class PSACTrainer:
             log_alpha_param=self.log_alpha_param.detach().numpy(),
         )
 
-        logger.info(f"P-SAC model saved to {dirpath}")
+        logger.info("P-SAC model saved to %s", dirpath)
 
     def load(self, dirpath: str):
         dirpath = Path(dirpath)
@@ -673,4 +680,4 @@ class PSACTrainer:
         self.param_mean = data["param_mean"] if "param_mean" in data else np.zeros(3)
         self.param_std = data["param_std"] if "param_std" in data else np.ones(3)
 
-        logger.info(f"P-SAC model loaded from {dirpath}")
+        logger.info("P-SAC model loaded from %s", dirpath)

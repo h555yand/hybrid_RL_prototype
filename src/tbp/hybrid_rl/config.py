@@ -1,4 +1,12 @@
-# config.py
+# Copyright 2025-2026 Thousand Brains Project
+#
+# Copyright may exist in Contributors' modifications
+# and/or contributions to the work.
+#
+# Use of this source code is governed by the MIT
+# license that can be found in the LICENSE file or at
+# https://opensource.org/licenses/MIT.
+
 """Default configuration for RL goal-approach controller."""
 
 DEFAULT_CONFIG = {
@@ -15,21 +23,21 @@ DEFAULT_CONFIG = {
     "calibration_percentile": 10.0,
     "min_calibration_samples": 100,
     "min_weight_threshold": 0.01,
-    "norm_warmup_steps": 5000,          # сколько raw states накопить для freeze
-    "norm_min_std": 1e-4,               # защита от нулевой дисперсии
-    "rebuild_on_freeze": True,          # rebuild индекса после freeze
+    "norm_warmup_steps": 5000,          # how many raw states to accumulate for freezing
+    "norm_min_std": 1e-4,               # zero dispersion protection
+    "rebuild_on_freeze": True,          # rebuild index after freeze
     # Actions
     "num_actions": 21,
     "free_step_small": 2.0,
     "surface_step": 3.0,   # mm
     "free_step": 8.0,     # mm
-    "rotation_step": 5.0, # degrees
+    "rotation_step": 5.0,  # degrees
     # Episode
-    "goal_threshold": 2.0, # mm
+    "goal_threshold": 2.0,  # mm
     "max_steps_per_goal": 200,
     # Collision detection
     "min_valid_depth": 0.5,    # mm — below = inside object
-    "max_sensor_range": 100.0, # mm — max depth reading
+    "max_sensor_range": 100.0,  # mm — max depth reading
     "normal_flip_threshold": -0.5,  # dot product for pass-through
     # Reward weights
     "reward_progress": 3.0,
@@ -41,7 +49,7 @@ DEFAULT_CONFIG = {
     "reward_near_goal_on_surface": 0.5,
     "reward_oscillation": -0.5,
     "reward_timeout": -12.0,
-    "reward_detach_collision": -3.0,    # ← ДОБАВИТЬ
+    "reward_detach_collision": -3.0,
     # Detour shaping: if goal is behind surface, clip negative progress penalty
     # to avoid over-penalizing necessary face-to-face transitions on polyhedra.
     "detour_alignment_threshold": -0.2,
@@ -50,13 +58,13 @@ DEFAULT_CONFIG = {
     "gamma": 0.95,             # discount factor
     "alpha": 0.1,              # learning rate
     "num_episodes": 1000,
-    # Режим
-    # "train"    — всегда обучение
-    # "train_adapt_epsilon"    — обучение с адаптивным epsilon
-    # "eval"     — всегда inference
-    # "auto"     — определяем автоматически
+    # Mode
+    # "train"    — always train
+    # "train_adapt_epsilon"    — train with adaptive epsilon
+    # "eval"     — always inference
+    # "auto"     — define autmatically
     "mode": "auto",
-    "auto_train_threshold": 3500,  # точек в Q-store для перехода в eval
+    "auto_train_threshold": 3500,  # points in the Q-store to go to eval
     # Training epsilon
     "epsilon_decay": 0.99977,    # per-step decay
     "epsilon_start": 1.0,      # initial exploration
@@ -64,6 +72,6 @@ DEFAULT_CONFIG = {
     # Eval epsilon
     "eval_epsilon": 0.02,
     # Eval learning rate multiplier
-    "eval_alpha_multiplier": 0.1,  # alpha × 0.1 в eval режиме
+    "eval_alpha_multiplier": 0.1,  # alpha × 0.1 в eval mode
     "temperature_override": None
 }

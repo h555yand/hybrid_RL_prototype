@@ -1,12 +1,20 @@
-# experience_extractor.py
-"""
-ExperienceExtractor: converts Q-learning 21D discrete trajectories
+# Copyright 2025-2026 Thousand Brains Project
+#
+# Copyright may exist in Contributors' modifications
+# and/or contributions to the work.
+#
+# Use of this source code is governed by the MIT
+# license that can be found in the LICENSE file or at
+# https://opensource.org/licenses/MIT.
+
+"""ExperienceExtractor: converts Q-learning 21D discrete trajectories
 to P-SAC 9-type parameterized format for Behavioral Cloning.
 """
 
-import numpy as np
 from dataclasses import dataclass
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict, List, Optional
+
+import numpy as np
 
 
 @dataclass

@@ -1,15 +1,23 @@
-# lightweight_env.py
-import trimesh
-import numpy as np
-from scipy.spatial.transform import Rotation as R
+# Copyright 2025-2026 Thousand Brains Project
+#
+# Copyright may exist in Contributors' modifications
+# and/or contributions to the work.
+#
+# Use of this source code is governed by the MIT
+# license that can be found in the LICENSE file or at
+# https://opensource.org/licenses/MIT.
+
 import logging
+
+import numpy as np
+import trimesh
+from scipy.spatial.transform import Rotation as R
 
 logger = logging.getLogger(__name__)
 
 
 class LightweightEnv:
-    """
-    A lightweight simulator for training/testing RL without Habitat.
+    """A lightweight simulator for training/testing RL without Habitat.
     Uses trimesh for:
     - Mesh loading (STL, OBJ, PLY)
     - Ray casting (depth, normal)
@@ -18,7 +26,7 @@ class LightweightEnv:
     - Habitat
     - GPU
     """
-    
+
     def __init__(self, mesh_path: str, seed=None):
         self.mesh = trimesh.load(mesh_path)
         # all numbers are mm
@@ -30,13 +38,13 @@ class LightweightEnv:
         # Yaw - turn left/right - rotation around the Y axis
         # Roll - turn head to shoulder - rotation around the Z axis
         # self.agent_rot = [Pitch, Yaw, Roll]
-        #self.agent_rot = [X-angle, Y-angle, Z-angle]
+        # self.agent_rot = [X-angle, Y-angle, Z-angle]
         # Note: seed is set globally in train() => np.random.seed()
         # trimesh.sample() uses global np.random
         self._passed_through = False
         self._detach_had_collision = False
         self._compute_up_direction()  # ← ДОБАВИТЬ
-    
+
     @staticmethod
     def _normalize_euler(angles):
         return (np.array(angles, dtype=float) + 180.0) % 360.0 - 180.0
@@ -65,14 +73,13 @@ class LightweightEnv:
             self.agent_rot = np.zeros(3)
 
         self.agent_rot = self._normalize_euler(self.agent_rot)
-        return self.get_sensor_data()    
-    
+        return self.get_sensor_data()
+
     def set_goal(self, goal_pose):
         self._current_goal = goal_pose
-        
+
     def step(self, action_index, action_space):
-        """
-        Perform an action, return new sensor data.
+        """Perform an action, return new sensor data.
         
         Args:
             action_index: action index (0-17)
@@ -81,15 +88,14 @@ class LightweightEnv:
         Returns:
             sensor_data: point_normal, on_object, depth
         """
-        # Сбрасываем флаг в начале каждого step
         self._detach_had_collision = False
-        
+
         action_info = action_space.get_info(action_index)
 
         if action_info.name in ("look_up", "look_down"):
             rot_before = R.from_euler("xyz", self.agent_rot, degrees=True)
             forward_before = rot_before.apply([0, 0, -1])
-        
+
         if action_info.name == "move_tangentially":
             self._move_tangentially(
                 action_info.direction_degrees,
@@ -124,7 +130,7 @@ class LightweightEnv:
                 down_distance=action_info.down_distance,
             )
         elif action_info.name == "detach":
-            if hasattr(self, '_current_goal') and self._current_goal is not None:
+            if hasattr(self, "_current_goal") and self._current_goal is not None:
                 self._detach_and_fly_to_goal(
                     goal_pose=self._current_goal,
                     rotation_step=action_space.rotation_step,
@@ -132,7 +138,7 @@ class LightweightEnv:
                     max_sub_steps=2
                 )
         elif action_info.name == "detach_edge":
-            if hasattr(self, '_current_goal') and self._current_goal is not None:
+            if hasattr(self, "_current_goal") and self._current_goal is not None:
                 self._detach_and_fly_to_edge(
                     goal_pose=self._current_goal,
                     rotation_step=action_space.rotation_step,
@@ -140,21 +146,20 @@ class LightweightEnv:
                 )
         elif action_info.name == "free_forward_small":
             self._move_forward(action_space.free_step_small)
-            
+
         if action_info.name in ("look_up", "look_down"):
             rot_after = R.from_euler("xyz", self.agent_rot, degrees=True)
             forward_after = rot_after.apply([0, 0, -1])
-            height_axis = getattr(self, 'height_axis', 2)
+            height_axis = getattr(self, "height_axis", 2)
             logger.debug(
                 f"LOOK_DEBUG: action={action_info.name}, "
                 f"forward_z_before={forward_before[height_axis]:.3f}, "
                 f"forward_z_after={forward_after[height_axis]:.3f}, "
                 f"agent_rot={self.agent_rot}"
             )
-        # Нормализовать в конце
         self.agent_rot = self._normalize_euler(self.agent_rot)
         return self.get_sensor_data()
-    
+
     def get_sensor_data(self):
         rot = R.from_euler("xyz", self.agent_rot, degrees=True)
         ray_direction = rot.apply([0, 0, -1])
@@ -162,11 +167,11 @@ class LightweightEnv:
             ray_origins=[self.agent_pos],
             ray_directions=[ray_direction],
         )
-        
+
         if len(locations) > 0:
             distances = np.linalg.norm(locations - self.agent_pos, axis=1)
             nearest_idx = np.argmin(distances)
-            
+
             depth = distances[nearest_idx]
             face_idx = index_tri[nearest_idx]
             point_normal = self.mesh.face_normals[face_idx].tolist()
@@ -177,26 +182,26 @@ class LightweightEnv:
             on_object = False
 
         goal_normal = None
-        if hasattr(self, '_current_goal') and self._current_goal is not None:
+        if hasattr(self, "_current_goal") and self._current_goal is not None:
             goal_pos = self._current_goal[:3]
             _, _, gf_id = self.mesh.nearest.on_surface([goal_pos])
             goal_normal = self.mesh.face_normals[gf_id[0]].tolist()
 
-        # ═══ path_blocked: агент и цель на разных сторонах стенки ═══
+        # ═══ path_blocked: the agent and the target are on different sides of the wall ═══
         path_blocked = False
-        if hasattr(self, '_current_goal') and self._current_goal is not None:
+        if hasattr(self, "_current_goal") and self._current_goal is not None:
             goal_pos = self._current_goal[:3]
             center = (self.mesh.bounds[0] + self.mesh.bounds[1]) / 2.0
             h = self.height_axis
 
-            # Вектор от центра (горизонтальная проекция)
+            # Vector from the center (horizontal projection)
             agent_from_center = self.agent_pos - center
             agent_from_center[h] = 0.0
 
             goal_from_center = goal_pos - center
             goal_from_center[h] = 0.0
 
-            # Определяем inside/outside по нормали агента
+            # determine inside/outside by the agent's normal
             agent_outside = True  # fallback
             if point_normal is not None:
                 n = np.array(point_normal)
@@ -205,7 +210,7 @@ class LightweightEnv:
                 if np.linalg.norm(n_horiz) > 0.1:
                     agent_outside = np.dot(n_horiz, agent_from_center) > 0
 
-            # Определяем inside/outside по нормали цели
+            # determine inside/outside by the target normal
             goal_outside = True  # fallback
             if goal_normal is not None:
                 gn = np.array(goal_normal)
@@ -215,23 +220,23 @@ class LightweightEnv:
                     goal_outside = np.dot(gn_horiz, goal_from_center) > 0
 
             path_blocked = (agent_outside != goal_outside)
-        
+
         return {
             "point_normal": point_normal,
             "principal_curvatures": self._estimate_curvature(),
             "on_object": on_object,
             "depth": depth,
-            "passed_through": getattr(self, '_passed_through', False),
+            "passed_through": getattr(self, "_passed_through", False),
             "goal_normal": goal_normal,
-            "detach_had_collision": getattr(self, '_detach_had_collision', False),
-            "detach_sub_steps": getattr(self, '_last_detach_sub_steps', 1),
+            "detach_had_collision": getattr(self, "_detach_had_collision", False),
+            "detach_sub_steps": getattr(self, "_last_detach_sub_steps", 1),
             "path_blocked": path_blocked,
         }
-        
+
     def get_pose(self):
         """The agent's current pose."""
         return np.concatenate([self.agent_pos, self.agent_rot])
-    
+
     def get_random_surface_point(
         self,
         reference_pos: np.ndarray = None,
@@ -241,8 +246,7 @@ class LightweightEnv:
         mesh_sample=False,
         same_cube_side=False
     ) -> np.ndarray:
-        """
-        A random point on the surface with an optional distance limit.
+        """A random point on the surface with an optional distance limit.
 
         Args:
         reference_pos: The reference point (the agent's position). If None, no distance filter is applied.
@@ -262,7 +266,6 @@ class LightweightEnv:
         if mesh_sample:
             points, face_ids = self.mesh.sample(max_attempts, return_index=True)
             for i in range(max_attempts):
-                # points, face_ids = self.mesh.sample(1, return_index=True)
                 normal = self.mesh.face_normals[face_ids[i]]
                 position = points[i] + normal * 2.0
 
@@ -318,7 +321,7 @@ class LightweightEnv:
         face_idx = index_tri[nearest_idx]
         vertex_indices = self.mesh.faces[face_idx]
 
-        if not hasattr(self, '_vertex_mean_curvature'):
+        if not hasattr(self, "_vertex_mean_curvature"):
             self._vertex_mean_curvature = trimesh.curvature.discrete_mean_curvature_measure(
                 self.mesh, self.mesh.vertices, radius=5.0
             )
@@ -330,10 +333,9 @@ class LightweightEnv:
         gauss_curv = float(np.mean(self._vertex_gaussian_curvature[vertex_indices]))
 
         return [mean_curv, gauss_curv]
-    
+
     def _look_at_direction(self, direction):
-        """
-        Return euler angles [rx, ry, rz] IN DEGREES such that:
+        """Return euler angles [rx, ry, rz] IN DEGREES such that:
         R.from_euler("xyz", euler, degrees=True).apply([0, 0, -1]) ≈ direction
         Convention: forward is -Z when euler = [0,0,0].
         """
@@ -349,8 +351,7 @@ class LightweightEnv:
         return rot.as_euler("xyz", degrees=True)
 
     def _look_at_direction_complex(self, direction):
-        """
-        Calculates euler angles for looking in a direction.
+        """Calculates euler angles for looking in a direction.
         Builds a full rotation matrix so that -Z (forward) looks in
         the direction, and Y (up) remains as vertical as possible.
         Resistant to gimbal lock (vertical normals).
@@ -436,7 +437,7 @@ class LightweightEnv:
         self._passed_through = False
 
         if abs(step_size) > 0.5:
-            # Ray cast: проверяем пересечение с мешем на пути
+            # Ray cast: check the intersection with the mesh on the path
             locations, _, _ = self.mesh.ray.intersects_location(
                 ray_origins=[old_pos],
                 ray_directions=[forward * np.sign(step_size)],
@@ -446,15 +447,15 @@ class LightweightEnv:
                 if np.min(distances) < abs(step_size):
                     self._passed_through = True
 
-            # Proximity: проверяем не оказались ли внутри меша
+            # Proximity: check if they are inside the mesh
             closest, dist_to_mesh, _ = self.mesh.nearest.on_surface([self.agent_pos])
-            # Порог зависит от размера шага
-            # Большой шаг (8mm): порог 1.0mm — строгий
-            # Маленький шаг (2mm): порог 0.5mm — мягче, позволяет посадку
+            # Threshold depends on the pitch size
+            # Large pitch (8mm): 1.0mm threshold — strict
+            # Small pitch (2mm): 0.5mm threshold — softer, allows for a more comfortable fit
             proximity_threshold = min(1.0, abs(step_size) * 0.25)
             if dist_to_mesh[0] < proximity_threshold:
                 self._passed_through = True
-    
+
     def _orient_horizontal(self, rotation_degrees, forward_distance, left_distance):
         """Moves the agent forward and sideways (left/right), projects onto surface, and yaws.
         
@@ -469,16 +470,16 @@ class LightweightEnv:
             0.0,
             -forward_distance      # +forward → -Z, -forward → +Z
         ])
-        
+
         if np.linalg.norm(local_dir) < 1e-8:
             local_dir = np.array([0.0, 0.0, -1.0])  # default: forward
         else:
             local_dir = local_dir / np.linalg.norm(local_dir)
-        
+
         # Rotate to world
         rot = R.from_euler("xyz", self.agent_rot, degrees=True)
         world_dir = rot.apply(local_dir)
-        
+
         # Project onto tangent plane
         sensor_data = self.get_sensor_data()
         if sensor_data["point_normal"] is not None:
@@ -487,11 +488,11 @@ class LightweightEnv:
             norm = np.linalg.norm(world_dir)
             if norm > 1e-8:
                 world_dir /= norm
-        
+
         # Total step distance in mm
         step = np.linalg.norm([forward_distance, left_distance])
         self.agent_pos += world_dir * step
-        
+
         # Apply yaw rotation
         self.agent_rot[1] += rotation_degrees  # Y-axis = yaw
 
@@ -509,16 +510,16 @@ class LightweightEnv:
             -down_distance,        # +down → -Y, -down → +Y (up)
             -forward_distance      # +forward → -Z
         ])
-        
+
         if np.linalg.norm(local_dir) < 1e-8:
             local_dir = np.array([0.0, 0.0, -1.0])  # default: forward
         else:
             local_dir = local_dir / np.linalg.norm(local_dir)
-        
+
         # Rotate to world
         rot = R.from_euler("xyz", self.agent_rot, degrees=True)
         world_dir = rot.apply(local_dir)
-        
+
         # Project onto tangent plane
         sensor_data = self.get_sensor_data()
         if sensor_data["point_normal"] is not None:
@@ -527,20 +528,20 @@ class LightweightEnv:
             norm = np.linalg.norm(world_dir)
             if norm > 1e-8:
                 world_dir /= norm
-        
+
         # Total step distance
         step = np.linalg.norm([forward_distance, down_distance])
         self.agent_pos += world_dir * step
-        
+
         # Apply pitch rotation (around X axis)
         self.agent_rot[0] += rotation_degrees  # X-axis = pitch
-    
+
     def _compute_up_direction(self):
         bbox_min = self.mesh.bounds[0]
         bbox_max = self.mesh.bounds[1]
         extents = bbox_max - bbox_min
 
-        # Используем centroid — устойчив к ручкам и другим выступам
+        # use centroid - it is resistant to handles and other protrusions
         center = np.array(self.mesh.centroid, dtype=float)
 
         n_probes = 25
@@ -562,7 +563,7 @@ class LightweightEnv:
                     probe_points.append(pt)
             probe_points = np.array(probe_points)
 
-            # Лучи в + направлении
+            # Rays in the + direction
             dir_plus = np.zeros(3)
             dir_plus[axis] = 1.0
             origins_plus = probe_points.copy()
@@ -572,7 +573,7 @@ class LightweightEnv:
                 ray_directions=np.tile(dir_plus, (n_probes, 1)),
             )
 
-            # Лучи в - направлении
+            # Rays in the - direction
             dir_minus = np.zeros(3)
             dir_minus[axis] = -1.0
             origins_minus = probe_points.copy()
@@ -587,9 +588,9 @@ class LightweightEnv:
             asymmetry = abs(n_plus - n_minus)
 
             axis_info[axis] = {
-                'plus': n_plus,
-                'minus': n_minus,
-                'asymmetry': asymmetry,
+                "plus": n_plus,
+                "minus": n_minus,
+                "asymmetry": asymmetry,
             }
 
             if asymmetry > best_asymmetry:
@@ -630,7 +631,6 @@ class LightweightEnv:
 
         self._detach_had_collision = False
 
-        # ═══ DEBUG START ═══
         logger.debug(
             f"DETACH_EDGE_START: "
             f"agent_pos={self.agent_pos.tolist()}, "
@@ -641,7 +641,6 @@ class LightweightEnv:
             f"open_edge_height={self.open_edge_height:.1f}, "
             f"bbox={self.mesh.bounds.tolist()}"
         )
-        # ═══ DEBUG END ═══
 
         sensor = self.get_sensor_data()
         if sensor.get("point_normal") is None:
@@ -652,7 +651,7 @@ class LightweightEnv:
         normal = np.array(sensor["point_normal"], dtype=float)
         normal /= (np.linalg.norm(normal) + 1e-12)
 
-        # ═══ Фаза 1: Отрыв по нормали ═══
+        # ═══ Phase 1: Normal Breakaway ═══
         self.agent_rot = self._look_at_direction(normal)
 
         logger.debug(
@@ -697,14 +696,14 @@ class LightweightEnv:
             f"sub_steps={sub_steps}"
         )
 
-        # ═══ Фаза 2: Лететь к открытому краю ═══
+        # ═══ Phase 2: Fly to the open edge ═══
         up_dir = self.up_direction
         height_axis = self.height_axis
         open_edge_height = self.open_edge_height
 
         center = np.array(self.mesh.centroid, dtype=float)
 
-        # Внутри или снаружи?
+        # Inside or outside?
         agent_to_center = center - self.agent_pos
         agent_to_center[height_axis] = 0.0
         dot_normal_to_center = np.dot(normal, agent_to_center)
@@ -780,15 +779,14 @@ class LightweightEnv:
                         f"target={target_height:.1f}"
                     )
                     break
-            else:
-                if self.agent_pos[height_axis] < target_height:
-                    logger.debug(
-                        f"DETACH_EDGE_PHASE2_REACHED: "
-                        f"fly_step_idx={fly_step_idx}, "
-                        f"height={self.agent_pos[height_axis]:.1f}, "
-                        f"target={target_height:.1f}"
-                    )
-                    break
+            elif self.agent_pos[height_axis] < target_height:
+                logger.debug(
+                    f"DETACH_EDGE_PHASE2_REACHED: "
+                    f"fly_step_idx={fly_step_idx}, "
+                    f"height={self.agent_pos[height_axis]:.1f}, "
+                    f"target={target_height:.1f}"
+                )
+                break
 
         logger.debug(
             f"DETACH_EDGE_PHASE2_DONE: "
@@ -798,12 +796,12 @@ class LightweightEnv:
             f"sub_steps={sub_steps}"
         )
 
-        # Если была коллизия в фазе 2, не продолжаем фазу 3
+        # If there was a collision in phase 2, do not continue phase 3
         if self._detach_had_collision:
             self._last_detach_sub_steps = sub_steps
             return self.get_sensor_data()
 
-        # ═══ Фаза 3: Горизонтальный перелёт в сторону цели ═══
+        # ═══ Phase 3: Horizontal flight towards the target ═══
         goal_pos = goal_pose[:3]
 
         direction_to_goal = goal_pos - self.agent_pos
@@ -820,7 +818,6 @@ class LightweightEnv:
 
         self.agent_rot = self._look_at_direction(direction_horiz)
 
-        # total_fly = detach_fly_step * max_sub_steps * 2
         total_fly = int(detach_fly_step * max_sub_steps * 1.5)
 
         logger.debug(
@@ -871,7 +868,7 @@ class LightweightEnv:
 
         self._last_detach_sub_steps = sub_steps
 
-        # Направляем взгляд вниз
+        # direct agent gaze downwards
         down_direction = -self.up_direction
         self.agent_rot = self._look_at_direction(down_direction)
 
@@ -946,31 +943,30 @@ class LightweightEnv:
 
         self._last_detach_sub_steps = sub_steps
         return self.get_sensor_data()
-        
+
 def is_on_same_cube_side(pos_a, pos_b, cube_side=42.0, atol=1e-5):
-    """
-    Проверяет, лежат ли две точки на одной стороне куба (например, обе на +X при x = +42).
-    
+    """Checks whether two points lie on the same side of a cube (e.g., both at +X when x = +42).
+
     Args:
-        pos_a: положение точки A [x, y, z]
-        pos_b: положение точки B [x, y, z]
-        cube_side: значение координаты грани куба (например, 42 мм)
-        atol: допуск на численную погрешность
-    
+        pos_a: position of point A [x, y, z]
+        pos_b: position of point B [x, y, z]
+        cube_side: cube side coordinate value (e.g., 42 mm)
+        atol: numerical error tolerance
+
     Returns:
-        bool: True, если точки на одной стороне куба
+        bool: True if the points are on the same side of the cube
     """
     pos_a = np.array(pos_a)
     pos_b = np.array(pos_b)
-    
-    # Проверяем каждую ось
+
+    # check each axis
     for i in range(3):
-        # Обе точки должны быть на грани (координата ≈ ±cube_side)
-        if (abs(abs(pos_a[i]) - cube_side) <= atol and 
+        # Both points must be on the edge (coordinate ≈ ±cube_side)
+        if (abs(abs(pos_a[i]) - cube_side) <= atol and
             abs(abs(pos_b[i]) - cube_side) <= atol):
-            
-            # И знак должен совпадать (обе +42 или обе -42)
+
+            # And the sign must match (both +42 or both -42)
             if np.sign(pos_a[i]) == np.sign(pos_b[i]):
                 return True
-    
+
     return False

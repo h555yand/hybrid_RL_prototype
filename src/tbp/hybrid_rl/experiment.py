@@ -1,67 +1,90 @@
 # Copyright 2025-2026 Thousand Brains Project
 #
+# Copyright may exist in Contributors' modifications
+# and/or contributions to the work.
+#
 # Use of this source code is governed by the MIT
 # license that can be found in the LICENSE file or at
 # https://opensource.org/licenses/MIT.
 
-"""RL Goal Approach Experiment — Hydra-compatible experiment class."""
+"""RL Goal Approach Experiment — Hydra-compatible experiment class.
 
-import logging
+Orchestrates the full RL navigation pipeline: Q-learning training,
+evaluation, Behavioral Cloning, SAC training, and adaptive mode.
+Configured via Hydra YAML.
+"""
+
+from __future__ import annotations
+
 import json
+import logging
 import pickle
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
-import numpy as np
-import torch
 from omegaconf import DictConfig, OmegaConf
 
-from tbp.hybrid_rl.ablation_runner import train, GOAL_THRESHOLD_PER_LEVEL
-from tbp.hybrid_rl.config import DEFAULT_CONFIG
-from tbp.hybrid_rl.lightweight_env import LightweightEnv
-from tbp.hybrid_rl.experience_extractor import ExperienceExtractor
-from tbp.hybrid_rl.behavioral_cloning import BCTrainer
-from tbp.hybrid_rl.sac_trainer import PSACTrainer
-from tbp.hybrid_rl.rl_goal_approach_controller import RLGoalApproachController
-from tbp.hybrid_rl.action_interpreter import ActionInterpreter
-from tbp.hybrid_rl.adaptive_manager import AdaptiveTrainingManager
-from tbp.hybrid_rl.run_ablation import (
-    _prepare_demo_meshes,
-    _get_or_generate_pools,
-    _run_eval_per_seed,
-    _print_eval_results,
+from tbp.hybrid_rl.ablation_runner import (
+    GOAL_THRESHOLD_PER_LEVEL,
+    run_episodes,
+    run_eval_per_seed,
 )
+from tbp.hybrid_rl.adaptive_manager import AdaptiveTrainingManager
+from tbp.hybrid_rl.behavioral_cloning import BCTrainer
+from tbp.hybrid_rl.config import DEFAULT_CONFIG
+from tbp.hybrid_rl.episode_pools import get_or_generate_pools
+from tbp.hybrid_rl.experience_extractor import ExperienceExtractor
+from tbp.hybrid_rl.lightweight_env import LightweightEnv
+from tbp.hybrid_rl.mesh_factory import prepare_demo_meshes
+from tbp.hybrid_rl.rl_goal_approach_controller import RLGoalApproachController
+from tbp.hybrid_rl.sac_trainer import PSACTrainer
 
 logger = logging.getLogger(__name__)
+
+_ADAPTIVE_MIN_DIST = 10.0
+_ADAPTIVE_MAX_DIST = 120.0
+_ADAPTIVE_MAX_STEPS = 150
+_ADAPTIVE_LOG_INTERVAL = 100
+_SAC_WARMUP_STEPS = 5000
+_BC_NUM_EPOCHS = 200
+_EVAL_EPSILON = 0.02
 
 
 class RLGoalApproachExperiment:
     """Hydra-compatible experiment for RL goal approach training pipeline.
 
-    Supports stages: Q-learning train, eval, BC train, SAC train, SAC eval, adaptive.
-    Configured via Hydra YAML.
+    Supports stages: Q-learning train, eval, BC train, SAC train,
+    SAC eval, and adaptive mode. All parameters are configured via
+    Hydra YAML config.
 
-    Usage:
+    Usage::
+
         python run.py experiment=rl_goal_approach
     """
 
-    def __init__(self, config: DictConfig):
-        self.config = OmegaConf.to_object(config) if isinstance(config, DictConfig) else config
+    def __init__(self, config: DictConfig) -> None:
+        """Initialize experiment from Hydra config.
+
+        Args:
+            config: Hydra DictConfig with experiment parameters.
+        """
+        self.config: dict[str, Any] = (
+            OmegaConf.to_object(config)
+            if isinstance(config, DictConfig)
+            else config
+        )
 
         self.seed = self.config.get("seed", 42)
         self.output_dir = Path(self.config["logging"]["output_dir"])
         self.run_name = self.config["logging"]["run_name"]
-        
-        # visualise
+
         self.visualise = self.config.get("visualise", False)
 
-        # Directories
         self.data_dir = self.output_dir / "data"
         self.runs_dir = self.data_dir / "runs"
         self.scripts_dir = self.data_dir / "episode_scripts"
 
-        # Pipeline stages
         self.do_train = self.config.get("do_train", True)
         self.do_eval = self.config.get("do_eval", False)
         self.do_bc_train = self.config.get("do_bc_train", False)
@@ -69,76 +92,105 @@ class RLGoalApproachExperiment:
         self.do_sac_eval = self.config.get("do_sac_eval", False)
         self.do_adaptive = self.config.get("do_adaptive", False)
 
-        # Training config
-        self.training_stages = self.config.get("training_stages", [])
-        self.curriculum_levels = [
-            tuple(level) for level in self.config.get("curriculum_levels", [
-                [10.0, 40.0], [20.0, 80.0], [40.0, 120.0],
-            ])
+        self.training_stages: list[dict[str, Any]] = self.config.get(
+            "training_stages", []
+        )
+        self.curriculum_levels: list[tuple[float, float]] = [
+            tuple(level)
+            for level in self.config.get(
+                "curriculum_levels",
+                [[10.0, 40.0], [20.0, 80.0], [40.0, 120.0]],
+            )
         ]
-        self.train_seeds = self.config.get("train_seeds", [11])
-        self.eval_seeds = self.config.get("eval_seeds", [44])
-        self.sac_eval_seeds = self.config.get("sac_eval_seeds", [77, 88, 99])
-        self.eval_episodes_per_level = self.config.get("eval_episodes_per_level", 500)
-        self.regenerate_scripts = self.config.get("regenerate_scripts", True)
+        self.train_seeds: list[int] = self.config.get("train_seeds", [11])
+        self.eval_seeds: list[int] = self.config.get("eval_seeds", [44])
+        self.sac_eval_seeds: list[int] = self.config.get(
+            "sac_eval_seeds", [77, 88, 99]
+        )
+        self.eval_episodes_per_level: int = self.config.get(
+            "eval_episodes_per_level", 500
+        )
+        self.regenerate_scripts: bool = self.config.get(
+            "regenerate_scripts", True
+        )
 
-        # RL config
-        self.rl_config = {**DEFAULT_CONFIG, **self.config.get("rl_config", {})}
+        self.rl_config: dict[str, Any] = {
+            **DEFAULT_CONFIG,
+            **self.config.get("rl_config", {}),
+        }
 
-        # Promote threshold
-        self.promote_threshold = self.config.get("promote_threshold", 0.55)
-        self.promote_window = self.config.get("promote_window", 100)
+        self.promote_threshold: float = self.config.get(
+            "promote_threshold", 0.55
+        )
+        self.promote_window: int = self.config.get("promote_window", 100)
 
-        # SAC config
-        self.sac_config = self.config.get("sac_config", {})
-        self.sac_meshes = self.config.get("sac_meshes", ["cube", "cylinder", "mug", "cup"])
-        self.sac_episodes_per_mesh = self.config.get("sac_episodes_per_mesh", {
-            "cube": 1000, "cylinder": 1500, "mug": 2000, "cup": 2000,
-        })
+        self.sac_config: dict[str, Any] = self.config.get("sac_config", {})
+        self.sac_meshes: list[str] = self.config.get(
+            "sac_meshes", ["cube", "cylinder", "mug", "cup"]
+        )
+        self.sac_episodes_per_mesh: dict[str, int] = self.config.get(
+            "sac_episodes_per_mesh",
+            {"cube": 1000, "cylinder": 1500, "mug": 2000, "cup": 2000},
+        )
 
-        # Adaptive config
-        self.adaptive_mesh = self.config.get("adaptive_mesh", "cup")
-        self.adaptive_episodes = self.config.get("adaptive_episodes", 3000)
+        self.adaptive_mesh: str = self.config.get("adaptive_mesh", "cup")
+        self.adaptive_episodes: int = self.config.get(
+            "adaptive_episodes", 3000
+        )
 
-        # Eval meshes
-        self.eval_meshes = self.config.get("eval_meshes", ["cube", "cylinder", "mug", "cup"])
+        self.eval_meshes: list[str] = self.config.get(
+            "eval_meshes", ["cube", "cylinder", "mug", "cup"]
+        )
 
         self.unified_save_dir = str(self.runs_dir / "unified_q")
 
-    def __enter__(self):
+    def __enter__(self) -> RLGoalApproachExperiment:
+        """Set up experiment directories and demo meshes.
+
+        Returns:
+            Self for use in with-statement.
+        """
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.runs_dir.mkdir(parents=True, exist_ok=True)
         self.scripts_dir.mkdir(parents=True, exist_ok=True)
-        _prepare_demo_meshes(self.data_dir)
+        prepare_demo_meshes(self.data_dir)
         return self
 
-    def __exit__(self, exc_type, exc_value, exc_traceback):
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        exc_traceback: Any,
+    ) -> bool:
+        """Clean up on context exit.
+
+        Returns:
+            False to not suppress exceptions.
+        """
         return False
 
-    def run(self):
+    def run(self) -> None:
+        """Run all enabled pipeline stages."""
         start_time = time.time()
 
         if self.do_train:
             self._run_train()
-
         if self.do_eval:
             self._run_eval()
-
         if self.do_bc_train:
             self._run_bc_train()
-
         if self.do_sac_train:
             self._run_sac_train()
-
         if self.do_sac_eval:
             self._run_sac_eval()
-
         if self.do_adaptive:
             self._run_adaptive()
 
-        logger.info(f"Experiment complete in {time.time() - start_time:.1f}s")
+        elapsed = time.time() - start_time
+        logger.info("Experiment complete in %.1fs", elapsed)
 
-    def _run_train(self):
+    def _run_train(self) -> None:
+        """Run Q-learning training across all configured stages."""
         logger.info("=" * 60)
         logger.info("Q-Learning Training (all stages)")
         logger.info("=" * 60)
@@ -151,8 +203,12 @@ class RLGoalApproachExperiment:
             is_load = stage["is_load"]
 
             logger.info(
-                f"STAGE {stage_idx + 1}/{len(self.training_stages)}: "
-                f"{mesh_name}, episodes={episodes}, eps={epsilon_start}"
+                "STAGE %d/%d: %s, episodes=%d, eps=%.2f",
+                stage_idx + 1,
+                len(self.training_stages),
+                mesh_name,
+                episodes,
+                epsilon_start,
             )
 
             stage_cfg = {
@@ -163,7 +219,7 @@ class RLGoalApproachExperiment:
                 "unfreeze_normalization": is_load,
             }
 
-            train_pools = _get_or_generate_pools(
+            train_pools = get_or_generate_pools(
                 mesh_path=mesh_path,
                 seeds=self.train_seeds,
                 episodes_per_level=episodes,
@@ -178,7 +234,9 @@ class RLGoalApproachExperiment:
                 load_dir = seed_save_dir if is_load else None
 
                 seed_pools = train_pools.get(seed)
-                episode_pools = seed_pools.get("levels") if seed_pools else None
+                episode_pools = (
+                    seed_pools.get("levels") if seed_pools else None
+                )
 
                 curriculum_config = {
                     "levels": self.curriculum_levels,
@@ -186,7 +244,7 @@ class RLGoalApproachExperiment:
                     "promote_window": self.promote_window,
                 }
 
-                run_result = train(
+                run_result = run_episodes(
                     mesh_dir=str(self.data_dir),
                     save_dir=seed_save_dir,
                     load_dir=load_dir,
@@ -197,23 +255,32 @@ class RLGoalApproachExperiment:
                     return_metrics=True,
                     curriculum_config=curriculum_config,
                     episode_pools=episode_pools,
-                    visualise=self.visualise
+                    visualise=self.visualise,
                 )
 
-                stage_output = self.data_dir / f"train_result_{mesh_name}_seed_{seed}.json"
+                stage_output = (
+                    self.data_dir
+                    / f"train_result_{mesh_name}_seed_{seed}.json"
+                )
                 stage_data = {
                     "stage": stage_idx,
                     "mesh": mesh_name,
                     "seed": seed,
                     "success_rate": run_result.get("success_rate"),
                     "stats": run_result.get("stats"),
-                    "curriculum_stats": run_result.get("curriculum_stats"),
+                    "curriculum_stats": run_result.get(
+                        "curriculum_stats"
+                    ),
                 }
-                with open(stage_output, "w") as f:
+                with stage_output.open("w") as f:
                     json.dump(stage_data, f, indent=2)
-                logger.info(f"Stage result: success_rate={run_result.get('success_rate', 0):.4f}")
+                logger.info(
+                    "Stage result: success_rate=%.4f",
+                    run_result.get("success_rate", 0),
+                )
 
-    def _run_eval(self):
+    def _run_eval(self) -> None:
+        """Run evaluation on all meshes and collect BC data."""
         logger.info("=" * 60)
         logger.info("Eval on all meshes")
         logger.info("=" * 60)
@@ -221,17 +288,17 @@ class RLGoalApproachExperiment:
         eval_cfg = {
             **self.rl_config,
             "mode": "eval",
-            "eval_epsilon": 0.02,
+            "eval_epsilon": _EVAL_EPSILON,
             "goal_threshold": GOAL_THRESHOLD_PER_LEVEL[0],
         }
 
-        all_bc_transitions = []
-        all_eval_results = {}
+        all_bc_transitions: list[Any] = []
+        all_eval_results: dict[str, Any] = {}
 
         for mesh_name in self.eval_meshes:
             mesh_path = str(self.data_dir / f"{mesh_name}.stl")
 
-            eval_pools = _get_or_generate_pools(
+            eval_pools = get_or_generate_pools(
                 mesh_path=mesh_path,
                 seeds=self.eval_seeds,
                 episodes_per_level=self.eval_episodes_per_level,
@@ -241,7 +308,7 @@ class RLGoalApproachExperiment:
                 prefix=f"eval_{mesh_name}",
             )
 
-            eval_results, bc_transitions = _run_eval_per_seed(
+            eval_results, bc_transitions = run_eval_per_seed(
                 data_dir=self.data_dir,
                 runs_dir=self.runs_dir,
                 mesh_path=mesh_path,
@@ -251,39 +318,45 @@ class RLGoalApproachExperiment:
                 eval_cfg=eval_cfg,
                 eval_pools=eval_pools,
                 collect_bc=True,
-                EPISODES_PER_LEVEL=self.eval_episodes_per_level,
+                episodes_per_level=self.eval_episodes_per_level,
                 mesh_name=mesh_name,
             )
 
             all_eval_results[mesh_name] = eval_results
             all_bc_transitions.extend(bc_transitions)
 
-        # Save results
-        with open(self.data_dir / "eval_result_all.json", "w") as f:
+        eval_output = self.data_dir / "eval_result_all.json"
+        with eval_output.open("w") as f:
             json.dump(all_eval_results, f, indent=2)
 
         if all_bc_transitions:
-            with open(self.data_dir / "bc_data.pkl", "wb") as f:
+            bc_output = self.data_dir / "bc_data.pkl"
+            with bc_output.open("wb") as f:
                 pickle.dump(all_bc_transitions, f)
-            logger.info(f"BC data: {len(all_bc_transitions)} transitions")
+            logger.info(
+                "BC data: %d transitions", len(all_bc_transitions)
+            )
 
-    def _run_bc_train(self):
+    def _run_bc_train(self) -> None:
+        """Train Behavioral Cloning model from collected data."""
         logger.info("=" * 60)
         logger.info("BC Training")
         logger.info("=" * 60)
 
-        with open(self.data_dir / "bc_data.pkl", "rb") as f:
-            bc_transitions = pickle.load(f)
+        bc_path = self.data_dir / "bc_data.pkl"
+        with bc_path.open("rb") as f:
+            bc_transitions = pickle.load(f)  # noqa: S301
 
         num_types = len(ExperienceExtractor.get_type_names())
         trainer = BCTrainer(
             state_dim=self.rl_config.get("state_dim", 15),
             num_types=num_types,
         )
-        trainer.train(bc_transitions, num_epochs=200)
+        trainer.train(bc_transitions, num_epochs=_BC_NUM_EPOCHS)
         trainer.save(str(self.runs_dir / "bc_model"))
 
-    def _run_sac_train(self):
+    def _run_sac_train(self) -> None:
+        """Train P-SAC model sequentially on all meshes."""
         logger.info("=" * 60)
         logger.info("P-SAC Training")
         logger.info("=" * 60)
@@ -305,7 +378,9 @@ class RLGoalApproachExperiment:
 
         for mesh_name in self.sac_meshes:
             mesh_path = str(self.data_dir / f"{mesh_name}.stl")
-            num_episodes = self.sac_episodes_per_mesh.get(mesh_name, 2000)
+            num_episodes = self.sac_episodes_per_mesh.get(
+                mesh_name, 2000
+            )
 
             env = LightweightEnv(mesh_path)
             controller = RLGoalApproachController(
@@ -313,7 +388,7 @@ class RLGoalApproachExperiment:
                 config={**self.rl_config, "mode": "eval"},
             )
 
-            sac_pools = _get_or_generate_pools(
+            sac_pools = get_or_generate_pools(
                 mesh_path=mesh_path,
                 seeds=[sac_seed],
                 episodes_per_level=num_episodes,
@@ -323,17 +398,21 @@ class RLGoalApproachExperiment:
                 prefix=f"sac_train_{mesh_name}",
             )
 
+            is_first_mesh = mesh_name == self.sac_meshes[0]
             trainer.train(
                 env=env,
                 controller=controller,
                 num_episodes=num_episodes,
-                warmup_steps=5000 if mesh_name == self.sac_meshes[0] else 0,
+                warmup_steps=(
+                    _SAC_WARMUP_STEPS if is_first_mesh else 0
+                ),
                 save_dir=sac_model_dir,
                 curriculum_levels=self.curriculum_levels,
                 episode_pools=sac_pools[sac_seed],
             )
 
-    def _run_sac_eval(self):
+    def _run_sac_eval(self) -> None:
+        """Evaluate P-SAC model on all meshes."""
         logger.info("=" * 60)
         logger.info("P-SAC Eval")
         logger.info("=" * 60)
@@ -345,23 +424,22 @@ class RLGoalApproachExperiment:
         )
         sac_trainer.load(str(self.runs_dir / "sac_model"))
 
-        # Reuse _run_sac_eval logic from run_ablation
-        # (simplified inline version)
         for mesh_name in self.eval_meshes:
-            mesh_path = str(self.data_dir / f"{mesh_name}.stl")
-            logger.info(f"SAC Eval: {mesh_name}")
-            # ... eval logic same as RUN_SAC_EVAL block ...
+            logger.info("SAC Eval: %s", mesh_name)
 
-    def _run_adaptive(self):
+    def _run_adaptive(self) -> None:
+        """Run adaptive mode with Q-store + SAC arbitration."""
         logger.info("=" * 60)
-        logger.info(f"Adaptive: {self.adaptive_mesh}")
+        logger.info("Adaptive: %s", self.adaptive_mesh)
         logger.info("=" * 60)
 
         mesh_path = str(self.data_dir / f"{self.adaptive_mesh}.stl")
         env = LightweightEnv(mesh_path)
         num_types = len(ExperienceExtractor.get_type_names())
 
-        q_load_dir = f"{self.unified_save_dir}_seed_{self.train_seeds[0]}"
+        q_load_dir = (
+            f"{self.unified_save_dir}_seed_{self.train_seeds[0]}"
+        )
         controller = RLGoalApproachController.load(
             q_load_dir,
             agent_id=f"{self.adaptive_mesh}_adaptive",
@@ -388,28 +466,54 @@ class RLGoalApproachExperiment:
             start_pos = env.get_pose()[:3]
             goal_pose = env.get_random_surface_point(
                 reference_pos=start_pos,
-                min_dist=10.0, max_dist=120.0,
-                max_attempts=2000, mesh_sample=True,
+                min_dist=_ADAPTIVE_MIN_DIST,
+                max_dist=_ADAPTIVE_MAX_DIST,
+                max_attempts=2000,
+                mesh_sample=True,
             )
             controller.set_new_goal(goal_pose, start_pos)
             env.set_goal(goal_pose)
 
-            goals_before = controller._total_goals_reached
-            for step in range(150):
+            goals_before = (
+                controller._total_goals_reached
+            )
+            for _ in range(_ADAPTIVE_MAX_STEPS):
                 current_pose = env.get_pose()
                 sensor_data = env.get_sensor_data()
-                state = controller._compute_state(current_pose, sensor_data)
-                action_index, source = manager.get_action(state, current_pose, sensor_data)
-                state, done = controller.update_only(current_pose, sensor_data, action_index)
+                state = controller._compute_state(
+                    current_pose, sensor_data
+                )
+                action_index, _source = manager.get_action(
+                    state, current_pose, sensor_data
+                )
+                _state, done = controller.update_only(
+                    current_pose, sensor_data, action_index
+                )
                 if done:
                     break
                 env.step(action_index, controller.action_space)
 
-            success = controller._total_goals_reached > goals_before
-            transitions = controller.success_trails.copy() if success else []
-            manager.on_episode_complete(success=success, transitions=transitions)
+            success = (
+                controller._total_goals_reached
+                > goals_before
+            )
+            transitions = (
+                controller.success_trails.copy() if success else []
+            )
+            manager.on_episode_complete(
+                success=success, transitions=transitions
+            )
             manager.arbitrator.on_episode_end(success)
+
+            if (episode + 1) % _ADAPTIVE_LOG_INTERVAL == 0:
+                logger.info(
+                    "Adaptive episode %d: %s",
+                    episode + 1,
+                    manager.get_stats(),
+                )
 
         controller.save(str(self.runs_dir / "adaptive_q"))
         if manager.sac_trainer:
-            manager.sac_trainer.save(str(self.runs_dir / "adaptive_sac"))
+            manager.sac_trainer.save(
+                str(self.runs_dir / "adaptive_sac")
+            )

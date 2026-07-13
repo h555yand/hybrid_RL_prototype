@@ -1,10 +1,17 @@
-# action_space.py
-import numpy as np
+# Copyright 2025-2026 Thousand Brains Project
+#
+# Copyright may exist in Contributors' modifications
+# and/or contributions to the work.
+#
+# Use of this source code is governed by the MIT
+# license that can be found in the LICENSE file or at
+# https://opensource.org/licenses/MIT.
+
 import logging
 from dataclasses import dataclass
-from typing import Optional, List, Tuple, NewType
+from typing import List, NewType, Optional, Tuple
 
-from scipy.spatial.transform import Rotation as R
+import numpy as np
 
 AgentID = NewType("AgentID", str)
 
@@ -14,6 +21,7 @@ logger = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class ActionInfo:
     """Metadata about a discrete action for logging and heuristics.
+
     Attributes:
         index: Action index in Q-table (0 to num_actions-1).
         name: Human-readable name.
@@ -57,6 +65,9 @@ class ActionSpace:
             15: SetSensorRotation - (counter-clockwise)
             16: OrientHorizontal
             17: OrientVertical
+            18: Detach
+            19: DetachEdge
+            20: MoveForward Small
 
     Args:
         agent_id: Monty agent identifier for Action objects.
@@ -232,7 +243,7 @@ class ActionSpace:
             ActionInfo dataclass with name, category, etc.
         """
         return self._action_info[action_index]
-    
+
 
     # ══════════════════════════════════════════════════════════
     # HEURISTIC SUPPORT
@@ -277,7 +288,7 @@ class ActionSpace:
                         max(ai.index, ai.opposite_index))
                 pairs.add(pair)
         return pairs
-    
+
     def are_opposite(self, action_a: int, action_b: int) -> bool:
         """Check if two actions are opposites (for anti-oscillation).
 

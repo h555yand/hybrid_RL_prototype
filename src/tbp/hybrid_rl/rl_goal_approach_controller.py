@@ -1,26 +1,32 @@
-# rl_goal_approach_controller.py
-"""
-RL Goal Approach Controller.
+# Copyright 2025-2026 Thousand Brains Project
+#
+# Copyright may exist in Contributors' modifications
+# and/or contributions to the work.
+#
+# Use of this source code is governed by the MIT
+# license that can be found in the LICENSE file or at
+# https://opensource.org/licenses/MIT.
+
+"""RL Goal Approach Controller.
 
 Receives goal_pose, uses current proprioceptive state + sensor data to choose actions,
 and learns from dense reward (distance reduction to goal).
 """
 
-import numpy as np
-import logging
-from typing import Optional, Dict, Any, Tuple, List
-from scipy.spatial.transform import Rotation as R
-import os
 import json
+import logging
+import os
+import pathlib
+from typing import Any, Dict, List, Optional, Tuple
 
-from tbp.monty.frameworks.actions.actions import Action
+import numpy as np
+from scipy.spatial.transform import Rotation as R
 
-from .hnsw_state_store import HNSWStateStore
 from .action_space import ActionSpace
 from .config import DEFAULT_CONFIG
+from .hnsw_state_store import HNSWStateStore
 
 logger = logging.getLogger(__name__)
-# logger.setLevel(logging.DEBUG)
 
 
 class RLGoalApproachController:
@@ -51,18 +57,10 @@ class RLGoalApproachController:
         # Merge config with defaults
         self.config = {**DEFAULT_CONFIG, **(config or {})}
         self.agent_id = agent_id
-        # Режим работы
+        # Mode
         self.mode = self.config.get("mode", "auto")
-        # "train"    — всегда обучение
-        # "train_adapt_epsilon"    — обучение с адаптивным epsilon
-        # "eval"     — всегда inference
-        # "auto"     — определяем автоматически
-        
-        # Epsilon для eval режима
         self.eval_epsilon = self.config.get("eval_epsilon", 0.02)
         self.eval_alpha_multiplier = self.config.get("eval_alpha_multiplier", 0.1)
-        
-        # Порог для auto режима
         self.auto_train_threshold = self.config.get(
             "auto_train_threshold", 100
         )
@@ -78,7 +76,6 @@ class RLGoalApproachController:
         self.num_actions = self.action_space.NUM_ACTIONS
 
         # HNSW Q-store
-        # self.q_store = HNSWStateStore(config=self.config)
         self.q_store_free = HNSWStateStore(config=self.config, name="free")
         self.q_store_surface = HNSWStateStore(config=self.config, name="surface")
 
@@ -160,14 +157,13 @@ class RLGoalApproachController:
     # ══════════════════════════════════════════════════════════
     @property
     def is_training(self):
-        """Определяем режим."""
+        """Define mode."""
         if self.mode in ("train", "train_adapt_epsilon"):
             return True
-        elif self.mode == "eval":
+        if self.mode == "eval":
             return False
-        else:
-            # AUTO: если мало опыта → train, иначе → eval
-            return self.q_store.next_id < self.auto_train_threshold
+        # AUTO: If have little experience → train, otherwise → eval
+        return self.q_store.next_id < self.auto_train_threshold
 
     def set_new_goal(self, goal_pose: np.ndarray, start_pos: np.ndarray):
         """Called when LM provides a new goal state.
@@ -234,7 +230,6 @@ class RLGoalApproachController:
             logger.warning("step() called without goal. Call set_new_goal() first.")
             return None, None
 
-        # ← ДОБАВИТЬ: сохраняем sub_steps из sensor_data
         self._last_detach_sub_steps = sensor_data.get("detach_sub_steps", 1)
         self._steps += 1
         self._total_steps += 1
@@ -260,7 +255,7 @@ class RLGoalApproachController:
         if self._prev_state is not None:
             prev_store = self._select_store(self._prev_state)
         next_store = self._select_store(state)
-        
+
         if self._prev_state is not None:
             reward, done, termination_reason = self._compute_reward(
                 state, self._prev_state, self._last_action, collision
@@ -276,20 +271,9 @@ class RLGoalApproachController:
             if done:
                 td_target = reward
             else:
-                # next_q = self.q_store.get_q_values(state)
                 next_q = next_store.get_q_values(state)
                 td_target = reward + self.gamma * np.max(next_q)
 
-            #self.q_store.update_q_value(
-            #    self._prev_state, self._last_action, td_target, self.alpha
-            #)
-            # Обучение: обновляем Q-values
-            #self.q_store.update_q_value(
-            #    self._prev_state,
-            #    self._last_action,
-            #    td_target,
-            #    self._get_learning_rate(),
-            #)
             prev_store.update_q_value(self._prev_state, self._last_action, td_target, self._get_learning_rate())
 
             if done:
@@ -313,11 +297,11 @@ class RLGoalApproachController:
         self._prev_sensor_data = sensor_data
         self._prev_action = self._last_action
         self._last_action = action_index
-        # Статистика
+        # Info
         action_name = self.action_space.get_info(action_index).name
         self._global_action_counts[action_name] = self._global_action_counts.get(action_name, 0) + 1
 
-        # Decay epsilon только в training
+        # Decay epsilon only in training
         if not self.is_training:
             self.epsilon = self.eval_epsilon
 
@@ -391,6 +375,7 @@ class RLGoalApproachController:
         ])
 
         return state
+
     # ══════════════════════════════════════════════════════════
     # COLLISION DETECTION
     # ══════════════════════════════════════════════════════════
@@ -398,9 +383,8 @@ class RLGoalApproachController:
         if sensor_data.get("passed_through", False):
             return "surface_violation"
 
-        # ← ДОБАВИТЬ: detach тоже может иметь коллизию
         if sensor_data.get("detach_had_collision", False):
-            return "detach_collision"               # новый тип коллизии
+            return "detach_collision"
 
         depth = sensor_data.get("depth", self.config["max_sensor_range"])
 
@@ -435,10 +419,11 @@ class RLGoalApproachController:
                 return "lost_object"
 
         return None
+
     # ══════════════════════════════════════════════════════════
     # REWARD
     # ══════════════════════════════════════════════════════════
-    
+
     def _compute_reward(self, state, prev_state, action, collision):
         cfg = self.config
         reward = 0.0
@@ -530,7 +515,7 @@ class RLGoalApproachController:
                 termination_reason = "timeout"
 
         return reward, done, termination_reason
-    
+
     # ══════════════════════════════════════════════════════════
     # ACTION SELECTION
     # ══════════════════════════════════════════════════════════
@@ -598,12 +583,11 @@ class RLGoalApproachController:
         )
 
     def _get_current_epsilon(self):
-        """Epsilon зависит от режима."""
+        """Epsilon depends from mode."""
         if self.is_training:
             return self.epsilon  # decaying
-        else:
-            return self.eval_epsilon  # фиксированный, маленький
-    
+        return self.eval_epsilon  # fixed, small
+
     def _generate_choice_interpretation(
         self,
         action_index: int,
@@ -623,21 +607,21 @@ class RLGoalApproachController:
 
         if is_random:
             return (
-                f"##### Случайное действие: {action_name} - {action_index} "
+                f"##### Random: {action_name} - {action_index} "
                 f"epsilon {eps}."
             )
-        elif is_heuristic_override:
+        if is_heuristic_override:
             return (
-                f"##### Эвристика действие: {action_name} - {action_index} "
+                f"##### Heuristics: {action_name} - {action_index} "
                 f"epsilon {eps}."
             )
 
         return (
-            f"##### Softmax действие; {action_name}, уверенность {confidence:.0%}). "
+            f"##### Softmax; {action_name}, confidence {confidence:.0%}). "
             f"blend: {blend}. "
-            f"Q рекомендует: {q_action_name} - {q_recommends}; Эвристика: {h_action_name} - {h_recommends}. "
+            f"Q recommends: {q_action_name} - {q_recommends}; Heuristics: {h_action_name} - {h_recommends}. "
         )
-    
+
     def _choose_action(self,
         state: np.ndarray,
         current_pose: np.ndarray,
@@ -674,8 +658,8 @@ class RLGoalApproachController:
         if self.temperature_override is not None:
             temperature = self.temperature_override
 
-        # ═══ ACTION MASK: физически невалидные действия ═══
-        if state[11] < 0.5:  # on_object = 0 → агент в воздухе
+        # ═══ ACTION MASK: physically invalid actions ═══
+        if state[11] < 0.5:  # on_object = 0 → agent in the air
             combined[self.action_space.IDX_DETACH] = -1e9
             combined[self.action_space.IDX_DETACH_EDGE] = -1e9
 
@@ -795,20 +779,20 @@ class RLGoalApproachController:
         on_object = float(state[11])
         alignment = float(state[12])
         distance = float(state[13])
-        point_normal = sensor_data.get("point_normal", None)
+        point_normal = sensor_data.get("point_normal")
 
         eps = 1e-8
 
         rot = R.from_euler("xyz", current_pose[3:6], degrees=True)
 
-        # Адаптивный порог detach: на кривых поверхностях alignment
-        # быстрее становится отрицательным, порог мягче
+        # Adaptive detach threshold: on curved surfaces, 
+        # alignment becomes negative faster, and the threshold is softer
         curvature = abs(float(state[9])) + abs(float(state[10]))
         DETACH_ALIGN_THR = -0.3 + min(curvature * 5.0, 0.2)
         SURFACE_STRENGTH = 2.0
 
-        # Близко к цели: distance < 9mm И цель доступна по поверхности
-        # Используется для разрешения orient действий и блокировки detach
+        # Close to target: distance < 9mm AND the target is accessible on the surface
+        # Used to enable orient actions and block detach
         close_to_goal = (
             distance < 3.0 * self.action_space.surface_step
             and alignment > DETACH_ALIGN_THR
@@ -832,7 +816,7 @@ class RLGoalApproachController:
             )
 
         # ────────────────────────────────────────────────────
-        # 0) SUPPRESS: подавить бесполезные действия
+        # 0) SUPPRESS: suppress useless actions
         # ────────────────────────────────────────────────────
         suppress = np.zeros(self.num_actions, dtype=float)
         suppress[self.action_space.IDX_ROTATE_POS] -= 2.0
@@ -842,17 +826,17 @@ class RLGoalApproachController:
             suppress[self.action_space.IDX_ORIENT_HOR] -= 2.0
             suppress[self.action_space.IDX_ORIENT_VERT] -= 2.0
 
-        # Подавить detach в воздухе
+        # Suppress detach in the air
         if on_object < 0.5:
             suppress[self.action_space.IDX_DETACH] -= 5.0
             suppress[self.action_space.IDX_DETACH_EDGE] -= 5.0
 
-        # Подавить detach подряд
+        # Suppress detach in a row
         if self._last_action in (self.action_space.IDX_DETACH, self.action_space.IDX_DETACH_EDGE):
             suppress[self.action_space.IDX_DETACH] -= 5.0
             suppress[self.action_space.IDX_DETACH_EDGE] -= 5.0
 
-        # Подавить detach если был в последних 3 шагах
+        # Suppress detach if it was in the last 3 steps
         recent_detach = sum(
             1 for tr in self._episode_transitions[-3:]
             if tr["action"] in (self.action_space.IDX_DETACH, self.action_space.IDX_DETACH_EDGE)
@@ -861,8 +845,8 @@ class RLGoalApproachController:
             suppress[self.action_space.IDX_DETACH] -= 5.0
             suppress[self.action_space.IDX_DETACH_EDGE] -= 5.0
 
-        # Подавить detach/detach_edge по умолчанию —
-        # они будут разблокированы в секции detach если нужны
+        # Suppress detach/detach_edge by default —
+        # They will be unblocked in the detach section if needed
         suppress[self.action_space.IDX_DETACH] -= 3.0
         suppress[self.action_space.IDX_DETACH_EDGE] -= 3.0
 
@@ -870,16 +854,16 @@ class RLGoalApproachController:
         components["suppress"] = suppress
 
         # ────────────────────────────────────────────────────
-        # 1) SURFACE MOVE: ползти по поверхности к цели
-        # Ситуация: агент на поверхности, цель доступна (alignment >= порог)
-        # Принцип: проецируем направление на цель на касательную плоскость,
-        # выбираем из 8 tangential направлений то, которое максимально
-        # уменьшает тангенциальную ошибку
+        # 1) SURFACE MOVE: crawl along the surface toward the target
+        # Situation: agent on the surface, target accessible (alignment >= threshold)
+        # Principle: project the target direction onto the tangent plane,
+        # select the one from 8 tangential directions that maximizes
+        # reduces tangential error
         # ────────────────────────────────────────────────────
         surface_move = np.zeros(self.num_actions, dtype=float)
 
         if on_object > 0.5 and alignment >= DETACH_ALIGN_THR:
-            n_world = sensor_data.get("point_normal", None)
+            n_world = sensor_data.get("point_normal")
 
             if n_world is not None:
                 n_world = np.asarray(n_world, dtype=float)
@@ -894,8 +878,8 @@ class RLGoalApproachController:
                     tangential_dist = float(np.linalg.norm(e_t))
                     normal_dist = abs(float(np.dot(e_world, n_hat)))
 
-                    # should_crawl: ползти если цель больше "вдоль" чем "за" поверхностью
-                    # Если normal_dist >> tangential_dist — detach эвристика решит
+                    # should_crawl: crawl if the target is more "along" than "behind" the surface
+                    # If normal_dist >> tangential_dist — the detach heuristic will decide
                     should_crawl = not (normal_dist > tangential_dist * 2.0 and distance > 3 * step)
 
                     if should_crawl:
@@ -951,10 +935,10 @@ class RLGoalApproachController:
         components["surface_move"] = surface_move
 
         # ────────────────────────────────────────────────────
-        # 2) STAGNATION: застрял на поверхности — вызвать detach
-        # Ситуация: агент на поверхности, alignment нормальный,
-        # но за 5 шагов distance не уменьшилась (застрял у ребра, в вогнутости)
-        # Принцип: если tangential ползание не помогает — detach перелетит
+        # 2) STAGNATION: Stuck on the surface - call detach
+        # Situation: Agent on the surface, alignment is normal,
+        # but the distance hasn't decreased after 5 steps (stuck near an edge, in a concavity)
+        # Principle: If tangential crawling doesn't help, detach will fly over
         # ────────────────────────────────────────────────────
         stagnation_override = np.zeros(self.num_actions, dtype=float)
         if on_object > 0.5 and alignment >= DETACH_ALIGN_THR:
@@ -972,15 +956,15 @@ class RLGoalApproachController:
         components["stagnation_override"] = stagnation_override
 
         # ────────────────────────────────────────────────────
-        # 3) DETACH: цель недоступна — оторваться и перелететь
+        # 3) DETACH: the goal is unreachable - break away and fly over
         # ────────────────────────────────────────────────────
         detach = np.zeros(self.num_actions, dtype=float)
         if on_object > 0.5:
             need_detach = False
             need_edge_detach = False
 
-            n_world = sensor_data.get("point_normal", None)
-            goal_normal = sensor_data.get("goal_normal", None)
+            n_world = sensor_data.get("point_normal")
+            goal_normal = sensor_data.get("goal_normal")
             path_blocked = sensor_data.get("path_blocked", False)
 
             if n_world is not None:
@@ -993,19 +977,19 @@ class RLGoalApproachController:
                     tangential_dist = float(np.linalg.norm(e_t))
                     normal_dist = abs(float(np.dot(e_world, n_hat)))
 
-                    # ═══ Когда нужен detach (любой тип) ═══
+                    # ═══ When detachment is needed (any type) ═══
                     needs_fly = False
 
                     if path_blocked:
                         needs_fly = True
                     elif alignment < DETACH_ALIGN_THR:
-                        # alignment отрицательный, но path_blocked=False
-                        # значит прямая видимость есть — ползти по вогнутой поверхности
+                        # alignment is negative, but path_blocked=False
+                        # this means there is direct line of sight—crawl along a concave surface
                         needs_fly = False
                     elif normal_dist > tangential_dist * 2.0 and distance > 3.0 * self.action_space.surface_step:
                         needs_fly = True
 
-                    # ═══ Выбор типа: detach vs detach_edge ═══
+                    # ═══ Choosing a Type: Detach vs. Detach_Edge ═══
                     if needs_fly and goal_normal is not None:
                         goal_n = np.array(goal_normal, dtype=float)
                         goal_n /= (np.linalg.norm(goal_n) + 1e-12)
@@ -1028,7 +1012,7 @@ class RLGoalApproachController:
                             f"tangential_dist={tangential_dist:.1f}"
                         )
 
-            # ═══ Применение detach bias ═══
+            # ═══ Using detach bias ═══
             if need_detach or need_edge_detach:
                 recent_detach_count = sum(
                     1 for tr in self._episode_transitions[-5:]
@@ -1038,10 +1022,10 @@ class RLGoalApproachController:
 
                 if recent_detach_count < 1 and not last_was_detach and not close_to_goal:
                     if need_edge_detach:
-                        # +8.0 = компенсировать suppress (-3.0) + сильный bias (+5.0)
+                        # +8.0 = compensate suppress (-3.0) + strong bias (+5.0)
                         detach[self.action_space.IDX_DETACH_EDGE] += 8.0
                     else:
-                        # +8.0 = компенсировать suppress (-3.0) + сильный bias (+5.0)
+                        # +8.0 = compensate suppress (-3.0) + strong bias (+5.0)
                         detach[self.action_space.IDX_DETACH] += 8.0
                     for idx in range(8):
                         detach[idx] -= 2.0
@@ -1050,11 +1034,11 @@ class RLGoalApproachController:
                     detach[self.action_space.IDX_LOOK_UP] -= 1.0
                     detach[self.action_space.IDX_LOOK_DOWN] -= 1.0
 
-            # ═══ Alignment отрицательный — рекомендовать обычный detach ═══
-            # Ситуация: агент на поверхности, цель "за" поверхностью
-            # (например на дне, а цель на боковой стенке)
-            # surface_move не работает при отрицательном alignment,
-            # нужен detach чтобы оторваться и полететь к цели
+            # ═══ Alignment negative — recommend regular detach ═══
+            # Situation: agent on the surface, target "behind" the surface
+            # (for example, on the bottom, and the target on the side wall)
+            # surface_move doesn't work with negative alignment,
+            # detach is needed to break away and fly to the target
             if not need_detach and not need_edge_detach:
                 if alignment < DETACH_ALIGN_THR and distance > 3.0 * self.action_space.surface_step:
                     recent_detach_count = sum(
@@ -1064,9 +1048,9 @@ class RLGoalApproachController:
                     last_was_detach = self._last_action in (self.action_space.IDX_DETACH, self.action_space.IDX_DETACH_EDGE)
 
                     if recent_detach_count < 1 and not last_was_detach:
-                        # Обычный detach, НЕ edge — цель не за стенкой,
-                        # а просто на другой грани
-                        # +6.0 = компенсировать suppress (-3.0) + bias (+3.0)
+                        # Regular detach, NOT edge—the target isn't behind the wall,
+                        # but simply on the other edge
+                        # +6.0 = compensate for suppress (-3.0) + bias (+3.0)
                         detach[self.action_space.IDX_DETACH] += 6.0
                         for idx in range(8):
                             detach[idx] -= 2.0
@@ -1077,34 +1061,34 @@ class RLGoalApproachController:
         components["detach"] = detach
 
         # ────────────────────────────────────────────────────
-        # 4) STEER IN AIR: навигация в воздухе к цели
-        # Ситуация: агент не на поверхности (после detach или соскользнул)
-        # Принцип: симулируем каждый поворот и выбираем тот,
-        # который максимально приближает взгляд к цели (max dot product)
+        # 4) STEER IN AIR: Air navigation to the target
+        # Situation: The agent is not on the surface (after detachment or slipped)
+        # Principle: We simulate every turn and choose the one
+        # that brings the view closest to the target (max dot product)
         # ────────────────────────────────────────────────────
         steer = np.zeros(self.num_actions, dtype=float)
         if on_object <= 0.5:
             STEER_STRENGTH = 4.0
             rotation_step = self.action_space.rotation_step
 
-            # Направление на цель в мировых координатах
+            # Direction to target in world coordinates
             goal_dir_world = self._current_goal[:3] - current_pose[:3]
             goal_dist_world = np.linalg.norm(goal_dir_world)
             if goal_dist_world > 1e-8:
                 goal_dir_world /= goal_dist_world
 
-            # Текущее направление взгляда
+            # Current direction of gaze
             rot_current = R.from_euler("xyz", current_pose[3:6], degrees=True)
             forward_current = rot_current.apply([0, 0, -1])
 
-            # Текущий dot product (насколько смотрим на цель)
+            # Current dot product (as far as we're looking at the target)
             dot_current = np.dot(forward_current, goal_dir_world)
 
-            # Угол к цели
+            # Angle to target
             angle_to_goal = np.degrees(np.arccos(np.clip(dot_current, -1, 1)))
             deviation = min(angle_to_goal / 45.0, 1.0)
 
-            # Симулируем 4 поворота и считаем improvement
+            # simulate 4 turns and calculate the improvement
             pose_angles = current_pose[3:6]
 
             # look_up (pitch += rotation_step)
@@ -1131,7 +1115,7 @@ class RLGoalApproachController:
             ).apply([0, 0, -1])
             improvement_right = np.dot(forward_right, goal_dir_world) - dot_current
 
-            # Pitch: выбираем лучшее направление
+            # Pitch: choosing the best direction
             best_pitch_improvement = max(improvement_up, improvement_down)
             if best_pitch_improvement > 0.001:
                 pitch_bonus = STEER_STRENGTH * deviation
@@ -1140,15 +1124,15 @@ class RLGoalApproachController:
                 else:
                     steer[self.action_space.IDX_LOOK_DOWN] += pitch_bonus
 
-            # Yaw: выбираем лучшее направление
+            # Yaw: choosing the best direction
             best_yaw_improvement = max(improvement_left, improvement_right)
             if best_yaw_improvement > 0.001:
-                # Yaw только если pitch не слишком большой
-                # (когда цель прямо внизу — yaw ненадёжен)
-                height_axis = getattr(self, '_height_axis_cache',
+                # Yaw only if the pitch isn't too high
+                # (When the target is right below, yaw is unreliable)
+                height_axis = getattr(self, "_height_axis_cache",
                     self.action_space.rotation_step)  # fallback
-                if hasattr(self, '_current_goal'):
-                    h_ax = getattr(self, 'height_axis_cache', 2)
+                if hasattr(self, "_current_goal"):
+                    h_ax = getattr(self, "height_axis_cache", 2)
                     horiz_components = [goal_dir_world[i] for i in range(3) if i != h_ax]
                     abs_horiz = np.sqrt(sum(c**2 for c in horiz_components))
                 else:
@@ -1163,14 +1147,14 @@ class RLGoalApproachController:
                     else:
                         steer[self.action_space.IDX_TURN_RIGHT] += yaw_bonus
 
-            # Forward: сила зависит от выравнивания
+            # Forward: strength depends on alignment
             forward_weight = max(1.0 - deviation * 0.5, 0.5)
             steer[self.action_space.IDX_FREE_FORWARD] += STEER_STRENGTH * forward_weight
             steer[self.action_space.IDX_FREE_FORWARD_SMALL] += STEER_STRENGTH * forward_weight  # ← одинаковый bias
 
             steer[self.action_space.IDX_FREE_BACKWARD] -= 2.0
 
-            # Подавить бесполезные действия в воздухе
+            # Suppress useless actions in the air
             for idx in range(8):  # move_tangentially 0-7
                 steer[idx] -= 3.0
             steer[self.action_space.IDX_ORIENT_HOR] -= 3.0
@@ -1182,10 +1166,10 @@ class RLGoalApproachController:
         components["steer_in_air"] = steer
 
         # ────────────────────────────────────────────────────
-        # 5) DAMP FREE: на поверхности подавить free_forward/backward
-        # Ситуация: агент на поверхности, цель доступна по поверхности
-        # Принцип: tangential ползание эффективнее чем free_forward
-        # на поверхности, free_forward может вызвать коллизию со стенкой
+        # 5) DAMP FREE: on the surface suppress free_forward/backward 
+        # Situation: agent on the surface, target accessible by surface 
+        # Principle: tangential crawling is more efficient than free_forward 
+        # on a surface, free_forward may cause a collision with a wall
         # ────────────────────────────────────────────────────
         damp_free = np.zeros(self.num_actions, dtype=float)
         if on_object > 0.5:
@@ -1196,7 +1180,7 @@ class RLGoalApproachController:
         components["damp_free_on_surface"] = damp_free
 
         return bias, components
-    
+
     # ══════════════════════════════════════════════════════════
     # COORDINATE TRANSFORMS
     # ══════════════════════════════════════════════════════════
@@ -1358,7 +1342,7 @@ class RLGoalApproachController:
         self._episode_reward = 0.0
         self._episode_transitions = []
 
-# ══════════════════════════════════════════════════════════
+    # ══════════════════════════════════════════════════════════
     # DIAGNOSTICS
     # ══════════════════════════════════════════════════════════
 
@@ -1466,13 +1450,12 @@ class RLGoalApproachController:
             dirpath: Directory path. Created if doesn't exist.
         """
         import os
-        os.makedirs(dirpath, exist_ok=True)
+        pathlib.Path(dirpath).mkdir(exist_ok=True, parents=True)
 
         # Save Q-store (with native HNSW index for fast reload)
         self.q_store_free.save_with_index(os.path.join(dirpath, "q_store_free"))
         self.q_store_surface.save_with_index(os.path.join(dirpath, "q_store_surface"))
 
-        # Сохраняем текущий epsilon
         controller_state = {
             "epsilon": self.epsilon,
             "total_episodes": self._total_episodes,
@@ -1481,14 +1464,7 @@ class RLGoalApproachController:
             "mode": self.mode,
             "config": self.config,
         }
-        # Save controller state
-        #controller_state = {
-        #    "epsilon": self.epsilon,
-        #    "total_episodes": self._total_episodes,
-        #    "total_steps": self._total_steps,
-        #    "total_goals_reached": self._total_goals_reached,
-        #    "config": self.config,
-        #}
+
         np.savez(
             os.path.join(dirpath, "controller_state.npz"),
             **{k: np.array(v) if not isinstance(v, dict) else np.array([0])
@@ -1497,10 +1473,10 @@ class RLGoalApproachController:
 
         # Save config separately as readable format
         import json
-        with open(os.path.join(dirpath, "config.json"), "w") as f:
+        with pathlib.Path(os.path.join(dirpath, "config.json")).open("w") as f:
             json.dump(self.config, f, indent=2)
 
-        logger.info(f"Controller saved to {dirpath}")
+        logger.info("Controller saved to %s", dirpath)
 
     @classmethod
     def load(cls, dirpath: str, agent_id: str, config=None) -> "RLGoalApproachController":
@@ -1514,13 +1490,13 @@ class RLGoalApproachController:
             Restored controller with learned Q-values.
         """
         # Load config
-        with open(os.path.join(dirpath, "config.json"), "r") as f:
+        with pathlib.Path(os.path.join(dirpath, "config.json")).open() as f:
             saved_config = json.load(f)
         cfg = {**saved_config, **(config or {})}
 
         # Create controller
         controller = cls(agent_id=agent_id, config=cfg)
-        
+
         # Load Q-store (fast path with native index, fallback to rebuild)
         controller.q_store_free = HNSWStateStore.load_with_index(
             os.path.join(dirpath, "q_store_free"), extra_cfg=config
