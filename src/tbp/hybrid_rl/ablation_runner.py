@@ -121,6 +121,7 @@ def run_eval_per_seed(  # noqa: PLR0913
             rates = metrics.get("stats", {}).get(
                 "termination_rates", {}
             )
+            stats = metrics.get("stats", {})
             seed_results[f"level_{level_idx}"] = {
                 "success_rate": float(
                     metrics.get("success_rate", 0.0)
@@ -129,8 +130,16 @@ def run_eval_per_seed(  # noqa: PLR0913
                 "collision_rate": float(
                     rates.get("collision_surface_violation", 0.0)
                 ),
-                "collision_stats": metrics.get("stats", {}).get(
-                    "collision_stats", {}
+                "collision_stats": stats.get("collision_stats", {}),
+                "global_action_counts": stats.get(
+                    "global_action_counts", {}
+                ),
+                "collision_rate_per_action": stats.get(
+                    "collision_rate_per_action", {}
+                ),
+                "steps_per_success": stats.get("steps_per_success", 0),
+                "surface_air_ratio": stats.get(
+                    "surface_air_ratio", {}
                 ),
             }
 

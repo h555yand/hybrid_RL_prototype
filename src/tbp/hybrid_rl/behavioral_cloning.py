@@ -10,10 +10,10 @@
 """BC Actor Network for Parameterized SAC.
 Behavioral Cloning: learns to copy Q-learning expert from successful trajectories.
 """
-
+from __future__ import annotations
 import logging
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Any
 
 import numpy as np
 import torch
@@ -281,3 +281,97 @@ class BCTrainer:
         param_dim = len(action_params_norm)
         action_params = action_params_norm * self.param_std[:param_dim] + self.param_mean[:param_dim]
         return action_type, action_params
+    
+    def get_training_stats(
+        self, transitions: list[PSACTransition]
+    ) -> dict[str, Any]:
+        """Get comprehensive BC training statistics.
+
+        Args:
+            transitions: Original BC transitions for data analysis.
+
+        Returns:
+            Dict with data distribution, training metrics,
+            and per-mesh breakdown.
+        """
+        type_names = ExperienceExtractor.get_type_names()
+        mesh_id_to_name = {
+            v: k
+            for k, v in ExperienceExtractor.MESH_NAME_TO_ID.items()
+        }
+
+        # Data distribution by action type
+        type_counts: dict[str, int] = {}
+        for tr in transitions:
+            name = type_names.get(
+                tr.action_type, f"type_{tr.action_type}"
+            )
+            type_counts[name] = type_counts.get(name, 0) + 1
+
+        # Data distribution by mesh
+        mesh_counts: dict[str, int] = {}
+        for tr in transitions:
+            mesh_label = mesh_id_to_name.get(
+                tr.mesh_id, f"unknown_{tr.mesh_id}"
+            )
+            mesh_counts[mesh_label] = (
+                mesh_counts.get(mesh_label, 0) + 1
+            )
+
+        # Validation accuracy per type
+        per_type_accuracy: dict[str, float] = {}
+        if hasattr(self, "val_states") and len(self.val_states) > 0:
+            self.actor.eval()
+            with torch.no_grad():
+                type_logits, _ = self.actor(self.val_states)
+                predicted = torch.argmax(type_logits, dim=1)
+                for type_id in range(self.num_types):
+                    mask = self.val_types == type_id
+                    if mask.sum() > 0:
+                        correct = (
+                            (predicted[mask] == type_id)
+                            .float()
+                            .mean()
+                            .item()
+                        )
+                        name = type_names.get(
+                            type_id, f"type_{type_id}"
+                        )
+                        per_type_accuracy[name] = round(
+                            correct, 4
+                        )
+
+        # Overall val metrics
+        val_loss = 0.0
+        val_acc = 0.0
+        if hasattr(self, "val_states") and len(self.val_states) > 0:
+            self.actor.eval()
+            with torch.no_grad():
+                loss, _tl, _pl, acc = self._compute_loss(
+                    self.val_states,
+                    self.val_types,
+                    self.val_params,
+                )
+                val_loss = loss.item()
+                val_acc = acc
+
+        return {
+            "total_transitions": len(transitions),
+            "train_size": (
+                len(self.train_states)
+                if hasattr(self, "train_states")
+                else 0
+            ),
+            "val_size": (
+                len(self.val_states)
+                if hasattr(self, "val_states")
+                else 0
+            ),
+            "action_type_distribution": type_counts,
+            "mesh_distribution": mesh_counts,
+            "val_loss": round(val_loss, 4),
+            "val_accuracy": round(val_acc, 4),
+            "per_type_accuracy": per_type_accuracy,
+            "num_types": self.num_types,
+            "state_dim": self.state_dim,
+        }

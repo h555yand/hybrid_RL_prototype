@@ -8,7 +8,7 @@ experiment:
   config:
     seed: 42
     visualise: false
-    do_train: true
+    do_train: false
     do_eval: true
     do_bc_train: true
     do_sac_train: true
@@ -85,11 +85,11 @@ experiment:
 
     sac_meshes: [cube, cylinder, mug, cup]
     sac_episodes_per_mesh:
-      cube: 1000
-      cylinder: 1500
-      mug: 2000
-      cup: 2000
-    sac_eval_episodes_per_level: 500
+      cube: 100
+      cylinder: 150
+      mug: 200
+      cup: 200
+    sac_eval_episodes_per_level: 50
 
     adaptive_mesh: cup
     adaptive_episodes: 3000

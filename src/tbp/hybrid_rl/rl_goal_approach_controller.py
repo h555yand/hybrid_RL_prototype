@@ -1350,7 +1350,8 @@ class RLGoalApproachController:
         """Get controller statistics for monitoring.
 
         Returns:
-            Dict with episode counts, success rate, Q-store stats.
+            Dict with episode counts, success rate, Q-store stats,
+            action counts, collision rates per action, and efficiency metrics.
         """
         success_rate = (
             self._total_goals_reached / max(self._total_episodes, 1)
@@ -1359,6 +1360,33 @@ class RLGoalApproachController:
         termination_rates = {
             k: float(v) / episodes for k, v in self._termination_counts.items()
         }
+
+        # Collision rate per action: collisions[action] / action_counts[action]
+        collision_rate_per_action = {}
+        for action_name, collision_count in self._collision_stats.items():
+            total_calls = self._global_action_counts.get(action_name, 0)
+            collision_rate_per_action[action_name] = (
+                float(collision_count) / max(total_calls, 1)
+            )
+
+        # Steps per success
+        steps_per_success = (
+            float(self._total_steps) / max(self._total_goals_reached, 1)
+        )
+
+        # Surface vs air ratio
+        surface_actions = {"move_tangentially", "orient_horizontal", "orient_vertical"}
+        air_actions = {
+            "free_forward", "free_forward_small", "free_backward",
+            "look_up", "look_down", "turn_left", "turn_right",
+        }
+        surface_steps = sum(
+            self._global_action_counts.get(a, 0) for a in surface_actions
+        )
+        air_steps = sum(
+            self._global_action_counts.get(a, 0) for a in air_actions
+        )
+        total_nav_steps = max(surface_steps + air_steps, 1)
 
         stats = {
             "total_episodes": self._total_episodes,
@@ -1370,15 +1398,22 @@ class RLGoalApproachController:
             "current_episode_reward": self._episode_reward,
             "termination_counts": dict(self._termination_counts),
             "termination_rates": termination_rates,
-            # "q_store": self.q_store.get_stats(),
             "q_store_free": self.q_store_free.get_stats(),
             "q_store_surface": self.q_store_surface.get_stats(),
             "collision_stats": dict(self._collision_stats),
             "global_action_counts": dict(self._global_action_counts),
+            "collision_rate_per_action": collision_rate_per_action,
+            "steps_per_success": steps_per_success,
+            "surface_air_ratio": {
+                "surface_steps": surface_steps,
+                "air_steps": air_steps,
+                "surface_ratio": float(surface_steps) / total_nav_steps,
+                "air_ratio": float(air_steps) / total_nav_steps,
+            },
         }
 
         return stats
-
+    
     def update_only(self, current_pose, sensor_data, action_index):
         if self._current_goal is None:
             return None, True

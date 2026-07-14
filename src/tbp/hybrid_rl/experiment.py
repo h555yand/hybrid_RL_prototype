@@ -20,18 +20,21 @@ import json
 import logging
 import pickle
 import time
+import types
 from pathlib import Path
 from typing import Any
 
-import torch
 import numpy as np
+import torch
 from omegaconf import DictConfig, OmegaConf
+from typing_extensions import Self
 
 from tbp.hybrid_rl.ablation_runner import (
     GOAL_THRESHOLD_PER_LEVEL,
     run_episodes,
     run_eval_per_seed,
 )
+from tbp.hybrid_rl.action_interpreter import ActionInterpreter
 from tbp.hybrid_rl.adaptive_manager import AdaptiveTrainingManager
 from tbp.hybrid_rl.behavioral_cloning import BCTrainer
 from tbp.hybrid_rl.config import DEFAULT_CONFIG
@@ -41,7 +44,6 @@ from tbp.hybrid_rl.lightweight_env import LightweightEnv
 from tbp.hybrid_rl.mesh_factory import prepare_demo_meshes
 from tbp.hybrid_rl.rl_goal_approach_controller import RLGoalApproachController
 from tbp.hybrid_rl.sac_trainer import PSACTrainer
-from tbp.hybrid_rl.action_interpreter import ActionInterpreter
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +54,7 @@ _ADAPTIVE_LOG_INTERVAL = 100
 _SAC_WARMUP_STEPS = 5000
 _BC_NUM_EPOCHS = 200
 _EVAL_EPSILON = 0.02
+_COLLISION_DEPTH_THRESHOLD = 0.5
 
 
 class RLGoalApproachExperiment:
@@ -105,13 +108,20 @@ class RLGoalApproachExperiment:
                 [[10.0, 40.0], [20.0, 80.0], [40.0, 120.0]],
             )
         ]
-        self.train_seeds: list[int] = self.config.get("train_seeds", [11])
-        self.eval_seeds: list[int] = self.config.get("eval_seeds", [44])
+        self.train_seeds: list[int] = self.config.get(
+            "train_seeds", [11]
+        )
+        self.eval_seeds: list[int] = self.config.get(
+            "eval_seeds", [44]
+        )
         self.sac_eval_seeds: list[int] = self.config.get(
             "sac_eval_seeds", [77, 88, 99]
         )
         self.eval_episodes_per_level: int = self.config.get(
             "eval_episodes_per_level", 500
+        )
+        self.sac_eval_episodes_per_level: int = self.config.get(
+            "sac_eval_episodes_per_level", 500
         )
         self.regenerate_scripts: bool = self.config.get(
             "regenerate_scripts", True
@@ -125,18 +135,29 @@ class RLGoalApproachExperiment:
         self.promote_threshold: float = self.config.get(
             "promote_threshold", 0.55
         )
-        self.promote_window: int = self.config.get("promote_window", 100)
+        self.promote_window: int = self.config.get(
+            "promote_window", 100
+        )
 
-        self.sac_config: dict[str, Any] = self.config.get("sac_config", {})
+        self.sac_config: dict[str, Any] = self.config.get(
+            "sac_config", {}
+        )
         self.sac_meshes: list[str] = self.config.get(
             "sac_meshes", ["cube", "cylinder", "mug", "cup"]
         )
         self.sac_episodes_per_mesh: dict[str, int] = self.config.get(
             "sac_episodes_per_mesh",
-            {"cube": 1000, "cylinder": 1500, "mug": 2000, "cup": 2000},
+            {
+                "cube": 1000,
+                "cylinder": 1500,
+                "mug": 2000,
+                "cup": 2000,
+            },
         )
 
-        self.adaptive_mesh: str = self.config.get("adaptive_mesh", "cup")
+        self.adaptive_mesh: str = self.config.get(
+            "adaptive_mesh", "cup"
+        )
         self.adaptive_episodes: int = self.config.get(
             "adaptive_episodes", 3000
         )
@@ -144,12 +165,10 @@ class RLGoalApproachExperiment:
         self.eval_meshes: list[str] = self.config.get(
             "eval_meshes", ["cube", "cylinder", "mug", "cup"]
         )
-        self.sac_eval_episodes_per_level: int = self.config.get(
-            "sac_eval_episodes_per_level", 500
-        )
+
         self.unified_save_dir = str(self.runs_dir / "unified_q")
 
-    def __enter__(self) -> RLGoalApproachExperiment:
+    def __enter__(self) -> Self:
         """Set up experiment directories and demo meshes.
 
         Returns:
@@ -165,7 +184,7 @@ class RLGoalApproachExperiment:
         self,
         exc_type: type[BaseException] | None,
         exc_value: BaseException | None,
-        exc_traceback: Any,
+        exc_traceback: types.TracebackType | None,
     ) -> bool:
         """Clean up on context exit.
 
@@ -235,12 +254,16 @@ class RLGoalApproachExperiment:
             )
 
             for seed in self.train_seeds:
-                seed_save_dir = f"{self.unified_save_dir}_seed_{seed}"
+                seed_save_dir = (
+                    f"{self.unified_save_dir}_seed_{seed}"
+                )
                 load_dir = seed_save_dir if is_load else None
 
                 seed_pools = train_pools.get(seed)
                 episode_pools = (
-                    seed_pools.get("levels") if seed_pools else None
+                    seed_pools.get("levels")
+                    if seed_pools
+                    else None
                 )
 
                 curriculum_config = {
@@ -302,6 +325,7 @@ class RLGoalApproachExperiment:
 
         for mesh_name in self.eval_meshes:
             mesh_path = str(self.data_dir / f"{mesh_name}.stl")
+            logger.info("Evaluating: %s", mesh_name)
 
             eval_pools = get_or_generate_pools(
                 mesh_path=mesh_path,
@@ -330,16 +354,28 @@ class RLGoalApproachExperiment:
             all_eval_results[mesh_name] = eval_results
             all_bc_transitions.extend(bc_transitions)
 
+            mesh_output = (
+                self.data_dir / f"eval_result_{mesh_name}.json"
+            )
+            with mesh_output.open("w") as f:
+                json.dump(eval_results, f, indent=2)
+
         eval_output = self.data_dir / "eval_result_all.json"
         with eval_output.open("w") as f:
             json.dump(all_eval_results, f, indent=2)
 
         if all_bc_transitions:
+            # Filter for quality and balance
+            all_bc_transitions = self._filter_bc_transitions(
+                all_bc_transitions
+            )
+
             bc_output = self.data_dir / "bc_data.pkl"
             with bc_output.open("wb") as f:
-                pickle.dump(all_bc_transitions, f)
+                pickle.dump(all_bc_transitions, f)  # noqa: S301
             logger.info(
-                "BC data: %d transitions", len(all_bc_transitions)
+                "BC data: %d transitions",
+                len(all_bc_transitions),
             )
 
     def _run_bc_train(self) -> None:
@@ -352,6 +388,10 @@ class RLGoalApproachExperiment:
         with bc_path.open("rb") as f:
             bc_transitions = pickle.load(f)  # noqa: S301
 
+        logger.info(
+            "Loaded %d BC transitions", len(bc_transitions)
+        )
+
         num_types = len(ExperienceExtractor.get_type_names())
         trainer = BCTrainer(
             state_dim=self.rl_config.get("state_dim", 15),
@@ -359,6 +399,19 @@ class RLGoalApproachExperiment:
         )
         trainer.train(bc_transitions, num_epochs=_BC_NUM_EPOCHS)
         trainer.save(str(self.runs_dir / "bc_model"))
+
+        # Save BC training stats
+        bc_stats = trainer.get_training_stats(bc_transitions)
+        bc_stats_path = self.data_dir / "bc_train_result.json"
+        with bc_stats_path.open("w") as f:
+            json.dump(bc_stats, f, indent=2)
+        logger.info(
+            "BC training complete: val_acc=%.4f, "
+            "transitions=%d, saved to %s",
+            bc_stats["val_accuracy"],
+            bc_stats["total_transitions"],
+            bc_stats_path,
+        )
 
     def _run_sac_train(self) -> None:
         """Train P-SAC model sequentially on all meshes."""
@@ -387,6 +440,12 @@ class RLGoalApproachExperiment:
                 mesh_name, 2000
             )
 
+            logger.info(
+                "SAC Training: %s, %d episodes",
+                mesh_name,
+                num_episodes,
+            )
+
             env = LightweightEnv(mesh_path)
             controller = RLGoalApproachController(
                 agent_id=f"sac_{mesh_name}",
@@ -403,6 +462,8 @@ class RLGoalApproachExperiment:
                 prefix=f"sac_train_{mesh_name}",
             )
 
+            trainer.start_mesh_tracking(mesh_name)
+
             is_first_mesh = mesh_name == self.sac_meshes[0]
             trainer.train(
                 env=env,
@@ -415,6 +476,28 @@ class RLGoalApproachExperiment:
                 curriculum_levels=self.curriculum_levels,
                 episode_pools=sac_pools[sac_seed],
             )
+
+            # Save per-mesh training stats
+            sac_stats = trainer.get_training_stats()
+            result_path = (
+                self.data_dir
+                / f"sac_train_result_{mesh_name}.json"
+            )
+            with result_path.open("w") as f:
+                json.dump(sac_stats, f, indent=2)
+            logger.info(
+                "SAC %s: rate=%.3f, steps_per_success=%.1f",
+                mesh_name,
+                sac_stats["success_rate"],
+                sac_stats["steps_per_success"],
+            )
+
+        # Save final combined stats
+        final_stats = trainer.get_training_stats()
+        final_path = self.data_dir / "sac_train_result_all.json"
+        with final_path.open("w") as f:
+            json.dump(final_stats, f, indent=2)
+        logger.info("SAC training complete. Saved to %s", final_path)
 
     def _run_sac_eval(self) -> None:
         """Evaluate P-SAC model on all meshes."""
@@ -438,7 +521,9 @@ class RLGoalApproachExperiment:
             sac_eval_pools = get_or_generate_pools(
                 mesh_path=mesh_path,
                 seeds=self.sac_eval_seeds,
-                episodes_per_level=self.sac_eval_episodes_per_level,
+                episodes_per_level=(
+                    self.sac_eval_episodes_per_level
+                ),
                 scripts_dir=self.scripts_dir,
                 curriculum_levels=self.curriculum_levels,
                 regenerate=self.regenerate_scripts,
@@ -465,7 +550,8 @@ class RLGoalApproachExperiment:
                 )
 
             eval_output = (
-                self.data_dir / f"sac_eval_result_{mesh_name}.json"
+                self.data_dir
+                / f"sac_eval_result_{mesh_name}.json"
             )
             with eval_output.open("w") as f:
                 json.dump(results, f, indent=2)
@@ -473,9 +559,11 @@ class RLGoalApproachExperiment:
         eval_output = self.data_dir / "sac_eval_result_all.json"
         with eval_output.open("w") as f:
             json.dump(all_sac_eval_results, f, indent=2)
-        logger.info("Saved all SAC eval results to %s", eval_output)
+        logger.info(
+            "Saved all SAC eval results to %s", eval_output
+        )
 
-    def _eval_sac_on_pools(  # noqa: SLF001
+    def _eval_sac_on_pools(
         self,
         sac_trainer: PSACTrainer,
         sac_eval_pools: dict[int, dict[str, Any]],
@@ -489,9 +577,10 @@ class RLGoalApproachExperiment:
             mesh_path: Path to the mesh file.
 
         Returns:
-            Dict with per-level evaluation results.
+            Dict with per-level evaluation results including
+            action distribution and collision stats.
         """
-
+        type_names = ExperienceExtractor.get_type_names()
         results_per_level: dict[str, Any] = {}
         sample_seed = self.sac_eval_seeds[0]
         num_levels = len(
@@ -503,6 +592,9 @@ class RLGoalApproachExperiment:
             level_timeouts = 0
             level_collisions = 0
             level_total = 0
+            level_action_counts: dict[int, int] = {}
+            level_collision_counts: dict[int, int] = {}
+            level_total_steps = 0
 
             for eval_seed in self.sac_eval_seeds:
                 level_pool = sac_eval_pools[eval_seed]["levels"][
@@ -513,7 +605,9 @@ class RLGoalApproachExperiment:
                 torch.manual_seed(eval_seed)
                 env = LightweightEnv(mesh_path, seed=eval_seed)
                 controller = RLGoalApproachController(
-                    agent_id=f"sac_eval_L{level_idx}_{eval_seed}",
+                    agent_id=(
+                        f"sac_eval_L{level_idx}_{eval_seed}"
+                    ),
                     config={**self.rl_config, "mode": "eval"},
                 )
                 interpreter = ActionInterpreter(env)
@@ -528,32 +622,54 @@ class RLGoalApproachExperiment:
                         np.array(ep_data["goal_pos"]),
                         np.array(ep_data["goal_rot"]),
                     ])
-                    controller.set_new_goal(goal_pose, start_pos)
+                    controller.set_new_goal(
+                        goal_pose, start_pos
+                    )
                     env.set_goal(goal_pose)
 
                     success = False
                     collision = False
+                    ep_steps = 0
 
-                    for _ in range(sac_trainer.max_steps_per_goal):
+                    for _ in range(
+                        sac_trainer.max_steps_per_goal
+                    ):
                         current_pose = env.get_pose()
                         sensor_data = env.get_sensor_data()
-                        state_raw = controller._compute_state(
-                            current_pose, sensor_data
+                        state_raw = (
+                            controller._compute_state(  # noqa: SLF001
+                                current_pose, sensor_data
+                            )
                         )
-                        state = sac_trainer.normalize_state(state_raw)
+                        state = sac_trainer.normalize_state(
+                            state_raw
+                        )
 
                         state_t = torch.FloatTensor(
                             state.astype(np.float32)
                         ).unsqueeze(0)
                         with torch.no_grad():
                             at, ap, _, _ = (
-                                sac_trainer.actor.sample_eval(state_t)
+                                sac_trainer.actor.sample_eval(
+                                    state_t
+                                )
                             )
                         action_type = at[0].item()
                         action_params = (
-                            ap[0].numpy() * sac_trainer.param_std
+                            ap[0].numpy()
+                            * sac_trainer.param_std
                             + sac_trainer.param_mean
                         )
+
+                        # Track action
+                        level_action_counts[action_type] = (
+                            level_action_counts.get(
+                                action_type, 0
+                            )
+                            + 1
+                        )
+                        level_total_steps += 1
+                        ep_steps += 1
 
                         sensor_data = interpreter.execute(
                             action_type, action_params
@@ -562,7 +678,8 @@ class RLGoalApproachExperiment:
                         current_pose = env.get_pose()
                         distance = float(
                             np.linalg.norm(
-                                goal_pose[:3] - current_pose[:3]
+                                goal_pose[:3]
+                                - current_pose[:3]
                             )
                         )
 
@@ -571,8 +688,17 @@ class RLGoalApproachExperiment:
                             break
 
                         depth = sensor_data.get("depth", 100.0)
-                        if depth < 0.5:
+                        if depth < _COLLISION_DEPTH_THRESHOLD:
                             collision = True
+                            # Track collision
+                            level_collision_counts[
+                                action_type
+                            ] = (
+                                level_collision_counts.get(
+                                    action_type, 0
+                                )
+                                + 1
+                            )
                             break
 
                     level_total += 1
@@ -585,27 +711,82 @@ class RLGoalApproachExperiment:
 
             count = max(level_total, 1)
             bounds = self.curriculum_levels[level_idx]
+
+            # Action distribution
+            total_actions = max(
+                sum(level_action_counts.values()), 1
+            )
+            action_distribution = {
+                type_names.get(k, f"type_{k}"): {
+                    "count": v,
+                    "rate": round(v / total_actions, 4),
+                }
+                for k, v in sorted(
+                    level_action_counts.items()
+                )
+            }
+
+            # Collision rate per type
+            collision_rate_per_type = {}
+            for (
+                type_id,
+                col_count,
+            ) in level_collision_counts.items():
+                total_calls = level_action_counts.get(
+                    type_id, 0
+                )
+                name = type_names.get(
+                    type_id, f"type_{type_id}"
+                )
+                collision_rate_per_type[name] = {
+                    "collisions": col_count,
+                    "total_calls": total_calls,
+                    "rate": round(
+                        col_count / max(total_calls, 1), 4
+                    ),
+                }
+
             results_per_level[f"level_{level_idx}"] = {
                 "bounds_mm": list(bounds),
                 "success_rate": level_successes / count,
                 "timeout_rate": level_timeouts / count,
                 "collision_rate": level_collisions / count,
+                "action_distribution": action_distribution,
+                "collision_stats": {
+                    type_names.get(k, f"type_{k}"): v
+                    for k, v in level_collision_counts.items()
+                },
+                "collision_rate_per_type": (
+                    collision_rate_per_type
+                ),
+                "steps_per_success": round(
+                    level_total_steps
+                    / max(level_successes, 1),
+                    1,
+                ),
+                "mean_episode_steps": round(
+                    level_total_steps / max(level_total, 1),
+                    1,
+                ),
             }
 
         return results_per_level
-    
+
     def _run_adaptive(self) -> None:
         """Run adaptive mode with Q-store + SAC arbitration."""
         logger.info("=" * 60)
         logger.info("Adaptive: %s", self.adaptive_mesh)
         logger.info("=" * 60)
 
-        mesh_path = str(self.data_dir / f"{self.adaptive_mesh}.stl")
+        mesh_path = str(
+            self.data_dir / f"{self.adaptive_mesh}.stl"
+        )
         env = LightweightEnv(mesh_path)
         num_types = len(ExperienceExtractor.get_type_names())
 
         q_load_dir = (
-            f"{self.unified_save_dir}_seed_{self.train_seeds[0]}"
+            f"{self.unified_save_dir}"
+            f"_seed_{self.train_seeds[0]}"
         )
         controller = RLGoalApproachController.load(
             q_load_dir,
@@ -642,13 +823,15 @@ class RLGoalApproachExperiment:
             env.set_goal(goal_pose)
 
             goals_before = (
-                controller._total_goals_reached
+                controller._total_goals_reached  # noqa: SLF001
             )
             for _ in range(_ADAPTIVE_MAX_STEPS):
                 current_pose = env.get_pose()
                 sensor_data = env.get_sensor_data()
-                state = controller._compute_state(
-                    current_pose, sensor_data
+                state = (
+                    controller._compute_state(  # noqa: SLF001
+                        current_pose, sensor_data
+                    )
                 )
                 action_index, _source = manager.get_action(
                     state, current_pose, sensor_data
@@ -661,11 +844,13 @@ class RLGoalApproachExperiment:
                 env.step(action_index, controller.action_space)
 
             success = (
-                controller._total_goals_reached
+                controller._total_goals_reached  # noqa: SLF001
                 > goals_before
             )
             transitions = (
-                controller.success_trails.copy() if success else []
+                controller.success_trails.copy()
+                if success
+                else []
             )
             manager.on_episode_complete(
                 success=success, transitions=transitions
@@ -684,3 +869,64 @@ class RLGoalApproachExperiment:
             manager.sac_trainer.save(
                 str(self.runs_dir / "adaptive_sac")
             )
+        logger.info(
+            "Adaptive complete: %s", manager.get_stats()
+        )
+
+    @staticmethod
+    def _filter_bc_transitions(
+        transitions: list[Any],
+        max_per_mesh: int = 10000,
+    ) -> list[Any]:
+        """Filter BC transitions for quality and balance.
+
+        Keeps shorter trajectories (more efficient demonstrations)
+        and balances across meshes.
+
+        Args:
+            transitions: All collected BC transitions.
+            max_per_mesh: Maximum transitions per mesh.
+
+        Returns:
+            Filtered list of transitions.
+        """
+        mesh_id_to_name = {
+            v: k
+            for k, v in ExperienceExtractor.MESH_NAME_TO_ID.items()
+        }
+
+        # Group by mesh
+        by_mesh: dict[int, list[Any]] = {}
+        for tr in transitions:
+            mesh_id = getattr(tr, "mesh_id", -1)
+            if mesh_id not in by_mesh:
+                by_mesh[mesh_id] = []
+            by_mesh[mesh_id].append(tr)
+
+        # Cap per mesh
+        filtered: list[Any] = []
+        for mesh_id, mesh_transitions in by_mesh.items():
+            mesh_name = mesh_id_to_name.get(
+                mesh_id, f"unknown_{mesh_id}"
+            )
+            if len(mesh_transitions) > max_per_mesh:
+                # Keep random subset
+                indices = np.random.permutation(
+                    len(mesh_transitions)
+                )[:max_per_mesh]
+                mesh_transitions = [
+                    mesh_transitions[i] for i in indices
+                ]
+                logger.info(
+                    "BC filter: %s capped to %d transitions",
+                    mesh_name,
+                    max_per_mesh,
+                )
+            filtered.extend(mesh_transitions)
+
+        logger.info(
+            "BC filter: %d → %d transitions",
+            len(transitions),
+            len(filtered),
+        )
+        return filtered
