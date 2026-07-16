@@ -76,7 +76,7 @@ class ActionSpace:
         rotation_step: Step size for LookUp/Down/Rotation (degrees).
     """
 
-    NUM_ACTIONS = 21
+    NUM_ACTIONS = 25
 
     # Surface action directions (8 evenly spaced)
     SURFACE_DIRECTIONS = [0, 45, 90, 135, 180, 225, 270, 315]
@@ -96,6 +96,10 @@ class ActionSpace:
     IDX_DETACH = 18
     IDX_DETACH_EDGE = 19
     IDX_FREE_FORWARD_SMALL = 20
+    IDX_LOOK_UP_BIG = 21
+    IDX_LOOK_DOWN_BIG = 22
+    IDX_TURN_LEFT_BIG = 23
+    IDX_TURN_RIGHT_BIG = 24
 
     def __init__(
         self,
@@ -103,13 +107,17 @@ class ActionSpace:
         surface_step: float = 3.0,
         free_step: float = 5.0,
         rotation_step: float = 5.0,
-        free_step_small=1.5
+        free_step_small: float = 1.5,
+        rotation_step_big: float = 15.0,
+        free_step_backward: float = 2.0,
     ):
         self.agent_id = agent_id
         self.surface_step = surface_step
         self.free_step = free_step
         self.rotation_step = rotation_step
         self.free_step_small = free_step_small
+        self.rotation_step_big = rotation_step_big
+        self.free_step_backward = free_step_backward
 
         # Build action info table
         self._action_info = self._build_action_info()
@@ -229,6 +237,34 @@ class ActionSpace:
             name="free_forward_small",
             opposite_index=self.IDX_FREE_BACKWARD,
             category="free",
+        ))
+
+        info.append(ActionInfo(
+            index=self.IDX_LOOK_UP_BIG,
+            name="look_up_big",
+            opposite_index=self.IDX_LOOK_DOWN_BIG,
+            category="orient",
+        ))
+
+        info.append(ActionInfo(
+            index=self.IDX_LOOK_DOWN_BIG,
+            name="look_down_big",
+            opposite_index=self.IDX_LOOK_UP_BIG,
+            category="orient",
+        ))
+
+        info.append(ActionInfo(
+            index=self.IDX_TURN_LEFT_BIG,
+            name="turn_left_big",
+            opposite_index=self.IDX_TURN_RIGHT_BIG,
+            category="orient",
+        ))
+
+        info.append(ActionInfo(
+            index=self.IDX_TURN_RIGHT_BIG,
+            name="turn_right_big",
+            opposite_index=self.IDX_TURN_LEFT_BIG,
+            category="orient",
         ))
 
         return info

@@ -235,6 +235,121 @@ def _create_toroidal_handle(
     return handle
 
 
+def create_vase(
+    bottom_radius: float = 15.0,
+    body_radius: float = 35.0,
+    neck_radius: float = 12.0,
+    top_radius: float = 18.0,
+    body_height: float = 45.0,
+    neck_height: float = 25.0,
+    wall_thickness: float = 2.0,
+    bottom_thickness: float = 2.5,
+    body_segments: int = 64,
+) -> trimesh.Trimesh:
+    """Create a vase mesh with bulging body and narrow neck.
+
+    Profile (cross-section):
+        top_radius (18mm)
+           |    |
+           |    |  neck (25mm)
+          neck_radius (12mm)
+         /      \\
+        /        \\  body (45mm)
+       body_radius (35mm)
+        \\        /
+         \\______/
+       bottom_radius (15mm)
+
+    Args:
+        bottom_radius: Bottom radius in mm.
+        body_radius: Maximum body radius in mm.
+        neck_radius: Narrowest neck radius in mm.
+        top_radius: Top opening radius in mm.
+        body_height: Height of the body section in mm.
+        neck_height: Height of the neck section in mm.
+        wall_thickness: Wall thickness in mm.
+        bottom_thickness: Bottom thickness in mm.
+        body_segments: Number of segments around circumference.
+
+    Returns:
+        Vase trimesh.
+    """
+    total_height = body_height + neck_height
+    n_profile = 20
+    angles = np.linspace(0, 2 * np.pi, body_segments, endpoint=False)
+
+    # Build profile: radius as function of height
+    # Body: bottom_radius → body_radius → neck_radius (sine curve)
+    # Neck: neck_radius → top_radius (linear)
+    profile_heights = []
+    profile_radii_outer = []
+    profile_radii_inner = []
+
+    # Body section (0 to body_height)
+    for i in range(n_profile):
+        t = i / (n_profile - 1)
+        z = -total_height / 2 + t * body_height
+        # Sine bulge: starts at bottom_radius, peaks at body_radius,
+        # ends at neck_radius
+        if t < 0.5:
+            r = bottom_radius + (body_radius - bottom_radius) * np.sin(
+                t * np.pi
+            )
+        else:
+            r = neck_radius + (body_radius - neck_radius) * np.sin(
+                (1 - t) * np.pi
+            )
+        profile_heights.append(z)
+        profile_radii_outer.append(r)
+        r_inner = max(r - wall_thickness, 1.0)
+        profile_radii_inner.append(r_inner)
+
+    # Neck section (body_height to total_height)
+    for i in range(1, n_profile):
+        t = i / (n_profile - 1)
+        z = -total_height / 2 + body_height + t * neck_height
+        r = neck_radius + (top_radius - neck_radius) * t
+        profile_heights.append(z)
+        profile_radii_outer.append(r)
+        r_inner = max(r - wall_thickness, 1.0)
+        profile_radii_inner.append(r_inner)
+
+    n_rings = len(profile_heights)
+
+    # Build outer shell vertices
+    outer_verts = []
+    for i in range(n_rings):
+        r = profile_radii_outer[i]
+        z = profile_heights[i]
+        for angle in angles:
+            outer_verts.append([
+                r * np.cos(angle),
+                r * np.sin(angle),
+                z,
+            ])
+    outer_verts = np.array(outer_verts)
+    outer_hull = trimesh.convex.convex_hull(outer_verts)
+
+    # Build inner shell vertices (skip bottom for solid bottom)
+    inner_start = 1  # skip first ring (bottom is solid)
+    inner_verts = []
+    for i in range(inner_start, n_rings):
+        r = profile_radii_inner[i]
+        z = profile_heights[i]
+        if i == inner_start:
+            z = profile_heights[inner_start] + bottom_thickness
+        for angle in angles:
+            inner_verts.append([
+                r * np.cos(angle),
+                r * np.sin(angle),
+                z,
+            ])
+    inner_verts = np.array(inner_verts)
+    inner_hull = trimesh.convex.convex_hull(inner_verts)
+
+    return outer_hull.difference(inner_hull)
+
+
 def prepare_demo_meshes(data_dir: Path) -> None:
     """Generate and save all demo meshes to a directory.
 
@@ -256,3 +371,4 @@ def prepare_demo_meshes(data_dir: Path) -> None:
     )
     create_mug().export(str(data_dir / "mug.stl"))
     create_tea_cup().export(str(data_dir / "cup.stl"))
+    create_vase().export(str(data_dir / "vase.stl"))

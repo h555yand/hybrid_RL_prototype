@@ -47,34 +47,41 @@ def sac_to_discrete(action_type: int, action_params: np.ndarray) -> int:
                 best_idx = i
         return best_idx
 
-    if action_type == 1:
+    elif action_type == 1:
         step = float(action_params[0])
         if step < 0:
             return 9   # free_backward
-        if abs(step) <= 3.0:
+        elif abs(step) <= 3.0:
             return 20  # free_forward_small
-        return 8   # free_forward
+        else:
+            return 8   # free_forward
 
-    if action_type == 2:
-        return 10 if float(action_params[0]) >= 0 else 11
+    elif action_type == 2:  # Turn
+        angle = float(action_params[0])
+        if abs(angle) > 10.0:
+            return 23 if angle >= 0 else 24  # turn_left/right_big
+        return 10 if angle >= 0 else 11      # turn_left/right
 
-    if action_type == 3:
-        return 12 if float(action_params[0]) >= 0 else 13
+    elif action_type == 3:  # Look
+        angle = float(action_params[0])
+        if abs(angle) > 10.0:
+            return 21 if angle >= 0 else 22  # look_up/down_big
+        return 12 if angle >= 0 else 13      # look_up/down
 
-    if action_type == 4:
+    elif action_type == 4:
         return 14 if float(action_params[0]) >= 0 else 15
 
-    if action_type == 5:
+    elif action_type == 5:
         return 16
 
-    if action_type == 6:
+    elif action_type == 6:
         return 17
 
-    if action_type == 7:
-        return 18  # detach
+    elif action_type == 7:
+        return 18
 
-    if action_type == 8:
-        return 19  # detach_edge
+    elif action_type == 8:
+        return 19
 
     return 0
 
@@ -108,7 +115,6 @@ class Arbitrator:
 
         self.stats = {
             "q_store_chosen": 0,
-            "q_store_weak_chosen": 0,
             "sac_chosen": 0,
             "heuristic_chosen": 0,
             "total_decisions": 0,
@@ -137,13 +143,35 @@ class Arbitrator:
         self._q_episode_results = deque(maxlen=source_success_window)
         self._sac_episode_results = deque(maxlen=source_success_window)
         self._heuristic_episode_results = deque(maxlen=source_success_window)
-        self.boost_sac = False  # controlled from AdaptiveTrainingManager
+
+        self.q_confidence_history = deque(maxlen=1000)
+        self.q_spread_history = deque(maxlen=1000)
+        self.sac_confidence_history = deque(maxlen=1000)
 
     def decide(self, state, current_pose, sensor_data):
+        """Choose action source based on performance.
+
+        Uses confidence × track_record scoring. When insufficient
+        track record data, uses neutral prior (0.5) to let
+        confidence decide. Heuristic is fallback only when
+        both Q-store and SAC have zero score.
+
+        Args:
+            state: Current state vector.
+            current_pose: Current agent pose.
+            sensor_data: Current sensor readings.
+
+        Returns:
+            Tuple of (action_index, source_name).
+        """
         self.stats["total_decisions"] += 1
 
-        q_action, q_confidence, q_spread = self._get_q_action(state)
-        sac_action, sac_confidence = self._get_sac_action_discrete(state)
+        q_action, q_confidence, q_spread = (
+            self._get_q_action(state)
+        )
+        sac_action, sac_confidence = (
+            self._get_sac_action_discrete(state)
+        )
 
         action_space = self.controller.action_space
         q_name = action_space.get_info(q_action).name
@@ -152,52 +180,72 @@ class Arbitrator:
         self.q_proposed_actions[q_name] += 1
         if self.sac_actor is not None:
             self.sac_proposed_actions[sac_name] += 1
-
-        if self.sac_actor is not None:
             self.both_proposed_count += 1
             if q_action == sac_action:
                 self.agreement_count += 1
 
-        if len(self.q_confidence_history) < 1000:
-            self.q_confidence_history.append(q_confidence)
-            self.q_spread_history.append(q_spread)
-            if self.sac_actor is not None:
-                self.sac_confidence_history.append(sac_confidence)
+        self.q_confidence_history.append(q_confidence)
+        self.q_spread_history.append(q_spread)
+        if self.sac_actor is not None:
+            self.sac_confidence_history.append(
+                sac_confidence
+            )
 
-        # Q-store threshold: increased if SAC priority is active
-        q_spread_thr = self.q_spread_threshold
-        if self.boost_sac:
-            q_spread_thr = self.q_spread_threshold * 3.0
+        # Track record: use actual rate if enough data,
+        # otherwise neutral prior to let confidence decide
+        min_episodes = 10
 
-        # 1. Q-store is confident and differentiates actions
-        if q_confidence > self.q_confidence_threshold and q_spread > q_spread_thr:
-            self.stats["q_store_chosen"] += 1
-            self.q_chosen_actions[q_name] += 1
-            self._current_episode_sources.append("q_store")
-            return q_action, "q_store"
+        q_episodes = len(self._q_episode_results)
+        q_track = (
+            self.q_success_rate
+            if q_episodes >= min_episodes
+            else 0.5
+        )
 
-        # 2. SAC is confident
-        if self.sac_actor is not None and sac_confidence > self.sac_confidence_threshold:
+        sac_episodes = len(self._sac_episode_results)
+        sac_track = (
+            self.sac_success_rate
+            if sac_episodes >= min_episodes
+            else 0.5
+        )
+
+        # Q-store score: needs confidence and spread
+        q_score = 0.0
+        if q_confidence > 0.2 and q_spread > 0.5:
+            q_score = q_confidence * q_track
+
+        # SAC score: needs actor
+        sac_score = 0.0
+        if self.sac_actor is not None:
+            sac_score = sac_confidence * sac_track
+
+        # Choose best source, heuristic as fallback only
+        if q_score > 0 or sac_score > 0:
+            if q_score >= sac_score:
+                self.stats["q_store_chosen"] += 1
+                self.q_chosen_actions[q_name] += 1
+                self._current_episode_sources.append(
+                    "q_store"
+                )
+                return q_action, "q_store"
+
             self.stats["sac_chosen"] += 1
             self.sac_chosen_actions[sac_name] += 1
             self._current_episode_sources.append("sac")
             return sac_action, "sac"
 
-        # 3. Q-store weak fallback
-        if q_confidence > self.q_weak_threshold:
-            self.stats["q_store_weak_chosen"] += 1
-            self.q_chosen_actions[q_name] += 1
-            self._current_episode_sources.append("q_store")
-            return q_action, "q_store_weak"
-
-        # 4. Heuristic
-        heuristic_action = self._get_heuristic_action(state, current_pose, sensor_data)
-        h_name = action_space.get_info(heuristic_action).name
+        # Fallback: neither Q nor SAC available
+        heuristic_action = self._get_heuristic_action(
+            state, current_pose, sensor_data
+        )
+        h_name = action_space.get_info(
+            heuristic_action
+        ).name
         self.stats["heuristic_chosen"] += 1
         self.heuristic_chosen_actions[h_name] += 1
         self._current_episode_sources.append("heuristic")
         return heuristic_action, "heuristic"
-
+    
     def on_episode_end(self, success: bool):
         """Called after each episode to calculate the success rate by source."""
         if not self._current_episode_sources:
@@ -338,7 +386,6 @@ class Arbitrator:
         return {
             "total_decisions": self.stats["total_decisions"],
             "q_store_rate": round(self.stats["q_store_chosen"] / total, 3),
-            "q_store_weak_rate": round(self.stats["q_store_weak_chosen"] / total, 3),
             "sac_rate": round(self.stats["sac_chosen"] / total, 3),
             "heuristic_rate": round(self.stats["heuristic_chosen"] / total, 3),
 

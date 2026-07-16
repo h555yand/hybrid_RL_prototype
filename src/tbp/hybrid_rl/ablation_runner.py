@@ -299,12 +299,7 @@ class _CurriculumTracker:
         )
 
         self.level_idx += 1
-        if self.level_idx < len(GOAL_THRESHOLD_PER_LEVEL):
-            new_threshold = GOAL_THRESHOLD_PER_LEVEL[self.level_idx]
-            controller.config["goal_threshold"] = new_threshold
-            logger.info(
-                "  [Curriculum] goal_threshold → %smm", new_threshold
-            )
+        # goal_threshold stays fixed from config — no per-level override
 
         self.window = collections.deque(maxlen=self.promote_window)
         self.level_episodes = 0
@@ -322,7 +317,7 @@ class _CurriculumTracker:
             rolling_rate,
             controller.epsilon,
         )
-
+        
     def finalize(self) -> dict[str, Any]:
         """Finalize and return curriculum statistics.
 

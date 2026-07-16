@@ -80,11 +80,11 @@ class LightweightEnv:
 
     def step(self, action_index, action_space):
         """Perform an action, return new sensor data.
-        
+
         Args:
-            action_index: action index (0-17)
+            action_index: action index (0-24)
             action_space: MontyActionSpace
-            
+
         Returns:
             sensor_data: point_normal, on_object, depth
         """
@@ -92,7 +92,7 @@ class LightweightEnv:
 
         action_info = action_space.get_info(action_index)
 
-        if action_info.name in ("look_up", "look_down"):
+        if action_info.name in ("look_up", "look_down", "look_up_big", "look_down_big"):
             rot_before = R.from_euler("xyz", self.agent_rot, degrees=True)
             forward_before = rot_before.apply([0, 0, -1])
 
@@ -104,11 +104,15 @@ class LightweightEnv:
         elif action_info.name == "free_forward":
             self._move_forward(action_space.free_step)
         elif action_info.name == "free_backward":
-            self._move_forward(-action_space.free_step)
+            self._move_forward(-action_space.free_step_backward)
         elif action_info.name == "look_up":
             self.agent_rot[0] += action_space.rotation_step
         elif action_info.name == "look_down":
             self.agent_rot[0] -= action_space.rotation_step
+        elif action_info.name == "look_up_big":
+            self.agent_rot[0] += action_space.rotation_step_big
+        elif action_info.name == "look_down_big":
+            self.agent_rot[0] -= action_space.rotation_step_big
         elif action_info.name == "rotate_sensor_+":
             self.agent_rot[2] += action_space.rotation_step
         elif action_info.name == "rotate_sensor_-":
@@ -117,6 +121,10 @@ class LightweightEnv:
             self.agent_rot[1] += action_space.rotation_step
         elif action_info.name == "turn_right":
             self.agent_rot[1] -= action_space.rotation_step
+        elif action_info.name == "turn_left_big":
+            self.agent_rot[1] += action_space.rotation_step_big
+        elif action_info.name == "turn_right_big":
+            self.agent_rot[1] -= action_space.rotation_step_big
         elif action_info.name == "orient_horizontal":
             self._orient_horizontal(
                 rotation_degrees=action_info.rotation_degrees,
@@ -135,7 +143,7 @@ class LightweightEnv:
                     goal_pose=self._current_goal,
                     rotation_step=action_space.rotation_step,
                     free_step=action_space.free_step,
-                    max_sub_steps=2
+                    max_sub_steps=2,
                 )
         elif action_info.name == "detach_edge":
             if hasattr(self, "_current_goal") and self._current_goal is not None:
@@ -147,7 +155,7 @@ class LightweightEnv:
         elif action_info.name == "free_forward_small":
             self._move_forward(action_space.free_step_small)
 
-        if action_info.name in ("look_up", "look_down"):
+        if action_info.name in ("look_up", "look_down", "look_up_big", "look_down_big"):
             rot_after = R.from_euler("xyz", self.agent_rot, degrees=True)
             forward_after = rot_after.apply([0, 0, -1])
             height_axis = getattr(self, "height_axis", 2)
@@ -437,7 +445,6 @@ class LightweightEnv:
         self._passed_through = False
 
         if abs(step_size) > 0.5:
-            # Ray cast: check the intersection with the mesh on the path
             locations, _, _ = self.mesh.ray.intersects_location(
                 ray_origins=[old_pos],
                 ray_directions=[forward * np.sign(step_size)],
@@ -447,15 +454,12 @@ class LightweightEnv:
                 if np.min(distances) < abs(step_size):
                     self._passed_through = True
 
-            # Proximity: check if they are inside the mesh
             closest, dist_to_mesh, _ = self.mesh.nearest.on_surface([self.agent_pos])
-            # Threshold depends on the pitch size
-            # Large pitch (8mm): 1.0mm threshold — strict
-            # Small pitch (2mm): 0.5mm threshold — softer, allows for a more comfortable fit
+            # Adaptive proximity threshold based on step size
             proximity_threshold = min(1.0, abs(step_size) * 0.25)
             if dist_to_mesh[0] < proximity_threshold:
                 self._passed_through = True
-
+                
     def _orient_horizontal(self, rotation_degrees, forward_distance, left_distance):
         """Moves the agent forward and sideways (left/right), projects onto surface, and yaws.
         

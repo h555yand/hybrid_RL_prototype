@@ -72,6 +72,8 @@ class RLGoalApproachController:
             free_step=self.config["free_step"],
             rotation_step=self.config["rotation_step"],
             free_step_small=self.config.get("free_step_small", 2.0),
+            rotation_step_big=self.config.get("rotation_step_big", 15.0),
+            free_step_backward=self.config.get("free_step_backward", 2.0),
         )
         self.num_actions = self.action_space.NUM_ACTIONS
 
@@ -662,6 +664,10 @@ class RLGoalApproachController:
         if state[11] < 0.5:  # on_object = 0 → agent in the air
             combined[self.action_space.IDX_DETACH] = -1e9
             combined[self.action_space.IDX_DETACH_EDGE] = -1e9
+        # ═══ ACTION MASK: block detach spam ═══
+        if self._consecutive_detach_count >= 3:
+            combined[self.action_space.IDX_DETACH] = -1e9
+            combined[self.action_space.IDX_DETACH_EDGE] = -1e9
 
         is_random_override = False
         is_heuristic_override = False
@@ -1115,22 +1121,27 @@ class RLGoalApproachController:
             ).apply([0, 0, -1])
             improvement_right = np.dot(forward_right, goal_dir_world) - dot_current
 
-            # Pitch: choosing the best direction
+            # Pitch: choose best direction and step size
             best_pitch_improvement = max(improvement_up, improvement_down)
             if best_pitch_improvement > 0.001:
                 pitch_bonus = STEER_STRENGTH * deviation
                 if improvement_up > improvement_down:
-                    steer[self.action_space.IDX_LOOK_UP] += pitch_bonus
+                    # Big step if large deviation, small step if close
+                    if angle_to_goal > 30.0:
+                        steer[self.action_space.IDX_LOOK_UP_BIG] += pitch_bonus
+                    else:
+                        steer[self.action_space.IDX_LOOK_UP] += pitch_bonus
                 else:
-                    steer[self.action_space.IDX_LOOK_DOWN] += pitch_bonus
+                    if angle_to_goal > 30.0:
+                        steer[self.action_space.IDX_LOOK_DOWN_BIG] += pitch_bonus
+                    else:
+                        steer[self.action_space.IDX_LOOK_DOWN] += pitch_bonus
 
-            # Yaw: choosing the best direction
+            # Yaw: choose best direction and step size
             best_yaw_improvement = max(improvement_left, improvement_right)
             if best_yaw_improvement > 0.001:
-                # Yaw only if the pitch isn't too high
-                # (When the target is right below, yaw is unreliable)
                 height_axis = getattr(self, "_height_axis_cache",
-                    self.action_space.rotation_step)  # fallback
+                    self.action_space.rotation_step)
                 if hasattr(self, "_current_goal"):
                     h_ax = getattr(self, "height_axis_cache", 2)
                     horiz_components = [goal_dir_world[i] for i in range(3) if i != h_ax]
@@ -1143,9 +1154,15 @@ class RLGoalApproachController:
                 if yaw_reliable:
                     yaw_bonus = STEER_STRENGTH * deviation
                     if improvement_left > improvement_right:
-                        steer[self.action_space.IDX_TURN_LEFT] += yaw_bonus
+                        if angle_to_goal > 30.0:
+                            steer[self.action_space.IDX_TURN_LEFT_BIG] += yaw_bonus
+                        else:
+                            steer[self.action_space.IDX_TURN_LEFT] += yaw_bonus
                     else:
-                        steer[self.action_space.IDX_TURN_RIGHT] += yaw_bonus
+                        if angle_to_goal > 30.0:
+                            steer[self.action_space.IDX_TURN_RIGHT_BIG] += yaw_bonus
+                        else:
+                            steer[self.action_space.IDX_TURN_RIGHT] += yaw_bonus
 
             # Forward: strength depends on alignment
             forward_weight = max(1.0 - deviation * 0.5, 0.5)
@@ -1162,6 +1179,13 @@ class RLGoalApproachController:
             steer[self.action_space.IDX_ROTATE_POS] -= 3.0
             steer[self.action_space.IDX_ROTATE_NEG] -= 3.0
 
+            # Suppress big rotations in the air when close to target direction
+            if deviation < 0.3:
+                steer[self.action_space.IDX_LOOK_UP_BIG] -= 2.0
+                steer[self.action_space.IDX_LOOK_DOWN_BIG] -= 2.0
+                steer[self.action_space.IDX_TURN_LEFT_BIG] -= 2.0
+                steer[self.action_space.IDX_TURN_RIGHT_BIG] -= 2.0
+
         bias += steer
         components["steer_in_air"] = steer
 
@@ -1176,6 +1200,11 @@ class RLGoalApproachController:
             damp_free[self.action_space.IDX_FREE_FORWARD] -= 3.0
             damp_free[self.action_space.IDX_FREE_BACKWARD] -= 3.0
             damp_free[self.action_space.IDX_FREE_FORWARD_SMALL] -= 3.0
+            # Suppress big rotations on surface — small steps preferred
+            damp_free[self.action_space.IDX_LOOK_UP_BIG] -= 2.0
+            damp_free[self.action_space.IDX_LOOK_DOWN_BIG] -= 2.0
+            damp_free[self.action_space.IDX_TURN_LEFT_BIG] -= 2.0
+            damp_free[self.action_space.IDX_TURN_RIGHT_BIG] -= 2.0
         bias += damp_free
         components["damp_free_on_surface"] = damp_free
 

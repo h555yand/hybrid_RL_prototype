@@ -54,6 +54,10 @@ class ExperienceExtractor:
         18: (7, lambda cfg: []),
         19: (8, lambda cfg: []),
         20: (1, lambda cfg: [cfg.get("free_step_small", 2.0)]),
+        21: (3, lambda cfg: [cfg.get("rotation_step_big", 15.0)]),
+        22: (3, lambda cfg: [-cfg.get("rotation_step_big", 15.0)]),
+        23: (2, lambda cfg: [cfg.get("rotation_step_big", 15.0)]),
+        24: (2, lambda cfg: [-cfg.get("rotation_step_big", 15.0)]),
     }
 
     MESH_NAME_TO_ID = {
@@ -61,6 +65,7 @@ class ExperienceExtractor:
         "cylinder": 1,
         "mug": 2,
         "cup": 3,
+        "vase": 4,
     }
 
     def __init__(self, config: Dict[str, Any], mesh_name: str = ""):

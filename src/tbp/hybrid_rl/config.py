@@ -27,11 +27,13 @@ DEFAULT_CONFIG = {
     "norm_min_std": 1e-4,               # zero dispersion protection
     "rebuild_on_freeze": True,          # rebuild index after freeze
     # Actions
-    "num_actions": 21,
+    "num_actions": 25,
     "free_step_small": 2.0,
     "surface_step": 3.0,   # mm
     "free_step": 8.0,     # mm
-    "rotation_step": 5.0,  # degrees
+    "free_step_backward": 2.0,         # mm
+    "rotation_step": 5.0,              # degrees
+    "rotation_step_big": 15.0,         # degrees
     # Episode
     "goal_threshold": 2.0,  # mm
     "max_steps_per_goal": 200,

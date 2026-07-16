@@ -16,6 +16,7 @@ Configured via Hydra YAML.
 
 from __future__ import annotations
 
+import datetime
 import json
 import logging
 import pickle
@@ -30,7 +31,6 @@ from omegaconf import DictConfig, OmegaConf
 from typing_extensions import Self
 
 from tbp.hybrid_rl.ablation_runner import (
-    GOAL_THRESHOLD_PER_LEVEL,
     run_episodes,
     run_eval_per_seed,
 )
@@ -42,14 +42,15 @@ from tbp.hybrid_rl.episode_pools import get_or_generate_pools
 from tbp.hybrid_rl.experience_extractor import ExperienceExtractor
 from tbp.hybrid_rl.lightweight_env import LightweightEnv
 from tbp.hybrid_rl.mesh_factory import prepare_demo_meshes
-from tbp.hybrid_rl.rl_goal_approach_controller import RLGoalApproachController
+from tbp.hybrid_rl.rl_goal_approach_controller import (
+    RLGoalApproachController,
+)
 from tbp.hybrid_rl.sac_trainer import PSACTrainer
 
 logger = logging.getLogger(__name__)
 
 _ADAPTIVE_MIN_DIST = 10.0
 _ADAPTIVE_MAX_DIST = 120.0
-_ADAPTIVE_MAX_STEPS = 150
 _ADAPTIVE_LOG_INTERVAL = 100
 _SAC_WARMUP_STEPS = 5000
 _BC_NUM_EPOCHS = 200
@@ -58,11 +59,20 @@ _COLLISION_DEPTH_THRESHOLD = 0.5
 
 
 class RLGoalApproachExperiment:
-    """Hydra-compatible experiment for RL goal approach training pipeline.
+    """Hydra-compatible experiment for RL goal approach training.
 
     Supports stages: Q-learning train, eval, BC train, SAC train,
-    SAC eval, and adaptive mode. All parameters are configured via
-    Hydra YAML config.
+    SAC eval, and adaptive mode. All parameters configured via YAML.
+
+    Model storage convention::
+
+        runs/
+        ├── q_store_seed_11/     # Q-learning model
+        ├── sac_seed_11/         # SAC model
+        ├── bc_model/            # BC model (no seed)
+        ├── adaptive_q_seed_11/  # Adaptive Q-store
+        ├── adaptive_sac_seed_11/# Adaptive SAC
+        └── meta/                # Training metadata
 
     Usage::
 
@@ -82,24 +92,34 @@ class RLGoalApproachExperiment:
         )
 
         self.seed = self.config.get("seed", 42)
-        self.output_dir = Path(self.config["logging"]["output_dir"])
+        self.output_dir = Path(
+            self.config["logging"]["output_dir"]
+        )
         self.run_name = self.config["logging"]["run_name"]
-
         self.visualise = self.config.get("visualise", False)
 
+        # Directories
         self.data_dir = self.output_dir / "data"
         self.runs_dir = self.data_dir / "runs"
         self.scripts_dir = self.data_dir / "episode_scripts"
 
+        # Pipeline stages
         self.do_train = self.config.get("do_train", True)
         self.do_eval = self.config.get("do_eval", False)
         self.do_bc_train = self.config.get("do_bc_train", False)
-        self.do_sac_train = self.config.get("do_sac_train", False)
-        self.do_sac_eval = self.config.get("do_sac_eval", False)
-        self.do_adaptive = self.config.get("do_adaptive", False)
+        self.do_sac_train = self.config.get(
+            "do_sac_train", False
+        )
+        self.do_sac_eval = self.config.get(
+            "do_sac_eval", False
+        )
+        self.do_adaptive = self.config.get(
+            "do_adaptive", False
+        )
 
-        self.training_stages: list[dict[str, Any]] = self.config.get(
-            "training_stages", []
+        # Training config
+        self.training_stages: list[dict[str, Any]] = (
+            self.config.get("training_stages", [])
         )
         self.curriculum_levels: list[tuple[float, float]] = [
             tuple(level)
@@ -117,6 +137,9 @@ class RLGoalApproachExperiment:
         self.sac_eval_seeds: list[int] = self.config.get(
             "sac_eval_seeds", [77, 88, 99]
         )
+        self.sac_seed: int = self.config.get(
+            "sac_seed", self.train_seeds[0]
+        )
         self.eval_episodes_per_level: int = self.config.get(
             "eval_episodes_per_level", 500
         )
@@ -127,6 +150,7 @@ class RLGoalApproachExperiment:
             "regenerate_scripts", True
         )
 
+        # RL config
         self.rl_config: dict[str, Any] = {
             **DEFAULT_CONFIG,
             **self.config.get("rl_config", {}),
@@ -139,22 +163,27 @@ class RLGoalApproachExperiment:
             "promote_window", 100
         )
 
+        # SAC config
         self.sac_config: dict[str, Any] = self.config.get(
             "sac_config", {}
         )
         self.sac_meshes: list[str] = self.config.get(
-            "sac_meshes", ["cube", "cylinder", "mug", "cup"]
+            "sac_meshes",
+            ["cube", "cylinder", "mug", "cup"],
         )
-        self.sac_episodes_per_mesh: dict[str, int] = self.config.get(
-            "sac_episodes_per_mesh",
-            {
-                "cube": 1000,
-                "cylinder": 1500,
-                "mug": 2000,
-                "cup": 2000,
-            },
+        self.sac_episodes_per_mesh: dict[str, int] = (
+            self.config.get(
+                "sac_episodes_per_mesh",
+                {
+                    "cube": 1000,
+                    "cylinder": 1500,
+                    "mug": 2000,
+                    "cup": 2000,
+                },
+            )
         )
 
+        # Adaptive config
         self.adaptive_mesh: str = self.config.get(
             "adaptive_mesh", "cup"
         )
@@ -162,11 +191,105 @@ class RLGoalApproachExperiment:
             "adaptive_episodes", 3000
         )
 
+        # Eval meshes
         self.eval_meshes: list[str] = self.config.get(
-            "eval_meshes", ["cube", "cylinder", "mug", "cup"]
+            "eval_meshes",
+            ["cube", "cylinder", "mug", "cup"],
         )
 
-        self.unified_save_dir = str(self.runs_dir / "unified_q")
+    # ══════════════════════════════════════════════════════
+    # Model path helpers
+    # ══════════════════════════════════════════════════════
+
+    def _q_model_dir(self, seed: int) -> str:
+        """Get Q-store directory path for a seed.
+
+        Args:
+            seed: Training seed.
+
+        Returns:
+            Path string to Q-store directory.
+        """
+        return str(self.runs_dir / f"q_store_seed_{seed}")
+
+    def _sac_model_dir(self, seed: int) -> str:
+        """Get SAC model directory path for a seed.
+
+        Args:
+            seed: Training seed.
+
+        Returns:
+            Path string to SAC model directory.
+        """
+        return str(self.runs_dir / f"sac_seed_{seed}")
+
+    def _resolve_load_dir(
+        self,
+        load_mode: str | None,
+        model_type: str,
+        seed: int,
+    ) -> str | None:
+        """Resolve load_mode to actual directory path.
+
+        Args:
+            load_mode: null (from scratch), "auto" (standard path),
+                or explicit path string.
+            model_type: "q_store" or "sac".
+            seed: Training seed.
+
+        Returns:
+            Directory path or None.
+        """
+        if load_mode is None:
+            return None
+        if load_mode == "auto":
+            if model_type == "q_store":
+                return self._q_model_dir(seed)
+            if model_type == "sac":
+                return self._sac_model_dir(seed)
+            return None
+        return str(load_mode)
+
+    def _save_meta(
+        self,
+        model_type: str,
+        seed: int | None,
+        stats: dict[str, Any],
+        meshes: list[str],
+    ) -> None:
+        """Save training metadata to meta/ directory.
+
+        Args:
+            model_type: "q_store", "sac", or "bc".
+            seed: Training seed (None for BC).
+            stats: Training statistics.
+            meshes: List of meshes trained on.
+        """
+        meta_dir = self.runs_dir / "meta"
+        meta_dir.mkdir(parents=True, exist_ok=True)
+
+        meta_name = (
+            f"{model_type}_seed_{seed}.json"
+            if seed is not None
+            else f"{model_type}.json"
+        )
+        meta = {
+            "model_type": model_type,
+            "seed": seed,
+            "created": datetime.datetime.now(
+                tz=datetime.timezone.utc
+            ).isoformat(),
+            "meshes": meshes,
+            "stats": stats,
+        }
+        meta_path = meta_dir / meta_name
+        with meta_path.open("w") as f:
+            json.dump(meta, f, indent=2)
+        logger.info("Meta saved to %s", meta_path)
+
+    # ══════════════════════════════════════════════════════
+    # Context manager
+    # ══════════════════════════════════════════════════════
 
     def __enter__(self) -> Self:
         """Set up experiment directories and demo meshes.
@@ -213,34 +336,50 @@ class RLGoalApproachExperiment:
         elapsed = time.time() - start_time
         logger.info("Experiment complete in %.1fs", elapsed)
 
+    # ══════════════════════════════════════════════════════
+    # Q-learning training
+    # ══════════════════════════════════════════════════════
+
     def _run_train(self) -> None:
-        """Run Q-learning training across all configured stages."""
+        """Run Q-learning training across all stages."""
         logger.info("=" * 60)
         logger.info("Q-Learning Training (all stages)")
         logger.info("=" * 60)
 
-        for stage_idx, stage in enumerate(self.training_stages):
+        trained_meshes: list[str] = []
+
+        for stage_idx, stage in enumerate(
+            self.training_stages
+        ):
             mesh_name = stage["mesh"]
-            mesh_path = str(self.data_dir / f"{mesh_name}.stl")
+            mesh_path = str(
+                self.data_dir / f"{mesh_name}.stl"
+            )
             episodes = stage["episodes"]
             epsilon_start = stage["epsilon_start"]
-            is_load = stage["is_load"]
+            load_mode = stage.get("load_mode")
 
             logger.info(
-                "STAGE %d/%d: %s, episodes=%d, eps=%.2f",
+                "STAGE %d/%d: %s, episodes=%d, eps=%.2f, "
+                "load_mode=%s",
                 stage_idx + 1,
                 len(self.training_stages),
                 mesh_name,
                 episodes,
                 epsilon_start,
+                load_mode,
             )
 
             stage_cfg = {
                 **self.rl_config,
                 "epsilon_start": epsilon_start,
-                "epsilon_min": stage.get("epsilon_min", 0.05),
+                "epsilon_min": stage.get(
+                    "epsilon_min", 0.05
+                ),
                 "num_episodes": episodes,
-                "unfreeze_normalization": is_load,
+                "unfreeze_normalization": (
+                    load_mode is not None
+                ),
             }
 
             train_pools = get_or_generate_pools(
@@ -254,10 +393,10 @@ class RLGoalApproachExperiment:
             )
 
             for seed in self.train_seeds:
-                seed_save_dir = (
-                    f"{self.unified_save_dir}_seed_{seed}"
+                save_dir = self._q_model_dir(seed)
+                load_dir = self._resolve_load_dir(
+                    load_mode, "q_store", seed
                 )
-                load_dir = seed_save_dir if is_load else None
 
                 seed_pools = train_pools.get(seed)
                 episode_pools = (
@@ -268,13 +407,15 @@ class RLGoalApproachExperiment:
 
                 curriculum_config = {
                     "levels": self.curriculum_levels,
-                    "promote_threshold": self.promote_threshold,
+                    "promote_threshold": (
+                        self.promote_threshold
+                    ),
                     "promote_window": self.promote_window,
                 }
 
                 run_result = run_episodes(
                     mesh_dir=str(self.data_dir),
-                    save_dir=seed_save_dir,
+                    save_dir=save_dir,
                     load_dir=load_dir,
                     num_episodes=episodes,
                     config=stage_cfg,
@@ -288,13 +429,17 @@ class RLGoalApproachExperiment:
 
                 stage_output = (
                     self.data_dir
-                    / f"train_result_{mesh_name}_seed_{seed}.json"
+                    / f"train_result_{mesh_name}"
+                    f"_seed_{seed}.json"
                 )
                 stage_data = {
                     "stage": stage_idx,
                     "mesh": mesh_name,
                     "seed": seed,
-                    "success_rate": run_result.get("success_rate"),
+                    "load_mode": load_mode,
+                    "success_rate": run_result.get(
+                        "success_rate"
+                    ),
                     "stats": run_result.get("stats"),
                     "curriculum_stats": run_result.get(
                         "curriculum_stats"
@@ -307,8 +452,23 @@ class RLGoalApproachExperiment:
                     run_result.get("success_rate", 0),
                 )
 
+            trained_meshes.append(mesh_name)
+
+        # Save meta
+        for seed in self.train_seeds:
+            self._save_meta(
+                "q_store",
+                seed,
+                {"trained_meshes": trained_meshes},
+                trained_meshes,
+            )
+
+    # ══════════════════════════════════════════════════════
+    # Q-learning evaluation
+    # ══════════════════════════════════════════════════════
+
     def _run_eval(self) -> None:
-        """Run evaluation on all meshes and collect BC data."""
+        """Run Q-learning eval on all meshes, collect BC data."""
         logger.info("=" * 60)
         logger.info("Eval on all meshes")
         logger.info("=" * 60)
@@ -317,45 +477,53 @@ class RLGoalApproachExperiment:
             **self.rl_config,
             "mode": "eval",
             "eval_epsilon": _EVAL_EPSILON,
-            "goal_threshold": GOAL_THRESHOLD_PER_LEVEL[0],
         }
 
         all_bc_transitions: list[Any] = []
         all_eval_results: dict[str, Any] = {}
 
         for mesh_name in self.eval_meshes:
-            mesh_path = str(self.data_dir / f"{mesh_name}.stl")
+            mesh_path = str(
+                self.data_dir / f"{mesh_name}.stl"
+            )
             logger.info("Evaluating: %s", mesh_name)
 
             eval_pools = get_or_generate_pools(
                 mesh_path=mesh_path,
                 seeds=self.eval_seeds,
-                episodes_per_level=self.eval_episodes_per_level,
+                episodes_per_level=(
+                    self.eval_episodes_per_level
+                ),
                 scripts_dir=self.scripts_dir,
                 curriculum_levels=self.curriculum_levels,
                 regenerate=self.regenerate_scripts,
                 prefix=f"eval_{mesh_name}",
             )
 
-            eval_results, bc_transitions = run_eval_per_seed(
-                data_dir=self.data_dir,
-                runs_dir=self.runs_dir,
-                mesh_path=mesh_path,
-                train_seeds=self.train_seeds,
-                eval_seeds=self.eval_seeds,
-                variant="unified_q",
-                eval_cfg=eval_cfg,
-                eval_pools=eval_pools,
-                collect_bc=True,
-                episodes_per_level=self.eval_episodes_per_level,
-                mesh_name=mesh_name,
+            eval_results, bc_transitions = (
+                run_eval_per_seed(
+                    data_dir=self.data_dir,
+                    runs_dir=self.runs_dir,
+                    mesh_path=mesh_path,
+                    train_seeds=self.train_seeds,
+                    eval_seeds=self.eval_seeds,
+                    variant="q_store",
+                    eval_cfg=eval_cfg,
+                    eval_pools=eval_pools,
+                    collect_bc=True,
+                    episodes_per_level=(
+                        self.eval_episodes_per_level
+                    ),
+                    mesh_name=mesh_name,
+                )
             )
 
             all_eval_results[mesh_name] = eval_results
             all_bc_transitions.extend(bc_transitions)
 
             mesh_output = (
-                self.data_dir / f"eval_result_{mesh_name}.json"
+                self.data_dir
+                / f"eval_result_{mesh_name}.json"
             )
             with mesh_output.open("w") as f:
                 json.dump(eval_results, f, indent=2)
@@ -365,21 +533,27 @@ class RLGoalApproachExperiment:
             json.dump(all_eval_results, f, indent=2)
 
         if all_bc_transitions:
-            # Filter for quality and balance
-            all_bc_transitions = self._filter_bc_transitions(
-                all_bc_transitions
+            all_bc_transitions = (
+                self._filter_bc_transitions(
+                    all_bc_transitions
+                )
             )
-
             bc_output = self.data_dir / "bc_data.pkl"
             with bc_output.open("wb") as f:
-                pickle.dump(all_bc_transitions, f)  # noqa: S301
+                pickle.dump(  # noqa: S301
+                    all_bc_transitions, f
+                )
             logger.info(
                 "BC data: %d transitions",
                 len(all_bc_transitions),
             )
 
+    # ══════════════════════════════════════════════════════
+    # Behavioral Cloning
+    # ══════════════════════════════════════════════════════
+
     def _run_bc_train(self) -> None:
-        """Train Behavioral Cloning model from collected data."""
+        """Train BC model from collected data."""
         logger.info("=" * 60)
         logger.info("BC Training")
         logger.info("=" * 60)
@@ -389,53 +563,106 @@ class RLGoalApproachExperiment:
             bc_transitions = pickle.load(f)  # noqa: S301
 
         logger.info(
-            "Loaded %d BC transitions", len(bc_transitions)
+            "Loaded %d BC transitions",
+            len(bc_transitions),
         )
 
-        num_types = len(ExperienceExtractor.get_type_names())
+        num_types = len(
+            ExperienceExtractor.get_type_names()
+        )
         trainer = BCTrainer(
             state_dim=self.rl_config.get("state_dim", 15),
             num_types=num_types,
         )
-        trainer.train(bc_transitions, num_epochs=_BC_NUM_EPOCHS)
+        trainer.train(
+            bc_transitions, num_epochs=_BC_NUM_EPOCHS
+        )
         trainer.save(str(self.runs_dir / "bc_model"))
 
-        # Save BC training stats
-        bc_stats = trainer.get_training_stats(bc_transitions)
-        bc_stats_path = self.data_dir / "bc_train_result.json"
+        bc_stats = trainer.get_training_stats(
+            bc_transitions
+        )
+        bc_stats_path = (
+            self.data_dir / "bc_train_result.json"
+        )
         with bc_stats_path.open("w") as f:
             json.dump(bc_stats, f, indent=2)
+
+        self._save_meta(
+            "bc",
+            None,
+            bc_stats,
+            list(self.eval_meshes),
+        )
         logger.info(
-            "BC training complete: val_acc=%.4f, "
-            "transitions=%d, saved to %s",
+            "BC complete: val_acc=%.4f, transitions=%d",
             bc_stats["val_accuracy"],
             bc_stats["total_transitions"],
-            bc_stats_path,
         )
+
+    # ══════════════════════════════════════════════════════
+    # SAC training
+    # ══════════════════════════════════════════════════════
 
     def _run_sac_train(self) -> None:
         """Train P-SAC model sequentially on all meshes."""
         logger.info("=" * 60)
-        logger.info("P-SAC Training")
+        logger.info("P-SAC Training (seed=%d)", self.sac_seed)
         logger.info("=" * 60)
 
-        num_types = len(ExperienceExtractor.get_type_names())
-        sac_seed = self.train_seeds[0]
+        num_types = len(
+            ExperienceExtractor.get_type_names()
+        )
 
+        sac_cfg = {
+            k: v
+            for k, v in self.sac_config.items()
+            if k != "load_mode"
+        }
         trainer = PSACTrainer(
             state_dim=self.rl_config.get("state_dim", 15),
             num_types=num_types,
-            **self.sac_config,
-        )
-        trainer.load_bc(
-            bc_model_dir=str(self.runs_dir / "bc_model"),
-            bc_data_path=str(self.data_dir / "bc_data.pkl"),
+            **sac_cfg,
         )
 
-        sac_model_dir = str(self.runs_dir / "sac_model")
+        load_mode = self.sac_config.get("load_mode")
+        load_dir = self._resolve_load_dir(
+            load_mode, "sac", self.sac_seed
+        )
+
+        if load_dir:
+            trainer.load(load_dir)
+            bc_path = self.data_dir / "bc_data.pkl"
+            if bc_path.exists():
+                with bc_path.open("rb") as f:
+                    bc_data = pickle.load(f)  # noqa: S301
+                bc_norm = (
+                    trainer._normalize_bc_transitions(  # noqa: SLF001
+                        bc_data
+                    )
+                )
+                trainer.buffer.load_bc_data(bc_norm)
+                trainer.bc_data = bc_data
+            logger.info(
+                "SAC loaded from %s for fine-tuning",
+                load_dir,
+            )
+        else:
+            trainer.load_bc(
+                bc_model_dir=str(
+                    self.runs_dir / "bc_model"
+                ),
+                bc_data_path=str(
+                    self.data_dir / "bc_data.pkl"
+                ),
+            )
+
+        sac_model_dir = self._sac_model_dir(self.sac_seed)
 
         for mesh_name in self.sac_meshes:
-            mesh_path = str(self.data_dir / f"{mesh_name}.stl")
+            mesh_path = str(
+                self.data_dir / f"{mesh_name}.stl"
+            )
             num_episodes = self.sac_episodes_per_mesh.get(
                 mesh_name, 2000
             )
@@ -454,7 +681,7 @@ class RLGoalApproachExperiment:
 
             sac_pools = get_or_generate_pools(
                 mesh_path=mesh_path,
-                seeds=[sac_seed],
+                seeds=[self.sac_seed],
                 episodes_per_level=num_episodes,
                 scripts_dir=self.scripts_dir,
                 curriculum_levels=self.curriculum_levels,
@@ -464,20 +691,21 @@ class RLGoalApproachExperiment:
 
             trainer.start_mesh_tracking(mesh_name)
 
-            is_first_mesh = mesh_name == self.sac_meshes[0]
+            is_first = mesh_name == self.sac_meshes[0]
             trainer.train(
                 env=env,
                 controller=controller,
                 num_episodes=num_episodes,
                 warmup_steps=(
-                    _SAC_WARMUP_STEPS if is_first_mesh else 0
+                    _SAC_WARMUP_STEPS
+                    if is_first and not load_dir
+                    else 0
                 ),
                 save_dir=sac_model_dir,
                 curriculum_levels=self.curriculum_levels,
-                episode_pools=sac_pools[sac_seed],
+                episode_pools=sac_pools[self.sac_seed],
             )
 
-            # Save per-mesh training stats
             sac_stats = trainer.get_training_stats()
             result_path = (
                 self.data_dir
@@ -485,37 +713,60 @@ class RLGoalApproachExperiment:
             )
             with result_path.open("w") as f:
                 json.dump(sac_stats, f, indent=2)
+            mesh_stat = sac_stats["mesh_stats"].get(
+                mesh_name, {}
+            )
             logger.info(
-                "SAC %s: rate=%.3f, steps_per_success=%.1f",
+                "SAC %s: rate=%.3f",
                 mesh_name,
-                sac_stats["success_rate"],
-                sac_stats["steps_per_success"],
+                mesh_stat.get("success_rate", 0),
             )
 
-        # Save final combined stats
         final_stats = trainer.get_training_stats()
-        final_path = self.data_dir / "sac_train_result_all.json"
+        final_path = (
+            self.data_dir / "sac_train_result_all.json"
+        )
         with final_path.open("w") as f:
             json.dump(final_stats, f, indent=2)
-        logger.info("SAC training complete. Saved to %s", final_path)
+
+        self._save_meta(
+            "sac",
+            self.sac_seed,
+            final_stats,
+            list(self.sac_meshes),
+        )
+        logger.info(
+            "SAC training complete. Saved to %s",
+            sac_model_dir,
+        )
+
+    # ══════════════════════════════════════════════════════
+    # SAC evaluation
+    # ══════════════════════════════════════════════════════
 
     def _run_sac_eval(self) -> None:
         """Evaluate P-SAC model on all meshes."""
         logger.info("=" * 60)
-        logger.info("P-SAC Eval")
+        logger.info("P-SAC Eval (seed=%d)", self.sac_seed)
         logger.info("=" * 60)
 
-        num_types = len(ExperienceExtractor.get_type_names())
+        num_types = len(
+            ExperienceExtractor.get_type_names()
+        )
         sac_trainer = PSACTrainer(
             state_dim=self.rl_config.get("state_dim", 15),
             num_types=num_types,
         )
-        sac_trainer.load(str(self.runs_dir / "sac_model"))
+        sac_trainer.load(
+            self._sac_model_dir(self.sac_seed)
+        )
 
-        all_sac_eval_results: dict[str, Any] = {}
+        all_results: dict[str, Any] = {}
 
         for mesh_name in self.eval_meshes:
-            mesh_path = str(self.data_dir / f"{mesh_name}.stl")
+            mesh_path = str(
+                self.data_dir / f"{mesh_name}.stl"
+            )
             logger.info("SAC Eval: %s", mesh_name)
 
             sac_eval_pools = get_or_generate_pools(
@@ -535,13 +786,13 @@ class RLGoalApproachExperiment:
                 sac_eval_pools=sac_eval_pools,
                 mesh_path=mesh_path,
             )
-            all_sac_eval_results[mesh_name] = results
+            all_results[mesh_name] = results
 
             for key in sorted(results.keys()):
                 data = results[key]
                 logger.info(
-                    "  %s (%smm): success=%.4f, timeout=%.4f, "
-                    "collision=%.4f",
+                    "  %s (%smm): success=%.4f, "
+                    "timeout=%.4f, collision=%.4f",
                     key,
                     data.get("bounds_mm", []),
                     data["success_rate"],
@@ -549,18 +800,20 @@ class RLGoalApproachExperiment:
                     data["collision_rate"],
                 )
 
-            eval_output = (
+            eval_out = (
                 self.data_dir
                 / f"sac_eval_result_{mesh_name}.json"
             )
-            with eval_output.open("w") as f:
+            with eval_out.open("w") as f:
                 json.dump(results, f, indent=2)
 
-        eval_output = self.data_dir / "sac_eval_result_all.json"
-        with eval_output.open("w") as f:
-            json.dump(all_sac_eval_results, f, indent=2)
+        all_out = (
+            self.data_dir / "sac_eval_result_all.json"
+        )
+        with all_out.open("w") as f:
+            json.dump(all_results, f, indent=2)
         logger.info(
-            "Saved all SAC eval results to %s", eval_output
+            "Saved all SAC eval results to %s", all_out
         )
 
     def _eval_sac_on_pools(
@@ -577,46 +830,56 @@ class RLGoalApproachExperiment:
             mesh_path: Path to the mesh file.
 
         Returns:
-            Dict with per-level evaluation results including
-            action distribution and collision stats.
+            Dict with per-level evaluation results.
         """
         type_names = ExperienceExtractor.get_type_names()
-        results_per_level: dict[str, Any] = {}
+        results: dict[str, Any] = {}
         sample_seed = self.sac_eval_seeds[0]
         num_levels = len(
             sac_eval_pools[sample_seed].get("levels", [])
         )
 
         for level_idx in range(num_levels):
-            level_successes = 0
-            level_timeouts = 0
-            level_collisions = 0
-            level_total = 0
-            level_action_counts: dict[int, int] = {}
-            level_collision_counts: dict[int, int] = {}
-            level_total_steps = 0
+            successes = 0
+            timeouts = 0
+            collisions = 0
+            total = 0
+            action_counts: dict[int, int] = {}
+            collision_counts: dict[int, int] = {}
+            total_steps = 0
 
             for eval_seed in self.sac_eval_seeds:
-                level_pool = sac_eval_pools[eval_seed]["levels"][
-                    level_idx
-                ]
+                pool = sac_eval_pools[eval_seed][
+                    "levels"
+                ][level_idx]
 
                 np.random.seed(eval_seed)  # noqa: NPY002
                 torch.manual_seed(eval_seed)
-                env = LightweightEnv(mesh_path, seed=eval_seed)
+                env = LightweightEnv(
+                    mesh_path, seed=eval_seed
+                )
                 controller = RLGoalApproachController(
                     agent_id=(
-                        f"sac_eval_L{level_idx}_{eval_seed}"
+                        f"sac_eval_L{level_idx}"
+                        f"_{eval_seed}"
                     ),
-                    config={**self.rl_config, "mode": "eval"},
+                    config={
+                        **self.rl_config,
+                        "mode": "eval",
+                    },
                 )
                 interpreter = ActionInterpreter(env)
 
-                for ep_data in level_pool:
-                    start_pos = np.array(ep_data["start_pos"])
-                    start_rot = np.array(ep_data["start_rot"])
+                for ep_data in pool:
+                    start_pos = np.array(
+                        ep_data["start_pos"]
+                    )
+                    start_rot = np.array(
+                        ep_data["start_rot"]
+                    )
                     env.reset(
-                        position=start_pos, rotation=start_rot
+                        position=start_pos,
+                        rotation=start_rot,
                     )
                     goal_pose = np.concatenate([
                         np.array(ep_data["goal_pos"]),
@@ -629,20 +892,19 @@ class RLGoalApproachExperiment:
 
                     success = False
                     collision = False
-                    ep_steps = 0
 
                     for _ in range(
                         sac_trainer.max_steps_per_goal
                     ):
-                        current_pose = env.get_pose()
-                        sensor_data = env.get_sensor_data()
-                        state_raw = (
-                            controller._compute_state(  # noqa: SLF001
-                                current_pose, sensor_data
-                            )
+                        pose = env.get_pose()
+                        sensor = env.get_sensor_data()
+                        state_raw = controller._compute_state(  # noqa: SLF001
+                            pose, sensor
                         )
-                        state = sac_trainer.normalize_state(
-                            state_raw
+                        state = (
+                            sac_trainer.normalize_state(
+                                state_raw
+                            )
                         )
 
                         state_t = torch.FloatTensor(
@@ -650,127 +912,131 @@ class RLGoalApproachExperiment:
                         ).unsqueeze(0)
                         with torch.no_grad():
                             at, ap, _, _ = (
-                                sac_trainer.actor.sample_eval(
-                                    state_t
-                                )
+                                sac_trainer.actor
+                                .sample_eval(state_t)
                             )
-                        action_type = at[0].item()
-                        action_params = (
+                        atype = at[0].item()
+                        aparams = (
                             ap[0].numpy()
                             * sac_trainer.param_std
                             + sac_trainer.param_mean
                         )
 
-                        # Track action
-                        level_action_counts[action_type] = (
-                            level_action_counts.get(
-                                action_type, 0
-                            )
+                        action_counts[atype] = (
+                            action_counts.get(atype, 0)
                             + 1
                         )
-                        level_total_steps += 1
-                        ep_steps += 1
+                        total_steps += 1
 
-                        sensor_data = interpreter.execute(
-                            action_type, action_params
+                        sensor = interpreter.execute(
+                            atype, aparams
                         )
-
-                        current_pose = env.get_pose()
-                        distance = float(
+                        pose = env.get_pose()
+                        dist = float(
                             np.linalg.norm(
                                 goal_pose[:3]
-                                - current_pose[:3]
+                                - pose[:3]
                             )
                         )
 
-                        if distance < sac_trainer.goal_threshold:
+                        if (
+                            dist
+                            < sac_trainer.goal_threshold
+                        ):
                             success = True
                             break
 
-                        depth = sensor_data.get("depth", 100.0)
-                        if depth < _COLLISION_DEPTH_THRESHOLD:
+                        depth = sensor.get(
+                            "depth", 100.0
+                        )
+                        if (
+                            depth
+                            < _COLLISION_DEPTH_THRESHOLD
+                        ):
                             collision = True
-                            # Track collision
-                            level_collision_counts[
-                                action_type
-                            ] = (
-                                level_collision_counts.get(
-                                    action_type, 0
+                            collision_counts[atype] = (
+                                collision_counts.get(
+                                    atype, 0
                                 )
                                 + 1
                             )
                             break
 
-                    level_total += 1
+                    total += 1
                     if success:
-                        level_successes += 1
+                        successes += 1
                     elif collision:
-                        level_collisions += 1
+                        collisions += 1
                     else:
-                        level_timeouts += 1
+                        timeouts += 1
 
-            count = max(level_total, 1)
+            count = max(total, 1)
             bounds = self.curriculum_levels[level_idx]
-
-            # Action distribution
-            total_actions = max(
-                sum(level_action_counts.values()), 1
+            total_act = max(
+                sum(action_counts.values()), 1
             )
-            action_distribution = {
-                type_names.get(k, f"type_{k}"): {
-                    "count": v,
-                    "rate": round(v / total_actions, 4),
-                }
-                for k, v in sorted(
-                    level_action_counts.items()
-                )
-            }
 
-            # Collision rate per type
             collision_rate_per_type = {}
-            for (
-                type_id,
-                col_count,
-            ) in level_collision_counts.items():
-                total_calls = level_action_counts.get(
-                    type_id, 0
-                )
+            for tid, cc in collision_counts.items():
+                tc = action_counts.get(tid, 0)
                 name = type_names.get(
-                    type_id, f"type_{type_id}"
+                    tid, f"type_{tid}"
                 )
                 collision_rate_per_type[name] = {
-                    "collisions": col_count,
-                    "total_calls": total_calls,
+                    "collisions": cc,
+                    "total_calls": tc,
                     "rate": round(
-                        col_count / max(total_calls, 1), 4
+                        cc / max(tc, 1), 4
                     ),
                 }
 
-            results_per_level[f"level_{level_idx}"] = {
+            results[f"level_{level_idx}"] = {
                 "bounds_mm": list(bounds),
-                "success_rate": level_successes / count,
-                "timeout_rate": level_timeouts / count,
-                "collision_rate": level_collisions / count,
-                "action_distribution": action_distribution,
+                "total_episodes": total,
+                "success_count": successes,
+                "timeout_count": timeouts,
+                "collision_count": collisions,
+                "success_rate": successes / count,
+                "timeout_rate": timeouts / count,
+                "collision_rate": collisions / count,
+                "action_distribution": {
+                    type_names.get(
+                        k, f"type_{k}"
+                    ): {
+                        "count": v,
+                        "rate": round(
+                            v / total_act, 4
+                        ),
+                    }
+                    for k, v in sorted(
+                        action_counts.items()
+                    )
+                },
                 "collision_stats": {
-                    type_names.get(k, f"type_{k}"): v
-                    for k, v in level_collision_counts.items()
+                    type_names.get(
+                        k, f"type_{k}"
+                    ): v
+                    for k, v in (
+                        collision_counts.items()
+                    )
                 },
                 "collision_rate_per_type": (
                     collision_rate_per_type
                 ),
                 "steps_per_success": round(
-                    level_total_steps
-                    / max(level_successes, 1),
+                    total_steps / max(successes, 1),
                     1,
                 ),
                 "mean_episode_steps": round(
-                    level_total_steps / max(level_total, 1),
-                    1,
+                    total_steps / max(total, 1), 1
                 ),
             }
 
-        return results_per_level
+        return results
+
+    # ══════════════════════════════════════════════════════
+    # Adaptive
+    # ══════════════════════════════════════════════════════
 
     def _run_adaptive(self) -> None:
         """Run adaptive mode with Q-store + SAC arbitration."""
@@ -782,23 +1048,62 @@ class RLGoalApproachExperiment:
             self.data_dir / f"{self.adaptive_mesh}.stl"
         )
         env = LightweightEnv(mesh_path)
-        num_types = len(ExperienceExtractor.get_type_names())
-
-        q_load_dir = (
-            f"{self.unified_save_dir}"
-            f"_seed_{self.train_seeds[0]}"
+        num_types = len(
+            ExperienceExtractor.get_type_names()
         )
+        adapt_seed = self.train_seeds[0]
+
+        # Load Q-store: adaptive if exists, otherwise training
+        adaptive_q_dir = str(
+            self.runs_dir
+            / f"adaptive_q_seed_{adapt_seed}"
+        )
+        if (
+            Path(adaptive_q_dir) / "config.json"
+        ).exists():
+            q_load_dir = adaptive_q_dir
+            logger.info(
+                "Loading Q-store from adaptive: %s",
+                q_load_dir,
+            )
+        else:
+            q_load_dir = self._q_model_dir(adapt_seed)
+            logger.info(
+                "Loading Q-store from training: %s",
+                q_load_dir,
+            )
+
         controller = RLGoalApproachController.load(
             q_load_dir,
             agent_id=f"{self.adaptive_mesh}_adaptive",
             config={**self.rl_config, "mode": "eval"},
         )
 
+        # Load SAC: adaptive if exists, otherwise training
+        adaptive_sac_dir = str(
+            self.runs_dir
+            / f"adaptive_sac_seed_{self.sac_seed}"
+        )
         sac_trainer = PSACTrainer(
             state_dim=self.rl_config.get("state_dim", 15),
             num_types=num_types,
         )
-        sac_trainer.load(str(self.runs_dir / "sac_model"))
+        if (
+            Path(adaptive_sac_dir) / "sac_actor.pt"
+        ).exists():
+            sac_trainer.load(adaptive_sac_dir)
+            logger.info(
+                "Loading SAC from adaptive: %s",
+                adaptive_sac_dir,
+            )
+        else:
+            sac_trainer.load(
+                self._sac_model_dir(self.sac_seed)
+            )
+            logger.info(
+                "Loading SAC from training: %s",
+                self._sac_model_dir(self.sac_seed),
+            )
 
         manager = AdaptiveTrainingManager(
             controller=controller,
@@ -808,6 +1113,44 @@ class RLGoalApproachExperiment:
             mesh_path=mesh_path,
         )
         manager.sac_trainer = sac_trainer
+
+        # Metrics tracking
+        episode_log: list[dict[str, Any]] = []
+        snapshot_log: list[dict[str, Any]] = []
+        action_counts: dict[str, int] = {}
+        collision_counts: dict[str, int] = {}
+        source_counts: dict[str, int] = {
+            "q_store": 0,
+            "sac": 0,
+            "heuristic": 0,
+        }
+        total_steps_adaptive = 0
+        rolling_successes: list[bool] = []
+        # Create adaptive logs directory
+        adaptive_log_dir = (
+            self.data_dir
+            / f"adaptive_logs_{self.adaptive_mesh}"
+        )
+        adaptive_log_dir.mkdir(parents=True, exist_ok=True)
+        self._prev_adaptive_mode = "online"
+        # Per-source detailed tracking
+        q_terminations: dict[str, int] = {
+            "success": 0, "collision": 0, "timeout": 0
+        }
+        sac_terminations: dict[str, int] = {
+            "success": 0, "collision": 0, "timeout": 0
+        }
+        q_final_distances: list[float] = []
+        sac_final_distances: list[float] = []
+        q_episode_steps: list[int] = []
+        sac_episode_steps: list[int] = []
+        adaptive_max_steps = self.rl_config.get(
+            "max_steps_per_goal", 400
+        )
+        # Перед эпизодом:
+        collision_stats_before = dict(
+            controller._collision_stats  # noqa: SLF001
+        )
 
         for episode in range(self.adaptive_episodes):
             env.reset()
@@ -825,63 +1168,587 @@ class RLGoalApproachExperiment:
             goals_before = (
                 controller._total_goals_reached  # noqa: SLF001
             )
-            for _ in range(_ADAPTIVE_MAX_STEPS):
-                current_pose = env.get_pose()
-                sensor_data = env.get_sensor_data()
+            ep_steps = 0
+            ep_sources: list[str] = []
+            ep_actions: list[int] = []
+
+            for _ in range(adaptive_max_steps):
+                pose = env.get_pose()
+                sensor = env.get_sensor_data()
                 state = (
                     controller._compute_state(  # noqa: SLF001
-                        current_pose, sensor_data
+                        pose, sensor
                     )
                 )
-                action_index, _source = manager.get_action(
-                    state, current_pose, sensor_data
+                action_idx, source = manager.get_action(
+                    state, pose, sensor
                 )
-                _state, done = controller.update_only(
-                    current_pose, sensor_data, action_index
+                _st, done = controller.update_only(
+                    pose, sensor, action_idx
                 )
+
+                ep_steps += 1
+                total_steps_adaptive += 1
+                ep_sources.append(source)
+                ep_actions.append(action_idx)
+
+                # Track action
+                act_name = controller.action_space.get_info(
+                    action_idx
+                ).name
+                action_counts[act_name] = (
+                    action_counts.get(act_name, 0) + 1
+                )
+
+                # Track source
+                source_key = (
+                    source
+                    if source in source_counts
+                    else "heuristic"
+                )
+                source_counts[source_key] = (
+                    source_counts.get(source_key, 0) + 1
+                )
+
                 if done:
                     break
-                env.step(action_index, controller.action_space)
+                env.step(
+                    action_idx, controller.action_space
+                )
 
             success = (
                 controller._total_goals_reached  # noqa: SLF001
                 > goals_before
             )
+
+            # Check collision
+            collision = False
+            if not success and not done:
+                collision = False  # timeout
+            elif not success and done:
+                collision = True  # collision ended episode
+
+            # Determine termination
+            if success:
+                termination = "success"
+            elif collision:
+                termination = "collision"
+            else:
+                termination = "timeout"
+
             transitions = (
                 controller.success_trails.copy()
                 if success
                 else []
             )
+            if termination == "collision":
+                for act_name, count in (
+                    controller._collision_stats.items()  # noqa: SLF001
+                ):
+                    prev = collision_stats_before.get(
+                        act_name, 0
+                    )
+                    if count > prev:
+                        collision_counts[act_name] = (
+                            collision_counts.get(
+                                act_name, 0
+                            )
+                            + (count - prev)
+                        )
             manager.on_episode_complete(
-                success=success, transitions=transitions
+                success=success,
+                transitions=transitions,
             )
+            # Save on mode change
+            current_mode = manager.mode
+            if (
+                episode > 0
+                and episode_log
+                and hasattr(self, "_prev_adaptive_mode")
+                and self._prev_adaptive_mode != current_mode
+            ):
+                mode_change = {
+                    "episode": episode,
+                    "from_mode": self._prev_adaptive_mode,
+                    "to_mode": current_mode,
+                    "rolling_success_rate": round(
+                        rolling_rate, 3
+                    ),
+                    "trigger": (
+                        "success_rate_change"
+                    ),
+                    "recent_episodes": episode_log[-10:],
+                }
+                change_path = (
+                    adaptive_log_dir
+                    / f"mode_change_ep_{episode:05d}.json"
+                )
+                with change_path.open("w") as f:
+                    json.dump(mode_change, f, indent=2)
+                logger.info(
+                    "Mode change at ep %d: %s → %s "
+                    "(rate=%.3f), saved to %s",
+                    episode,
+                    self._prev_adaptive_mode,
+                    current_mode,
+                    rolling_rate,
+                    change_path,
+                )
+            self._prev_adaptive_mode = current_mode
             manager.arbitrator.on_episode_end(success)
 
+            rolling_successes.append(success)
+            if len(rolling_successes) > 100:
+                rolling_successes.pop(0)
+            rolling_rate = (
+                sum(rolling_successes)
+                / len(rolling_successes)
+            )
+
+            # Dominant source for this episode
+            from collections import Counter
+
+            source_counter = Counter(ep_sources)
+            dominant_source = (
+                source_counter.most_common(1)[0][0]
+                if ep_sources
+                else "none"
+            )
+
+            # Per-episode log
+            start_dist = float(
+                np.linalg.norm(goal_pose[:3] - start_pos)
+            )
+            final_pose = env.get_pose()
+            final_dist = float(
+                np.linalg.norm(
+                    goal_pose[:3] - final_pose[:3]
+                )
+            )
+
+            episode_log.append({
+                "episode": episode,
+                "success": success,
+                "termination": termination,
+                "steps": ep_steps,
+                "start_distance": round(start_dist, 1),
+                "final_distance": round(final_dist, 1),
+                "dominant_source": dominant_source,
+                "rolling_success_rate": round(
+                    rolling_rate, 3
+                ),
+                "mode": manager.mode,
+            })
+            # Per-source termination and distance tracking
+            if dominant_source == "q_store":
+                q_terminations[termination] = (
+                    q_terminations.get(termination, 0) + 1
+                )
+                q_final_distances.append(
+                    round(final_dist, 1)
+                )
+                q_episode_steps.append(ep_steps)
+            elif dominant_source == "sac":
+                sac_terminations[termination] = (
+                    sac_terminations.get(termination, 0) + 1
+                )
+                sac_final_distances.append(
+                    round(final_dist, 1)
+                )
+                sac_episode_steps.append(ep_steps)
+
+            # Snapshot every 100 episodes — save to file
             if (episode + 1) % _ADAPTIVE_LOG_INTERVAL == 0:
-                logger.info(
-                    "Adaptive episode %d: %s",
-                    episode + 1,
-                    manager.get_stats(),
+                stats = manager.get_stats()
+                arb_stats = manager.arbitrator.get_stats()
+
+                total_src = max(
+                    sum(source_counts.values()), 1
+                )
+                total_act = max(
+                    sum(action_counts.values()), 1
                 )
 
-        controller.save(str(self.runs_dir / "adaptive_q"))
-        if manager.sac_trainer:
-            manager.sac_trainer.save(
-                str(self.runs_dir / "adaptive_sac")
-            )
-        logger.info(
-            "Adaptive complete: %s", manager.get_stats()
+                snapshot = {
+                    "episode": episode + 1,
+                    "rolling_success_rate": round(
+                        rolling_rate, 3
+                    ),
+                    "mode": stats["mode"],
+                    "total_episodes": episode + 1,
+                    "total_steps": total_steps_adaptive,
+                    "success_count": sum(
+                        1
+                        for e in episode_log
+                        if e["success"]
+                    ),
+                    "collision_count": sum(
+                        1
+                        for e in episode_log
+                        if e["termination"] == "collision"
+                    ),
+                    "timeout_count": sum(
+                        1
+                        for e in episode_log
+                        if e["termination"] == "timeout"
+                    ),
+                    "source_distribution": {
+                        k: round(v / total_src, 3)
+                        for k, v in source_counts.items()
+                    },
+                    "action_distribution": {
+                        k: {
+                            "count": v,
+                            "rate": round(
+                                v / total_act, 4
+                            ),
+                        }
+                        for k, v in sorted(
+                            action_counts.items(),
+                            key=lambda x: -x[1],
+                        )
+                    },
+                    "collision_stats": dict(
+                        collision_counts
+                    ),
+                    "steps_per_success": round(
+                        total_steps_adaptive
+                        / max(
+                            sum(
+                                1
+                                for e in episode_log
+                                if e["success"]
+                            ),
+                            1,
+                        ),
+                        1,
+                    ),
+                    "arbitrator": {
+                        "q_store_rate": arb_stats.get(
+                            "q_store_rate", 0
+                        ),
+                        "sac_rate": arb_stats.get(
+                            "sac_rate", 0
+                        ),
+                        "heuristic_rate": arb_stats.get(
+                            "heuristic_rate", 0
+                        ),
+                        "agreement_rate": arb_stats.get(
+                            "agreement_rate", 0
+                        ),
+                        "q_spread_mean": arb_stats.get(
+                            "q_spread_mean", 0
+                        ),
+                        "sac_confidence_mean": arb_stats.get(
+                            "sac_confidence_mean", 0
+                        ),
+                        "q_success_rate": arb_stats.get(
+                            "q_success_rate", 0
+                        ),
+                        "sac_success_rate": arb_stats.get(
+                            "sac_success_rate", 0
+                        ),
+                    },
+                    "manager": {
+                        "sac_updates": stats.get(
+                            "total_sac_updates", 0
+                        ),
+                        "offline_iterations": stats.get(
+                            "total_offline_iterations",
+                            0,
+                        ),
+                    },
+                    "per_source_analysis": {
+                        "q_store": {
+                            "terminations": dict(
+                                q_terminations
+                            ),
+                            "chosen_actions": (
+                                arb_stats.get(
+                                    "q_chosen_top", {}
+                                )
+                            ),
+                            "proposed_actions": (
+                                arb_stats.get(
+                                    "q_proposed_top", {}
+                                )
+                            ),
+                            "mean_final_distance": round(
+                                float(
+                                    np.mean(
+                                        q_final_distances
+                                    )
+                                )
+                                if q_final_distances
+                                else 0,
+                                1,
+                            ),
+                            "near_miss_count": sum(
+                                1
+                                for d in q_final_distances
+                                if 2.0 < d <= 5.0
+                            ),
+                            "mean_episode_steps": round(
+                                float(
+                                    np.mean(
+                                        q_episode_steps
+                                    )
+                                )
+                                if q_episode_steps
+                                else 0,
+                                1,
+                            ),
+                        },
+                        "sac": {
+                            "terminations": dict(
+                                sac_terminations
+                            ),
+                            "chosen_actions": (
+                                arb_stats.get(
+                                    "sac_chosen_top", {}
+                                )
+                            ),
+                            "proposed_actions": (
+                                arb_stats.get(
+                                    "sac_proposed_top", {}
+                                )
+                            ),
+                            "mean_final_distance": round(
+                                float(
+                                    np.mean(
+                                        sac_final_distances
+                                    )
+                                )
+                                if sac_final_distances
+                                else 0,
+                                1,
+                            ),
+                            "near_miss_count": sum(
+                                1
+                                for d in sac_final_distances
+                                if 2.0 < d <= 5.0
+                            ),
+                            "mean_episode_steps": round(
+                                float(
+                                    np.mean(
+                                        sac_episode_steps
+                                    )
+                                )
+                                if sac_episode_steps
+                                else 0,
+                                1,
+                            ),
+                        },
+                    },
+                }
+                snapshot_log.append(snapshot)
+
+                # Save snapshot to file
+                snap_path = (
+                    adaptive_log_dir
+                    / f"snapshot_ep_{episode + 1:05d}.json"
+                )
+                with snap_path.open("w") as f:
+                    json.dump(snapshot, f, indent=2)
+
+                logger.info(
+                    "Adaptive ep %d: rate=%.3f, "
+                    "mode=%s, saved to %s",
+                    episode + 1,
+                    rolling_rate,
+                    stats["mode"],
+                    snap_path,
+                )
+
+        # Save adaptive models (separate from training)
+        adapt_q_dir = str(
+            self.runs_dir
+            / f"adaptive_q_seed_{adapt_seed}"
         )
+        controller.save(adapt_q_dir)
+        logger.info(
+            "Adaptive Q-store saved to %s", adapt_q_dir
+        )
+
+        if manager.sac_trainer:
+            adapt_sac_dir = str(
+                self.runs_dir
+                / f"adaptive_sac_seed_{self.sac_seed}"
+            )
+            manager.sac_trainer.save(adapt_sac_dir)
+            logger.info(
+                "Adaptive SAC saved to %s", adapt_sac_dir
+            )
+
+        # Save comprehensive results
+        total_src = max(sum(source_counts.values()), 1)
+        total_act = max(sum(action_counts.values()), 1)
+        successes = sum(
+            1 for e in episode_log if e["success"]
+        )
+        collisions = sum(
+            1
+            for e in episode_log
+            if e["termination"] == "collision"
+        )
+        timeouts = sum(
+            1
+            for e in episode_log
+            if e["termination"] == "timeout"
+        )
+        total_ep = len(episode_log)
+
+        final_results = {
+            "mesh": self.adaptive_mesh,
+            "total_episodes": total_ep,
+            "total_steps": total_steps_adaptive,
+            "success_rate": round(
+                successes / max(total_ep, 1), 4
+            ),
+            "collision_rate": round(
+                collisions / max(total_ep, 1), 4
+            ),
+            "timeout_rate": round(
+                timeouts / max(total_ep, 1), 4
+            ),
+            "steps_per_success": round(
+                total_steps_adaptive
+                / max(successes, 1),
+                1,
+            ),
+            "source_distribution": {
+                k: round(v / total_src, 4)
+                for k, v in source_counts.items()
+            },
+            "action_distribution": {
+                k: {
+                    "count": v,
+                    "rate": round(v / total_act, 4),
+                }
+                for k, v in sorted(
+                    action_counts.items(),
+                    key=lambda x: -x[1],
+                )
+            },
+            "collision_stats": dict(collision_counts),
+            "snapshots": snapshot_log,
+            "episode_log": episode_log,
+            "per_source_analysis": {
+                "q_store": {
+                    "terminations": dict(q_terminations),
+                    "mean_final_distance": round(
+                        float(np.mean(q_final_distances))
+                        if q_final_distances
+                        else 0,
+                        1,
+                    ),
+                    "near_miss_count": sum(
+                        1
+                        for d in q_final_distances
+                        if 2.0 < d <= 5.0
+                    ),
+                    "near_miss_rate": round(
+                        sum(
+                            1
+                            for d in q_final_distances
+                            if 2.0 < d <= 5.0
+                        )
+                        / max(len(q_final_distances), 1),
+                        3,
+                    ),
+                    "mean_episode_steps": round(
+                        float(np.mean(q_episode_steps))
+                        if q_episode_steps
+                        else 0,
+                        1,
+                    ),
+                    "total_episodes": len(
+                        q_final_distances
+                    ),
+                },
+                "sac": {
+                    "terminations": dict(sac_terminations),
+                    "mean_final_distance": round(
+                        float(np.mean(sac_final_distances))
+                        if sac_final_distances
+                        else 0,
+                        1,
+                    ),
+                    "near_miss_count": sum(
+                        1
+                        for d in sac_final_distances
+                        if 2.0 < d <= 5.0
+                    ),
+                    "near_miss_rate": round(
+                        sum(
+                            1
+                            for d in sac_final_distances
+                            if 2.0 < d <= 5.0
+                        )
+                        / max(
+                            len(sac_final_distances), 1
+                        ),
+                        3,
+                    ),
+                    "mean_episode_steps": round(
+                        float(
+                            np.mean(sac_episode_steps)
+                        )
+                        if sac_episode_steps
+                        else 0,
+                        1,
+                    ),
+                    "total_episodes": len(
+                        sac_final_distances
+                    ),
+                },
+            },
+        }
+
+        results_path = (
+            self.data_dir
+            / f"adaptive_result_{self.adaptive_mesh}.json"
+        )
+        with results_path.open("w") as f:
+            json.dump(final_results, f, indent=2)
+        logger.info(
+            "Adaptive results saved to %s", results_path
+        )
+
+        # Save meta
+        self._save_meta(
+            f"adaptive_{self.adaptive_mesh}",
+            adapt_seed,
+            {
+                "success_rate": final_results[
+                    "success_rate"
+                ],
+                "total_episodes": total_ep,
+                "source_distribution": final_results[
+                    "source_distribution"
+                ],
+            },
+            [self.adaptive_mesh],
+        )
+
+        logger.info(
+            "Adaptive complete: success=%.3f, "
+            "collision=%.3f, timeout=%.3f",
+            final_results["success_rate"],
+            final_results["collision_rate"],
+            final_results["timeout_rate"],
+        )
+
+    # ══════════════════════════════════════════════════════
+    # Utilities
+    # ══════════════════════════════════════════════════════
 
     @staticmethod
     def _filter_bc_transitions(
         transitions: list[Any],
         max_per_mesh: int = 10000,
     ) -> list[Any]:
-        """Filter BC transitions for quality and balance.
-
-        Keeps shorter trajectories (more efficient demonstrations)
-        and balances across meshes.
+        """Filter BC transitions for balance across meshes.
 
         Args:
             transitions: All collected BC transitions.
@@ -892,37 +1759,36 @@ class RLGoalApproachExperiment:
         """
         mesh_id_to_name = {
             v: k
-            for k, v in ExperienceExtractor.MESH_NAME_TO_ID.items()
+            for k, v in (
+                ExperienceExtractor
+                .MESH_NAME_TO_ID
+                .items()
+            )
         }
 
-        # Group by mesh
         by_mesh: dict[int, list[Any]] = {}
         for tr in transitions:
-            mesh_id = getattr(tr, "mesh_id", -1)
-            if mesh_id not in by_mesh:
-                by_mesh[mesh_id] = []
-            by_mesh[mesh_id].append(tr)
+            mid = getattr(tr, "mesh_id", -1)
+            if mid not in by_mesh:
+                by_mesh[mid] = []
+            by_mesh[mid].append(tr)
 
-        # Cap per mesh
         filtered: list[Any] = []
-        for mesh_id, mesh_transitions in by_mesh.items():
-            mesh_name = mesh_id_to_name.get(
-                mesh_id, f"unknown_{mesh_id}"
+        for mid, mtrs in by_mesh.items():
+            mname = mesh_id_to_name.get(
+                mid, f"unknown_{mid}"
             )
-            if len(mesh_transitions) > max_per_mesh:
-                # Keep random subset
-                indices = np.random.permutation(
-                    len(mesh_transitions)
+            if len(mtrs) > max_per_mesh:
+                indices = np.random.permutation(  # noqa: NPY002
+                    len(mtrs)
                 )[:max_per_mesh]
-                mesh_transitions = [
-                    mesh_transitions[i] for i in indices
-                ]
+                mtrs = [mtrs[i] for i in indices]
                 logger.info(
-                    "BC filter: %s capped to %d transitions",
-                    mesh_name,
+                    "BC filter: %s capped to %d",
+                    mname,
                     max_per_mesh,
                 )
-            filtered.extend(mesh_transitions)
+            filtered.extend(mtrs)
 
         logger.info(
             "BC filter: %d → %d transitions",
