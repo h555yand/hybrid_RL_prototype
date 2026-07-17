@@ -28,6 +28,61 @@ from tbp.hybrid_rl.lightweight_env import LightweightEnv
 logger = logging.getLogger(__name__)
 
 
+def _is_reachable_by_surface(
+    env: LightweightEnv,
+    start_pos: np.ndarray,
+    goal_pos: np.ndarray,
+) -> bool:
+    """Check if start and goal are on the same side of the object.
+
+    Uses surface normal directions relative to object centroid.
+    Both normals pointing outward = external side.
+    Both normals pointing inward = internal side.
+    Mixed = different sides, path blocked by wall.
+
+    Args:
+        env: Environment with mesh.
+        start_pos: Start position [x, y, z].
+        goal_pos: Goal position [x, y, z].
+
+    Returns:
+        True if both points are on the same side.
+    """
+    center = np.array(env.mesh.centroid, dtype=float)
+    height_axis = env.height_axis
+
+    # Get normals at nearest surface points
+    _, _, start_face = env.mesh.nearest.on_surface([start_pos])
+    _, _, goal_face = env.mesh.nearest.on_surface([goal_pos])
+
+    start_normal = env.mesh.face_normals[start_face[0]]
+    goal_normal = env.mesh.face_normals[goal_face[0]]
+
+    # Horizontal components (ignore height axis)
+    start_n = start_normal.copy()
+    start_n[height_axis] = 0.0
+
+    goal_n = goal_normal.copy()
+    goal_n[height_axis] = 0.0
+
+    # If either normal is mostly vertical (top/bottom surface) — allow
+    if np.linalg.norm(start_n) < 0.3 or np.linalg.norm(goal_n) < 0.3:
+        return True
+
+    # Direction from center to each point (horizontal)
+    start_from_center = start_pos - center
+    start_from_center[height_axis] = 0.0
+
+    goal_from_center = goal_pos - center
+    goal_from_center[height_axis] = 0.0
+
+    # Outward = normal points same direction as center→point
+    start_outward = np.dot(start_n, start_from_center) > 0
+    goal_outward = np.dot(goal_n, goal_from_center) > 0
+
+    return start_outward == goal_outward
+
+
 def generate_episode_pools(
     mesh_path: str,
     episodes_per_level: int,
@@ -35,6 +90,9 @@ def generate_episode_pools(
     curriculum_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Generate episode pools with fixed start/goal positions.
+
+    For Level 0, ensures start and goal are on the same side
+    of the object (reachable by surface crawling without detach).
 
     Args:
         mesh_path: Path to the mesh file.
@@ -48,9 +106,15 @@ def generate_episode_pools(
     np.random.seed(seed)  # noqa: NPY002
     random.seed(seed)
     env = LightweightEnv(mesh_path, seed=seed)
-    curr_levels = list((curriculum_config or {}).get("levels", []))
-    use_curriculum = bool(curriculum_config is not None and curr_levels)
-    level_specs = curr_levels if use_curriculum else [(None, None)]
+    curr_levels = list(
+        (curriculum_config or {}).get("levels", [])
+    )
+    use_curriculum = bool(
+        curriculum_config is not None and curr_levels
+    )
+    level_specs = (
+        curr_levels if use_curriculum else [(None, None)]
+    )
     levels: list[list[dict[str, Any]]] = []
 
     for level_idx, bounds in enumerate(level_specs):
@@ -60,25 +124,65 @@ def generate_episode_pools(
             env.reset()
             start_pose = env.get_pose()
             start_pos = start_pose[:3]
+
+            is_cube = "cube" in mesh_path.lower()
+            require_same_side = (
+                use_curriculum and level_idx == 0
+            )
+
             if use_curriculum:
-                is_cube = "cube" in mesh_path.lower()
-                goal_pose = env.get_random_surface_point(
-                    reference_pos=start_pos,
-                    min_dist=min_d,
-                    max_dist=max_d,
-                    max_attempts=2000,
-                    mesh_sample=True,
-                    same_cube_side=bool(
-                        is_cube and level_idx == 0
-                    ),
+                max_goal_attempts = (
+                    50 if require_same_side else 1
                 )
-                curriculum_bounds = [float(min_d), float(max_d)]
+                goal_pose = None
+
+                for _attempt in range(max_goal_attempts):
+                    candidate = env.get_random_surface_point(
+                        reference_pos=start_pos,
+                        min_dist=min_d,
+                        max_dist=max_d,
+                        max_attempts=2000,
+                        mesh_sample=True,
+                        same_cube_side=bool(
+                            is_cube and level_idx == 0
+                        ),
+                    )
+
+                    if not require_same_side:
+                        goal_pose = candidate
+                        break
+
+                    if _is_reachable_by_surface(
+                        env, start_pos, candidate[:3]
+                    ):
+                        goal_pose = candidate
+                        break
+
+                if goal_pose is None:
+                    goal_pose = candidate
+                    logger.warning(
+                        "Level %d ep %d: could not find "
+                        "same-side goal in %d attempts, "
+                        "using fallback",
+                        level_idx,
+                        item_idx,
+                        max_goal_attempts,
+                    )
+
+                curriculum_bounds = [
+                    float(min_d), float(max_d)
+                ]
             else:
                 goal_pose = env.get_random_surface_point()
                 curriculum_bounds = None
+
             target_distance = float(
                 np.linalg.norm(goal_pose[:3] - start_pos)
             )
+            same_side = bool(_is_reachable_by_surface(
+                env, start_pos, goal_pose[:3]
+            ))
+
             entry: dict[str, Any] = {
                 "pool_index": int(item_idx),
                 "start_pos": start_pose[:3].tolist(),
@@ -86,6 +190,7 @@ def generate_episode_pools(
                 "goal_pos": goal_pose[:3].tolist(),
                 "goal_rot": goal_pose[3:].tolist(),
                 "target_distance": target_distance,
+                "same_side": same_side,
             }
             if use_curriculum:
                 entry["curriculum_level"] = int(level_idx)

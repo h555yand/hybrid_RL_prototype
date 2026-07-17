@@ -212,12 +212,14 @@ class Arbitrator:
         # Q-store score: needs confidence and spread
         q_score = 0.0
         if q_confidence > 0.2 and q_spread > 0.5:
-            q_score = q_confidence * q_track
+            # q_score = q_confidence * q_track
+            q_score = (0.3 * q_confidence + 0.7) * q_track
 
         # SAC score: needs actor
         sac_score = 0.0
         if self.sac_actor is not None:
-            sac_score = sac_confidence * sac_track
+            # sac_score = sac_confidence * sac_track
+            sac_score = (0.3 * sac_confidence + 0.7) * sac_track
 
         # Choose best source, heuristic as fallback only
         if q_score > 0 or sac_score > 0:
@@ -246,35 +248,27 @@ class Arbitrator:
         self._current_episode_sources.append("heuristic")
         return heuristic_action, "heuristic"
     
-    def on_episode_end(self, success: bool):
-        """Called after each episode to calculate the success rate by source."""
+    def on_episode_end(self, success):
         if not self._current_episode_sources:
             self._current_episode_sources = []
             return
 
-        # Determine the dominant source of the episode (>50% of solutions)
         counts = Counter(self._current_episode_sources)
         total = len(self._current_episode_sources)
-        dominant = counts.most_common(1)[0][0]
-        dominant_ratio = counts[dominant] / total
 
-        # Write down the result for the dominant source
-        if dominant_ratio > 0.5:
-            if dominant == "q_store":
-                self._q_episode_results.append(success)
-            elif dominant == "sac":
-                self._sac_episode_results.append(success)
-            elif dominant == "heuristic":
-                self._heuristic_episode_results.append(success)
-        else:
-            # Mixed episode - record for both
-            for source in counts:
+        # Record for every source that participated (>10%)
+        min_participation = 0.1
+        for source, count in counts.items():
+            participation = count / total
+            if participation >= min_participation:
                 if source == "q_store":
                     self._q_episode_results.append(success)
                 elif source == "sac":
                     self._sac_episode_results.append(success)
                 elif source == "heuristic":
-                    self._heuristic_episode_results.append(success)
+                    self._heuristic_episode_results.append(
+                        success
+                    )
 
         self._current_episode_sources = []
 
@@ -315,6 +309,10 @@ class Arbitrator:
         q_confidence = min(weight_sum / k, 1.0)
 
         q_values = store.get_q_values(state)
+        # Anti-spam: block detach if consecutive
+        if self.controller._consecutive_detach_count >= 3:
+            q_values[self.controller.action_space.IDX_DETACH] = -1e9
+            q_values[self.controller.action_space.IDX_DETACH_EDGE] = -1e9
         q_action = int(np.argmax(q_values))
         q_spread = float(np.max(q_values) - np.min(q_values))
 

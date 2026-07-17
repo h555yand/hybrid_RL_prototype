@@ -29,7 +29,7 @@ from tbp.hybrid_rl.config import DEFAULT_CONFIG
 from tbp.hybrid_rl.experience_extractor import ExperienceExtractor
 from tbp.hybrid_rl.lightweight_env import LightweightEnv
 from tbp.hybrid_rl.rl_goal_approach_controller import RLGoalApproachController
-from tbp.hybrid_rl.visualize_env import save_episode_frames
+from tbp.hybrid_rl.visualize_env import save_episode_frames, visualize_agent_goal
 
 GOAL_THRESHOLD_PER_LEVEL = [5.0, 3.0, 2.0]
 
@@ -704,6 +704,12 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
         if episode_success:
             success_trails.append(controller.success_trails)
             success_actions.append(action_explanations)
+
+        if visualise:
+            start_rot = np.array([0.0, 0.0, 0.0])
+            visualize_agent_goal(env, np.concatenate([start_pos, start_rot]), goal_pose)
+            #for pose in current_poses:
+            #   visualize_agent_goal(env, pose, goal_pose)
 
         if visualise and vis_dir and vis_filter:
             _maybe_save_visualization(

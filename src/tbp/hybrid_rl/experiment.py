@@ -430,13 +430,19 @@ class RLGoalApproachExperiment:
                 stage_output = (
                     self.data_dir
                     / f"train_result_{mesh_name}"
-                    f"_seed_{seed}.json"
+                    f"_seed_{seed}"
+                    f"_stage_{stage_idx}.json"
                 )
                 stage_data = {
                     "stage": stage_idx,
                     "mesh": mesh_name,
                     "seed": seed,
+                    "epsilon_start": epsilon_start,
+                    "epsilon_min": stage.get(
+                        "epsilon_min", 0.05
+                    ),
                     "load_mode": load_mode,
+                    "episodes": episodes,
                     "success_rate": run_result.get(
                         "success_rate"
                     ),
@@ -1078,6 +1084,7 @@ class RLGoalApproachExperiment:
             agent_id=f"{self.adaptive_mesh}_adaptive",
             config={**self.rl_config, "mode": "eval"},
         )
+        controller._collision_stats = {}  # noqa: SLF001
 
         # Load SAC: adaptive if exists, otherwise training
         adaptive_sac_dir = str(
@@ -1151,17 +1158,71 @@ class RLGoalApproachExperiment:
         collision_stats_before = dict(
             controller._collision_stats  # noqa: SLF001
         )
+        # Epsilon decay for Q-store exploration
+        #adaptive_eps_start = 0.3
+        #adaptive_eps_end = 0.1
+        #adaptive_eps_decay = (
+        #    (adaptive_eps_end / adaptive_eps_start)
+        #    ** (1.0 / max(self.adaptive_episodes, 1))
+        #)
+        #current_eps = adaptive_eps_start
+
+        # Curriculum for adaptive
+        adaptive_curriculum = list(self.curriculum_levels)
+        adaptive_level = 0
+        adaptive_promote_window: list[bool] = []
+        adaptive_promote_threshold = 0.50
+        adaptive_promote_window_size = 100
+
+        # Fixed epsilon — no decay
+        adaptive_epsilon = 0.2
 
         for episode in range(self.adaptive_episodes):
+            # Set Q-store epsilon
+            controller.epsilon = adaptive_epsilon
+            #current_eps = max(
+            #    adaptive_eps_end,
+            #    current_eps * adaptive_eps_decay,
+            #)
             env.reset()
             start_pos = env.get_pose()[:3]
-            goal_pose = env.get_random_surface_point(
-                reference_pos=start_pos,
-                min_dist=_ADAPTIVE_MIN_DIST,
-                max_dist=_ADAPTIVE_MAX_DIST,
-                max_attempts=2000,
-                mesh_sample=True,
-            )
+            # Curriculum goal generation
+            min_dist, max_dist = adaptive_curriculum[
+                adaptive_level
+            ]
+
+            # Level 0: filter for same side
+            require_same_side = (adaptive_level == 0)
+            goal_pose = None
+
+            if require_same_side:
+                from tbp.hybrid_rl.episode_pools import (
+                    _is_reachable_by_surface,
+                )
+                for _attempt in range(50):
+                    candidate = env.get_random_surface_point(
+                        reference_pos=start_pos,
+                        min_dist=min_dist,
+                        max_dist=max_dist,
+                        max_attempts=2000,
+                        mesh_sample=True,
+                    )
+                    if _is_reachable_by_surface(
+                        env, start_pos, candidate[:3]
+                    ):
+                        goal_pose = candidate
+                        break
+                if goal_pose is None:
+                    goal_pose = candidate
+            else:
+                goal_pose = env.get_random_surface_point(
+                    reference_pos=start_pos,
+                    min_dist=min_dist,
+                    max_dist=max_dist,
+                    max_attempts=2000,
+                    mesh_sample=True,
+                )
+
             controller.set_new_goal(goal_pose, start_pos)
             env.set_goal(goal_pose)
 
@@ -1182,6 +1243,10 @@ class RLGoalApproachExperiment:
                 )
                 action_idx, source = manager.get_action(
                     state, pose, sensor
+                )
+                 # Save transitions before update_only clears them
+                last_transitions = (
+                    controller._episode_transitions.copy()
                 )
                 _st, done = controller.update_only(
                     pose, sensor, action_idx
@@ -1236,11 +1301,6 @@ class RLGoalApproachExperiment:
             else:
                 termination = "timeout"
 
-            transitions = (
-                controller.success_trails.copy()
-                if success
-                else []
-            )
             if termination == "collision":
                 for act_name, count in (
                     controller._collision_stats.items()  # noqa: SLF001
@@ -1255,6 +1315,20 @@ class RLGoalApproachExperiment:
                             )
                             + (count - prev)
                         )
+            # Update baseline after every episode
+            collision_stats_before = dict(
+                controller._collision_stats  # noqa: SLF001
+            )
+                        #transitions = (
+            #    controller.success_trails.copy()
+            #    if success
+            #    else []
+            #)
+            #transitions = (
+            #    controller._episode_transitions.copy()
+            #)
+            transitions = last_transitions
+            
             manager.on_episode_complete(
                 success=success,
                 transitions=transitions,
@@ -1297,6 +1371,31 @@ class RLGoalApproachExperiment:
             self._prev_adaptive_mode = current_mode
             manager.arbitrator.on_episode_end(success)
 
+            # Curriculum promote
+            adaptive_promote_window.append(success)
+            if len(adaptive_promote_window) > adaptive_promote_window_size:
+                adaptive_promote_window.pop(0)
+            if (
+                len(adaptive_promote_window) == adaptive_promote_window_size
+                and adaptive_level < len(adaptive_curriculum) - 1
+            ):
+                promote_rate = (
+                    sum(adaptive_promote_window)
+                    / adaptive_promote_window_size
+                )
+                if promote_rate >= adaptive_promote_threshold:
+                    adaptive_level += 1
+                    adaptive_promote_window = []
+                    logger.info(
+                        "Adaptive curriculum: promoted to "
+                        "level %d (%s mm) at ep %d "
+                        "(rate=%.3f)",
+                        adaptive_level,
+                        adaptive_curriculum[adaptive_level],
+                        episode + 1,
+                        promote_rate,
+                    )
+
             rolling_successes.append(success)
             if len(rolling_successes) > 100:
                 rolling_successes.pop(0)
@@ -1338,6 +1437,7 @@ class RLGoalApproachExperiment:
                     rolling_rate, 3
                 ),
                 "mode": manager.mode,
+                "curriculum_level": adaptive_level,
             })
             # Per-source termination and distance tracking
             if dominant_source == "q_store":
@@ -1374,6 +1474,7 @@ class RLGoalApproachExperiment:
                     "rolling_success_rate": round(
                         rolling_rate, 3
                     ),
+                    "curriculum_level": adaptive_level,
                     "mode": stats["mode"],
                     "total_episodes": episode + 1,
                     "total_steps": total_steps_adaptive,
@@ -1746,7 +1847,7 @@ class RLGoalApproachExperiment:
     @staticmethod
     def _filter_bc_transitions(
         transitions: list[Any],
-        max_per_mesh: int = 10000,
+        max_per_mesh: int = 30000,
     ) -> list[Any]:
         """Filter BC transitions for balance across meshes.
 

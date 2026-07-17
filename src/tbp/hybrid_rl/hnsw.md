@@ -246,6 +246,50 @@ def _check_normalization_health(self, state: np.ndarray):
 Для будущего — добавить `_check_normalization_health` как диагностику. Если mean deviation > 3.0 — логировать warning. Решение о разморозке — вручную или автоматически.
 
 Что думаешь? Двигаемся к следующему вопросу или хочешь реализовать health check?
+## 1) Авто-разморозка нормализации
+
+Предложенный `_check_normalization_health` — хорошая идея, но нужно доработать:
+
+**Проблема:** `mean_deviation > 3.0` может срабатывать ложно. Один выброс (например agent далеко от объекта, distance=200mm при mean=50mm) даст deviation > 3.0 по одному измерению.
+
+**Лучше:** считать **долю** состояний с deviation > 3.0, а не среднее:
+
+```python
+def _check_normalization_health(self, state: np.ndarray):
+    norm_state = self._normalize(state)
+    has_outlier = bool(np.any(np.abs(norm_state) > 3.0))
+    self._outlier_history.append(has_outlier)
+    
+    if len(self._outlier_history) >= 200:
+        outlier_rate = sum(self._outlier_history) / len(self._outlier_history)
+        if outlier_rate > 0.3 and self._norm_frozen:
+            logger.info(
+                "Normalization mismatch: outlier_rate=%.2f, unfreezing",
+                outlier_rate,
+            )
+            self._norm_frozen = False
+            self._freeze_done = False
+            self._outlier_history.clear()
+```
+
+30% состояний с выбросами → нормализация не подходит → разморозить.
+
+**Где вызывать:** в `update_q_value`, после `_update_normalization`:
+
+```python
+self._update_normalization(state)
+if self._norm_frozen:
+    self._check_normalization_health(state)
+```
+
+**Инициализация:** в `__init__`:
+
+```python
+self._outlier_history: deque = deque(maxlen=500)
+```
+
+Но для текущего эксперимента (кружка → ваза) мы обсудили что нормализация подходит. Добавить как диагностику — логировать warning, не размораживать автоматически. Решение о разморозке — вручную.
+
 
 
 Отличный вопрос. Давай разберём.
@@ -644,4 +688,374 @@ Q-store знает куда идти (final_distance 9.2mm — ближе чем
 **Быстрая победа:** Q-store выбирает **тип** действия, SAC выбирает **параметры**. Q-store говорит "поверни налево", SAC выбирает "на 23.7°". Лучшее из обоих миров.
 
 Хочешь обсудить эту архитектуру?
+
+## 2) Параметры HNSW — что используем, что нет
+
+### Активно используемые
+
+| Параметр | Значение | Статус | Комментарий |
+|---|---|---|---|
+| `state_dim` | 15 | ✅ Используется | Размерность state vector |
+| `num_actions` | 25 | ✅ Используется | Количество дискретных действий |
+| `max_points` | 500000 | ✅ Используется | Лимит памяти. Не достигался (max ~270K) |
+| `k_neighbors` | 7 | ✅ Используется | Число соседей для kNN. Хорошее значение |
+| `sigma` | 1.0 | ✅ Используется | Base sigma для Gaussian kernel |
+| `insert_threshold` | 0.5 | ✅ Используется | Порог вставки vs обновления. Ключевой параметр |
+| `adaptive_sigma` | True | ✅ Используется | Адаптивная ширина ядра. Работает хорошо |
+| `min_weight_threshold` | 0.01 | ✅ Используется | "Не знаю" детектор. Возвращает нули если далеко от всех точек |
+
+### Используемые но не тестированные
+
+| Параметр | Значение | Статус | Комментарий |
+|---|---|---|---|
+| `evict_fraction` | 0.1 | ⚠️ Не тестирован | Eviction не срабатывал (max_points не достигнут) |
+| `norm_warmup_steps` | 5000 | ⚠️ Работает но не тюнился | Может быть мало для сложных объектов |
+| `norm_min_std` | 1e-4 | ⚠️ Защита | Предотвращает деление на ноль |
+| `rebuild_on_freeze` | True | ⚠️ Работает | Перестраивает индекс после freeze нормализации |
+
+### Не используемые (отключены)
+
+| Параметр | Значение | Статус | Комментарий |
+|---|---|---|---|
+| `auto_calibrate` | **False** | ❌ Отключен | Автокалибровка insert_threshold. Реализована но не тестирована |
+| `calibration_percentile` | 10.0 | ❌ Не используется | Для auto_calibrate |
+| `min_calibration_samples` | 100 | ❌ Не используется | Для auto_calibrate |
+
+### Хардкод внутри класса
+
+| Параметр | Значение | Где | Комментарий |
+|---|---|---|---|
+| `_rebuild_threshold` | 0.3 | `__init__` | Ghost ratio для rebuild. Не в config |
+| `_calibration_interval` | 500 | `__init__` | Интервал рекалибровки. Не в config |
+| `_norm_update_interval` | 50 | `__init__` | Как часто пересчитывать нормализацию |
+| `_norm_min_samples` | 50 | `__init__` | Минимум samples для нормализации |
+| HNSW `M=16` | 16 | `_init_index` | Connections per layer |
+| HNSW `ef_construction=200` | 200 | `_init_index` | Build-time search depth |
+| HNSW `ef=50` | 50 | `_init_index` | Query-time search depth |
+
+### Рекомендации
+
+**1. `auto_calibrate` — стоит протестировать.** Автоматическая калибровка `insert_threshold` по расстояниям до соседей. Может улучшить баланс insert/update. Сейчас фиксированный 0.5 — может быть неоптимален для разных объектов.
+
+**2. `insert_threshold = 0.5` — ключевой параметр.** Определяет гранулярность памяти. Маленький (0.3) → больше точек, точнее но медленнее. Большой (1.0) → меньше точек, грубее но быстрее. 0.5 — компромисс, но не факт что оптимальный.
+
+**3. `k_neighbors = 7` — можно экспериментировать.** Меньше (3-5) → более локальная интерполяция, быстрее. Больше (9-11) → более гладкая, но может усреднять разные ситуации.
+
+**4. `max_points = 500000` — избыточен.** Максимум было ~270K. Можно уменьшить до 300K для экономии памяти. Или оставить — запас не мешает.
+
+**5. Хардкод HNSW параметров** — `M=16`, `ef_construction=200`, `ef=50` — стандартные значения hnswlib. Для нашего размера данных (100-300K точек) оптимальны. Не нужно менять.
+
+**6. `_rebuild_threshold = 0.3`** — вынести в config. Если eviction начнёт срабатывать на больших объёмах — нужно будет тюнить.
+
+Что хочешь обсудить подробнее или реализовать?
+
+## Что делает `_get_sigma`
+
+```python
+def _get_sigma(self, distances: np.ndarray) -> float:
+    if not self.adaptive_sigma:
+        return self.sigma  # фиксированный = 1.0
+
+    actual_distances = np.sqrt(np.maximum(distances, 0))
+    median_dist = np.median(actual_distances)
+
+    adaptive = max(median_dist * 0.5, 0.1)
+
+    return 0.7 * adaptive + 0.3 * self.sigma
+```
+
+## Простыми словами
+
+Sigma — это **радиус влияния** точки в Q-store. Когда мы спрашиваем "какие Q-values в этом состоянии?", kNN находит 7 ближайших соседей. Sigma определяет **как сильно** каждый сосед влияет:
+
+- **Маленький sigma** → только самые близкие соседи влияют. Как спросить совет у ближайшего соседа по дому.
+- **Большой sigma** → далёкие соседи тоже влияют. Как спросить совет у всего района.
+
+**Adaptive sigma** подстраивается под **плотность** точек вокруг:
+
+- В **плотной** области (много точек рядом, median_dist маленький) → sigma маленький → точная интерполяция. Агент часто бывает здесь, много данных, можно быть точным.
+- В **разреженной** области (точки далеко, median_dist большой) → sigma большой → грубая интерполяция. Мало данных, приходится обобщать.
+
+## Магические числа
+
+**`median_dist * 0.5`** — sigma = половина медианного расстояния до соседей.
+
+Почему 0.5? При sigma = median_dist ближайший сосед получает вес `exp(-1/2) ≈ 0.61`, самый дальний (на расстоянии ~2×median) получает `exp(-2) ≈ 0.14`. Все 7 соседей значимо влияют — слишком размыто.
+
+При sigma = 0.5 × median_dist: ближайший `exp(-2) ≈ 0.14`, дальний `exp(-8) ≈ 0.0003`. Только 2-3 ближайших соседа реально влияют — более локально.
+
+**`0.1`** — минимальный sigma. Защита от случая когда точки очень плотные (median_dist ≈ 0). Без floor sigma → 0 → все веса → 0 → деление на ноль.
+
+**`0.7 * adaptive + 0.3 * self.sigma`** — blend адаптивного и базового sigma.
+
+Почему не 100% adaptive? Защита от экстремальных значений. Если в одной области 1 точка (median_dist огромный) → adaptive sigma огромный → все точки в store влияют одинаково → Q-values усредняются по всему пространству. Base sigma (1.0) с весом 0.3 ограничивает рост.
+
+## Можно ли улучшить?
+
+**Вариант: вынести коэффициенты в config:**
+
+```python
+"sigma_adaptive_multiplier": 0.5,    # было хардкод 0.5
+"sigma_adaptive_floor": 0.1,         # было хардкод 0.1
+"sigma_adaptive_blend": 0.7,         # было хардкод 0.7
+```
+
+**Вариант: убрать blend, использовать чистый adaptive с clamp:**
+
+```python
+adaptive = max(median_dist * 0.5, 0.1)
+return min(adaptive, 3.0)  # clamp сверху вместо blend
+```
+
+Проще, без магического blend. Clamp 3.0 = максимальный радиус влияния.
+
+Но текущие значения работают — `adaptive_sigma: True` показал хорошие результаты. Менять стоит только если видим проблемы с интерполяцией.
+
+Хочешь вынести в config или оставить как есть?
+
+## `get_q_values` — простыми словами
+
+Это главный метод — "что делать в этом состоянии?"
+
+```python
+def get_q_values(self, state):
+```
+
+Агент спрашивает: "я в состоянии S, какое действие лучше?" Q-store отвечает массивом из 25 чисел — оценка каждого действия.
+
+## Пошагово
+
+### Шаг 1: Пустой store
+
+```python
+if self.next_id == 0:
+    return np.zeros(self.num_actions)
+```
+
+Нет опыта → все действия одинаковы (нули). "Не знаю, попробуй что угодно."
+
+### Шаг 2: Найти соседей
+
+```python
+norm_state = self._normalize(state)
+k = min(self.k_neighbors, self.next_id)
+labels, distances = self._index.knn_query(norm_state.reshape(1, -1), k=k)
+```
+
+Нормализуем состояние, ищем 7 ближайших точек в HNSW графе. `distances` — квадраты расстояний (особенность hnswlib).
+
+### Шаг 3: Точное совпадение
+
+```python
+if distances[0] < self.insert_threshold ** 2:
+    point = self.points[labels[0]]
+    point.visit_count += 1
+    point.last_step = self.global_step
+    return point.q_values.copy()
+```
+
+Если ближайший сосед **очень близко** (< 0.5 в нормализованном пространстве) — считаем что это **то же самое** состояние. Возвращаем его Q-values напрямую, без интерполяции.
+
+**Вопрос:** порог `insert_threshold² = 0.25`. Это в нормализованном пространстве. Состояние на расстоянии 0.5 по каждому из 15 измерений — это "то же самое"? Зависит от задачи. Для нас 0.5 sigma по каждому измерению — разумно.
+
+### Шаг 4: Проверка уверенности
+
+```python
+sigma = self._get_sigma(distances)
+weights = self._gaussian_kernel(distances, sigma)
+weight_sum = weights.sum()
+
+if weight_sum < self.min_weight_threshold:
+    return np.zeros(self.num_actions)
+```
+
+Считаем веса через Gaussian kernel. Если **суммарный вес слишком мал** (< 0.01) — все соседи далеко, интерполяция ненадёжна. Возвращаем нули — "не знаю".
+
+**Это важный механизм** — Q-store честно говорит "я не был в похожем состоянии". Арбитратор увидит нулевой q_spread и передаст решение SAC.
+
+### Шаг 5: Confidence scaling
+
+```python
+max_possible_weight = k * 1.0
+confidence = min(weight_sum / max_possible_weight, 1.0)
+```
+
+`confidence` = доля от максимально возможного веса. Если все 7 соседей на расстоянии 0 → weight_sum = 7 → confidence = 1.0. Если соседи далеко → weight_sum = 0.5 → confidence = 0.07.
+
+### Шаг 6: Интерполяция
+
+```python
+weights /= weight_sum
+q_values = np.zeros(self.num_actions)
+for i, label in enumerate(labels):
+    q_values += weights[i] * self.points[label].q_values
+```
+
+Взвешенное среднее Q-values соседей. Ближние соседи влияют больше.
+
+### Шаг 7: Масштабирование по confidence
+
+```python
+q_values *= confidence
+```
+
+**Это спорный момент.** Если confidence = 0.3 → Q-values уменьшаются в 3 раза. Действие с Q=10 становится Q=3. Это значит Q-store **занижает** оценки когда не уверен.
+
+**Проблема:** в арбитраторе `q_spread = max(Q) - min(Q)`. После confidence scaling spread тоже уменьшается. Q-store с confidence 0.3 имеет spread в 3 раза меньше → арбитратор реже выбирает Q-store.
+
+**Это правильное поведение** — если Q-store не уверен, пусть SAC решает. Но это также значит что Q-store на новом объекте (где confidence низкий) **никогда не получит шанс** показать себя — spread маленький → арбитратор не выбирает → Q-store не учится.
+
+## Потенциальные улучшения
+
+**1. Убрать confidence scaling для арбитража**
+
+Q-store возвращает "чистые" Q-values, а confidence передаётся отдельно в арбитратор:
+
+```python
+return q_values, confidence  # вместо q_values * confidence
+```
+
+Арбитратор использует confidence для scoring, но Q-values не искажаются.
+
+**2. Recency-weighted interpolation**
+
+Свежие точки (от текущего объекта) получают больший вес:
+
+```python
+for i, label in enumerate(labels):
+    point = self.points[label]
+    recency = 1.0 / (self.global_step - point.last_step + 1)
+    weights[i] *= min(recency * 1000, 1.0)
+```
+
+Точки от вазы (свежие) доминируют над точками от кружки (старые).
+
+**3. Visit-count weighted**
+
+Часто посещаемые точки более надёжны:
+
+```python
+for i, label in enumerate(labels):
+    point = self.points[label]
+    visit_weight = min(point.visit_count / 10.0, 1.0)
+    weights[i] *= visit_weight
+```
+
+Точки с 1 посещением (новые, неточные) влияют меньше.
+
+Что хочешь обсудить или реализовать?
+
+
+Разберём по порядку.
+
+## 1) `distances[0]` — первый элемент чего?
+
+`self._index.knn_query()` возвращает `labels` и `distances` — массивы отсортированные по расстоянию. `distances[0]` — расстояние до **самого ближайшего** соседа. `distances[6]` — до самого дальнего из 7.
+
+```
+distances = [0.1, 0.3, 0.5, 0.8, 1.2, 1.5, 2.0]
+              ↑ ближайший                    ↑ дальний
+```
+
+## 2) Нормализованное пространство
+
+State vector — 15 чисел с **разными масштабами**:
+
+```
+local_pos_error:  [-120, +120] mm     — масштаб ~240
+rot_error:        [-180, +180] degrees — масштаб ~360
+local_normal:     [-1, +1]            — масштаб ~2
+curvature:        [0, 20]             — масштаб ~20
+on_object:        [0, 1]              — масштаб ~1
+alignment:        [-1, +1]            — масштаб ~2
+distance:         [0, 120] mm         — масштаб ~120
+norm_depth:       [0, 1]              — масштаб ~1
+```
+
+Без нормализации kNN расстояние определяется **только** большими числами (pos_error, rot_error). Маленькие (normal, alignment) игнорируются.
+
+Нормализация: `norm_state = (state - mean) / std`. После этого все измерения имеют масштаб ~1. Расстояние 0.5 в нормализованном пространстве = "половина стандартного отклонения по каждому измерению".
+
+Пример: `pos_error_x` имеет `std=50mm`. Нормализованное расстояние 0.5 = `0.5 × 50 = 25mm` в реальных координатах. Для `alignment` с `std=0.4`: `0.5 × 0.4 = 0.2` в реальных единицах.
+
+## 3) `insert_threshold ** 2` — магическое число?
+
+Нет, это **квадрат** порога. hnswlib возвращает **квадраты** расстояний (L2²), не расстояния. Поэтому сравниваем `distances[0] < threshold²` вместо `sqrt(distances[0]) < threshold`.
+
+`insert_threshold = 0.5` — это параметр из config. `0.5²= 0.25` — просто оптимизация чтобы не считать sqrt.
+
+## 4) `_gaussian_kernel` — основной движок?
+
+```python
+def _gaussian_kernel(self, squared_distances, sigma):
+    return np.exp(-squared_distances / (2.0 * sigma ** 2))
+```
+
+Это **функция веса**. Преобразует расстояние в "степень доверия":
+
+```
+Расстояние 0   → вес 1.0    (точное совпадение — полное доверие)
+Расстояние σ   → вес 0.61   (на расстоянии sigma — 61% доверия)
+Расстояние 2σ  → вес 0.14   (далеко — 14% доверия)
+Расстояние 3σ  → вес 0.01   (очень далеко — 1% доверия)
+```
+
+Это **не** выбор действия. Это **интерполяция** — как смешать Q-values от 7 соседей. Ближние соседи получают больший вес.
+
+**Выбор действия** происходит потом: `argmax(q_values)` — действие с максимальным Q-value после интерполяции.
+
+## 5) Confidence — как влияет на выбор действия
+
+```python
+confidence = min(weight_sum / max_possible_weight, 1.0)
+q_values *= confidence
+```
+
+`max_possible_weight = k = 7`. Если все 7 соседей на расстоянии 0: `weight_sum = 7`, `confidence = 1.0`. Q-values не меняются.
+
+Если соседи далеко: `weight_sum = 0.5`, `confidence = 0.07`. Q-values уменьшаются в 14 раз.
+
+**Как это влияет:**
+
+Допустим Q-store считает что `detach` лучше `move_tangentially`:
+```
+До scaling:  Q(detach)=10, Q(move)=5, spread=5
+После (conf=0.3): Q(detach)=3, Q(move)=1.5, spread=1.5
+```
+
+Spread уменьшился с 5 до 1.5. В арбитраторе `q_spread_threshold = 0.5` — spread 1.5 проходит. Но `q_score = q_confidence × q_track`. `q_confidence` в арбитраторе считается **отдельно** от confidence в get_q_values — это разные вещи!
+
+**Двойное занижение:** confidence scaling в get_q_values уменьшает spread → арбитратор видит маленький spread → реже выбирает Q-store. Плюс арбитратор сам считает confidence через weight_sum → ещё раз занижает.
+
+**Это проблема для adaptive** — Q-store на новом объекте имеет низкий confidence → Q-values занижены → spread маленький → арбитратор не выбирает → Q-store не учится.
+
+## 6) Что делать для adaptive
+
+**Рекомендация: убрать confidence scaling из get_q_values.**
+
+Confidence нужен **только** для арбитража (решить кто отвечает — Q или SAC). Не нужен для самих Q-values.
+
+```python
+# Было:
+q_values *= confidence
+return q_values
+
+# Стало:
+return q_values  # чистые Q-values без scaling
+```
+
+Арбитратор уже считает свой confidence через `_get_q_action`:
+
+```python
+def _get_q_action(self, state):
+    ...
+    q_confidence = min(weight_sum / k, 1.0)  # свой confidence
+    q_values = store.get_q_values(state)       # теперь без scaling
+    q_spread = max(Q) - min(Q)                 # честный spread
+    return q_action, q_confidence, q_spread
+```
+
+Spread будет реальным, не заниженным. Арбитратор сам решит через `q_score = q_confidence × q_track` — доверять Q-store или нет.
+
+Хочешь применить?
 

@@ -337,8 +337,8 @@ class HNSWStateStore:
         #
         # confidence = 1.0 when neighbors are close (weight_sum is large)
         # confidence → 0.0 when neighbors are far (weight_sum is small)
-        max_possible_weight = k * 1.0
-        confidence = min(weight_sum / max_possible_weight, 1.0)
+        # max_possible_weight = k * 1.0
+        # confidence = min(weight_sum / max_possible_weight, 1.0)
 
         # Normalizing weights for interpolation
         weights /= weight_sum
@@ -349,7 +349,7 @@ class HNSWStateStore:
 
         # Scaling by confidence
         # Far from known points → Q-values ​​closer to zero
-        q_values *= confidence
+        # q_values *= confidence
 
         return q_values
 

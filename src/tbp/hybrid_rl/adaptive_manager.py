@@ -241,7 +241,7 @@ class AdaptiveTrainingManager:
             success: Whether the episode was successful.
             transitions: Episode transitions from controller.
         """
-        if success and transitions:
+        if transitions:
             psac_transitions = (
                 self.extractor.convert_trajectory(transitions)
             )
