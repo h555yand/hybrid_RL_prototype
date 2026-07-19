@@ -1,0 +1,36 @@
+{
+  "total_transitions": 120000,
+  "train_size": 108000,
+  "val_size": 12000,
+  "action_type_distribution": {
+    "MoveTangentially": 87752,
+    "Look": 10796,
+    "MoveLinear": 10270,
+    "Detach": 1468,
+    "Turn": 9546,
+    "SensorRotate": 22,
+    "OrientHorizontal": 3,
+    "OrientVertical": 4,
+    "DetachEdge": 139
+  },
+  "mesh_distribution": {
+    "cube": 30000,
+    "cylinder": 30000,
+    "mug": 30000,
+    "cup": 30000
+  },
+  "val_loss": 0.5474,
+  "val_accuracy": 0.904,
+  "per_type_accuracy": {
+    "MoveTangentially": 0.989,
+    "MoveLinear": 0.7036,
+    "Turn": 0.7267,
+    "Look": 0.6867,
+    "SensorRotate": 0.0,
+    "OrientHorizontal": 0.0,
+    "Detach": 0.1748,
+    "DetachEdge": 0.0
+  },
+  "num_types": 9,
+  "state_dim": 15
+}

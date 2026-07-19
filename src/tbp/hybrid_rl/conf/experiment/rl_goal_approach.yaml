@@ -9,12 +9,12 @@ experiment:
     seed: 42
     visualise: false
     regenerate_scripts: true
-    do_train: true
-    do_eval: true
-    do_bc_train: true
-    do_sac_train: true
-    do_sac_eval: true
-    do_adaptive: false
+    do_train: false
+    do_eval: false
+    do_bc_train: false
+    do_sac_train: false
+    do_sac_eval: false
+    do_adaptive: true
 
     train_seeds: [11]
     eval_seeds: [44]
@@ -66,6 +66,8 @@ experiment:
       reward_timeout: -12.0
       reward_surface_violation: -12.0
       reward_step_penalty: -0.5
+      reward_near_goal_on_surface: 0.5
+      reward_progress: 3.0
       surface_step: 3.0
       free_step: 8.0
       free_step_small: 2.0

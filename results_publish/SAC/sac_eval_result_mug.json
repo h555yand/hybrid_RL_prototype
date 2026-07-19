@@ -1,0 +1,191 @@
+{
+  "level_0": {
+    "bounds_mm": [
+      10.0,
+      40.0
+    ],
+    "total_episodes": 500,
+    "success_count": 103,
+    "timeout_count": 394,
+    "collision_count": 3,
+    "success_rate": 0.206,
+    "timeout_rate": 0.788,
+    "collision_rate": 0.006,
+    "action_distribution": {
+      "MoveTangentially": {
+        "count": 62615,
+        "rate": 0.9603
+      },
+      "MoveLinear": {
+        "count": 688,
+        "rate": 0.0106
+      },
+      "Turn": {
+        "count": 862,
+        "rate": 0.0132
+      },
+      "Look": {
+        "count": 930,
+        "rate": 0.0143
+      },
+      "Detach": {
+        "count": 107,
+        "rate": 0.0016
+      },
+      "DetachEdge": {
+        "count": 4,
+        "rate": 0.0001
+      }
+    },
+    "collision_stats": {
+      "Turn": 2,
+      "Look": 1
+    },
+    "collision_rate_per_type": {
+      "Turn": {
+        "collisions": 2,
+        "total_calls": 862,
+        "rate": 0.0023
+      },
+      "Look": {
+        "collisions": 1,
+        "total_calls": 930,
+        "rate": 0.0011
+      }
+    },
+    "steps_per_success": 633.1,
+    "mean_episode_steps": 130.4
+  },
+  "level_1": {
+    "bounds_mm": [
+      20.0,
+      80.0
+    ],
+    "total_episodes": 500,
+    "success_count": 72,
+    "timeout_count": 413,
+    "collision_count": 15,
+    "success_rate": 0.144,
+    "timeout_rate": 0.826,
+    "collision_rate": 0.03,
+    "action_distribution": {
+      "MoveTangentially": {
+        "count": 61281,
+        "rate": 0.8934
+      },
+      "MoveLinear": {
+        "count": 2230,
+        "rate": 0.0325
+      },
+      "Turn": {
+        "count": 2813,
+        "rate": 0.041
+      },
+      "Look": {
+        "count": 1859,
+        "rate": 0.0271
+      },
+      "Detach": {
+        "count": 384,
+        "rate": 0.0056
+      },
+      "DetachEdge": {
+        "count": 26,
+        "rate": 0.0004
+      }
+    },
+    "collision_stats": {
+      "MoveLinear": 9,
+      "Turn": 5,
+      "MoveTangentially": 1
+    },
+    "collision_rate_per_type": {
+      "MoveLinear": {
+        "collisions": 9,
+        "total_calls": 2230,
+        "rate": 0.004
+      },
+      "Turn": {
+        "collisions": 5,
+        "total_calls": 2813,
+        "rate": 0.0018
+      },
+      "MoveTangentially": {
+        "collisions": 1,
+        "total_calls": 61281,
+        "rate": 0.0
+      }
+    },
+    "steps_per_success": 952.7,
+    "mean_episode_steps": 137.2
+  },
+  "level_2": {
+    "bounds_mm": [
+      40.0,
+      120.0
+    ],
+    "total_episodes": 500,
+    "success_count": 67,
+    "timeout_count": 424,
+    "collision_count": 9,
+    "success_rate": 0.134,
+    "timeout_rate": 0.848,
+    "collision_rate": 0.018,
+    "action_distribution": {
+      "MoveTangentially": {
+        "count": 60615,
+        "rate": 0.8794
+      },
+      "MoveLinear": {
+        "count": 2664,
+        "rate": 0.0386
+      },
+      "Turn": {
+        "count": 3148,
+        "rate": 0.0457
+      },
+      "Look": {
+        "count": 1916,
+        "rate": 0.0278
+      },
+      "Detach": {
+        "count": 565,
+        "rate": 0.0082
+      },
+      "DetachEdge": {
+        "count": 23,
+        "rate": 0.0003
+      }
+    },
+    "collision_stats": {
+      "MoveLinear": 5,
+      "Look": 1,
+      "Turn": 2,
+      "MoveTangentially": 1
+    },
+    "collision_rate_per_type": {
+      "MoveLinear": {
+        "collisions": 5,
+        "total_calls": 2664,
+        "rate": 0.0019
+      },
+      "Look": {
+        "collisions": 1,
+        "total_calls": 1916,
+        "rate": 0.0005
+      },
+      "Turn": {
+        "collisions": 2,
+        "total_calls": 3148,
+        "rate": 0.0006
+      },
+      "MoveTangentially": {
+        "collisions": 1,
+        "total_calls": 60615,
+        "rate": 0.0
+      }
+    },
+    "steps_per_success": 1028.8,
+    "mean_episode_steps": 137.9
+  }
+}

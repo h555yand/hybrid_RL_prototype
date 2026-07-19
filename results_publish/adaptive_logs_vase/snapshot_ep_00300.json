@@ -1,0 +1,217 @@
+{
+  "episode": 300,
+  "rolling_success_rate": 0.48,
+  "curriculum_level": 2,
+  "mode": "online",
+  "total_episodes": 300,
+  "total_steps": 67459,
+  "success_count": 163,
+  "collision_count": 137,
+  "timeout_count": 0,
+  "source_distribution": {
+    "q_store": 0.251,
+    "sac": 0.749,
+    "heuristic": 0.0
+  },
+  "action_distribution": {
+    "move_tangentially": {
+      "count": 47761,
+      "rate": 0.708
+    },
+    "look_down_big": {
+      "count": 3976,
+      "rate": 0.0589
+    },
+    "turn_left_big": {
+      "count": 3763,
+      "rate": 0.0558
+    },
+    "free_forward": {
+      "count": 3469,
+      "rate": 0.0514
+    },
+    "look_up_big": {
+      "count": 3292,
+      "rate": 0.0488
+    },
+    "turn_right_big": {
+      "count": 2438,
+      "rate": 0.0361
+    },
+    "free_backward": {
+      "count": 1348,
+      "rate": 0.02
+    },
+    "detach": {
+      "count": 558,
+      "rate": 0.0083
+    },
+    "free_forward_small": {
+      "count": 503,
+      "rate": 0.0075
+    },
+    "detach_edge": {
+      "count": 121,
+      "rate": 0.0018
+    },
+    "look_up": {
+      "count": 99,
+      "rate": 0.0015
+    },
+    "look_down": {
+      "count": 50,
+      "rate": 0.0007
+    },
+    "turn_left": {
+      "count": 32,
+      "rate": 0.0005
+    },
+    "turn_right": {
+      "count": 25,
+      "rate": 0.0004
+    },
+    "rotate_sensor_-": {
+      "count": 14,
+      "rate": 0.0002
+    },
+    "rotate_sensor_+": {
+      "count": 7,
+      "rate": 0.0001
+    },
+    "orient_vertical": {
+      "count": 3,
+      "rate": 0.0
+    }
+  },
+  "collision_stats": {
+    "free_forward": 62,
+    "free_backward": 1,
+    "detach": 2,
+    "move_tangentially": 1
+  },
+  "steps_per_success": 413.9,
+  "arbitrator": {
+    "q_store_rate": 0.251,
+    "sac_rate": 0.749,
+    "heuristic_rate": 0.0,
+    "agreement_rate": 0.168,
+    "q_spread_mean": 11.01,
+    "sac_confidence_mean": 0.946,
+    "q_success_rate": 0.58,
+    "sac_success_rate": 0.48
+  },
+  "manager": {
+    "sac_updates": 0,
+    "offline_iterations": 0
+  },
+  "per_source_analysis": {
+    "q_store": {
+      "terminations": {
+        "success": 53,
+        "collision": 39,
+        "timeout": 0
+      },
+      "chosen_actions": {
+        "move_tangentially": {
+          "count": 8446,
+          "rate": 0.499
+        },
+        "free_forward": {
+          "count": 2273,
+          "rate": 0.134
+        },
+        "look_down_big": {
+          "count": 1832,
+          "rate": 0.108
+        },
+        "turn_left_big": {
+          "count": 1693,
+          "rate": 0.1
+        },
+        "look_up_big": {
+          "count": 1189,
+          "rate": 0.07
+        }
+      },
+      "proposed_actions": {
+        "move_tangentially": {
+          "count": 46876,
+          "rate": 0.695
+        },
+        "look_down_big": {
+          "count": 5199,
+          "rate": 0.077
+        },
+        "turn_left_big": {
+          "count": 4909,
+          "rate": 0.073
+        },
+        "free_forward": {
+          "count": 3840,
+          "rate": 0.057
+        },
+        "look_up_big": {
+          "count": 2147,
+          "rate": 0.032
+        }
+      },
+      "mean_final_distance": 13.3,
+      "near_miss_count": 40,
+      "mean_episode_steps": 178.9
+    },
+    "sac": {
+      "terminations": {
+        "success": 110,
+        "collision": 98,
+        "timeout": 0
+      },
+      "chosen_actions": {
+        "move_tangentially": {
+          "count": 39315,
+          "rate": 0.778
+        },
+        "look_down_big": {
+          "count": 2144,
+          "rate": 0.042
+        },
+        "look_up_big": {
+          "count": 2103,
+          "rate": 0.042
+        },
+        "turn_left_big": {
+          "count": 2070,
+          "rate": 0.041
+        },
+        "turn_right_big": {
+          "count": 1872,
+          "rate": 0.037
+        }
+      },
+      "proposed_actions": {
+        "move_tangentially": {
+          "count": 47465,
+          "rate": 0.704
+        },
+        "look_down_big": {
+          "count": 3665,
+          "rate": 0.054
+        },
+        "look_up_big": {
+          "count": 3505,
+          "rate": 0.052
+        },
+        "turn_left_big": {
+          "count": 3400,
+          "rate": 0.05
+        },
+        "turn_right_big": {
+          "count": 3192,
+          "rate": 0.047
+        }
+      },
+      "mean_final_distance": 15.5,
+      "near_miss_count": 90,
+      "mean_episode_steps": 245.2
+    }
+  }
+}

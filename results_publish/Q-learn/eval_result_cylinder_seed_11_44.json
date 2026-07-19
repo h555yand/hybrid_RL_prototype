@@ -1,0 +1,118 @@
+{
+  "level_0": {
+    "success_rate": 0.834,
+    "timeout_rate": 0.136,
+    "collision_rate": 0.03,
+    "collision_stats": {
+      "free_forward": 13,
+      "free_forward_small": 2
+    },
+    "global_action_counts": {
+      "detach": 236,
+      "free_forward": 921,
+      "look_down_big": 4484,
+      "turn_left_big": 3029,
+      "move_tangentially": 41704,
+      "look_up": 89,
+      "turn_right_big": 2515,
+      "look_up_big": 2658,
+      "free_forward_small": 398,
+      "turn_right": 5,
+      "turn_left": 6,
+      "look_down": 179,
+      "rotate_sensor_-": 3,
+      "orient_horizontal": 2,
+      "rotate_sensor_+": 9,
+      "free_backward": 60,
+      "orient_vertical": 225
+    },
+    "collision_rate_per_action": {
+      "free_forward": 0.014115092290988056,
+      "free_forward_small": 0.005025125628140704
+    },
+    "steps_per_success": 136.74580335731414,
+    "surface_air_ratio": {
+      "surface_steps": 41931,
+      "air_steps": 1658,
+      "surface_ratio": 0.9619628805432563,
+      "air_ratio": 0.03803711945674367
+    }
+  },
+  "level_1": {
+    "success_rate": 0.64,
+    "timeout_rate": 0.116,
+    "collision_rate": 0.244,
+    "collision_stats": {
+      "free_forward": 112,
+      "free_forward_small": 10
+    },
+    "global_action_counts": {
+      "move_tangentially": 36640,
+      "detach": 867,
+      "free_forward": 2599,
+      "turn_right_big": 1516,
+      "look_up_big": 2758,
+      "look_down_big": 4146,
+      "turn_left_big": 2671,
+      "free_forward_small": 1166,
+      "turn_right": 31,
+      "look_up": 375,
+      "free_backward": 196,
+      "look_down": 27,
+      "turn_left": 65,
+      "rotate_sensor_-": 11,
+      "orient_horizontal": 2,
+      "rotate_sensor_+": 4
+    },
+    "collision_rate_per_action": {
+      "free_forward": 0.04309349749903809,
+      "free_forward_small": 0.008576329331046312
+    },
+    "steps_per_success": 167.41875,
+    "surface_air_ratio": {
+      "surface_steps": 36642,
+      "air_steps": 4459,
+      "surface_ratio": 0.8915111554463395,
+      "air_ratio": 0.1084888445536605
+    }
+  },
+  "level_2": {
+    "success_rate": 0.532,
+    "timeout_rate": 0.13,
+    "collision_rate": 0.338,
+    "collision_stats": {
+      "free_forward_small": 6,
+      "free_forward": 163
+    },
+    "global_action_counts": {
+      "move_tangentially": 31801,
+      "detach": 4239,
+      "free_forward": 3411,
+      "turn_left_big": 4774,
+      "look_down_big": 4679,
+      "turn_right_big": 2896,
+      "look_up_big": 3410,
+      "free_forward_small": 1242,
+      "look_down": 375,
+      "turn_right": 424,
+      "turn_left": 659,
+      "rotate_sensor_+": 95,
+      "orient_horizontal": 28,
+      "free_backward": 215,
+      "look_up": 399,
+      "orient_vertical": 27,
+      "rotate_sensor_-": 9
+    },
+    "collision_rate_per_action": {
+      "free_forward_small": 0.004830917874396135,
+      "free_forward": 0.047786572852535916
+    },
+    "steps_per_success": 222.49248120300751,
+    "surface_air_ratio": {
+      "surface_steps": 31856,
+      "air_steps": 6725,
+      "surface_ratio": 0.8256914025038231,
+      "air_ratio": 0.1743085974961769
+    }
+  }
+}

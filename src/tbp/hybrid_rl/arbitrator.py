@@ -212,13 +212,11 @@ class Arbitrator:
         # Q-store score: needs confidence and spread
         q_score = 0.0
         if q_confidence > 0.2 and q_spread > 0.5:
-            # q_score = q_confidence * q_track
             q_score = (0.3 * q_confidence + 0.7) * q_track
 
         # SAC score: needs actor
         sac_score = 0.0
         if self.sac_actor is not None:
-            # sac_score = sac_confidence * sac_track
             sac_score = (0.3 * sac_confidence + 0.7) * sac_track
 
         # Choose best source, heuristic as fallback only

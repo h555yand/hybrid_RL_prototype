@@ -49,206 +49,45 @@ This aligns with Monty's broader goal of biologically plausible computation.
 ### HNSW + kNN + Gaussian Kernel Interpolation
 
 Hierarchical Navigable Small World (HNSW) is an approximate nearest neighbor search algorithm based on a layered graph data structure. It belongs to the family of proximity graphs, where nodes (vertices) are connected based on their proximity, typically measured by the Euclidean distance.  
-HNSW is currently actively used in embedding databases for searching similar text by vectors. So, I decided to use it to store and find states.  [What is State](#state-vector-15d)  
+HNSW is currently actively used in embedding databases for searching similar text by vectors. So, I decided to use it to store and find states.  [What is State](#state-vector-13d)  
 During the learning process, the agent stores experience in a graph and then uses the weighted past experience in a similar situation. Thehnically it looks like: store point in HNSW graph, then find the K closest ones and mix them with Gaussian kernel weights.
-[Realization details here](src/tbp/hybrid_rl/hnsw_state_store.py)
 
 ### Why not only Deep Learing
 I'm not opposed to deep learning. I agree that it's well suited for approximation, embedding, and many other tasks.  
 I'm not suggesting replacing neural networks, I'm suggesting supplementing it and improving the learning process.
 
-## You can read README_v1.md for details and questions before POC was implemented
+## You can read README_old.md for details and questions before POC was implemented
 [LINK](README_v1.md)
 
 # Guide-level explanation
 
-# Main Proof of Concept Results
+##  Main Proof of Concept Results
 
-The prototype has been implemented and tested on the Lightweight Environment (Trimesh-based). Below are the key results that I hope confirm the ideas from the RFC.
+The prototype has been implemented and tested on the Lightweight Environment (Trimesh-based). Below are the key results that I hope validate the ideas from the RFC.
 
-## Pipeline Validation
+### Training Pipeline Validated
 
-**The full pipeline works end-to-end: Q-learning → Behavioral Cloning → SAC → Arbitrage**
+The full pipeline works end-to-end: **Q-learning → Behavioral Cloning → SAC → Arbitrage**
 
-### Training and validation stategy
-#### Use several oblects from simple to complex: cube, cylinder, mug, cup, vase
-[Sizes and realization are](src/tbp/hybrid_rl/mesh_factory.py)
-
-#### Training and validation stages
-- I used the standard Monty approach with [Hynda YAML](src/tbp/hybrid_rl/conf/experiment/rl_goal_approach.yaml) and [experiment.py](src/tbp/hybrid_rl/experiment.py)
-You can reproduce the results by yourself. Example of VSCode settings.json below
-```
-"configurations": [
-   {
-      "name": "RL Goal Approach — Config",
-      "type": "debugpy",
-      "request": "launch",
-      "program": "${workspaceFolder}/run.py",
-      "args": [
-            "--config-dir", "${workspaceFolder}/src/tbp/hybrid_rl/conf",
-            "experiment=rl_goal_approach",
-      ],
-      "cwd": "${workspaceFolder}",
-      "env": {
-            "MONTY_LOGS": "${workspaceFolder}/results",
-            "MONTY_MODELS": "${workspaceFolder}/results/pretrained_models",
-            "MONTY_DATA": "${workspaceFolder}/data"
-      },
-      "console": "integratedTerminal",
-      "justMyCode": false
-   }, 
-]
-```
-- I used curriculum_levels approach from simple to complex tasks depends on distnace between goal and agent:
-      - [10.0, 40.0] # use additional check that agent and goal were on the same side of object
-      - [20.0, 80.0]
-      - [40.0, 120.0]
-   - promote_threshold: 0.6
-   - promote_window: 100
-
-- Stages
-1) Q-learning - train and validate cube, cylinder, mug, cup
-    - training_stages:
-      - mesh: cube
-        episodes: 2000
-        epsilon_start: 1.0
-        epsilon_min: 0.10
-        load_mode: null # Start from scrtach
-      - mesh: cylinder
-        episodes: 3000
-        epsilon_start: 1.0
-        epsilon_min: 0.10
-        load_mode: auto # use and update previous Q-store
-      - mesh: mug
-        episodes: 7000
-        epsilon_start: 1.0
-        epsilon_min: 0.10
-        load_mode: auto # use and update previous Q-store
-      - mesh: cup
-        episodes: 7000
-        epsilon_start: 1.0
-        epsilon_min: 0.10
-        load_mode: auto # use and update previous Q-store
-
-    - eval_meshes: [cube, cylinder, mug, cup]
-    - eval_episodes_per_level: 500   
-    
-[You can find details results here](results_publish/Q-learn)
-
-- rl_config:
-      mode: train_adapt_epsilon
-      goal_threshold: 4.0
-      max_points: 500000
-      k_neighbors: 7
-      max_steps_per_goal: 500
-      adaptive_sigma: true
-      insert_threshold: 0.50
-      auto_calibrate: false
-      reward_goal_reached: 60.0
-      reward_timeout: -12.0
-      reward_surface_violation: -12.0
-      reward_step_penalty: -0.5
-      surface_step: 3.0
-      free_step: 8.0
-      free_step_small: 2.0
-      rotation_step: 5.0
-      num_actions: 25
-      rotation_step_big: 15.0
-      free_step_backward: 2.0
-
-
-2) Collect success trails from Q-learing validation and train Behavioral Cloning (SAC Actor)   
-[You can find details results here](results_publish/BC-train)
-
-3) Train and validate SAC using BC knowledge (BC warm-start)
-    - sac_meshes: [cube, cylinder, mug, cup]
-    - sac_episodes_per_mesh:
-      cube: 1000
-      cylinder: 1500
-      mug: 3000
-      cup: 2000
-    - sac_eval_episodes_per_level: 500
-    - sac_config:
-      load_mode: null
-      goal_threshold: 4.0
-      gamma: 0.99
-      tau: 0.005
-      lr_actor: 0.00001
-      lr_critic: 0.0003
-      batch_size: 256
-      buffer_capacity: 500000
-      bc_lambda_init: 5.0
-      bc_lambda_decay: 0.999999
-      max_steps_per_goal: 300
-      eval_interval: 200
-      eval_episodes: 100
-
-      [You can find details results here](results_publish/SAC)
-
-4) Run adaptive mode with arbitrage and online learning for vase using Q and SAC knowledge from cube, cylinder, mug, cup
-
-Let's describe in more detail adaptive arbitrage mode as it's the one of key feature of the hybrid approach.  
-- Adaptive arbitrage decides which action source to use per step. [Full realization here](src/tbp/hybrid_rl/arbitrator.py)  
-Switches between Q-store (episodic memory), SAC (skill), and heuristic (fallback).
-Main function is def decide(self, state, current_pose, sensor_data):
-Choose action source based on performance. Uses confidence × track_record scoring. 
-When insufficient track record data, uses neutral prior (0.5) to let confidence decide. 
-Heuristic is fallback only when both Q-store and SAC have zero score.
-- Adaptive arbitrage continiously learning. [Full realization here](src/tbp/hybrid_rl/adaptive_manager.py)  
-   - online: Q-store updates every step, SAC updates periodically. Default mode — always learning.
-   - inference_only: no updates. Only when consistently high success rate — system has mastered the object.
-   - offline: full retraining. Only when both sources fail for extended period — emergency mode.
-
-- YAML config for testing
-   - adaptive_mesh: vase
-   - adaptive_episodes: 2000
-   [You can find details results here](results_publish/adaptive_logs_vase)
-
-
-### Resuls summary for Q and SAC train and validation
-
-| Stage | Method | Success Rate (avg for levels) | Object |
+| Stage | Method | Success Rate | Object |
 |-------|--------|-------------|--------|
-| Q-learning (episodic memory) - Train | HNSW + kNN + Heuristic | 58% | cube |
-| Q-learning (episodic memory) - Train | HNSW + kNN + Heuristic | 53% | cylinder |
-| Q-learning (episodic memory) - Train | HNSW + kNN + Heuristic | 47% | mug |
-| Q-learning (episodic memory) - Train | HNSW + kNN + Heuristic | 51% | cup |
-| Q-learning (episodic memory) - Eval | HNSW + kNN + Heuristic | 73% | cube |
-| Q-learning (episodic memory) - Eval | HNSW + kNN + Heuristic | 67% | cylinder |
-| Q-learning (episodic memory) - Eval | HNSW + kNN + Heuristic | 46% | mug |
-| Q-learning (episodic memory) - Eval | HNSW + kNN + Heuristic | 48% | cup |
-| SAC (skill, softmax policy) - Train | BC warm-start → SAC | 46% | cube |
-| SAC (skill, softmax policy) - Train | BC warm-start → SAC | 68% | cylinder |
-| SAC (skill, softmax policy) - Train | BC warm-start → SAC | 41% | mug |
-| SAC (skill, softmax policy) - Train | BC warm-start → SAC | 33% | cup |
-| SAC (skill, softmax policy) - Eval | BC warm-start → SAC | 14% | cube |
-| SAC (skill, softmax policy) - Eval | BC warm-start → SAC | 29% | cylinder |
-| SAC (skill, softmax policy) - Eval | BC warm-start → SAC | 16% | mug |
-
-
-### Resuls summary for adaptive arbitrage mode
-| episode | q_store_rate | sac_rate | agreement_rate | q_success_rate | sac_success_rate | weighted_rate | level |
-|-------|-------|--------|-------------|--------|--------|--------|--------|
-| 100 | 2% | 98% | 17% | 100% | 54% | 53% | 0 -> 1 |
-| 1000 | 36% | 64% | 16% | 46% | 35% | 39% | 2 |
-| 2000 | 61% | 39% | 17% | 70% | 26% | 53% | 2 |
-
+| Q-learning (episodic memory) | HNSW + kNN + Heuristic-Guided Exploration | 65–70% | Mug |
+| SAC (skill, softmax policy) | BC warm-start → SAC | 71–77% | Mug |
+| Arbitrage (memory + skill) | Q-store + SAC + Heuristic | **78%** | Mug |
+| SAC zero-shot transfer | No retraining | **73%** | Cup (new object) |
 
 ### Key Findings
 
-**1. Episodic Memory (HNSW State Store) works as proposed.** One-shot/few-shot learning through Q-update is effective. Update hit rate 0.8–0.95 confirms that kNN + Gaussian Kernel interpolation correctly finds and updates similar states. The store grows organically — dense where the agent visits often, sparse where it rarely goes.
+**1. Episodic Memory (HNSW State Store) works as proposed.** One-shot/few-shot learning through Q-update is effective. Update hit rate 0.84–0.95 confirms that kNN + Gaussian Kernel interpolation correctly finds and updates similar states. The store grows organically — dense where the agent visits often, sparse where it rarely goes.
 
 **2. Heuristic-Guided Exploration significantly outperforms ε-greedy.** This confirms the hypothesis from the RFC. Pure geometric heuristics (move toward goal, detach when stuck, steer in air) provide reasonable behavior from step 1, and Q-values gradually take over as experience accumulates.
 
-**3. Q-learning improves with experience**  Learning begins working from step 1 and improves success rate even transfering to more complex levels. On training more collitions rate and less timeouts. On validation vice versa. Agent became more accurate but sometimes goes out of step limit per episode. Agent crawls mostly and discrtete actions needs more steps to achieve the target.
+**4. Arbitrage between episodic memory and skills works.** On familiar objects, Q-store handles 59% of decisions (precise, local knowledge), SAC handles 41% (general strategy). Agreement rate 31% shows they provide complementary information.
 
-**4. SAC results less than Q-learning** It needs more investigation, reason is high timeout rate.
-- SAC steps per episode limit (300) was less than Q-learning (500) as continues actions should be more flexible
-- SAC inherited accurate crawl strategy from Q-learning and it was not enough episodes to study more optimal one
-- Hyperparameters and implementation should be checked one more time
-
-**5. Adaptive arbitrage between episodic memory and skills works.** On the new object vase adaptive arbitrage shows 53% success rate. This is more than independent Q and SAC rates on validation phase for known objects. First, more SAC used, then Q-learinig. Because SAC, as a neural network, is always more confident, but then success statistics help Q-learinig to increase q_store_rate. Agent mostly crawled, failures were due to collisions.
-
+**5. On new objects transfer limitation discovered.** Q-store from one object can hurt performance on a new object (arbitrage zero-shot: 52% vs pure SAC: 73%).  This is expected — episodic memory is local by nature.  SAC generalizes better on new objects. This validates the skill-based approach — the neural network learns general navigation patterns that transfer across similar geometries. One more SAC advantage is continues parameters.
+The solution can be:
+- Start with pure SAC on new objects and let Q-store accumulate fresh experience.
+- Use Online / Offline learning approach during working with new objects. If success rate below online threshold during 100 episodes to start online learning in parallel, if below offline threshold to start offline and after finish to continue working with new object.
 ---
 
 ## Answers to Open Questions
@@ -265,38 +104,17 @@ Extensive empirical testing was performed. Key findings:
 `q_store_free` — airborne state (on_object = 0). Navigation: turns, forward, landing
 ` q_store_surface` — surface state (on_object = 1). Crawling, detaching, orientation
 The same position in space requires **opposite strategies** depending on whether the agent is touching the surface
-
-- **Number of actions**
-At the beginning I used 18 actions then 2 macro actions and 5 different step / rotation size actions were added:
-
+- **Reward weights:** Increase penalty for collision from -5 to -15 
+- **Action steps:** `surface_step=3mm`, `free_step=5mm`, `rotation_step=5°` — smaller steps reduce collisions but increase episode length.
+- **SAC alpha bounds:** Critical for stability. `alpha_type ≥ 0.135` prevents policy collapse, `alpha_param ≤ 1.0` prevents parameter noise explosion.
+- **Replay buffer:** BC-protected reservoir (15%) prevents catastrophic forgetting of expert demonstrations.
+- **At the beginning I used 18 actions and then 2 macro actions were added**
 | Index | Action | Category | Description |
 |-------|--------|----------|-------------|
-| 18 | Detach | macro | Detach from surface along normal, then fly toward goal |
-| 19 | DetachEdge | macro | Detach from surface along normal, then fly upward to the edge, turn toward goal and fly over to the other side. Used when the goal and agent are on opposite sides of the wall |
-| 20 | MoveForward Small | free | MoveForward on small step |
-| 21 | LOOK_UP_BIG | orient | look up at big rotation |
-| 22 | LOOK_DOWN_BIG | orient | look down at big rotation |
-| 23 | TURN_LEFT_BIG | orient | turn left at big rotation |
-| 24 | TURN_RIGHT_BIG | orient | turn right at big rotation |
+| 18 | Detach | macro | Detach from surface along normal, then fly toward goal (blending goal direction with surface normal to avoid collision). Multi-step action: lift off along normal → turn toward goal → series of forward steps with depth checking and collision avoidance → land on contact with surface. Each sub-step incurs a step penalty. Collisions during flight are penalized but do not terminate the episode — the agent is repositioned to pre-collision location and the macro action terminates early |
+| 19 | DetachEdge | macro | Detach from surface along normal, then fly upward along the object's longest bounding-box axis until reaching the edge, turn toward goal and fly over to the other side. Used when the goal is through a thin wall (agent and goal normals are opposite). Same penalty and collision handling as Detach |
 
-- **Action steps:** Smaller steps reduce collisions but increase episode step length. After many iterartions values were choosen:
-   - surface_step: 3.0
-   - free_step: 8.0
-   - free_step_small: 2.0
-   - rotation_step: 5.0
-   - rotation_step_big: 15.0
-   - free_step_backward: 2.0
-
-- **Reward weights:** 
-   - reward_goal_reached: 60.0
-   - reward_timeout: -12.0
-   - reward_surface_violation: -12.0
-   - reward_step_penalty: -0.5
-   - reward_near_goal_on_surface: 0.5
-   - reward_progress: 3.0
-
-Details of logic here: def _compute_reward(self, state, prev_state, action, collision):
-[LINK](src/tbp/hybrid_rl/rl_goal_approach_controller.py)
+The Lightweight Environment (Trimesh) proved essential for rapid iteration — each experiment takes ~ 30-60 minutes on my laptop)
 
 ---
 
@@ -307,7 +125,7 @@ Details of logic here: def _compute_reward(self, state, prev_state, action, coll
 **Status: Partially addressed.**
 - `ActionSpace` is a configurable input parameter — adding or removing actions does not require architectural changes to Q-learning or SAC
 - HNSW and SAC work with any number of discrete actions
-- The system was tested with 25 actions, confirming that the core learning pipeline adapts
+- The system was tested with 18 actions (without detach) and 20 actions (with detach), confirming that the core learning pipeline adapts
 
 **Limitation:** Heuristic biases currently reference specific action indices (e.g., `IDX_DETACH`, `IDX_FREE_FORWARD`). For a different action space, heuristics would need to be adapted. This is by design — heuristics encode domain-specific geometric reasoning that depends on what actions are available. A fully action-space independent heuristic system would require a mapping layer between geometric intentions (e.g., "move toward goal") and available actions.
 
@@ -321,7 +139,20 @@ Of course they can be improved, but it's continues effort to tune them for new c
 The key insight: heuristics provide the **starting point**, episodic memory stores **exceptions and refinements**, and SAC learns **general patterns**. Each layer adds value.
 
 
-#### Below previous materails that were updated based on POC results
+Of course it's not enough to understand all things, I will prepare and share details later together with the source code. Now it works but it needs to review, comment, check one more time etc.
+After that we can discuss details and next steps.
+
+## Training strategy
+### You can read files train.md in ./docs folder
+[LINK train](docs/train.md)
+
+## Architecture Overview
+
+### You can read files design.md, HNSW_store.md in ./docs folder
+[LINK design](docs/design.md)  
+[LINK HNSW_store](docs/HNSW_store.md)
+
+#### Below old materails that will be updated based on POC results
 
 Evidence LM's Goal-State Generator proposes the goal-state from the hypothesis-testing policy.
 **goal_pose** = [x, y, z, pitch, yaw, roll]  
@@ -357,7 +188,7 @@ In future when SAC is trained we use it as **skills to propose continuous action
 
 **Below is explanation of the main components**:
 
-## State Vector (15D)
+## State Vector (13D)
 **Purpose**: To represent the current state of the agent relative to the goal. The state vector is a 13-dimensional vector that includes spatial and rotational errors, surface normal, and sensor information.
 All spatial quantities are in the agent's local coordinate frame.
 
@@ -370,7 +201,7 @@ All spatial quantities are in the agent's local coordinate frame.
 | 10   | alignment   | dot(goal_direction, surface_normal)   |
 | 11   | distance   | Euclidean distance to goal   |
 | 12   | norm_depth   | normalized depth to nearest surface   |
-+ 2 additional features (mean curvature, Gaussian curvature) improved surface navigation.
+
 
 ## HNSWStateStore
 Update state → normalize → KNN search
@@ -403,7 +234,7 @@ The policy outputs a vector [Δx, Δy, Δz, Δθ, Δφ] and then interprets this
 4. Mathematical controller (Low-level / Inverse kinematics & Impedance)
 This is 'spinal cord' that receives a command from the neural network (SAC) and instantly calculates the motor actions.
 
-### Discrete action space 25D
+### Discrete action space 18D
 | Index | Action               | Description                                                                 | Mode     | Parameters |
 |--------|------------------------|-------------------------------------------------------------------------|-----------|-----------|
 | 0–7    | MoveTangentially       | Movement tangent to the surface in 8 directions: 0°, 45°, ..., 315° | surface   | `distance: float`, `direction: VectorXYZ` |
@@ -417,7 +248,7 @@ This is 'spinal cord' that receives a command from the neural network (SAC) and 
 | 15     | SetSensorRotation (-)  | Rotate the sensor counterclockwise                                          | both       | `rotation_quat: Quaternion` |
 | 16     | OrientHorizontal       | Correction of position and orientation in the horizontal plane (with compensation) | surface   | `rotation_degrees: float`, `left_distance: float`, `forward_distance: float` |
 | 17     | OrientVertical         | Correction of position and orientation in the vertical plane                | surface   | `rotation_degrees: float`, `down_distance: float`, `forward_distance: float` |
-+ 2 macro actions and 5 different step / rotation size actions were added
+
 
 
 ## RLGoalApproachController
@@ -428,11 +259,14 @@ Dense reward signal computed locally in the motor system (no LM or CMP involveme
 | Component | Reward | Done? | When |
 |:----------|-------:|:-----:|:-----|
 | Progress (per good step) | ~+3.0 | No | Every step; `(prev_dist - dist) / surface_step × 3.0` |
-| Goal reached | +60.0 | Yes | `distance < goal_threshold (2mm)` |
-| Step penalty | -0.5 | No | Every step |
-| Surface violation | -12.0 | Yes | Agent passed through object (depth < 0.5mm or normal flipped) |
+| Goal reached | +50.0 | Yes | `distance < goal_threshold (2mm)` |
+| Step penalty | -0.2 | No | Every step |
+| Surface violation | -5.0 | Yes | Agent passed through object (depth < 0.5mm or normal flipped) |
+| Lost object (smart detach) | +0.5 | No | Lost surface but approaching goal with alignment < -0.3 |
+| Lost object (drifted away) | -3.0 | No | Lost surface and moved away from goal |
 | Near goal on surface | +0.5 | No | `distance < 3 × surface_step` AND `on_object = true` |
-| Timeout | -12.0 | Yes | `steps >= max_steps_per_goal` |
+| Oscillation | -0.5 | No | Current action is opposite of previous action |
+| Timeout | -10.0 | Yes | `steps >= max_steps_per_goal` |
 
 
 ### Heuristic-Guided Exploration
@@ -467,7 +301,6 @@ Transition Schedule
 | 3 | Goal through surface → detach | LookUp |
 | 4 | In the air navigating by rot_error | TurnRight, TurnLeft, LookDown, LookUp | 
 
-[Realization details here def _compute_heuristic_bias](src/tbp/hybrid_rl/rl_goal_approach_controller.py)
 
 
 ## RLMotorPolicy
@@ -482,14 +315,15 @@ Graceful degradation: If RL fails (timeout/collision), control returns to standa
 To fast test hypophesys and ideas we need to create relevant approximation of Habitat, especially for training policies based on haptics/active perception.
 It should not simulate graphics, but it should accurately reproduces the key physics that are important for training: contact, normals, ray casting, movement on surfaces.
 I suggest to use Trimesh python library for loading and using triangular meshes with an emphasis on watertight surfaces. https://github.com/mikedh/trimesh
-The Lightweight Environment (Trimesh) proved essential for rapid iteration — each experiment takes ~ 1-2 hours to test on my laptop
-[Details are here](src/tbp/hybrid_rl/lightweight_env.py)
 
 ### Obejscts
 To train / test complete action space we can start with these primitives:
 - Cube: trimesh.primitives.Box
 - Cylinder: trimesh.creation.cylinder
-- Mug, Cup, Vase
+- Sphere: trimesh.primitives.Sphere
+
+Next step can be to train / test with more complex objects, cup as example.
+It can be created from primitives or loaded from library. 
 
 ### Methods
 To compute State 13D it needs to implement enviroment methods to get:
@@ -499,6 +333,40 @@ To compute State 13D it needs to implement enviroment methods to get:
 - Surface normal
 - Depth
 - Flag on object
+
+### Actions
+It needs to implement 18D action space
+
+Trimesh provides many usefull methods so implementation of Lightweight Enviroment looks very realistic in reasonble time.
+
+
+# Unresolved questions
+
+## Open Questions
+### Q1: Optimal State Dimensionality
+Should we start with 13D or reduce by removing less informative features?
+Is 13D enough to distinguish one state from another to train RL controller?
+
+Several factors mitigate this:
+
+1. **Effective dimensionality is lower**: Only 6-8 features strongly
+   determine action choice. The remaining features provide refinement.
+
+2. **States lie on trajectories**: Not randomly distributed in 13D,
+   but along low-dimensional manifolds (movement paths).
+
+3. **Feature weighting**: Critical features (distance, alignment,
+   pos_error) can be upweighted in distance computation, effectively
+   reducing dimensionality.
+
+4. **Use Embeddings**: It needs a separate embedding module but we can increase dimensions without constaints risk   
+
+### Q2: Hyperparameter and Config Sensitivity
+How sensitive is the system to sigma, k_neighbors, and learning rate?
+What are optimal parameters for reward weights, action steps, etc?
+
+Current position: To be determined empirically during many tests.
+Mitigation: It makes sense to develop Lightweight Enviroment with trimesh for mesh-based primitives simulation to standalone RL training without Habitat.
 
 
 # Future possibilities

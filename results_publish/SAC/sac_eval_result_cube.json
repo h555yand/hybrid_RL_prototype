@@ -1,0 +1,103 @@
+{
+  "level_0": {
+    "bounds_mm": [
+      10.0,
+      40.0
+    ],
+    "total_episodes": 500,
+    "success_count": 156,
+    "timeout_count": 344,
+    "collision_count": 0,
+    "success_rate": 0.312,
+    "timeout_rate": 0.688,
+    "collision_rate": 0.0,
+    "action_distribution": {
+      "MoveTangentially": {
+        "count": 61091,
+        "rate": 1.0
+      }
+    },
+    "collision_stats": {},
+    "collision_rate_per_type": {},
+    "steps_per_success": 391.6,
+    "mean_episode_steps": 122.2
+  },
+  "level_1": {
+    "bounds_mm": [
+      20.0,
+      80.0
+    ],
+    "total_episodes": 500,
+    "success_count": 22,
+    "timeout_count": 478,
+    "collision_count": 0,
+    "success_rate": 0.044,
+    "timeout_rate": 0.956,
+    "collision_rate": 0.0,
+    "action_distribution": {
+      "MoveTangentially": {
+        "count": 72826,
+        "rate": 0.9868
+      },
+      "MoveLinear": {
+        "count": 325,
+        "rate": 0.0044
+      },
+      "Turn": {
+        "count": 359,
+        "rate": 0.0049
+      },
+      "Look": {
+        "count": 217,
+        "rate": 0.0029
+      },
+      "Detach": {
+        "count": 74,
+        "rate": 0.001
+      }
+    },
+    "collision_stats": {},
+    "collision_rate_per_type": {},
+    "steps_per_success": 3354.6,
+    "mean_episode_steps": 147.6
+  },
+  "level_2": {
+    "bounds_mm": [
+      40.0,
+      120.0
+    ],
+    "total_episodes": 500,
+    "success_count": 31,
+    "timeout_count": 469,
+    "collision_count": 0,
+    "success_rate": 0.062,
+    "timeout_rate": 0.938,
+    "collision_rate": 0.0,
+    "action_distribution": {
+      "MoveTangentially": {
+        "count": 70842,
+        "rate": 0.9749
+      },
+      "MoveLinear": {
+        "count": 421,
+        "rate": 0.0058
+      },
+      "Turn": {
+        "count": 892,
+        "rate": 0.0123
+      },
+      "Look": {
+        "count": 333,
+        "rate": 0.0046
+      },
+      "Detach": {
+        "count": 177,
+        "rate": 0.0024
+      }
+    },
+    "collision_stats": {},
+    "collision_rate_per_type": {},
+    "steps_per_success": 2344.0,
+    "mean_episode_steps": 145.3
+  }
+}
