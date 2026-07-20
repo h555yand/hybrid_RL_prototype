@@ -107,42 +107,42 @@ def _build_scene(
 
 
 def _compute_camera_transform(
+    scene: trimesh.Scene,
     agent_pos: np.ndarray,
     goal_pos: np.ndarray,
-    mesh_bounds: np.ndarray,
+    fixed_offset_multiplier: float = 2.0,
 ) -> np.ndarray:
-    """Compute a fixed camera position from the side and above.
+    """Вычисляет ракурс камеры, центрируясь на детали, но разворачиваясь к агенту."""
+    center = scene.bounds.mean(axis=0)
+    
+    # ИСПРАВЛЕНО: вычитаем минимальные границы из максимальных
+    mesh_size = float(np.linalg.norm(scene.bounds[1] - scene.bounds[0]))
+    camera_distance = mesh_size * fixed_offset_multiplier
 
-    Args:
-        agent_pos: Agent position [x, y, z].
-        goal_pos: Goal position [x, y, z].
-        mesh_bounds: Mesh bounding box [[min_x, min_y, min_z], [max, max, max]].
+    to_agent = agent_pos - center
+    to_agent_norm = np.linalg.norm(to_agent)
+    
+    if to_agent_norm > 1e-5:
+        dir_to_agent = to_agent / to_agent_norm
+    else:
+        dir_to_agent = np.array([1.0, 0.0, 0.0])
 
-    Returns:
-        4x4 camera transformation matrix.
-    """
-    center = (agent_pos + goal_pos) / 2.0
-    span = float(np.linalg.norm(agent_pos - goal_pos))
-    mesh_size = float(np.linalg.norm(mesh_bounds[1] - mesh_bounds[0]))
-    camera_distance = max(span, mesh_size) * _CAMERA_DISTANCE_MULTIPLIER
-
-    camera_pos = center + np.array([
-        camera_distance * 0.7,
-        camera_distance * 0.5,
-        camera_distance * 0.7,
-    ])
+    camera_pos = center + dir_to_agent * (camera_distance * 0.8)
+    camera_pos[2] += camera_distance * 0.5  # ИСПРАВЛЕНО: прибавляем строго к оси Z (высота)
 
     forward = center - camera_pos
-    forward /= np.linalg.norm(forward) + _NORM_EPSILON
+    forward /= np.linalg.norm(forward) + 1e-6
 
     world_up = np.array([0.0, 0.0, 1.0])
     right = np.cross(forward, world_up)
-    if np.linalg.norm(right) < _CROSS_PRODUCT_THRESHOLD:
+    
+    if np.linalg.norm(right) < 1e-3:
         world_up = np.array([0.0, 1.0, 0.0])
         right = np.cross(forward, world_up)
-    right /= np.linalg.norm(right) + _NORM_EPSILON
+        
+    right /= np.linalg.norm(right) + 1e-6
     up = np.cross(right, forward)
-    up /= np.linalg.norm(up) + _NORM_EPSILON
+    up /= np.linalg.norm(up) + 1e-6
 
     transform = np.eye(4)
     transform[:3, 0] = right
@@ -242,14 +242,25 @@ def render_frame_to_file(
     scene = _build_scene(env, agent_pose, goal_pose, trail_poses)
 
     camera_transform = _compute_camera_transform(
-        agent_pose[:3], goal_pose[:3], env.mesh.bounds,
+        scene=scene,
+        agent_pos=agent_pose[:3],
+        goal_pos=goal_pose[:3],
+        fixed_offset_multiplier=2.0  # Уменьшите до 1.5, если хотите покрупнее
     )
     scene.camera_transform = camera_transform
+
+    # ВАЖНО ДЛЯ OFF-LINE РЕНДЕРА:
+    # Задаем фокусное расстояние (FOV) и расширяем плоскости отсечения,
+    # чтобы стены и объекты гарантированно попадали в рендер и не исчезали.
+    scene.camera.fov = (60.0, 60.0)
+    scene.camera.z_near = 1.0
+    scene.camera.z_far = 100000.0  # Огромное расстояние, чтобы видеть всю карту
+    scene.camera.resolution = resolution
 
     filepath.parent.mkdir(parents=True, exist_ok=True)
 
     try:
-        png_data = scene.save_image(resolution=resolution, visible=False)
+        png_data = scene.save_image(resolution=resolution, visible=False, smooth=False)
 
         if png_data is None or len(png_data) < _MIN_RENDER_BYTES:
             msg = "Empty render output"
@@ -321,7 +332,7 @@ def save_episode_frames(
                 )
             else:
                 dist = 0.0
-            f.write(f"Step {i:03d} (dist={dist:.1f}mm): {action}\n")
+            f.write(f"Step {i+1:03d} (dist={dist:.1f}mm): {action}\n")
 
     meta = {
         "episode_id": episode_id,

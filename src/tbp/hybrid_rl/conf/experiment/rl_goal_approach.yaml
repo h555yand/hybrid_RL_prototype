@@ -7,14 +7,14 @@ experiment:
   _target_: tbp.hybrid_rl.experiment.RLGoalApproachExperiment
   config:
     seed: 42
-    visualise: false
-    regenerate_scripts: true
-    do_train: false
+    visualise: true
+    regenerate_scripts: false
+    do_train: true
     do_eval: false
     do_bc_train: false
     do_sac_train: false
     do_sac_eval: false
-    do_adaptive: true
+    do_adaptive: false
 
     train_seeds: [11]
     eval_seeds: [44]
@@ -29,16 +29,16 @@ experiment:
       - [40.0, 120.0]
 
     training_stages:
-      - mesh: cube
-        episodes: 2000
-        epsilon_start: 1.0
-        epsilon_min: 0.10
-        load_mode: null
-      - mesh: cylinder
-        episodes: 3000
-        epsilon_start: 1.0
-        epsilon_min: 0.10
-        load_mode: auto
+      #- mesh: cube
+      #  episodes: 2000
+      #  epsilon_start: 1.0
+      #  epsilon_min: 0.10
+      #  load_mode: null
+      #- mesh: cylinder
+      #  episodes: 3000
+      #  epsilon_start: 1.0
+      #  epsilon_min: 0.10
+      #  load_mode: auto
       - mesh: mug
         episodes: 7000
         epsilon_start: 1.0

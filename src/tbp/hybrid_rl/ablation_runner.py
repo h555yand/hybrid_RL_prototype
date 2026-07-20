@@ -452,8 +452,8 @@ def _maybe_save_visualization(  # noqa: PLR0913
         )
 
     filter_actions = vis_filter.get("actions", [])
-    has_all_actions = (
-        all(
+    has_any_actions = (
+        any(
             any(act_name in expl for expl in action_explanations)
             for act_name in filter_actions
         )
@@ -464,7 +464,7 @@ def _maybe_save_visualization(  # noqa: PLR0913
     max_count = vis_filter.get(f"max_{ep_result}", 5)
     under_limit = vis_counts[ep_result] < max_count
 
-    if has_all_actions and under_limit:
+    if has_any_actions and under_limit:
         episode_id = f"ep_{episode:05d}_{ep_result}"
         save_episode_frames(
             env=env,
@@ -565,7 +565,26 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
     vis_dir = Path(save_dir) / "visualizations" if visualise else None
     vis_filter = (
         (config or {}).get("visualise_filter", {
-            "actions": ["detach", "detach_edge"],
+            "actions": [
+                "move_tangentially",
+                "free_forward",
+                "free_backward",
+                "turn_left",
+                "turn_right",
+                "look_up",
+                "look_down",
+                "rotate_sensor_+",
+                "rotate_sensor_-",
+                "orient_horizontal",
+                "orient_vertical",
+                "detach",
+                "detach_edge",
+                "free_forward_small",
+                "look_up_big",
+                "look_down_big",
+                "turn_left_big",
+                "turn_right_big",
+            ],
             "max_success": 5,
             "max_collision": 5,
             "max_timeout": 5,
@@ -707,7 +726,7 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
 
         if visualise:
             start_rot = np.array([0.0, 0.0, 0.0])
-            visualize_agent_goal(env, np.concatenate([start_pos, start_rot]), goal_pose)
+            # visualize_agent_goal(env, np.concatenate([start_pos, start_rot]), goal_pose)
             #for pose in current_poses:
             #   visualize_agent_goal(env, pose, goal_pose)
 
