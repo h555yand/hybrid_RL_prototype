@@ -70,7 +70,7 @@ The prototype has been implemented and tested on the Lightweight Environment (Tr
 
 **The full pipeline works end-to-end: Q-learning → Behavioral Cloning → SAC → Arbitrage**
 
-### Training and validation stategy
+### Training and validation strategy
 #### Use several oblects from simple to complex: cube, cylinder, mug, cup, vase
 [Sizes and realization are](src/tbp/hybrid_rl/mesh_factory.py)
 
