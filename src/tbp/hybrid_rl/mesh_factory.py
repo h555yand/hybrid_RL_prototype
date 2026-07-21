@@ -372,3 +372,10 @@ def prepare_demo_meshes(data_dir: Path) -> None:
     create_mug().export(str(data_dir / "mug.stl"))
     create_tea_cup().export(str(data_dir / "cup.stl"))
     create_vase().export(str(data_dir / "vase.stl"))
+
+# show objects
+# trimesh.primitives.Box(extents=[80, 80, 80]).show()
+# trimesh.primitives.Cylinder(radius=35, height=100).show()
+# create_mug().show()
+# create_tea_cup().show()
+# create_vase().show()
