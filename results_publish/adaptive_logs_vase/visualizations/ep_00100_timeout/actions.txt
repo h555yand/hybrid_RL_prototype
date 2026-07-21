@@ -1,4 +1,4 @@
-Result: timeout
+Result: timeout - The agent crawled not along a straight path, but over the top, climbed over the edge into the vase, reached the target on the other side, but then spun around and was unable to get to the outside of the target
 Goal: [-21.370293074655773, -3.1521960128693234, 30.97577341964869, 46.68201053711656, -59.585738851460775, -42.44504126782082]
 Steps: 500
 Start: [2.0234323278225688, 24.356934288613555, 23.347181706020983, -64.90394143954451, -35.02888103563993, -17.859477043406287]

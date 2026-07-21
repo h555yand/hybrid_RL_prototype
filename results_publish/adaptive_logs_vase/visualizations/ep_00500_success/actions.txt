@@ -1,4 +1,4 @@
-Result: success
+Result: success - Initially, neither the agent nor the target are visible, apparently inside. Then there are other views where the target is on the outer wall. And then, a miracle: the agent appears through the wall and there is no collision. A bug.
 Goal: [16.41998278835931, 25.817672190694047, 6.717018137137794, -69.27812245021138, 11.017817580046035, -26.802253631010963]
 Steps: 208
 Start: [-5.11149537775448, -9.64017322478517, -28.263158798217773, 0.0, 0.0, 0.0]

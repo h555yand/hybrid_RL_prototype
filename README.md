@@ -204,6 +204,8 @@ Heuristic is fallback only when both Q-store and SAC have zero score.
    - adaptive_mesh: vase
    - adaptive_episodes: 2000
    [You can find detail results with visualizations here](results_publish/adaptive_logs_vase)
+   I've studied and commented results for 100, 200, 400, 600, 1900, 2000.
+   At the beginning the agent used not efficient strategy on new object (timeout, collisions). Then agent learnt object specific and last episodes it moves almast perfectly.
 
 
 ### Resuls summary for Q and SAC train and validation

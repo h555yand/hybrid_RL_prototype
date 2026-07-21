@@ -1,4 +1,4 @@
-Result: success
+Result: success - The agent and target are below on opposite sides. It took off correctly, flew over the bottom, flew up, aimed, and landed perfectly.
 Goal: [12.732398398438695, -33.578359418803856, -7.6439593436512006, -69.53372065024257, -6.640795201959785, -162.78383780083013]
 Steps: 31
 Start: [-18.109501350136522, 28.414811556723766, -21.426561768815077, -144.14625075467762, -47.01854153449068, 76.28912489872368]
