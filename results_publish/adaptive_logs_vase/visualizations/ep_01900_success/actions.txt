@@ -1,0 +1,39 @@
+Result: success
+Goal: [12.732398398438695, -33.578359418803856, -7.6439593436512006, -69.53372065024257, -6.640795201959785, -162.78383780083013]
+Steps: 31
+Start: [-18.109501350136522, 28.414811556723766, -21.426561768815077, -144.14625075467762, -47.01854153449068, 76.28912489872368]
+End: [11.54159474385807, -32.95230528853987, -4.969227725967876, -69.53372065024257, -6.640795201959776, -162.78383780083013]
+Start distance: 70.6mm
+End distance: 3.0mm
+
+Step 001 (dist=70.6mm): source: q_store, act_name: detach
+Step 002 (dist=70.4mm): source: sac, act_name: free_forward
+Step 003 (dist=63.0mm): source: sac, act_name: detach
+Step 004 (dist=62.3mm): source: q_store, act_name: free_forward
+Step 005 (dist=55.4mm): source: q_store, act_name: free_forward
+Step 006 (dist=48.7mm): source: q_store, act_name: free_forward
+Step 007 (dist=42.6mm): source: q_store, act_name: free_forward
+Step 008 (dist=37.2mm): source: q_store, act_name: free_forward
+Step 009 (dist=32.8mm): source: q_store, act_name: free_forward
+Step 010 (dist=30.0mm): source: q_store, act_name: look_up_big
+Step 011 (dist=30.0mm): source: q_store, act_name: free_forward
+Step 012 (dist=27.1mm): source: q_store, act_name: free_forward
+Step 013 (dist=26.4mm): source: q_store, act_name: look_up_big
+Step 014 (dist=26.4mm): source: q_store, act_name: free_forward
+Step 015 (dist=26.1mm): source: q_store, act_name: look_up_big
+Step 016 (dist=26.1mm): source: q_store, act_name: free_forward
+Step 017 (dist=26.2mm): source: q_store, act_name: look_up_big
+Step 018 (dist=26.2mm): source: q_store, act_name: look_up_big
+Step 019 (dist=26.2mm): source: q_store, act_name: free_forward
+Step 020 (dist=24.7mm): source: q_store, act_name: look_up_big
+Step 021 (dist=24.7mm): source: q_store, act_name: free_forward
+Step 022 (dist=23.7mm): source: q_store, act_name: look_up_big
+Step 023 (dist=23.7mm): source: q_store, act_name: free_forward
+Step 024 (dist=23.3mm): source: q_store, act_name: look_up_big
+Step 025 (dist=23.3mm): source: q_store, act_name: free_forward
+Step 026 (dist=23.7mm): source: q_store, act_name: look_up_big
+Step 027 (dist=23.7mm): source: q_store, act_name: look_up_big
+Step 028 (dist=23.7mm): source: q_store, act_name: move_tangentially
+Step 029 (dist=8.5mm): source: q_store, act_name: move_tangentially
+Step 030 (dist=5.9mm): source: q_store, act_name: move_tangentially
+Step 031 (dist=3.0mm): source: q_store, act_name: move_tangentially

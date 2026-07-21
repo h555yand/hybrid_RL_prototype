@@ -68,6 +68,10 @@ class ActionSpace:
             18: Detach
             19: DetachEdge
             20: MoveForward Small
+            IDX_LOOK_UP_BIG = 21
+            IDX_LOOK_DOWN_BIG = 22
+            IDX_TURN_LEFT_BIG = 23
+            IDX_TURN_RIGHT_BIG = 24
 
     Args:
         agent_id: Monty agent identifier for Action objects.

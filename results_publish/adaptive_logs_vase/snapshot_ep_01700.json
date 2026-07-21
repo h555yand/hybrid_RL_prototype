@@ -1,106 +1,111 @@
 {
   "episode": 1700,
-  "rolling_success_rate": 0.56,
+  "rolling_success_rate": 0.51,
+  "total_episodes_success_rate": 0.546,
   "curriculum_level": 2,
   "mode": "online",
   "total_episodes": 1700,
-  "total_steps": 313526,
-  "success_count": 909,
-  "collision_count": 791,
-  "timeout_count": 0,
+  "total_steps": 311048,
+  "success_count": 928,
+  "collision_count": 449,
+  "timeout_count": 323,
   "source_distribution": {
-    "q_store": 0.562,
-    "sac": 0.438,
+    "q_store": 0.493,
+    "sac": 0.507,
     "heuristic": 0.0
   },
   "action_distribution": {
     "move_tangentially": {
-      "count": 227556,
-      "rate": 0.7258
+      "count": 225734,
+      "rate": 0.7257
     },
     "free_forward": {
-      "count": 21110,
-      "rate": 0.0673
+      "count": 21456,
+      "rate": 0.069
     },
     "look_down_big": {
-      "count": 17086,
-      "rate": 0.0545
+      "count": 16839,
+      "rate": 0.0541
     },
     "turn_left_big": {
-      "count": 14158,
-      "rate": 0.0452
+      "count": 14235,
+      "rate": 0.0458
     },
     "look_up_big": {
-      "count": 11943,
-      "rate": 0.0381
+      "count": 11295,
+      "rate": 0.0363
     },
     "turn_right_big": {
-      "count": 6899,
-      "rate": 0.022
+      "count": 6182,
+      "rate": 0.0199
     },
     "free_backward": {
-      "count": 4325,
-      "rate": 0.0138
+      "count": 5055,
+      "rate": 0.0163
     },
     "free_forward_small": {
-      "count": 3602,
-      "rate": 0.0115
+      "count": 3974,
+      "rate": 0.0128
     },
     "detach": {
-      "count": 3278,
-      "rate": 0.0105
+      "count": 3676,
+      "rate": 0.0118
     },
     "detach_edge": {
-      "count": 1253,
-      "rate": 0.004
+      "count": 1060,
+      "rate": 0.0034
     },
     "look_up": {
-      "count": 1233,
-      "rate": 0.0039
+      "count": 712,
+      "rate": 0.0023
     },
     "look_down": {
-      "count": 390,
-      "rate": 0.0012
+      "count": 317,
+      "rate": 0.001
     },
     "turn_right": {
-      "count": 373,
-      "rate": 0.0012
-    },
-    "turn_left": {
-      "count": 259,
+      "count": 262,
       "rate": 0.0008
     },
+    "turn_left": {
+      "count": 160,
+      "rate": 0.0005
+    },
     "rotate_sensor_-": {
-      "count": 47,
+      "count": 35,
+      "rate": 0.0001
+    },
+    "orient_vertical": {
+      "count": 27,
       "rate": 0.0001
     },
     "rotate_sensor_+": {
-      "count": 9,
-      "rate": 0.0
+      "count": 22,
+      "rate": 0.0001
     },
-    "orient_vertical": {
-      "count": 5,
+    "orient_horizontal": {
+      "count": 7,
       "rate": 0.0
     }
   },
   "collision_stats": {
-    "free_forward": 398,
-    "free_backward": 3,
-    "detach": 7,
-    "move_tangentially": 4,
-    "detach_edge": 1,
-    "free_forward_small": 5
+    "detach_edge": 6,
+    "free_forward": 420,
+    "free_forward_small": 6,
+    "detach": 8,
+    "free_backward": 6,
+    "move_tangentially": 3
   },
-  "steps_per_success": 344.9,
+  "steps_per_success": 335.2,
   "arbitrator": {
-    "q_store_rate": 0.562,
-    "sac_rate": 0.438,
+    "q_store_rate": 0.493,
+    "sac_rate": 0.507,
     "heuristic_rate": 0.0,
-    "agreement_rate": 0.168,
-    "q_spread_mean": 6.582,
-    "sac_confidence_mean": 0.946,
-    "q_success_rate": 0.57,
-    "sac_success_rate": 0.3
+    "agreement_rate": 0.754,
+    "q_spread_mean": 5.648,
+    "sac_confidence_mean": 0.845,
+    "q_success_rate": 0.51,
+    "sac_success_rate": 0.28
   },
   "manager": {
     "sac_updates": 3,
@@ -109,111 +114,271 @@
   "per_source_analysis": {
     "q_store": {
       "terminations": {
-        "success": 649,
-        "collision": 416,
-        "timeout": 0
+        "success": 586,
+        "collision": 180,
+        "timeout": 159
       },
       "chosen_actions": {
         "move_tangentially": {
-          "count": 107446,
-          "rate": 0.61
+          "count": 84903,
+          "rate": 0.554
         },
         "free_forward": {
-          "count": 18437,
-          "rate": 0.105
+          "count": 17963,
+          "rate": 0.117
         },
         "look_down_big": {
-          "count": 14307,
-          "rate": 0.081
+          "count": 14622,
+          "rate": 0.095
         },
         "turn_left_big": {
-          "count": 11577,
-          "rate": 0.066
+          "count": 12124,
+          "rate": 0.079
         },
         "look_up_big": {
-          "count": 9358,
-          "rate": 0.053
+          "count": 9451,
+          "rate": 0.062
+        },
+        "turn_right_big": {
+          "count": 4220,
+          "rate": 0.028
+        },
+        "free_forward_small": {
+          "count": 3744,
+          "rate": 0.024
+        },
+        "detach": {
+          "count": 2262,
+          "rate": 0.015
+        },
+        "free_backward": {
+          "count": 1797,
+          "rate": 0.012
+        },
+        "detach_edge": {
+          "count": 855,
+          "rate": 0.006
+        },
+        "look_up": {
+          "count": 688,
+          "rate": 0.004
+        },
+        "look_down": {
+          "count": 290,
+          "rate": 0.002
+        },
+        "turn_right": {
+          "count": 248,
+          "rate": 0.002
+        },
+        "turn_left": {
+          "count": 133,
+          "rate": 0.001
+        },
+        "rotate_sensor_-": {
+          "count": 18,
+          "rate": 0.0
         }
       },
       "proposed_actions": {
         "move_tangentially": {
-          "count": 220109,
-          "rate": 0.702
+          "count": 220582,
+          "rate": 0.709
         },
         "free_forward": {
-          "count": 22685,
-          "rate": 0.072
+          "count": 23121,
+          "rate": 0.074
         },
         "look_down_big": {
-          "count": 18618,
-          "rate": 0.059
+          "count": 17226,
+          "rate": 0.055
         },
         "turn_left_big": {
-          "count": 15620,
+          "count": 15601,
           "rate": 0.05
         },
         "look_up_big": {
-          "count": 10911,
-          "rate": 0.035
+          "count": 10458,
+          "rate": 0.034
+        },
+        "detach": {
+          "count": 8182,
+          "rate": 0.026
+        },
+        "free_forward_small": {
+          "count": 4800,
+          "rate": 0.015
+        },
+        "turn_right_big": {
+          "count": 4477,
+          "rate": 0.014
+        },
+        "free_backward": {
+          "count": 2926,
+          "rate": 0.009
+        },
+        "detach_edge": {
+          "count": 1237,
+          "rate": 0.004
+        },
+        "turn_right": {
+          "count": 977,
+          "rate": 0.003
+        },
+        "look_up": {
+          "count": 976,
+          "rate": 0.003
+        },
+        "look_down": {
+          "count": 307,
+          "rate": 0.001
+        },
+        "turn_left": {
+          "count": 151,
+          "rate": 0.0
+        },
+        "rotate_sensor_-": {
+          "count": 20,
+          "rate": 0.0
         }
       },
-      "mean_final_distance": 11.9,
-      "near_miss_count": 543,
-      "mean_episode_steps": 163.5
+      "mean_final_distance": 12.2,
+      "near_miss_count": 491,
+      "mean_episode_steps": 155.5
     },
     "sac": {
       "terminations": {
-        "success": 260,
-        "collision": 375,
-        "timeout": 0
+        "success": 342,
+        "collision": 269,
+        "timeout": 164
       },
       "chosen_actions": {
         "move_tangentially": {
-          "count": 120110,
-          "rate": 0.874
-        },
-        "look_down_big": {
-          "count": 2779,
-          "rate": 0.02
-        },
-        "free_backward": {
-          "count": 2734,
-          "rate": 0.02
+          "count": 140831,
+          "rate": 0.893
         },
         "free_forward": {
-          "count": 2673,
-          "rate": 0.019
+          "count": 3493,
+          "rate": 0.022
+        },
+        "free_backward": {
+          "count": 3258,
+          "rate": 0.021
+        },
+        "look_down_big": {
+          "count": 2217,
+          "rate": 0.014
+        },
+        "turn_left_big": {
+          "count": 2111,
+          "rate": 0.013
+        },
+        "turn_right_big": {
+          "count": 1962,
+          "rate": 0.012
         },
         "look_up_big": {
-          "count": 2585,
-          "rate": 0.019
+          "count": 1844,
+          "rate": 0.012
+        },
+        "detach": {
+          "count": 1414,
+          "rate": 0.009
+        },
+        "free_forward_small": {
+          "count": 230,
+          "rate": 0.001
+        },
+        "detach_edge": {
+          "count": 205,
+          "rate": 0.001
+        },
+        "turn_left": {
+          "count": 27,
+          "rate": 0.0
+        },
+        "look_down": {
+          "count": 27,
+          "rate": 0.0
+        },
+        "orient_vertical": {
+          "count": 27,
+          "rate": 0.0
+        },
+        "look_up": {
+          "count": 24,
+          "rate": 0.0
+        },
+        "rotate_sensor_+": {
+          "count": 22,
+          "rate": 0.0
         }
       },
       "proposed_actions": {
         "move_tangentially": {
-          "count": 225865,
+          "count": 223936,
           "rate": 0.72
         },
         "look_down_big": {
-          "count": 25598,
-          "rate": 0.082
+          "count": 19361,
+          "rate": 0.062
         },
         "free_forward": {
-          "count": 16788,
+          "count": 16940,
           "rate": 0.054
         },
-        "look_up_big": {
-          "count": 16152,
-          "rate": 0.052
-        },
         "turn_left_big": {
-          "count": 7671,
-          "rate": 0.024
+          "count": 14692,
+          "rate": 0.047
+        },
+        "turn_right_big": {
+          "count": 12309,
+          "rate": 0.04
+        },
+        "look_up_big": {
+          "count": 10784,
+          "rate": 0.035
+        },
+        "free_backward": {
+          "count": 7716,
+          "rate": 0.025
+        },
+        "detach": {
+          "count": 2208,
+          "rate": 0.007
+        },
+        "free_forward_small": {
+          "count": 915,
+          "rate": 0.003
+        },
+        "detach_edge": {
+          "count": 899,
+          "rate": 0.003
+        },
+        "look_down": {
+          "count": 300,
+          "rate": 0.001
+        },
+        "look_up": {
+          "count": 277,
+          "rate": 0.001
+        },
+        "turn_left": {
+          "count": 165,
+          "rate": 0.001
+        },
+        "turn_right": {
+          "count": 146,
+          "rate": 0.0
+        },
+        "orient_vertical": {
+          "count": 135,
+          "rate": 0.0
         }
       },
-      "mean_final_distance": 22.3,
-      "near_miss_count": 214,
-      "mean_episode_steps": 219.5
+      "mean_final_distance": 21.4,
+      "near_miss_count": 286,
+      "mean_episode_steps": 215.7
     }
   }
 }

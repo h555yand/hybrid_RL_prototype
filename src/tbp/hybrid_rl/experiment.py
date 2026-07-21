@@ -46,6 +46,7 @@ from tbp.hybrid_rl.rl_goal_approach_controller import (
     RLGoalApproachController,
 )
 from tbp.hybrid_rl.sac_trainer import PSACTrainer
+from tbp.hybrid_rl.ablation_runner import _maybe_save_visualization, visualize_agent_goal
 
 logger = logging.getLogger(__name__)
 
@@ -1176,6 +1177,7 @@ class RLGoalApproachExperiment:
 
         # Fixed epsilon — no decay
         adaptive_epsilon = 0.2
+        ep_successes = []
 
         for episode in range(self.adaptive_episodes):
             # Set Q-store epsilon
@@ -1232,9 +1234,12 @@ class RLGoalApproachExperiment:
             ep_steps = 0
             ep_sources: list[str] = []
             ep_actions: list[int] = []
+            current_poses = []
+            action_explanations = []
 
-            for _ in range(adaptive_max_steps):
+            for step in range(adaptive_max_steps):
                 pose = env.get_pose()
+                current_poses.append(pose)
                 sensor = env.get_sensor_data()
                 state = (
                     controller._compute_state(  # noqa: SLF001
@@ -1264,6 +1269,7 @@ class RLGoalApproachExperiment:
                 action_counts[act_name] = (
                     action_counts.get(act_name, 0) + 1
                 )
+                action_explanations.append(f"source: {source}, act_name: {act_name}")
 
                 # Track source
                 source_key = (
@@ -1286,20 +1292,19 @@ class RLGoalApproachExperiment:
                 > goals_before
             )
 
-            # Check collision
-            collision = False
-            if not success and not done:
-                collision = False  # timeout
-            elif not success and done:
-                collision = True  # collision ended episode
+            ep_successes.append(success)
+            total_episodes_rate = (
+                sum(ep_successes)
+                / len(ep_successes)
+            )
 
             # Determine termination
             if success:
                 termination = "success"
-            elif collision:
-                termination = "collision"
-            else:
+            elif step == (adaptive_max_steps - 1):
                 termination = "timeout"
+            else:
+                termination = "collision"
 
             if termination == "collision":
                 for act_name, count in (
@@ -1319,14 +1324,7 @@ class RLGoalApproachExperiment:
             collision_stats_before = dict(
                 controller._collision_stats  # noqa: SLF001
             )
-                        #transitions = (
-            #    controller.success_trails.copy()
-            #    if success
-            #    else []
-            #)
-            #transitions = (
-            #    controller._episode_transitions.copy()
-            #)
+
             transitions = last_transitions
             
             manager.on_episode_complete(
@@ -1458,7 +1456,25 @@ class RLGoalApproachExperiment:
                 sac_episode_steps.append(ep_steps)
 
             # Snapshot every 100 episodes — save to file
+            # _ADAPTIVE_LOG_INTERVAL = 1
             if (episode + 1) % _ADAPTIVE_LOG_INTERVAL == 0:
+                if self.visualise:
+                    # start_rot = np.array([0.0, 0.0, 0.0])
+                    # visualize_agent_goal(env, np.concatenate([start_pos, start_rot]), goal_pose)
+                    vis_dir = Path(adaptive_log_dir) / "visualizations"
+                    _maybe_save_visualization(
+                        controller=controller,
+                        env=env,
+                        episode=episode,
+                        ep_result=termination,
+                        goal_pose=goal_pose,
+                        current_poses=current_poses,
+                        action_explanations=action_explanations,
+                        vis_dir=vis_dir,
+                        vis_filter=None,
+                        vis_counts=None,
+                    )
+
                 stats = manager.get_stats()
                 arb_stats = manager.arbitrator.get_stats()
 
@@ -1473,6 +1489,9 @@ class RLGoalApproachExperiment:
                     "episode": episode + 1,
                     "rolling_success_rate": round(
                         rolling_rate, 3
+                    ),
+                    "total_episodes_success_rate": round(
+                        total_episodes_rate, 3
                     ),
                     "curriculum_level": adaptive_level,
                     "mode": stats["mode"],

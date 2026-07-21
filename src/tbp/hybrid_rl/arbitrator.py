@@ -181,7 +181,7 @@ class Arbitrator:
         if self.sac_actor is not None:
             self.sac_proposed_actions[sac_name] += 1
             self.both_proposed_count += 1
-            if q_action == sac_action:
+            if q_name == sac_name:
                 self.agreement_count += 1
 
         self.q_confidence_history.append(q_confidence)
@@ -371,7 +371,7 @@ class Arbitrator:
         q_spread_mean = float(np.mean(self.q_spread_history)) if self.q_spread_history else 0.0
         sac_conf_mean = float(np.mean(self.sac_confidence_history)) if self.sac_confidence_history else 0.0
 
-        def _top_actions(action_dict, n=5):
+        def _top_actions(action_dict, n=15):
             sorted_actions = sorted(action_dict.items(), key=lambda x: -x[1])
             total_actions = max(sum(action_dict.values()), 1)
             return {

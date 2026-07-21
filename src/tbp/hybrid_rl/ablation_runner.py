@@ -416,13 +416,13 @@ def _maybe_save_visualization(  # noqa: PLR0913
     controller: RLGoalApproachController,
     env: LightweightEnv,
     episode: int,
-    episode_success: bool,
+    ep_result: str,
     goal_pose: np.ndarray,
     current_poses: list[np.ndarray],
     action_explanations: list[str],
     vis_dir: Path,
-    vis_filter: dict[str, Any],
-    vis_counts: dict[str, int],
+    vis_filter: dict[str, Any]=None,
+    vis_counts: dict[str, int]=None,
 ) -> None:
     """Save episode visualization if it matches the filter criteria.
 
@@ -438,34 +438,24 @@ def _maybe_save_visualization(  # noqa: PLR0913
         vis_filter: Filter configuration dict.
         vis_counts: Mutable counter dict for saved episodes per result.
     """
-    if episode_success:
-        ep_result = "success"
+    if vis_filter and vis_counts:
+        filter_actions = vis_filter.get("actions", [])
+        has_any_actions = (
+            any(
+                any(act_name in expl for expl in action_explanations)
+                for act_name in filter_actions
+            )
+            if filter_actions
+            else True
+        )
+        max_count = vis_filter.get(f"max_{ep_result}", 5)
+        under_limit = vis_counts[ep_result] < max_count
     else:
-        last_termination = max(
-            controller._termination_counts.items(),
-            key=lambda x: x[1],
-        )
-        ep_result = (
-            "collision"
-            if "collision" in str(last_termination[0])
-            else "timeout"
-        )
-
-    filter_actions = vis_filter.get("actions", [])
-    has_any_actions = (
-        any(
-            any(act_name in expl for expl in action_explanations)
-            for act_name in filter_actions
-        )
-        if filter_actions
-        else True
-    )
-
-    max_count = vis_filter.get(f"max_{ep_result}", 5)
-    under_limit = vis_counts[ep_result] < max_count
+        has_any_actions = True
+        under_limit = True
 
     if has_any_actions and under_limit:
-        episode_id = f"ep_{episode:05d}_{ep_result}"
+        episode_id = f"ep_{episode+1:05d}_{ep_result}"
         save_episode_frames(
             env=env,
             goal_pose=goal_pose,
@@ -475,13 +465,8 @@ def _maybe_save_visualization(  # noqa: PLR0913
             episode_id=episode_id,
             result=ep_result,
         )
-        vis_counts[ep_result] += 1
-        logger.info(
-            "[Vis] Saved %s episode: %s (counts: %s)",
-            ep_result,
-            episode_id,
-            vis_counts,
-        )
+        if vis_counts:
+            vis_counts[ep_result] += 1
 
 
 def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
@@ -723,6 +708,9 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
         if episode_success:
             success_trails.append(controller.success_trails)
             success_actions.append(action_explanations)
+            ep_result = "success"
+        else:
+            ep_result = "collision/timeout"
 
         if visualise:
             start_rot = np.array([0.0, 0.0, 0.0])
@@ -735,7 +723,7 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
                 controller=controller,
                 env=env,
                 episode=episode,
-                episode_success=episode_success,
+                ep_result=ep_result,
                 goal_pose=goal_pose,
                 current_poses=current_poses,
                 action_explanations=action_explanations,

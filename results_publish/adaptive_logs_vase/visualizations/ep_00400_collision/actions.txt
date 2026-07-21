@@ -1,0 +1,21 @@
+Result: collision
+Goal: [0.5160882862549366, -25.5312376951484, 20.380039084245496, -64.90394143954451, 35.028881035639934, -162.1405229565937]
+Steps: 13
+Start: [-7.600175438031819, -15.429636177744227, -35.86874573471637, 176.08778292571975, 35.58045777588762, 57.98397925918067]
+End: [0.8721676222305823, -21.652726674750532, -29.970576080997684, -163.70959131860315, -1.4155657183564188, -0.4136338980255232]
+Start distance: 57.7mm
+End distance: 50.5mm
+
+Step 001 (dist=57.7mm): source: sac, act_name: move_tangentially
+Step 002 (dist=58.4mm): source: sac, act_name: move_tangentially
+Step 003 (dist=57.2mm): source: sac, act_name: move_tangentially
+Step 004 (dist=57.3mm): source: sac, act_name: move_tangentially
+Step 005 (dist=55.8mm): source: sac, act_name: move_tangentially
+Step 006 (dist=54.4mm): source: sac, act_name: move_tangentially
+Step 007 (dist=55.8mm): source: sac, act_name: move_tangentially
+Step 008 (dist=55.9mm): source: sac, act_name: move_tangentially
+Step 009 (dist=58.0mm): source: sac, act_name: move_tangentially
+Step 010 (dist=57.8mm): source: sac, act_name: move_tangentially
+Step 011 (dist=58.4mm): source: q_store, act_name: detach
+Step 012 (dist=58.4mm): source: sac, act_name: free_forward
+Step 013 (dist=50.5mm): source: sac, act_name: move_tangentially

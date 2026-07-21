@@ -73,6 +73,7 @@ The prototype has been implemented and tested on the Lightweight Environment (Tr
 ### Training and validation strategy
 #### Use several oblects from simple to complex: cube, cylinder, mug, cup, vase
 [Sizes and realization are](src/tbp/hybrid_rl/mesh_factory.py)
+[Pictures are](results_publish/objects)
 
 #### Training and validation stages
 - I used the standard Monty approach with [Hynda YAML](src/tbp/hybrid_rl/conf/experiment/rl_goal_approach.yaml) and [experiment.py](src/tbp/hybrid_rl/experiment.py)
@@ -202,7 +203,7 @@ Heuristic is fallback only when both Q-store and SAC have zero score.
 - YAML config for testing
    - adaptive_mesh: vase
    - adaptive_episodes: 2000
-   [You can find details results here](results_publish/adaptive_logs_vase)
+   [You can find detail results with visualizations here](results_publish/adaptive_logs_vase)
 
 
 ### Resuls summary for Q and SAC train and validation
@@ -227,11 +228,12 @@ Heuristic is fallback only when both Q-store and SAC have zero score.
 
 
 ### Resuls summary for adaptive arbitrage mode
-| episode | q_store_rate | sac_rate | agreement_rate | q_success_rate | sac_success_rate | weighted_rate | level |
+| episode | q_store_weight_rate | sac_weight_rate | action_agreement_rate | q_success_rate | sac_success_rate | total_episodes_success_rate | curriculum level |
 |-------|-------|--------|-------------|--------|--------|--------|--------|
-| 100 | 2% | 98% | 17% | 100% | 54% | 53% | 0 -> 1 |
-| 1000 | 36% | 64% | 16% | 46% | 35% | 39% | 2 |
-| 2000 | 61% | 39% | 17% | 70% | 26% | 53% | 2 |
+| 100 | 29% | 71% | 77% | 84% | 61% | 72% | 0 -> 1 |
+| 1000 | 32% | 68% | 76% | 52% | 48% | 51% | 2 |
+| 1500 | 45% | 55% | 76% | 67% | 30% | 54% | 2 |
+| 2000 | 55% | 45% | 75% | 63% | 20% | 55% | 2 |
 
 
 ### Key Findings
@@ -247,7 +249,9 @@ Heuristic is fallback only when both Q-store and SAC have zero score.
 - SAC inherited accurate crawl strategy from Q-learning and it was not enough episodes to study more optimal one
 - Hyperparameters and implementation should be checked one more time
 
-**5. Adaptive arbitrage between episodic memory and skills works.** On the new object vase adaptive arbitrage shows 53% success rate. This is more than independent Q and SAC rates on validation phase for known objects. First, more SAC used, then Q-learinig. Because SAC, as a neural network, is always more confident, but then success statistics help Q-learinig to increase q_store_rate. Agent mostly crawled, failures were due to collisions.
+**5. Adaptive arbitrage between episodic memory and skills works.** On the new object vase adaptive arbitrage shows 55% success rate. This is more than independent Q and SAC rates on validation phase for known objects. First, more SAC was choosen, then Q-learinig. Because SAC, as a neural network, is always more confident, but then success statistics help Q-learinig to increase q_store_rate. 
+Agent mostly crawled (move_tangentially action takes more than 50%), but all other actions (orient, free_move, macro categories) are also used in less proportion.
+Failures were mostly due to collisions, then timeout (out of step limit per episode).
 
 ---
 

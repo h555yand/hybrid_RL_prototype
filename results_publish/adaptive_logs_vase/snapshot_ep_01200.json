@@ -1,106 +1,111 @@
 {
   "episode": 1200,
-  "rolling_success_rate": 0.55,
+  "rolling_success_rate": 0.65,
+  "total_episodes_success_rate": 0.512,
   "curriculum_level": 2,
   "mode": "online",
   "total_episodes": 1200,
-  "total_steps": 240534,
-  "success_count": 602,
-  "collision_count": 598,
-  "timeout_count": 0,
+  "total_steps": 239384,
+  "success_count": 615,
+  "collision_count": 341,
+  "timeout_count": 244,
   "source_distribution": {
-    "q_store": 0.436,
-    "sac": 0.564,
+    "q_store": 0.35,
+    "sac": 0.65,
     "heuristic": 0.0
   },
   "action_distribution": {
     "move_tangentially": {
-      "count": 178167,
-      "rate": 0.7407
+      "count": 176517,
+      "rate": 0.7374
     },
     "free_forward": {
-      "count": 14222,
-      "rate": 0.0591
+      "count": 15015,
+      "rate": 0.0627
     },
     "look_down_big": {
-      "count": 12471,
-      "rate": 0.0518
+      "count": 12729,
+      "rate": 0.0532
     },
     "turn_left_big": {
-      "count": 10896,
-      "rate": 0.0453
+      "count": 10797,
+      "rate": 0.0451
     },
     "look_up_big": {
-      "count": 8856,
-      "rate": 0.0368
+      "count": 8435,
+      "rate": 0.0352
     },
     "turn_right_big": {
-      "count": 5743,
-      "rate": 0.0239
+      "count": 4975,
+      "rate": 0.0208
     },
     "free_backward": {
-      "count": 3373,
-      "rate": 0.014
+      "count": 4451,
+      "rate": 0.0186
     },
     "free_forward_small": {
-      "count": 2352,
-      "rate": 0.0098
+      "count": 2840,
+      "rate": 0.0119
     },
     "detach": {
-      "count": 2329,
-      "rate": 0.0097
+      "count": 1921,
+      "rate": 0.008
     },
     "detach_edge": {
-      "count": 707,
-      "rate": 0.0029
+      "count": 639,
+      "rate": 0.0027
     },
     "look_up": {
-      "count": 679,
-      "rate": 0.0028
+      "count": 437,
+      "rate": 0.0018
     },
     "look_down": {
-      "count": 287,
-      "rate": 0.0012
-    },
-    "turn_right": {
-      "count": 206,
+      "count": 210,
       "rate": 0.0009
     },
-    "turn_left": {
-      "count": 194,
+    "turn_right": {
+      "count": 203,
       "rate": 0.0008
     },
-    "rotate_sensor_-": {
-      "count": 39,
-      "rate": 0.0002
+    "turn_left": {
+      "count": 136,
+      "rate": 0.0006
     },
-    "rotate_sensor_+": {
-      "count": 9,
-      "rate": 0.0
+    "rotate_sensor_-": {
+      "count": 26,
+      "rate": 0.0001
     },
     "orient_vertical": {
-      "count": 4,
+      "count": 24,
+      "rate": 0.0001
+    },
+    "rotate_sensor_+": {
+      "count": 22,
+      "rate": 0.0001
+    },
+    "orient_horizontal": {
+      "count": 7,
       "rate": 0.0
     }
   },
   "collision_stats": {
-    "free_forward": 298,
-    "free_backward": 3,
-    "detach": 4,
-    "move_tangentially": 4,
-    "detach_edge": 1,
-    "free_forward_small": 3
+    "detach_edge": 6,
+    "free_forward": 318,
+    "free_forward_small": 4,
+    "detach": 7,
+    "free_backward": 4,
+    "move_tangentially": 2
   },
-  "steps_per_success": 399.6,
+  "steps_per_success": 389.2,
   "arbitrator": {
-    "q_store_rate": 0.436,
-    "sac_rate": 0.564,
+    "q_store_rate": 0.35,
+    "sac_rate": 0.65,
     "heuristic_rate": 0.0,
-    "agreement_rate": 0.162,
-    "q_spread_mean": 6.771,
-    "sac_confidence_mean": 0.923,
-    "q_success_rate": 0.55,
-    "sac_success_rate": 0.33
+    "agreement_rate": 0.762,
+    "q_spread_mean": 8.648,
+    "sac_confidence_mean": 0.83,
+    "q_success_rate": 0.66,
+    "sac_success_rate": 0.37
   },
   "manager": {
     "sac_updates": 2,
@@ -109,111 +114,271 @@
   "per_source_analysis": {
     "q_store": {
       "terminations": {
-        "success": 342,
-        "collision": 253,
-        "timeout": 0
+        "success": 274,
+        "collision": 88,
+        "timeout": 81
       },
       "chosen_actions": {
         "move_tangentially": {
-          "count": 59227,
-          "rate": 0.565
+          "count": 37513,
+          "rate": 0.447
         },
         "free_forward": {
-          "count": 11658,
-          "rate": 0.111
+          "count": 11598,
+          "rate": 0.138
         },
         "look_down_big": {
-          "count": 9833,
-          "rate": 0.094
+          "count": 10608,
+          "rate": 0.126
         },
         "turn_left_big": {
-          "count": 8323,
-          "rate": 0.079
+          "count": 8740,
+          "rate": 0.104
         },
         "look_up_big": {
-          "count": 6330,
-          "rate": 0.06
+          "count": 6619,
+          "rate": 0.079
+        },
+        "turn_right_big": {
+          "count": 3054,
+          "rate": 0.036
+        },
+        "free_forward_small": {
+          "count": 2610,
+          "rate": 0.031
+        },
+        "free_backward": {
+          "count": 1231,
+          "rate": 0.015
+        },
+        "detach": {
+          "count": 557,
+          "rate": 0.007
+        },
+        "detach_edge": {
+          "count": 435,
+          "rate": 0.005
+        },
+        "look_up": {
+          "count": 415,
+          "rate": 0.005
+        },
+        "turn_right": {
+          "count": 189,
+          "rate": 0.002
+        },
+        "look_down": {
+          "count": 183,
+          "rate": 0.002
+        },
+        "turn_left": {
+          "count": 110,
+          "rate": 0.001
+        },
+        "rotate_sensor_-": {
+          "count": 10,
+          "rate": 0.0
         }
       },
       "proposed_actions": {
         "move_tangentially": {
-          "count": 170576,
-          "rate": 0.709
+          "count": 172050,
+          "rate": 0.719
         },
         "free_forward": {
-          "count": 15783,
-          "rate": 0.066
+          "count": 16652,
+          "rate": 0.07
         },
         "look_down_big": {
-          "count": 14095,
-          "rate": 0.059
+          "count": 13170,
+          "rate": 0.055
         },
         "turn_left_big": {
-          "count": 12344,
+          "count": 12177,
           "rate": 0.051
         },
+        "look_up_big": {
+          "count": 7607,
+          "rate": 0.032
+        },
         "detach": {
-          "count": 8242,
-          "rate": 0.034
+          "count": 6407,
+          "rate": 0.027
+        },
+        "free_forward_small": {
+          "count": 3603,
+          "rate": 0.015
+        },
+        "turn_right_big": {
+          "count": 3311,
+          "rate": 0.014
+        },
+        "free_backward": {
+          "count": 2351,
+          "rate": 0.01
+        },
+        "detach_edge": {
+          "count": 817,
+          "rate": 0.003
+        },
+        "look_up": {
+          "count": 703,
+          "rate": 0.003
+        },
+        "look_down": {
+          "count": 200,
+          "rate": 0.001
+        },
+        "turn_right": {
+          "count": 189,
+          "rate": 0.001
+        },
+        "turn_left": {
+          "count": 128,
+          "rate": 0.001
+        },
+        "rotate_sensor_-": {
+          "count": 12,
+          "rate": 0.0
         }
       },
-      "mean_final_distance": 12.8,
-      "near_miss_count": 292,
-      "mean_episode_steps": 171.0
+      "mean_final_distance": 14.1,
+      "near_miss_count": 235,
+      "mean_episode_steps": 165.2
     },
     "sac": {
       "terminations": {
-        "success": 260,
-        "collision": 345,
-        "timeout": 0
+        "success": 341,
+        "collision": 253,
+        "timeout": 163
       },
       "chosen_actions": {
         "move_tangentially": {
-          "count": 118940,
-          "rate": 0.876
-        },
-        "free_backward": {
-          "count": 2678,
-          "rate": 0.02
-        },
-        "look_down_big": {
-          "count": 2638,
-          "rate": 0.019
-        },
-        "turn_left_big": {
-          "count": 2573,
-          "rate": 0.019
+          "count": 139004,
+          "rate": 0.894
         },
         "free_forward": {
-          "count": 2564,
-          "rate": 0.019
+          "count": 3417,
+          "rate": 0.022
+        },
+        "free_backward": {
+          "count": 3220,
+          "rate": 0.021
+        },
+        "look_down_big": {
+          "count": 2121,
+          "rate": 0.014
+        },
+        "turn_left_big": {
+          "count": 2057,
+          "rate": 0.013
+        },
+        "turn_right_big": {
+          "count": 1921,
+          "rate": 0.012
+        },
+        "look_up_big": {
+          "count": 1816,
+          "rate": 0.012
+        },
+        "detach": {
+          "count": 1364,
+          "rate": 0.009
+        },
+        "free_forward_small": {
+          "count": 230,
+          "rate": 0.001
+        },
+        "detach_edge": {
+          "count": 204,
+          "rate": 0.001
+        },
+        "look_down": {
+          "count": 27,
+          "rate": 0.0
+        },
+        "turn_left": {
+          "count": 26,
+          "rate": 0.0
+        },
+        "orient_vertical": {
+          "count": 24,
+          "rate": 0.0
+        },
+        "look_up": {
+          "count": 22,
+          "rate": 0.0
+        },
+        "rotate_sensor_+": {
+          "count": 22,
+          "rate": 0.0
         }
       },
       "proposed_actions": {
         "move_tangentially": {
-          "count": 179481,
-          "rate": 0.746
+          "count": 174409,
+          "rate": 0.729
         },
         "look_down_big": {
-          "count": 14912,
-          "rate": 0.062
+          "count": 13070,
+          "rate": 0.055
         },
         "free_forward": {
-          "count": 12060,
-          "rate": 0.05
-        },
-        "look_up_big": {
-          "count": 11179,
-          "rate": 0.046
+          "count": 12708,
+          "rate": 0.053
         },
         "turn_left_big": {
-          "count": 7055,
-          "rate": 0.029
+          "count": 10532,
+          "rate": 0.044
+        },
+        "turn_right_big": {
+          "count": 9375,
+          "rate": 0.039
+        },
+        "look_up_big": {
+          "count": 8637,
+          "rate": 0.036
+        },
+        "free_backward": {
+          "count": 6709,
+          "rate": 0.028
+        },
+        "detach": {
+          "count": 1722,
+          "rate": 0.007
+        },
+        "free_forward_small": {
+          "count": 793,
+          "rate": 0.003
+        },
+        "detach_edge": {
+          "count": 612,
+          "rate": 0.003
+        },
+        "look_down": {
+          "count": 193,
+          "rate": 0.001
+        },
+        "look_up": {
+          "count": 180,
+          "rate": 0.001
+        },
+        "turn_left": {
+          "count": 119,
+          "rate": 0.0
+        },
+        "turn_right": {
+          "count": 112,
+          "rate": 0.0
+        },
+        "rotate_sensor_+": {
+          "count": 82,
+          "rate": 0.0
         }
       },
-      "mean_final_distance": 21.1,
-      "near_miss_count": 213,
-      "mean_episode_steps": 229.4
+      "mean_final_distance": 20.7,
+      "near_miss_count": 285,
+      "mean_episode_steps": 219.6
     }
   }
 }
