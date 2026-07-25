@@ -71,6 +71,47 @@ The prototype has been implemented and tested on the Lightweight Environment (Tr
 **The full pipeline works end-to-end: Q-learning → Behavioral Cloning → SAC → Arbitrage**
 
 ```mermaid
+flowchart TD
+    subgraph "Phase 1: Episodic Memory"
+        A[Goal Pose from LM] --> B[State Vector 15D]
+        B --> C{HNSW Q-Store}
+        C -->|kNN + Gaussian Kernel| D[Q-values per action]
+        E[Heuristic Bias] --> F[Blending]
+        D --> F
+        F -->|softmax sampling| G[Discrete Action]
+        G --> H[Environment Step]
+        H -->|reward, new state| C
+    end
+
+    subgraph "Phase 2: Behavioral Cloning"
+        C -->|successful trajectories| I[Replay Buffer]
+        I -->|supervised learning| J[SAC Actor weights]
+    end
+
+    subgraph "Phase 3: SAC Training"
+        J -->|warm-start| K[SAC Actor + Critic]
+        K -->|continuous actions| H
+        H -->|reward| K
+    end
+
+    subgraph "Phase 4: Adaptive Arbitrage"
+        C -->|Q-action + confidence| L{Arbitrator}
+        K -->|SAC-action + confidence| L
+        E -->|fallback| L
+        L -->|confidence × track_record| M[Best Action]
+        M --> H
+        H -->|online learning| C
+        H -->|periodic update| K
+    end
+
+    style A fill:#4a9eff,color:#fff
+    style C fill:#ff9f43,color:#fff
+    style K fill:#2ed573,color:#fff
+    style L fill:#a55eea,color:#fff
+```
+
+
+```mermaid
 flowchart LR
     A["🧠 Episodic Memory\n(HNSW Q-Store)\nFast learning\n48% → 73%"]
     -->|successful trails| B["📋 Behavioral Cloning\nImitate best\nexperience"]
