@@ -389,6 +389,7 @@ In future when SAC is trained we use it as **skills to propose continuous action
 - Biologically plausible – like human learning: first we copy, then we hone.
 
 
+
 ```mermaid
 flowchart TD
     subgraph ENV["Environment (Trimesh)"]
@@ -439,7 +440,8 @@ flowchart TD
 
         subgraph PHASE4["Phase 4 — Adaptive Arbitrage"]
             direction TB
-            MGR["Adaptive\nManager"] -->|"get_action"| ARB["Arbitrator"]
+            MGR["Adaptive\nManager"]
+            MGR -->|"get_action"| ARB["Arbitrator"]
             ARB -->|"get_q_action"| QS2["Q-Store\nkNN lookup"]
             ARB -->|"get_sac_action"| SAC2["SAC Actor\nforward pass"]
             ARB -->|"fallback"| HEUR2["Heuristic"]
@@ -447,6 +449,7 @@ flowchart TD
             SAC2 --> SCORE
             HEUR2 --> SCORE
             SCORE -->|"confidence\n× track_record"| BEST["Best\nAction"]
+            BEST --> MGR_OUT["Adaptive\nManager\n→ action"]
         end
 
         LM -->|"goal_pose"| MGR
@@ -466,7 +469,7 @@ flowchart TD
     E_pose -->|"pose"| SAC
 
     %% Phase 4 ↔ Environment
-    BEST -->|"action"| E_step
+    MGR_OUT -->|"action"| E_step
     E_sensor -->|"sensor"| MGR
     E_pose -->|"pose"| MGR
 
@@ -522,6 +525,7 @@ flowchart TD
     style HEUR2 fill:#827717,stroke:#dce775,color:#f9fbe7
     style SCORE fill:#4a148c,stroke:#ce93d8,color:#e1bee7
     style BEST fill:#6a1b9a,stroke:#ce93d8,color:#f3e5f5
+    style MGR_OUT fill:#6a1b9a,stroke:#ce93d8,color:#f3e5f5
 ```
 
 **Below is explanation of the main components**:
