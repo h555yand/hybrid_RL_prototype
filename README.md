@@ -397,45 +397,62 @@ flowchart TD
         E_pose["get_pose()"]
     end
 
-    subgraph PHASE1["Phase 1 — Q-Learning (Episodic Memory)"]
+    subgraph TRAIN["Training Pipeline"]
         direction TB
-        G["Goal Pose\nfrom LM"] --> CTRL["RLGoalApproach\nController"]
-        CTRL -->|"compute_state\n(pose, sensor)"| STATE["State Vector 15D"]
-        STATE --> QSEL{"on_object?"}
-        QSEL -->|"surface"| QS["q_store_surface\nHNSW graph"]
-        QSEL -->|"free"| QF["q_store_free\nHNSW graph"]
-        QS -->|"kNN + Gaussian\nKernel"| QV["Q-values\nper action"]
-        QF -->|"kNN + Gaussian\nKernel"| QV
-        HEUR["Heuristic Bias\ngeometry-based"] --> BLEND["Blend\n(1-ε)Q + εH\nsoftmax sample"]
-        QV --> BLEND
-        BLEND --> ACT["Discrete\nAction"]
+
+        CURR["Curriculum Levels\ngoal generation\n[10-40] → [20-80] → [40-120] mm"]
+
+        subgraph PHASE1["Phase 1 — Q-Learning (Episodic Memory)"]
+            direction TB
+            CTRL["RLGoalApproach\nController"]
+            CTRL -->|"compute_state\n(pose, sensor)"| STATE["State Vector 15D"]
+            STATE --> QSEL{"on_object?"}
+            QSEL -->|"surface"| QS["q_store_surface\nHNSW graph"]
+            QSEL -->|"free"| QF["q_store_free\nHNSW graph"]
+            QS -->|"kNN + Gaussian\nKernel"| QV["Q-values\nper action"]
+            QF -->|"kNN + Gaussian\nKernel"| QV
+            HEUR["Heuristic Bias\ngeometry-based"] --> BLEND["Blend\n(1-ε)Q + εH\nsoftmax sample"]
+            QV --> BLEND
+            BLEND --> ACT["Discrete\nAction"]
+        end
+
+        subgraph PHASE2["Phase 2 — Behavioral Cloning"]
+            direction TB
+            TRAILS["Success\nTrajectories"] -->|"ExperienceExtractor\nconvert"| BC["BCTrainer\nsupervised\nlearning"]
+            BC --> BCW["SAC Actor\nWeights"]
+        end
+
+        subgraph PHASE3["Phase 3 — SAC Training"]
+            direction TB
+            BCW2["BC Actor\nWeights"] -->|"warm-start"| SAC["PSACTrainer\nActor + Critic"]
+            SAC -->|"sample action"| INTERP["Action\nInterpreter"]
+        end
+
+        CURR -->|"goal_pose"| CTRL
+        CURR -->|"goal_pose"| SAC
     end
 
-    subgraph PHASE2["Phase 2 — Behavioral Cloning"]
+    subgraph DEPLOY["Deployment"]
         direction TB
-        TRAILS["Success\nTrajectories"] -->|"ExperienceExtractor\nconvert"| BC["BCTrainer\nsupervised\nlearning"]
-        BC --> BCW["SAC Actor\nWeights"]
+
+        LM["Learning Module\nhypothesis-testing\npolicy"]
+
+        subgraph PHASE4["Phase 4 — Adaptive Arbitrage"]
+            direction TB
+            MGR["Adaptive\nManager"] -->|"get_action"| ARB["Arbitrator"]
+            ARB -->|"get_q_action"| QS2["Q-Store\nkNN lookup"]
+            ARB -->|"get_sac_action"| SAC2["SAC Actor\nforward pass"]
+            ARB -->|"fallback"| HEUR2["Heuristic"]
+            QS2 --> SCORE["Score\nComparison"]
+            SAC2 --> SCORE
+            HEUR2 --> SCORE
+            SCORE -->|"confidence\n× track_record"| BEST["Best\nAction"]
+        end
+
+        LM -->|"goal_pose"| MGR
     end
 
-    subgraph PHASE3["Phase 3 — SAC Training"]
-        direction TB
-        BCW2["BC Actor\nWeights"] -->|"warm-start"| SAC["PSACTrainer\nActor + Critic"]
-        SAC -->|"sample action"| INTERP["Action\nInterpreter"]
-    end
-
-    subgraph PHASE4["Phase 4 — Adaptive Arbitrage"]
-        direction TB
-        MGR["Adaptive\nManager"] -->|"get_action"| ARB["Arbitrator"]
-        ARB -->|"get_q_action"| QS2["Q-Store\nkNN lookup"]
-        ARB -->|"get_sac_action"| SAC2["SAC Actor\nforward pass"]
-        ARB -->|"fallback"| HEUR2["Heuristic"]
-        QS2 --> SCORE["Score\nComparison"]
-        SAC2 --> SCORE
-        HEUR2 --> SCORE
-        SCORE -->|"confidence\n× track_record"| BEST["Best\nAction"]
-    end
-
-    %% Cross-phase data flows
+    %% Phase 1 ↔ Environment
     ACT -->|"action"| E_step
     E_sensor -->|"sensor_data"| CTRL
     E_pose -->|"pose"| CTRL
@@ -443,24 +460,35 @@ flowchart TD
     CTRL -->|"reward + TD"| QF
     CTRL -->|"success trails"| TRAILS
 
+    %% Phase 3 ↔ Environment
     INTERP -->|"execute"| E_step
     E_sensor -->|"sensor"| SAC
     E_pose -->|"pose"| SAC
 
+    %% Phase 4 ↔ Environment
     BEST -->|"action"| E_step
     E_sensor -->|"sensor"| MGR
     E_pose -->|"pose"| MGR
-    MGR -->|"online Q update"| QS2
-    MGR -->|"periodic SAC update"| SAC2
 
+    %% Between training phases
     BCW -->|"weights"| BCW2
 
-    %% Model transfer between phases
+    %% Model transfer: Training → Deployment
     QS -.->|"Q-store model"| QS2
     QF -.->|"Q-store model"| QS2
     SAC -.->|"SAC model"| SAC2
 
+    %% Online learning in deployment
+    MGR -->|"online Q update"| QS2
+    MGR -->|"periodic SAC update"| SAC2
+
     style ENV fill:#1a3a1a,stroke:#66bb6a,stroke-width:2px,color:#a5d6a7
+    style TRAIN fill:#1a1a2e,stroke:#7f8c8d,stroke-width:2px,color:#bdc3c7
+    style DEPLOY fill:#1a2a1a,stroke:#7f8c8d,stroke-width:2px,color:#bdc3c7
+
+    style CURR fill:#b71c1c,stroke:#ef9a9a,color:#ffebee
+    style LM fill:#b71c1c,stroke:#ef9a9a,color:#ffebee
+
     style PHASE1 fill:#3e2700,stroke:#ffb74d,stroke-width:2px,color:#ffe0b2
     style PHASE2 fill:#0a2d4f,stroke:#64b5f6,stroke-width:2px,color:#bbdefb
     style PHASE3 fill:#1a3a1a,stroke:#81c784,stroke-width:2px,color:#c8e6c9
@@ -470,7 +498,6 @@ flowchart TD
     style E_sensor fill:#2e7d32,stroke:#a5d6a7,color:#e8f5e9
     style E_pose fill:#2e7d32,stroke:#a5d6a7,color:#e8f5e9
 
-    style G fill:#e65100,stroke:#ffcc80,color:#fff3e0
     style CTRL fill:#bf360c,stroke:#ffab91,color:#fbe9e7
     style STATE fill:#4e342e,stroke:#bcaaa4,color:#efebe9
     style QS fill:#ff6f00,stroke:#ffca28,color:#fff8e1
@@ -496,7 +523,6 @@ flowchart TD
     style SCORE fill:#4a148c,stroke:#ce93d8,color:#e1bee7
     style BEST fill:#6a1b9a,stroke:#ce93d8,color:#f3e5f5
 ```
-
 
 **Below is explanation of the main components**:
 
