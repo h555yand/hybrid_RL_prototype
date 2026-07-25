@@ -43,7 +43,7 @@ class LightweightEnv:
         # trimesh.sample() uses global np.random
         self._passed_through = False
         self._detach_had_collision = False
-        self._compute_up_direction()  # ← ДОБАВИТЬ
+        self._compute_up_direction()
 
     @staticmethod
     def _normalize_euler(angles):

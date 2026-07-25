@@ -70,6 +70,61 @@ The prototype has been implemented and tested on the Lightweight Environment (Tr
 
 **The full pipeline works end-to-end: Q-learning → Behavioral Cloning → SAC → Arbitrage**
 
+```mermaid
+flowchart LR
+    A["🧠 Episodic Memory\n(HNSW Q-Store)\nFast learning\n48% → 73%"]
+    -->|successful trails| B["📋 Behavioral Cloning\nImitate best\nexperience"]
+    -->|warm-start weights| C["⚡ SAC\nGeneralize\ncontinuous actions"]
+
+    A --> D["🎯 Adaptive Arbitrage\nconfidence × track_record\n55% on new object"]
+    C --> D
+
+    D -->|online learning| A
+    D -->|periodic update| C
+
+    style A fill:#ff9f43,color:#fff
+    style B fill:#4a9eff,color:#fff
+    style C fill:#2ed573,color:#fff
+    style D fill:#a55eea,color:#fff
+```
+
+```mermaid
+flowchart LR
+    subgraph Phase1["Phase 1: Learn from Experience"]
+        direction TB
+        H[Heuristic-Guided\nExploration]
+        Q[HNSW Q-Store\n500K points\nkNN + Gaussian Kernel]
+        H --> Q
+    end
+
+    subgraph Phase2["Phase 2: Imitate Best"]
+        direction TB
+        BC[Behavioral Cloning\nSuccessful trajectories\n→ SAC Actor weights]
+    end
+
+    subgraph Phase3["Phase 3: Optimize"]
+        direction TB
+        SAC[SAC Training\nBC warm-start\nContinuous actions]
+    end
+
+    subgraph Phase4["Phase 4: Adapt"]
+        direction TB
+        ARB[Adaptive Arbitrage\nQ-store vs SAC\nconfidence × track_record\n+ online learning]
+    end
+
+    Phase1 -->|"success trails\nto replay buffer"| Phase2
+    Phase2 -->|"actor weights\nwarm-start"| Phase3
+    Phase3 --> Phase4
+    Phase1 --> Phase4
+
+    style Phase1 fill:#fff3e0,stroke:#ff9800
+    style Phase2 fill:#e3f2fd,stroke:#2196f3
+    style Phase3 fill:#e8f5e9,stroke:#4caf50
+    style Phase4 fill:#f3e5f5,stroke:#9c27b0
+```
+
+
+
 ### Training and validation strategy
 #### Use several oblects from simple to complex: cube, cylinder, mug, cup, vase
 [Sizes and realization are](src/tbp/hybrid_rl/mesh_factory.py)
