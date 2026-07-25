@@ -91,95 +91,12 @@ flowchart LR
     D -->|"online Q update"| A
     D -->|"periodic SAC update"| C
 
-    style ENV fill:#e8f5e9,stroke:#4caf50,stroke-width:2px,color:#1b5e20
-    style A fill:#ff9f43,color:#fff,stroke-width:2px
-    style B fill:#4a9eff,color:#fff,stroke-width:2px
-    style C fill:#2ed573,color:#fff,stroke-width:2px
-    style D fill:#a55eea,color:#fff,stroke-width:2px
+    style ENV fill:#2d4a2d,stroke:#66bb6a,stroke-width:2px,color:#a5d6a7
+    style A fill:#5c3a00,stroke:#ffb74d,stroke-width:2px,color:#ffe0b2
+    style B fill:#0d3b66,stroke:#64b5f6,stroke-width:2px,color:#bbdefb
+    style C fill:#1b5e20,stroke:#81c784,stroke-width:2px,color:#c8e6c9
+    style D fill:#4a148c,stroke:#ce93d8,stroke-width:2px,color:#e1bee7
 ```
-
-```mermaid
-flowchart TD
-    subgraph ENV["Lightweight Environment (Trimesh)"]
-        E_step["step(action)"]
-        E_sensor["get_sensor_data()"]
-        E_pose["get_pose()"]
-        E_reset["reset()"]
-        E_goal["set_goal()"]
-    end
-
-    subgraph PHASE1["Phase 1: Q-Learning (Episodic Memory)"]
-        direction TB
-        G[Goal Pose from LM] --> CTRL
-        CTRL["RLGoalApproachController"]
-        CTRL -->|"_compute_state(pose, sensor)"| STATE[State Vector 15D]
-        STATE --> QSEL{on_object?}
-        QSEL -->|"surface"| QS["q_store_surface\n(HNSW)"]
-        QSEL -->|"free"| QF["q_store_free\n(HNSW)"]
-        QS -->|"kNN + Gaussian Kernel"| QV[Q-values]
-        QF -->|"kNN + Gaussian Kernel"| QV
-        HEUR["Heuristic Bias\n(geometry-based)"] --> BLEND
-        QV --> BLEND["(1-ε)·Q + ε·Heuristic\nsoftmax sampling"]
-        BLEND --> ACT[Discrete Action]
-        ACT -->|"action_index"| E_step
-        E_step --> E_sensor
-        E_step --> E_pose
-        E_sensor -->|"sensor_data"| CTRL
-        E_pose -->|"current_pose"| CTRL
-        CTRL -->|"reward + TD target"| QS
-        CTRL -->|"reward + TD target"| QF
-        CTRL -->|"success trails"| TRAILS[Replay Buffer]
-    end
-
-    subgraph PHASE2["Phase 2: Behavioral Cloning"]
-        direction TB
-        TRAILS -->|"successful trajectories"| BC["BCTrainer\nsupervised learning"]
-        BC -->|"actor weights"| BC_W[SAC Actor Weights]
-    end
-
-    subgraph PHASE3["Phase 3: SAC Training"]
-        direction TB
-        BC_W -->|"warm-start"| SAC["PSACTrainer\nActor + Critic"]
-        SAC -->|"continuous action"| INTERP["ActionInterpreter"]
-        INTERP -->|"execute(type, params)"| E_step
-        E_sensor -->|"sensor_data"| SAC
-        E_pose -->|"pose"| SAC
-    end
-
-    subgraph PHASE4["Phase 4: Adaptive Arbitrage"]
-        direction TB
-        MGR["AdaptiveTrainingManager\nmode: online|inference|offline"]
-        MGR -->|"get_action(state, pose, sensor)"| ARB
-
-        ARB["Arbitrator\nconfidence × track_record"]
-        ARB -->|"_get_q_action"| QS2["Q-Store\n(kNN lookup)"]
-        ARB -->|"_get_sac_action"| SAC2["SAC Actor\n(forward pass)"]
-        ARB -->|"_get_heuristic"| HEUR2["Heuristic\n(fallback)"]
-
-        QS2 -->|"action + confidence + spread"| SCORE["Score Comparison\nq_score vs sac_score"]
-        SAC2 -->|"action + confidence"| SCORE
-        HEUR2 -->|"action (if both zero)"| SCORE
-        SCORE --> BEST[Best Action]
-
-        BEST -->|"action_index"| E_step
-        E_sensor --> MGR
-        E_pose --> MGR
-
-        MGR -->|"online: Q update every step"| QS2
-        MGR -->|"online: SAC update periodic"| SAC2
-        MGR -->|"on_episode_end(success)"| ARB
-    end
-
-    PHASE1 -.->|"Q-store model"| PHASE4
-    PHASE3 -.->|"SAC model"| PHASE4
-
-    style ENV fill:#e8f5e9,stroke:#4caf50,stroke-width:2px
-    style PHASE1 fill:#fff3e0,stroke:#ff9800,stroke-width:2px
-    style PHASE2 fill:#e3f2fd,stroke:#2196f3,stroke-width:2px
-    style PHASE3 fill:#f1f8e9,stroke:#8bc34a,stroke-width:2px
-    style PHASE4 fill:#f3e5f5,stroke:#9c27b0,stroke-width:2px
-```
-
 
 ### Training and validation strategy
 #### Use several oblects from simple to complex: cube, cylinder, mug, cup, vase
@@ -470,6 +387,115 @@ In future when SAC is trained we use it as **skills to propose continuous action
 - Stability – Heuristic-Guided Exploration learns in new areas.
 - Precision – then SAC makes movements smooth and optimal as skills.
 - Biologically plausible – like human learning: first we copy, then we hone.
+
+
+```mermaid
+flowchart TD
+    subgraph ENV["Environment (Trimesh)"]
+        E_step["step(action)"]
+        E_sensor["get_sensor_data()"]
+        E_pose["get_pose()"]
+    end
+
+    subgraph PHASE1["Phase 1 — Q-Learning (Episodic Memory)"]
+        direction TB
+        G["Goal Pose\nfrom LM"] --> CTRL["RLGoalApproach\nController"]
+        CTRL -->|"compute_state\n(pose, sensor)"| STATE["State Vector 15D"]
+        STATE --> QSEL{"on_object?"}
+        QSEL -->|"surface"| QS["q_store_surface\nHNSW graph"]
+        QSEL -->|"free"| QF["q_store_free\nHNSW graph"]
+        QS -->|"kNN + Gaussian\nKernel"| QV["Q-values\nper action"]
+        QF -->|"kNN + Gaussian\nKernel"| QV
+        HEUR["Heuristic Bias\ngeometry-based"] --> BLEND["Blend\n(1-ε)Q + εH\nsoftmax sample"]
+        QV --> BLEND
+        BLEND --> ACT["Discrete\nAction"]
+    end
+
+    subgraph PHASE2["Phase 2 — Behavioral Cloning"]
+        direction TB
+        TRAILS["Success\nTrajectories"] -->|"ExperienceExtractor\nconvert"| BC["BCTrainer\nsupervised\nlearning"]
+        BC --> BCW["SAC Actor\nWeights"]
+    end
+
+    subgraph PHASE3["Phase 3 — SAC Training"]
+        direction TB
+        BCW2["BC Actor\nWeights"] -->|"warm-start"| SAC["PSACTrainer\nActor + Critic"]
+        SAC -->|"sample action"| INTERP["Action\nInterpreter"]
+    end
+
+    subgraph PHASE4["Phase 4 — Adaptive Arbitrage"]
+        direction TB
+        MGR["Adaptive\nManager"] -->|"get_action"| ARB["Arbitrator"]
+        ARB -->|"get_q_action"| QS2["Q-Store\nkNN lookup"]
+        ARB -->|"get_sac_action"| SAC2["SAC Actor\nforward pass"]
+        ARB -->|"fallback"| HEUR2["Heuristic"]
+        QS2 --> SCORE["Score\nComparison"]
+        SAC2 --> SCORE
+        HEUR2 --> SCORE
+        SCORE -->|"confidence\n× track_record"| BEST["Best\nAction"]
+    end
+
+    %% Cross-phase data flows
+    ACT -->|"action"| E_step
+    E_sensor -->|"sensor_data"| CTRL
+    E_pose -->|"pose"| CTRL
+    CTRL -->|"reward + TD"| QS
+    CTRL -->|"reward + TD"| QF
+    CTRL -->|"success trails"| TRAILS
+
+    INTERP -->|"execute"| E_step
+    E_sensor -->|"sensor"| SAC
+    E_pose -->|"pose"| SAC
+
+    BEST -->|"action"| E_step
+    E_sensor -->|"sensor"| MGR
+    E_pose -->|"pose"| MGR
+    MGR -->|"online Q update"| QS2
+    MGR -->|"periodic SAC update"| SAC2
+
+    BCW -->|"weights"| BCW2
+
+    %% Model transfer between phases
+    QS -.->|"Q-store model"| QS2
+    QF -.->|"Q-store model"| QS2
+    SAC -.->|"SAC model"| SAC2
+
+    style ENV fill:#1a3a1a,stroke:#66bb6a,stroke-width:2px,color:#a5d6a7
+    style PHASE1 fill:#3e2700,stroke:#ffb74d,stroke-width:2px,color:#ffe0b2
+    style PHASE2 fill:#0a2d4f,stroke:#64b5f6,stroke-width:2px,color:#bbdefb
+    style PHASE3 fill:#1a3a1a,stroke:#81c784,stroke-width:2px,color:#c8e6c9
+    style PHASE4 fill:#2a0845,stroke:#ce93d8,stroke-width:2px,color:#e1bee7
+
+    style E_step fill:#2e7d32,stroke:#a5d6a7,color:#e8f5e9
+    style E_sensor fill:#2e7d32,stroke:#a5d6a7,color:#e8f5e9
+    style E_pose fill:#2e7d32,stroke:#a5d6a7,color:#e8f5e9
+
+    style G fill:#e65100,stroke:#ffcc80,color:#fff3e0
+    style CTRL fill:#bf360c,stroke:#ffab91,color:#fbe9e7
+    style STATE fill:#4e342e,stroke:#bcaaa4,color:#efebe9
+    style QS fill:#ff6f00,stroke:#ffca28,color:#fff8e1
+    style QF fill:#ff6f00,stroke:#ffca28,color:#fff8e1
+    style QV fill:#5d4037,stroke:#bcaaa4,color:#efebe9
+    style HEUR fill:#827717,stroke:#dce775,color:#f9fbe7
+    style BLEND fill:#4e342e,stroke:#bcaaa4,color:#efebe9
+    style ACT fill:#e65100,stroke:#ffcc80,color:#fff3e0
+
+    style TRAILS fill:#0d47a1,stroke:#90caf9,color:#e3f2fd
+    style BC fill:#1565c0,stroke:#90caf9,color:#e3f2fd
+    style BCW fill:#0d47a1,stroke:#90caf9,color:#e3f2fd
+
+    style BCW2 fill:#2e7d32,stroke:#a5d6a7,color:#e8f5e9
+    style SAC fill:#388e3c,stroke:#a5d6a7,color:#e8f5e9
+    style INTERP fill:#2e7d32,stroke:#a5d6a7,color:#e8f5e9
+
+    style MGR fill:#6a1b9a,stroke:#ce93d8,color:#f3e5f5
+    style ARB fill:#4a148c,stroke:#ce93d8,color:#e1bee7
+    style QS2 fill:#ff6f00,stroke:#ffca28,color:#fff8e1
+    style SAC2 fill:#388e3c,stroke:#a5d6a7,color:#e8f5e9
+    style HEUR2 fill:#827717,stroke:#dce775,color:#f9fbe7
+    style SCORE fill:#4a148c,stroke:#ce93d8,color:#e1bee7
+    style BEST fill:#6a1b9a,stroke:#ce93d8,color:#f3e5f5
+```
 
 
 **Below is explanation of the main components**:
