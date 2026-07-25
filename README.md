@@ -71,99 +71,114 @@ The prototype has been implemented and tested on the Lightweight Environment (Tr
 **The full pipeline works end-to-end: Q-learning → Behavioral Cloning → SAC → Arbitrage**
 
 ```mermaid
+flowchart LR
+    ENV["🌍 Environment\n(Trimesh)\npose, sensor_data\ncollisions, depth"]
+
+    A["🧠 Phase 1\nEpisodic Memory\nHNSW Q-Store\nHeuristic-Guided\nExploration"]
+    B["📋 Phase 2\nBehavioral Cloning\nImitate successful\ntrajectories"]
+    C["⚡ Phase 3\nSAC Training\nBC warm-start\nContinuous actions"]
+    D["🎯 Phase 4\nAdaptive Arbitrage\nconfidence × track_record\nonline learning"]
+
+    A <-->|"step / observe"| ENV
+    C <-->|"step / observe"| ENV
+    D <-->|"step / observe"| ENV
+
+    A -->|"success trails"| B
+    B -->|"actor weights"| C
+    A -->|"Q-store model"| D
+    C -->|"SAC model"| D
+
+    D -->|"online Q update"| A
+    D -->|"periodic SAC update"| C
+
+    style ENV fill:#e8f5e9,stroke:#4caf50,stroke-width:2px,color:#1b5e20
+    style A fill:#ff9f43,color:#fff,stroke-width:2px
+    style B fill:#4a9eff,color:#fff,stroke-width:2px
+    style C fill:#2ed573,color:#fff,stroke-width:2px
+    style D fill:#a55eea,color:#fff,stroke-width:2px
+```
+
+```mermaid
 flowchart TD
-    subgraph "Phase 1: Episodic Memory"
-        A[Goal Pose from LM] --> B[State Vector 15D]
-        B --> C{HNSW Q-Store}
-        C -->|kNN + Gaussian Kernel| D[Q-values per action]
-        E[Heuristic Bias] --> F[Blending]
-        D --> F
-        F -->|softmax sampling| G[Discrete Action]
-        G --> H[Environment Step]
-        H -->|reward, new state| C
+    subgraph ENV["Lightweight Environment (Trimesh)"]
+        E_step["step(action)"]
+        E_sensor["get_sensor_data()"]
+        E_pose["get_pose()"]
+        E_reset["reset()"]
+        E_goal["set_goal()"]
     end
 
-    subgraph "Phase 2: Behavioral Cloning"
-        C -->|successful trajectories| I[Replay Buffer]
-        I -->|supervised learning| J[SAC Actor weights]
+    subgraph PHASE1["Phase 1: Q-Learning (Episodic Memory)"]
+        direction TB
+        G[Goal Pose from LM] --> CTRL
+        CTRL["RLGoalApproachController"]
+        CTRL -->|"_compute_state(pose, sensor)"| STATE[State Vector 15D]
+        STATE --> QSEL{on_object?}
+        QSEL -->|"surface"| QS["q_store_surface\n(HNSW)"]
+        QSEL -->|"free"| QF["q_store_free\n(HNSW)"]
+        QS -->|"kNN + Gaussian Kernel"| QV[Q-values]
+        QF -->|"kNN + Gaussian Kernel"| QV
+        HEUR["Heuristic Bias\n(geometry-based)"] --> BLEND
+        QV --> BLEND["(1-ε)·Q + ε·Heuristic\nsoftmax sampling"]
+        BLEND --> ACT[Discrete Action]
+        ACT -->|"action_index"| E_step
+        E_step --> E_sensor
+        E_step --> E_pose
+        E_sensor -->|"sensor_data"| CTRL
+        E_pose -->|"current_pose"| CTRL
+        CTRL -->|"reward + TD target"| QS
+        CTRL -->|"reward + TD target"| QF
+        CTRL -->|"success trails"| TRAILS[Replay Buffer]
     end
 
-    subgraph "Phase 3: SAC Training"
-        J -->|warm-start| K[SAC Actor + Critic]
-        K -->|continuous actions| H
-        H -->|reward| K
+    subgraph PHASE2["Phase 2: Behavioral Cloning"]
+        direction TB
+        TRAILS -->|"successful trajectories"| BC["BCTrainer\nsupervised learning"]
+        BC -->|"actor weights"| BC_W[SAC Actor Weights]
     end
 
-    subgraph "Phase 4: Adaptive Arbitrage"
-        C -->|Q-action + confidence| L{Arbitrator}
-        K -->|SAC-action + confidence| L
-        E -->|fallback| L
-        L -->|confidence × track_record| M[Best Action]
-        M --> H
-        H -->|online learning| C
-        H -->|periodic update| K
+    subgraph PHASE3["Phase 3: SAC Training"]
+        direction TB
+        BC_W -->|"warm-start"| SAC["PSACTrainer\nActor + Critic"]
+        SAC -->|"continuous action"| INTERP["ActionInterpreter"]
+        INTERP -->|"execute(type, params)"| E_step
+        E_sensor -->|"sensor_data"| SAC
+        E_pose -->|"pose"| SAC
     end
 
-    style A fill:#4a9eff,color:#fff
-    style C fill:#ff9f43,color:#fff
-    style K fill:#2ed573,color:#fff
-    style L fill:#a55eea,color:#fff
+    subgraph PHASE4["Phase 4: Adaptive Arbitrage"]
+        direction TB
+        MGR["AdaptiveTrainingManager\nmode: online|inference|offline"]
+        MGR -->|"get_action(state, pose, sensor)"| ARB
+
+        ARB["Arbitrator\nconfidence × track_record"]
+        ARB -->|"_get_q_action"| QS2["Q-Store\n(kNN lookup)"]
+        ARB -->|"_get_sac_action"| SAC2["SAC Actor\n(forward pass)"]
+        ARB -->|"_get_heuristic"| HEUR2["Heuristic\n(fallback)"]
+
+        QS2 -->|"action + confidence + spread"| SCORE["Score Comparison\nq_score vs sac_score"]
+        SAC2 -->|"action + confidence"| SCORE
+        HEUR2 -->|"action (if both zero)"| SCORE
+        SCORE --> BEST[Best Action]
+
+        BEST -->|"action_index"| E_step
+        E_sensor --> MGR
+        E_pose --> MGR
+
+        MGR -->|"online: Q update every step"| QS2
+        MGR -->|"online: SAC update periodic"| SAC2
+        MGR -->|"on_episode_end(success)"| ARB
+    end
+
+    PHASE1 -.->|"Q-store model"| PHASE4
+    PHASE3 -.->|"SAC model"| PHASE4
+
+    style ENV fill:#e8f5e9,stroke:#4caf50,stroke-width:2px
+    style PHASE1 fill:#fff3e0,stroke:#ff9800,stroke-width:2px
+    style PHASE2 fill:#e3f2fd,stroke:#2196f3,stroke-width:2px
+    style PHASE3 fill:#f1f8e9,stroke:#8bc34a,stroke-width:2px
+    style PHASE4 fill:#f3e5f5,stroke:#9c27b0,stroke-width:2px
 ```
-
-
-```mermaid
-flowchart LR
-    A["🧠 Episodic Memory\n(HNSW Q-Store)\nFast learning\n48% → 73%"]
-    -->|successful trails| B["📋 Behavioral Cloning\nImitate best\nexperience"]
-    -->|warm-start weights| C["⚡ SAC\nGeneralize\ncontinuous actions"]
-
-    A --> D["🎯 Adaptive Arbitrage\nconfidence × track_record\n55% on new object"]
-    C --> D
-
-    D -->|online learning| A
-    D -->|periodic update| C
-
-    style A fill:#ff9f43,color:#fff
-    style B fill:#4a9eff,color:#fff
-    style C fill:#2ed573,color:#fff
-    style D fill:#a55eea,color:#fff
-```
-
-```mermaid
-flowchart LR
-    subgraph Phase1["Phase 1: Learn from Experience"]
-        direction TB
-        H[Heuristic-Guided\nExploration]
-        Q[HNSW Q-Store\n500K points\nkNN + Gaussian Kernel]
-        H --> Q
-    end
-
-    subgraph Phase2["Phase 2: Imitate Best"]
-        direction TB
-        BC[Behavioral Cloning\nSuccessful trajectories\n→ SAC Actor weights]
-    end
-
-    subgraph Phase3["Phase 3: Optimize"]
-        direction TB
-        SAC[SAC Training\nBC warm-start\nContinuous actions]
-    end
-
-    subgraph Phase4["Phase 4: Adapt"]
-        direction TB
-        ARB[Adaptive Arbitrage\nQ-store vs SAC\nconfidence × track_record\n+ online learning]
-    end
-
-    Phase1 -->|"success trails\nto replay buffer"| Phase2
-    Phase2 -->|"actor weights\nwarm-start"| Phase3
-    Phase3 --> Phase4
-    Phase1 --> Phase4
-
-    style Phase1 fill:#fff3e0,stroke:#ff9800
-    style Phase2 fill:#e3f2fd,stroke:#2196f3
-    style Phase3 fill:#e8f5e9,stroke:#4caf50
-    style Phase4 fill:#f3e5f5,stroke:#9c27b0
-```
-
 
 
 ### Training and validation strategy
