@@ -1,4 +1,14 @@
-Result: timeout
+1300 - Result: timeout
+**Phase 0 (steps 1-29): Surface Oscillation**
+**Phase 1 (steps 30-157): Detach → fly → crawl → detach_edge**
+- **Step 158: detach_edge at dist=10.9mm** → distance jumps to 70.2mm
+**Phases 2-4: Exact copy of Phase 1**
+
+The agent is on the outer wall, the target is on the inner wall. Detach_edge is the correct action — it's designed to fly over the wall to the other side.
+The problem is a bug in the detach_edge implementation. When the agent is on the outside, instead of going up and over the rim, the agent flies outward and up, ending up 70mm away from the target. Then it navigates back, crawls close again, and calls detach_edge again — same bug, same result. This happens five times.
+
+I've identified the specific code change needed. This is a good example of how the demo episodes help find bugs in macro actions that wouldn't be obvious from aggregate metrics alone)
+
 Goal: [5.2769172608558685, 27.7823414247585, -3.9020351155439474, 110.34762172270342, 2.76544752652292, -7.412395643009103]
 Steps: 500
 Start: [23.270821212331548, -2.7289679750133184, -31.27481114558116, -171.73871055763965, 37.31996258254273, -174.96943177525307]

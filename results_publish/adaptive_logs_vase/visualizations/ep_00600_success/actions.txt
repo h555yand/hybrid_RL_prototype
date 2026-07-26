@@ -1,4 +1,12 @@
-Result: success - Agent on top of the outer wall, target at the bottom. Detachment done correctly, then flew down and crawled perfectly.
+600 - Result: success
+**Phase 1 (Step 1): Instant detach**
+**Phase 2 (Steps 2–27): Q-store navigates in the air**
+**Phase 3 (Steps 28–29): Landing and Finish**
+
+The agent starts 74.7mm away — twice as far as episode 100 — and reaches the goal in just 29 steps.
+Watch the strategy: Step 1 — SAC immediately calls detach. Then Q-store takes over for air navigation: free_forward to close distance, look_down_big to adjust the angle, turn_left_big to correct course. The distance drops monotonically: 71, 65, 57, 52, 47, 43, 40, 38, 36, 34, 31, 30, 29, 26... Then step 28 — landing with move_tangentially, distance jumps from 26.7 to 3.7mm. Goal reached.
+Two things to notice here. First, **the coordination between SAC and Q-store**: SAC makes the strategic decision to detach, Q-store handles the tactical air navigation. The arbitrator switches between them correctly. Second, **Q-store learned the look_down + forward pattern** — this is not just heuristics, it's learned behavior. The specific sequence of when to look down and when to fly forward was learned from experience on this object.
+
 Goal: [11.014475519052468, -2.8827900685590464, -37.0, 180.0, 0.0, 180.0]
 Steps: 29
 Start: [-4.667539101518897, -19.94646440513675, 33.99631106665751, 69.6066711525732, -4.661805307222579, -12.331836652970878]

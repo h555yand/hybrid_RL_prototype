@@ -1,4 +1,7 @@
-Result: timeout - The initial situation is similar to episode 100, the first part of the path is the same, then the detachment started to do the right things, but I still can’t get out, the vase has a narrow neck and the detachment didn’t work as it should?
+200 - Result: timeout
+The initial situation is similar to episode 100, the first part of the path is the same, then the detachment started to do the right things, but due to the bug in detach_edge the agent fly away and can not return and freezes.
+Later in episode 600 in the similar situation the agent was able to return.
+
 Goal: [-27.729990511286058, -5.0932279938371545, -3.689441731315572, 112.45179200500634, -24.575695034638745, 88.68590705450602]
 Steps: 500
 Start: [-23.620410380186982, 14.581469168213502, -27.728004137299955, 152.0142248182974, -30.723594364897764, -164.81109524900256]

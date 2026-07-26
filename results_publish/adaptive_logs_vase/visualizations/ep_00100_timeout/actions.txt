@@ -1,4 +1,15 @@
-Result: timeout - The agent crawled not along a straight path, but over the top, climbed over the edge into the vase, reached the target on the other side, but then spun around and was unable to get to the outside of the target
+100 - Result: timeout
+**Phase 1 (Steps 1–22): Successful Approach**
+**Phase 2 (Steps 23-90): Stuck on the Inside Wall of the Vase**
+**Phase 3 (Steps 91–130): Drift Away from Target**
+**Phase 4 (steps 131–500): The Infinite Loop**
+
+The agent starts 37mm from the goal. Both are on the outer wall of the vase. The correct strategy would be to simply crawl along the outside surface — a straight path.
+Instead, the agent crawled upward, over the rim, and down inside the vase. It actually reached 7.8mm from the goal — very close in Euclidean distance — but now it's on the inner wall and the target is on the outer wall. Just a few millimeters of ceramic between them, but no surface path to get there.
+You can see the distance oscillating between 7 and 10mm for hundreds of steps — the agent is stuck on the inside, crawling in circles. All 500 steps are move_tangentially, timeout.
+The problem is that Q-store was trained on simpler objects — cubes, cylinders, mugs, cups — where crawling in any direction that reduces distance usually works. On the vase, the surface_move heuristic projected the goal direction and picked a tangential direction that went upward over the rim. Q-store confirmed this because it looked like a familiar state. Once inside, the agent doesn't know how to get out — it has never encountered this geometry before.
+This is episode 100 — the system has no vase-specific experience yet. It's applying strategies from other objects, and they don't work here.
+
 Goal: [-21.370293074655773, -3.1521960128693234, 30.97577341964869, 46.68201053711656, -59.585738851460775, -42.44504126782082]
 Steps: 500
 Start: [2.0234323278225688, 24.356934288613555, 23.347181706020983, -64.90394143954451, -35.02888103563993, -17.859477043406287]

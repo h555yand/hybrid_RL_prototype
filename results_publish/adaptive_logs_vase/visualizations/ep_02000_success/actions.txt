@@ -1,4 +1,6 @@
-Result: success - The target is at the bottom, the agent is inside. He did the detachment correctly, flew over the edge, then flew below and crawled to the finish line perfectly.
+2000 - Result: success
+The target is at the bottom, the agent is inside. He did the detachment correctly, flew over the edge, then flew below and crawled to the finish line perfectly.
+
 Goal: [-7.566707068266681, -29.678852035432907, -25.025966462126455, 136.15627206598543, 7.079173128898369, -6.750368627990527]
 Steps: 45
 Start: [14.897661129688728, 23.40219336509492, -2.4865013628951944, -144.20639725942084, 64.64782141635357, 97.64869982180221]

@@ -1,4 +1,11 @@
-Result: success - The agent and target are below on opposite sides. It took off correctly, flew over the bottom, flew up, aimed, and landed perfectly.
+1900 - Result: success
+**Phase 1 (Steps 1-3): Detach - free_forward - Detach**
+**Phase 2 (Steps 4–27): Air Navigation Masterclass**
+**Phase 3 (Steps 28–31): Perfect Landing and Finish**
+
+The hardest starting position so far — agent and target on opposite sides at the bottom of the vase, 70.6mm apart. Success in 31 steps.
+The strategy is beautiful: Step 1 — Q-store detaches. Step 2 — SAC flies forward. Step 3 — SAC calls a second detach because the first one wasn't enough to clear the vase walls. Then Q-store takes over: 6 free_forward steps bring the distance from 62 to 30mm. Then the look_up + forward pattern — look_up because the target is below and the agent is approaching from above. Distance drops to 23mm. Then landing: move_tangentially, and 4 crawling steps — 8.5, 5.9, 3.0mm. Goal reached.
+
 Goal: [12.732398398438695, -33.578359418803856, -7.6439593436512006, -69.53372065024257, -6.640795201959785, -162.78383780083013]
 Steps: 31
 Start: [-18.109501350136522, 28.414811556723766, -21.426561768815077, -144.14625075467762, -47.01854153449068, 76.28912489872368]
