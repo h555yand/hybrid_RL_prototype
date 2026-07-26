@@ -467,6 +467,7 @@ The prototype has been implemented and tested on the Lightweight Environment (Tr
 **The full pipeline works end-to-end: Q-learning → Behavioral Cloning → SAC → Arbitrage**
 
 > "Let me show the training results across objects. I trained Q-learning sequentially — cube first, then cylinder, mug, cup — each stage building on the previous Q-store."
+
 | Stage | Object | Train Success Rate | Eval Success Rate |
 |-------|--------|--------------------|-------------------|
 | Q-learning | cube | 58% | 73% |
