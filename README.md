@@ -477,6 +477,7 @@ The prototype has been implemented and tested on the Lightweight Environment (Tr
 > "A few things to note. First, **transfer works** — each new object starts from the previous Q-store, not from scratch. Cylinder benefits from cube experience, mug from both. Second, **eval is higher than train for simple objects** — cube 73% vs 58%, cylinder 53% vs 67%  — because during training epsilon is high and the agent explores, while during eval it exploits learned Q-values. Third, **complex objects are harder** — mug and cup have handles, concavities, thin walls. The agent is more accurate but sometimes runs out of steps — it crawls carefully but slowly. Similar results for mug and cup show that the agent has learned and is working on new target-agent pairs on validation stage."
 
 > "SAC results are below Q-learning, and I want to be transparent about this."
+
 | Stage | Object | Train Success Rate | Eval Success Rate |
 |-------|--------|--------------------|-------------------|
 | SAC | cube | 46% | 14% |
@@ -489,6 +490,7 @@ The prototype has been implemented and tested on the Lightweight Environment (Tr
 > However, SAC adds value in the adaptive mode — it provides strategic decisions like when to detach, and it generalizes to unfamiliar states."
 
 > "The adaptive mode on the vase — a completely new object — shows the hybrid approach working. The vase was never seen during training — Q-store and SAC were trained only on cube, cylinder, mug, and cup. In adaptive mode, Q-store updates every step, SAC gets a small update every 500 episodes. "
+
 | Episode | Q-store weight | SAC weight | Total success rate | Curriculum level |
 |---------|---------------|------------|-------------------|-----------------|
 | 100 | 29% | 71% | 72% | 0 → 1 |
