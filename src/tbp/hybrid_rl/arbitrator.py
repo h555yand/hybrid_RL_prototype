@@ -52,20 +52,20 @@ def sac_to_discrete(action_type: int, action_params: np.ndarray) -> int:
         if step < 0:
             return 9   # free_backward
         elif abs(step) <= 3.0:
-            return 20  # free_forward_small
+            return 19  # free_forward_small (was 20)
         else:
             return 8   # free_forward
 
     elif action_type == 2:  # Turn
         angle = float(action_params[0])
         if abs(angle) > 10.0:
-            return 23 if angle >= 0 else 24  # turn_left/right_big
+            return 22 if angle >= 0 else 23  # turn_left/right_big (was 23/24)
         return 10 if angle >= 0 else 11      # turn_left/right
 
     elif action_type == 3:  # Look
         angle = float(action_params[0])
         if abs(angle) > 10.0:
-            return 21 if angle >= 0 else 22  # look_up/down_big
+            return 20 if angle >= 0 else 21  # look_up/down_big (was 21/22)
         return 12 if angle >= 0 else 13      # look_up/down
 
     elif action_type == 4:
@@ -78,13 +78,9 @@ def sac_to_discrete(action_type: int, action_params: np.ndarray) -> int:
         return 17
 
     elif action_type == 7:
-        return 18
-
-    elif action_type == 8:
-        return 19
+        return 18  # detach
 
     return 0
-
 
 class Arbitrator:
 
@@ -310,7 +306,6 @@ class Arbitrator:
         # Anti-spam: block detach if consecutive
         if self.controller._consecutive_detach_count >= 3:
             q_values[self.controller.action_space.IDX_DETACH] = -1e9
-            q_values[self.controller.action_space.IDX_DETACH_EDGE] = -1e9
         q_action = int(np.argmax(q_values))
         q_spread = float(np.max(q_values) - np.min(q_values))
 

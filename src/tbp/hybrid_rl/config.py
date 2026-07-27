@@ -27,7 +27,7 @@ DEFAULT_CONFIG = {
     "norm_min_std": 1e-4,               # zero dispersion protection
     "rebuild_on_freeze": True,          # rebuild index after freeze
     # Actions
-    "num_actions": 25,
+    "num_actions": 24,
     "free_step_small": 2.0,
     "surface_step": 3.0,   # mm
     "free_step": 8.0,     # mm

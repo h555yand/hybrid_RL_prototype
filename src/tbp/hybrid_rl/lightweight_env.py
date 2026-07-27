@@ -82,8 +82,8 @@ class LightweightEnv:
         """Perform an action, return new sensor data.
 
         Args:
-            action_index: action index (0-24)
-            action_space: MontyActionSpace
+            action_index: action index (0-23)
+            action_space: ActionSpace
 
         Returns:
             sensor_data: point_normal, on_object, depth
@@ -139,18 +139,9 @@ class LightweightEnv:
             )
         elif action_info.name == "detach":
             if hasattr(self, "_current_goal") and self._current_goal is not None:
-                self._detach_and_fly_to_goal(
+                self._detach_simple(
                     goal_pose=self._current_goal,
-                    rotation_step=action_space.rotation_step,
-                    free_step=action_space.free_step,
-                    max_sub_steps=2,
-                )
-        elif action_info.name == "detach_edge":
-            if hasattr(self, "_current_goal") and self._current_goal is not None:
-                self._detach_and_fly_to_edge(
-                    goal_pose=self._current_goal,
-                    rotation_step=action_space.rotation_step,
-                    free_step=action_space.free_step,
+                    detach_distance=action_space.free_step,
                 )
         elif action_info.name == "free_forward_small":
             self._move_forward(action_space.free_step_small)
@@ -626,6 +617,68 @@ class LightweightEnv:
             f"up_direction={self.up_direction.tolist()}, "
             f"open_edge_height={self.open_edge_height}"
         )
+
+    def _detach_simple(self, goal_pose, detach_distance=8.0):
+        """Detach from surface along normal, then look toward goal.
+
+        Simple macro action:
+        1. Move along surface normal by detach_distance
+        2. Orient gaze toward goal position
+
+        After detach, Q-store/SAC decide what to do next
+        (turn, fly forward, detach again, etc.)
+
+        Args:
+            goal_pose: Target pose [x, y, z, rx, ry, rz].
+            detach_distance: How far to fly from surface (mm).
+        """
+        self._detach_had_collision = False
+        self._last_detach_sub_steps = 1
+
+        sensor = self.get_sensor_data()
+        if sensor.get("point_normal") is None:
+            logger.debug("DETACH_SIMPLE_ABORT: no point_normal")
+            return self.get_sensor_data()
+
+        normal = np.array(sensor["point_normal"], dtype=float)
+        normal /= (np.linalg.norm(normal) + 1e-12)
+
+        # Step 1: Move along normal (away from surface)
+        old_pos = self.agent_pos.copy()
+        self.agent_pos += normal * detach_distance
+
+        # Check for collision during detach
+        locations, _, _ = self.mesh.ray.intersects_location(
+            ray_origins=[old_pos],
+            ray_directions=[normal],
+        )
+        if len(locations) > 0:
+            distances = np.linalg.norm(locations - old_pos, axis=1)
+            if np.min(distances) < detach_distance:
+                self.agent_pos = old_pos
+                self._passed_through = False
+                self._detach_had_collision = True
+                logger.debug("DETACH_SIMPLE_COLLISION: hit object during detach")
+                return self.get_sensor_data()
+
+        # Step 2: Orient gaze toward goal
+        goal_pos = goal_pose[:3]
+        goal_dir = goal_pos - self.agent_pos
+        goal_dist = np.linalg.norm(goal_dir)
+        if goal_dist > 1e-8:
+            goal_dir /= goal_dist
+            self.agent_rot = self._look_at_direction(goal_dir)
+
+        logger.debug(
+            f"DETACH_SIMPLE_DONE: "
+            f"old_pos={old_pos.tolist()}, "
+            f"new_pos={self.agent_pos.tolist()}, "
+            f"normal={normal.tolist()}, "
+            f"goal_dir={goal_dir.tolist()}, "
+            f"dist_to_goal={goal_dist:.1f}"
+        )
+
+        return self.get_sensor_data()
 
     def _detach_and_fly_to_edge(self, goal_pose, rotation_step=5.0, free_step=8.0, max_sub_steps=3):
         detach_fly_step = 8.0

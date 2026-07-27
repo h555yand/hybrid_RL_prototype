@@ -66,12 +66,11 @@ class ActionSpace:
             16: OrientHorizontal
             17: OrientVertical
             18: Detach
-            19: DetachEdge
-            20: MoveForward Small
-            IDX_LOOK_UP_BIG = 21
-            IDX_LOOK_DOWN_BIG = 22
-            IDX_TURN_LEFT_BIG = 23
-            IDX_TURN_RIGHT_BIG = 24
+            19: MoveForward Small
+            IDX_LOOK_UP_BIG = 20
+            IDX_LOOK_DOWN_BIG = 21
+            IDX_TURN_LEFT_BIG = 22
+            IDX_TURN_RIGHT_BIG = 23
 
     Args:
         agent_id: Monty agent identifier for Action objects.
@@ -80,7 +79,7 @@ class ActionSpace:
         rotation_step: Step size for LookUp/Down/Rotation (degrees).
     """
 
-    NUM_ACTIONS = 25
+    NUM_ACTIONS = 24
 
     # Surface action directions (8 evenly spaced)
     SURFACE_DIRECTIONS = [0, 45, 90, 135, 180, 225, 270, 315]
@@ -98,12 +97,11 @@ class ActionSpace:
     IDX_ORIENT_HOR = 16
     IDX_ORIENT_VERT = 17
     IDX_DETACH = 18
-    IDX_DETACH_EDGE = 19
-    IDX_FREE_FORWARD_SMALL = 20
-    IDX_LOOK_UP_BIG = 21
-    IDX_LOOK_DOWN_BIG = 22
-    IDX_TURN_LEFT_BIG = 23
-    IDX_TURN_RIGHT_BIG = 24
+    IDX_FREE_FORWARD_SMALL = 19
+    IDX_LOOK_UP_BIG = 20
+    IDX_LOOK_DOWN_BIG = 21
+    IDX_TURN_LEFT_BIG = 22
+    IDX_TURN_RIGHT_BIG = 23
 
     def __init__(
         self,
@@ -227,12 +225,6 @@ class ActionSpace:
         info.append(ActionInfo(
             index=self.IDX_DETACH,
             name="detach",
-            category="macro",
-        ))
-
-        info.append(ActionInfo(
-            index=self.IDX_DETACH_EDGE,
-            name="detach_edge",
             category="macro",
         ))
 

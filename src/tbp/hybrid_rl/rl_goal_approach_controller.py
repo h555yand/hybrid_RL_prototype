@@ -496,11 +496,11 @@ class RLGoalApproachController:
                 f"distance={state[13]:.1f}, progress={progress_raw:.2f}"
             )
         elif collision == "lost_object":
-            if action != self.action_space.IDX_DETACH and action != self.action_space.IDX_DETACH_EDGE:
+            if action != self.action_space.IDX_DETACH:
                 reward += cfg["reward_drifted_away"]
 
         # ═══ 4.6 Detach while not on surface ═══
-        if action in (self.action_space.IDX_DETACH, self.action_space.IDX_DETACH_EDGE):
+        if action == self.action_space.IDX_DETACH:
             if prev_on_object < 0.5:
                 reward += -5.0
 
@@ -663,11 +663,9 @@ class RLGoalApproachController:
         # ═══ ACTION MASK: physically invalid actions ═══
         if state[11] < 0.5:  # on_object = 0 → agent in the air
             combined[self.action_space.IDX_DETACH] = -1e9
-            combined[self.action_space.IDX_DETACH_EDGE] = -1e9
         # ═══ ACTION MASK: block detach spam ═══
         if self._consecutive_detach_count >= 3:
             combined[self.action_space.IDX_DETACH] = -1e9
-            combined[self.action_space.IDX_DETACH_EDGE] = -1e9
 
         is_random_override = False
         is_heuristic_override = False
@@ -741,7 +739,7 @@ class RLGoalApproachController:
         }
 
         chosen_name = self.action_space.get_info(action_index).name
-        if chosen_name in ("detach", "detach_edge"):
+        if chosen_name == "detach":
             self._consecutive_detach_count += 1
         else:
             self._consecutive_detach_count = 0
@@ -791,14 +789,10 @@ class RLGoalApproachController:
 
         rot = R.from_euler("xyz", current_pose[3:6], degrees=True)
 
-        # Adaptive detach threshold: on curved surfaces, 
-        # alignment becomes negative faster, and the threshold is softer
         curvature = abs(float(state[9])) + abs(float(state[10]))
         DETACH_ALIGN_THR = -0.3 + min(curvature * 5.0, 0.2)
         SURFACE_STRENGTH = 2.0
 
-        # Close to target: distance < 9mm AND the target is accessible on the surface
-        # Used to enable orient actions and block detach
         close_to_goal = (
             distance < 3.0 * self.action_space.surface_step
             and alignment > DETACH_ALIGN_THR
@@ -835,36 +829,28 @@ class RLGoalApproachController:
         # Suppress detach in the air
         if on_object < 0.5:
             suppress[self.action_space.IDX_DETACH] -= 5.0
-            suppress[self.action_space.IDX_DETACH_EDGE] -= 5.0
 
         # Suppress detach in a row
-        if self._last_action in (self.action_space.IDX_DETACH, self.action_space.IDX_DETACH_EDGE):
+        if self._last_action == self.action_space.IDX_DETACH:
             suppress[self.action_space.IDX_DETACH] -= 5.0
-            suppress[self.action_space.IDX_DETACH_EDGE] -= 5.0
 
         # Suppress detach if it was in the last 3 steps
         recent_detach = sum(
             1 for tr in self._episode_transitions[-3:]
-            if tr["action"] in (self.action_space.IDX_DETACH, self.action_space.IDX_DETACH_EDGE)
+            if tr["action"] == self.action_space.IDX_DETACH
         )
         if recent_detach >= 1:
             suppress[self.action_space.IDX_DETACH] -= 5.0
-            suppress[self.action_space.IDX_DETACH_EDGE] -= 5.0
 
-        # Suppress detach/detach_edge by default —
-        # They will be unblocked in the detach section if needed
+        # Suppress detach by default —
+        # Will be unblocked in the detach section if needed
         suppress[self.action_space.IDX_DETACH] -= 3.0
-        suppress[self.action_space.IDX_DETACH_EDGE] -= 3.0
 
         bias += suppress
         components["suppress"] = suppress
 
         # ────────────────────────────────────────────────────
         # 1) SURFACE MOVE: crawl along the surface toward the target
-        # Situation: agent on the surface, target accessible (alignment >= threshold)
-        # Principle: project the target direction onto the tangent plane,
-        # select the one from 8 tangential directions that maximizes
-        # reduces tangential error
         # ────────────────────────────────────────────────────
         surface_move = np.zeros(self.num_actions, dtype=float)
 
@@ -884,8 +870,6 @@ class RLGoalApproachController:
                     tangential_dist = float(np.linalg.norm(e_t))
                     normal_dist = abs(float(np.dot(e_world, n_hat)))
 
-                    # should_crawl: crawl if the target is more "along" than "behind" the surface
-                    # If normal_dist >> tangential_dist — the detach heuristic will decide
                     should_crawl = not (normal_dist > tangential_dist * 2.0 and distance > 3 * step)
 
                     if should_crawl:
@@ -942,9 +926,6 @@ class RLGoalApproachController:
 
         # ────────────────────────────────────────────────────
         # 2) STAGNATION: Stuck on the surface - call detach
-        # Situation: Agent on the surface, alignment is normal,
-        # but the distance hasn't decreased after 5 steps (stuck near an edge, in a concavity)
-        # Principle: If tangential crawling doesn't help, detach will fly over
         # ────────────────────────────────────────────────────
         stagnation_override = np.zeros(self.num_actions, dtype=float)
         if on_object > 0.5 and alignment >= DETACH_ALIGN_THR:
@@ -962,15 +943,13 @@ class RLGoalApproachController:
         components["stagnation_override"] = stagnation_override
 
         # ────────────────────────────────────────────────────
-        # 3) DETACH: the goal is unreachable - break away and fly over
+        # 3) DETACH: the goal is unreachable by surface — lift off
         # ────────────────────────────────────────────────────
         detach = np.zeros(self.num_actions, dtype=float)
         if on_object > 0.5:
             need_detach = False
-            need_edge_detach = False
 
             n_world = sensor_data.get("point_normal")
-            goal_normal = sensor_data.get("goal_normal")
             path_blocked = sensor_data.get("path_blocked", False)
 
             if n_world is not None:
@@ -983,32 +962,14 @@ class RLGoalApproachController:
                     tangential_dist = float(np.linalg.norm(e_t))
                     normal_dist = abs(float(np.dot(e_world, n_hat)))
 
-                    # ═══ When detachment is needed (any type) ═══
-                    needs_fly = False
-
                     if path_blocked:
-                        needs_fly = True
+                        need_detach = True
                     elif alignment < DETACH_ALIGN_THR:
-                        # alignment is negative, but path_blocked=False
-                        # this means there is direct line of sight—crawl along a concave surface
-                        needs_fly = False
+                        need_detach = False
                     elif normal_dist > tangential_dist * 2.0 and distance > 3.0 * self.action_space.surface_step:
-                        needs_fly = True
-
-                    # ═══ Choosing a Type: Detach vs. Detach_Edge ═══
-                    if needs_fly and goal_normal is not None:
-                        goal_n = np.array(goal_normal, dtype=float)
-                        goal_n /= (np.linalg.norm(goal_n) + 1e-12)
-                        normals_dot = float(np.dot(n_hat, goal_n))
-
-                        if normals_dot < -0.3:
-                            need_edge_detach = True
-                        else:
-                            need_detach = True
-                    elif needs_fly:
                         need_detach = True
 
-                    if needs_fly and on_object > 0.5:
+                    if need_detach and on_object > 0.5:
                         logger.debug(
                             f"NEEDS_FLY_ON_SURFACE: step={self._steps}, "
                             f"path_blocked={path_blocked}, "
@@ -1018,21 +979,20 @@ class RLGoalApproachController:
                             f"tangential_dist={tangential_dist:.1f}"
                         )
 
-            # ═══ Using detach bias ═══
-            if need_detach or need_edge_detach:
+            # Also detach when alignment is negative
+            if not need_detach:
+                if alignment < DETACH_ALIGN_THR and distance > 3.0 * self.action_space.surface_step:
+                    need_detach = True
+
+            if need_detach:
                 recent_detach_count = sum(
                     1 for tr in self._episode_transitions[-5:]
-                    if tr["action"] in (self.action_space.IDX_DETACH, self.action_space.IDX_DETACH_EDGE)
+                    if tr["action"] == self.action_space.IDX_DETACH
                 )
-                last_was_detach = self._last_action in (self.action_space.IDX_DETACH, self.action_space.IDX_DETACH_EDGE)
+                last_was_detach = self._last_action == self.action_space.IDX_DETACH
 
                 if recent_detach_count < 1 and not last_was_detach and not close_to_goal:
-                    if need_edge_detach:
-                        # +8.0 = compensate suppress (-3.0) + strong bias (+5.0)
-                        detach[self.action_space.IDX_DETACH_EDGE] += 8.0
-                    else:
-                        # +8.0 = compensate suppress (-3.0) + strong bias (+5.0)
-                        detach[self.action_space.IDX_DETACH] += 8.0
+                    detach[self.action_space.IDX_DETACH] += 8.0
                     for idx in range(8):
                         detach[idx] -= 2.0
                     detach[self.action_space.IDX_FREE_FORWARD] -= 2.0
@@ -1040,93 +1000,56 @@ class RLGoalApproachController:
                     detach[self.action_space.IDX_LOOK_UP] -= 1.0
                     detach[self.action_space.IDX_LOOK_DOWN] -= 1.0
 
-            # ═══ Alignment negative — recommend regular detach ═══
-            # Situation: agent on the surface, target "behind" the surface
-            # (for example, on the bottom, and the target on the side wall)
-            # surface_move doesn't work with negative alignment,
-            # detach is needed to break away and fly to the target
-            if not need_detach and not need_edge_detach:
-                if alignment < DETACH_ALIGN_THR and distance > 3.0 * self.action_space.surface_step:
-                    recent_detach_count = sum(
-                        1 for tr in self._episode_transitions[-5:]
-                        if tr["action"] in (self.action_space.IDX_DETACH, self.action_space.IDX_DETACH_EDGE)
-                    )
-                    last_was_detach = self._last_action in (self.action_space.IDX_DETACH, self.action_space.IDX_DETACH_EDGE)
-
-                    if recent_detach_count < 1 and not last_was_detach:
-                        # Regular detach, NOT edge—the target isn't behind the wall,
-                        # but simply on the other edge
-                        # +6.0 = compensate for suppress (-3.0) + bias (+3.0)
-                        detach[self.action_space.IDX_DETACH] += 6.0
-                        for idx in range(8):
-                            detach[idx] -= 2.0
-                        detach[self.action_space.IDX_FREE_FORWARD] -= 2.0
-                        detach[self.action_space.IDX_FREE_BACKWARD] -= 2.0
-
         bias += detach
         components["detach"] = detach
 
         # ────────────────────────────────────────────────────
         # 4) STEER IN AIR: Air navigation to the target
-        # Situation: The agent is not on the surface (after detachment or slipped)
-        # Principle: We simulate every turn and choose the one
-        # that brings the view closest to the target (max dot product)
         # ────────────────────────────────────────────────────
         steer = np.zeros(self.num_actions, dtype=float)
         if on_object <= 0.5:
             STEER_STRENGTH = 4.0
             rotation_step = self.action_space.rotation_step
 
-            # Direction to target in world coordinates
             goal_dir_world = self._current_goal[:3] - current_pose[:3]
             goal_dist_world = np.linalg.norm(goal_dir_world)
             if goal_dist_world > 1e-8:
                 goal_dir_world /= goal_dist_world
 
-            # Current direction of gaze
             rot_current = R.from_euler("xyz", current_pose[3:6], degrees=True)
             forward_current = rot_current.apply([0, 0, -1])
 
-            # Current dot product (as far as we're looking at the target)
             dot_current = np.dot(forward_current, goal_dir_world)
 
-            # Angle to target
             angle_to_goal = np.degrees(np.arccos(np.clip(dot_current, -1, 1)))
             deviation = min(angle_to_goal / 45.0, 1.0)
 
-            # simulate 4 turns and calculate the improvement
             pose_angles = current_pose[3:6]
 
-            # look_up (pitch += rotation_step)
             forward_up = R.from_euler(
                 "xyz", pose_angles + np.array([rotation_step, 0, 0]), degrees=True
             ).apply([0, 0, -1])
             improvement_up = np.dot(forward_up, goal_dir_world) - dot_current
 
-            # look_down (pitch -= rotation_step)
             forward_down = R.from_euler(
                 "xyz", pose_angles + np.array([-rotation_step, 0, 0]), degrees=True
             ).apply([0, 0, -1])
             improvement_down = np.dot(forward_down, goal_dir_world) - dot_current
 
-            # turn_left (yaw += rotation_step)
             forward_left = R.from_euler(
                 "xyz", pose_angles + np.array([0, rotation_step, 0]), degrees=True
             ).apply([0, 0, -1])
             improvement_left = np.dot(forward_left, goal_dir_world) - dot_current
 
-            # turn_right (yaw -= rotation_step)
             forward_right = R.from_euler(
                 "xyz", pose_angles + np.array([0, -rotation_step, 0]), degrees=True
             ).apply([0, 0, -1])
             improvement_right = np.dot(forward_right, goal_dir_world) - dot_current
 
-            # Pitch: choose best direction and step size
             best_pitch_improvement = max(improvement_up, improvement_down)
             if best_pitch_improvement > 0.001:
                 pitch_bonus = STEER_STRENGTH * deviation
                 if improvement_up > improvement_down:
-                    # Big step if large deviation, small step if close
                     if angle_to_goal > 30.0:
                         steer[self.action_space.IDX_LOOK_UP_BIG] += pitch_bonus
                     else:
@@ -1137,17 +1060,11 @@ class RLGoalApproachController:
                     else:
                         steer[self.action_space.IDX_LOOK_DOWN] += pitch_bonus
 
-            # Yaw: choose best direction and step size
             best_yaw_improvement = max(improvement_left, improvement_right)
             if best_yaw_improvement > 0.001:
-                height_axis = getattr(self, "_height_axis_cache",
-                    self.action_space.rotation_step)
-                if hasattr(self, "_current_goal"):
-                    h_ax = getattr(self, "height_axis_cache", 2)
-                    horiz_components = [goal_dir_world[i] for i in range(3) if i != h_ax]
-                    abs_horiz = np.sqrt(sum(c**2 for c in horiz_components))
-                else:
-                    abs_horiz = 1.0
+                h_ax = getattr(self, "height_axis_cache", 2)
+                horiz_components = [goal_dir_world[i] for i in range(3) if i != h_ax]
+                abs_horiz = np.sqrt(sum(c**2 for c in horiz_components))
 
                 yaw_reliable = abs_horiz > 0.3 and best_pitch_improvement < best_yaw_improvement * 2.0
 
@@ -1164,22 +1081,19 @@ class RLGoalApproachController:
                         else:
                             steer[self.action_space.IDX_TURN_RIGHT] += yaw_bonus
 
-            # Forward: strength depends on alignment
             forward_weight = max(1.0 - deviation * 0.5, 0.5)
             steer[self.action_space.IDX_FREE_FORWARD] += STEER_STRENGTH * forward_weight
-            steer[self.action_space.IDX_FREE_FORWARD_SMALL] += STEER_STRENGTH * forward_weight  # ← одинаковый bias
+            steer[self.action_space.IDX_FREE_FORWARD_SMALL] += STEER_STRENGTH * forward_weight
 
             steer[self.action_space.IDX_FREE_BACKWARD] -= 2.0
 
-            # Suppress useless actions in the air
-            for idx in range(8):  # move_tangentially 0-7
+            for idx in range(8):
                 steer[idx] -= 3.0
             steer[self.action_space.IDX_ORIENT_HOR] -= 3.0
             steer[self.action_space.IDX_ORIENT_VERT] -= 3.0
             steer[self.action_space.IDX_ROTATE_POS] -= 3.0
             steer[self.action_space.IDX_ROTATE_NEG] -= 3.0
 
-            # Suppress big rotations in the air when close to target direction
             if deviation < 0.3:
                 steer[self.action_space.IDX_LOOK_UP_BIG] -= 2.0
                 steer[self.action_space.IDX_LOOK_DOWN_BIG] -= 2.0
@@ -1190,17 +1104,13 @@ class RLGoalApproachController:
         components["steer_in_air"] = steer
 
         # ────────────────────────────────────────────────────
-        # 5) DAMP FREE: on the surface suppress free_forward/backward 
-        # Situation: agent on the surface, target accessible by surface 
-        # Principle: tangential crawling is more efficient than free_forward 
-        # on a surface, free_forward may cause a collision with a wall
+        # 5) DAMP FREE: on the surface suppress free_forward/backward
         # ────────────────────────────────────────────────────
         damp_free = np.zeros(self.num_actions, dtype=float)
         if on_object > 0.5:
             damp_free[self.action_space.IDX_FREE_FORWARD] -= 3.0
             damp_free[self.action_space.IDX_FREE_BACKWARD] -= 3.0
             damp_free[self.action_space.IDX_FREE_FORWARD_SMALL] -= 3.0
-            # Suppress big rotations on surface — small steps preferred
             damp_free[self.action_space.IDX_LOOK_UP_BIG] -= 2.0
             damp_free[self.action_space.IDX_LOOK_DOWN_BIG] -= 2.0
             damp_free[self.action_space.IDX_TURN_LEFT_BIG] -= 2.0
