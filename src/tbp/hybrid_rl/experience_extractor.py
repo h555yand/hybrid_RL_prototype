@@ -7,8 +7,8 @@
 # license that can be found in the LICENSE file or at
 # https://opensource.org/licenses/MIT.
 
-"""ExperienceExtractor: converts Q-learning 21D discrete trajectories
-to P-SAC 9-type parameterized format for Behavioral Cloning.
+"""ExperienceExtractor: converts Q-learning discrete trajectories
+to P-SAC parameterized format for Behavioral Cloning.
 """
 
 from dataclasses import dataclass
@@ -26,12 +26,14 @@ class PSACTransition:
     next_state: Optional[np.ndarray] = None
     done: bool = False
     mesh_id: int = 0
+    level: int = 0  # curriculum level
 
 
 class ExperienceExtractor:
 
     MAX_PARAMS = 3
 
+    # 24-action space (no detach_edge)
     DISCRETE_TO_PSAC = {
         0:  (0, lambda cfg: [0.0, cfg["surface_step"]]),
         1:  (0, lambda cfg: [45.0, cfg["surface_step"]]),
@@ -49,15 +51,18 @@ class ExperienceExtractor:
         13: (3, lambda cfg: [-cfg["rotation_step"]]),
         14: (4, lambda cfg: [cfg["rotation_step"]]),
         15: (4, lambda cfg: [-cfg["rotation_step"]]),
-        16: (5, lambda cfg: [cfg["rotation_step"], cfg.get("orient_left_distance", 0.02), cfg.get("orient_forward_distance", 0.05)]),
-        17: (6, lambda cfg: [cfg["rotation_step"], cfg.get("orient_down_distance", 0.02), cfg.get("orient_forward_distance", 0.05)]),
-        18: (7, lambda cfg: []),
-        19: (8, lambda cfg: []),
-        20: (1, lambda cfg: [cfg.get("free_step_small", 2.0)]),
-        21: (3, lambda cfg: [cfg.get("rotation_step_big", 15.0)]),
-        22: (3, lambda cfg: [-cfg.get("rotation_step_big", 15.0)]),
-        23: (2, lambda cfg: [cfg.get("rotation_step_big", 15.0)]),
-        24: (2, lambda cfg: [-cfg.get("rotation_step_big", 15.0)]),
+        16: (5, lambda cfg: [cfg["rotation_step"],
+                             cfg.get("orient_left_distance", 0.02),
+                             cfg.get("orient_forward_distance", 0.05)]),
+        17: (6, lambda cfg: [cfg["rotation_step"],
+                             cfg.get("orient_down_distance", 0.02),
+                             cfg.get("orient_forward_distance", 0.05)]),
+        18: (7, lambda cfg: []),                                     # detach
+        19: (1, lambda cfg: [cfg.get("free_step_small", 2.0)]),      # free_forward_small
+        20: (3, lambda cfg: [cfg.get("rotation_step_big", 15.0)]),   # look_up_big
+        21: (3, lambda cfg: [-cfg.get("rotation_step_big", 15.0)]),  # look_down_big
+        22: (2, lambda cfg: [cfg.get("rotation_step_big", 15.0)]),   # turn_left_big
+        23: (2, lambda cfg: [-cfg.get("rotation_step_big", 15.0)]),  # turn_right_big
     }
 
     MESH_NAME_TO_ID = {
@@ -66,6 +71,10 @@ class ExperienceExtractor:
         "mug": 2,
         "cup": 3,
         "vase": 4,
+        "thin_cylinder": 5,
+        "flat_square": 6,
+        "sphere": 7,
+        "cone": 8,
     }
 
     def __init__(self, config: Dict[str, Any], mesh_name: str = ""):
@@ -87,14 +96,22 @@ class ExperienceExtractor:
         result = []
         for i, tr in enumerate(transitions):
             action_type, action_params = self.convert_action(tr["action"])
-            next_state = transitions[i + 1]["state"] if i + 1 < len(transitions) else None
+            next_state = (
+                transitions[i + 1]["state"]
+                if i + 1 < len(transitions)
+                else None
+            )
             done = (i == len(transitions) - 1)
             result.append(PSACTransition(
                 state=np.array(tr["state"], dtype=np.float32),
                 action_type=action_type,
                 action_params=action_params,
                 reward=float(tr["reward"]),
-                next_state=np.array(next_state, dtype=np.float32) if next_state is not None else None,
+                next_state=(
+                    np.array(next_state, dtype=np.float32)
+                    if next_state is not None
+                    else None
+                ),
                 done=done,
                 mesh_id=self.mesh_id,
             ))
@@ -112,15 +129,14 @@ class ExperienceExtractor:
     @staticmethod
     def get_param_dims() -> Dict[int, int]:
         return {
-            0: 2,
-            1: 1,
-            2: 1,
-            3: 1,
-            4: 1,
-            5: 3,
-            6: 3,
-            7: 0,
-            8: 0,
+            0: 2,  # MoveTangentially: angle, distance
+            1: 1,  # MoveLinear: distance
+            2: 1,  # Turn: angle
+            3: 1,  # Look: angle
+            4: 1,  # SensorRotate: angle
+            5: 3,  # OrientHorizontal: rotation, left, forward
+            6: 3,  # OrientVertical: rotation, down, forward
+            7: 0,  # Detach: no params
         }
 
     @staticmethod
@@ -134,5 +150,4 @@ class ExperienceExtractor:
             5: "OrientHorizontal",
             6: "OrientVertical",
             7: "Detach",
-            8: "DetachEdge",
         }

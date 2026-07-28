@@ -290,11 +290,13 @@ def save_episode_frames(
     output_dir: Path,
     episode_id: str,
     result: str = "unknown",
+    timeout_frame_interval: int = 50,
 ) -> None:
-    """Save all frames of an episode with action annotations.
+    """Save frames of an episode with action annotations.
 
-    Creates a directory with PNG frames for each step, an actions log,
-    and a JSON metadata file.
+    For timeout episodes, saves only every Nth frame and the last frame
+    to avoid excessive file generation. For success and collision episodes,
+    saves all frames.
 
     Args:
         env: LightweightEnv instance.
@@ -304,10 +306,12 @@ def save_episode_frames(
         output_dir: Root directory for saving.
         episode_id: Unique episode identifier.
         result: Episode result ("success", "collision", "timeout").
+        timeout_frame_interval: For timeout episodes, save every Nth frame.
     """
     ep_dir = output_dir / episode_id
     ep_dir.mkdir(parents=True, exist_ok=True)
 
+    # Always save full action log
     log_path = ep_dir / "actions.txt"
     with log_path.open("w") as f:
         f.write(f"Result: {result}\n")
@@ -350,49 +354,74 @@ def save_episode_frames(
     with meta_path.open("w") as f:
         json.dump(meta, f, indent=2)
 
+    # Determine which frames to save
+    is_timeout = result == "timeout"
+    last_step = len(episode_poses) - 1
+
+    def should_save_frame(step_idx: int) -> bool:
+        if not is_timeout:
+            return True
+        if step_idx == 0:
+            return True
+        if step_idx == last_step:
+            return True
+        if step_idx % timeout_frame_interval == 0:
+            return True
+        return False
+
     trail_so_far: list[np.ndarray] = []
+    saved_count = 0
 
     if episode_poses:
         distance = float(
             np.linalg.norm(goal_pose[:3] - episode_poses[0][:3])
         )
-        render_frame_to_file(
-            env=env,
-            agent_pose=episode_poses[0],
-            goal_pose=goal_pose,
-            filepath=ep_dir / "step_000.png",
-            text="RESET (initial position)",
-            step_num=0,
-            distance=distance,
-            result=result,
-        )
+        if should_save_frame(0):
+            render_frame_to_file(
+                env=env,
+                agent_pose=episode_poses[0],
+                goal_pose=goal_pose,
+                filepath=ep_dir / "step_000.png",
+                text="RESET (initial position)",
+                step_num=0,
+                distance=distance,
+                result=result,
+            )
+            saved_count += 1
         trail_so_far.append(episode_poses[0])
 
     for i in range(1, len(episode_poses)):
         trail_so_far.append(episode_poses[i])
-        action_text = (
-            episode_actions[i - 1]
-            if (i - 1) < len(episode_actions)
-            else "unknown"
-        )
-        distance = float(
-            np.linalg.norm(goal_pose[:3] - episode_poses[i][:3])
-        )
 
-        render_frame_to_file(
-            env=env,
-            agent_pose=episode_poses[i],
-            goal_pose=goal_pose,
-            filepath=ep_dir / f"step_{i:03d}.png",
-            text=action_text,
-            step_num=i,
-            distance=distance,
-            result=result,
-            trail_poses=trail_so_far[:-1],
-        )
+        if should_save_frame(i):
+            action_text = (
+                episode_actions[i - 1]
+                if (i - 1) < len(episode_actions)
+                else "unknown"
+            )
+            distance = float(
+                np.linalg.norm(goal_pose[:3] - episode_poses[i][:3])
+            )
+            render_frame_to_file(
+                env=env,
+                agent_pose=episode_poses[i],
+                goal_pose=goal_pose,
+                filepath=ep_dir / f"step_{i:03d}.png",
+                text=action_text,
+                step_num=i,
+                distance=distance,
+                result=result,
+                trail_poses=trail_so_far[:-1],
+            )
+            saved_count += 1
 
-    logger.info("Saved %d frames to %s", len(episode_poses), ep_dir)
-
+    logger.info(
+        "Saved %d/%d frames to %s (%s)",
+        saved_count,
+        len(episode_poses),
+        ep_dir,
+        result,
+    )
 
 def visualize_scene(
     env: LightweightEnv,
@@ -422,3 +451,96 @@ def visualize_agent_goal(
     """
     scene = _build_scene(env, agent_pose, goal_pose)
     scene.show(smooth=False)
+
+class EpisodeVisualizer:
+    """Manages episode visualization with per-level filtering.
+    
+    Saves limited number of episodes per result type per curriculum level
+    to avoid excessive file generation while ensuring coverage.
+    
+    Usage:
+        visualizer = EpisodeVisualizer(
+            output_dir=Path("results"),
+            mesh_name="cube",
+            stage="sac_train",
+        )
+        # In episode loop:
+        visualizer.save_episode(
+            env, episode, level, "success",
+            goal_pose, poses, actions,
+        )
+    """
+
+    def __init__(
+        self,
+        output_dir: Path,
+        mesh_name: str = "",
+        stage: str = "train",
+        max_per_type_per_level: int = 3,
+        num_levels: int = 3,
+        timeout_frame_interval: int = 100,
+    ):
+        self.output_dir = output_dir / f"visualizations_{stage}_{mesh_name}"
+        self.max_per_type = max_per_type_per_level
+        self.timeout_frame_interval = timeout_frame_interval
+
+        self.counts: dict[str, int] = {}
+        for level in range(num_levels):
+            for result in ("success", "collision", "timeout"):
+                self.counts[f"level_{level}_{result}"] = 0
+
+    def should_save(self, level: int, result: str) -> bool:
+        """Check if we should save this episode.
+
+        Args:
+            level: Curriculum level index.
+            result: Episode result ("success", "collision", "timeout").
+
+        Returns:
+            True if under the limit for this level+result combination.
+        """
+        key = f"level_{level}_{result}"
+        return self.counts.get(key, 0) < self.max_per_type
+
+    def save_episode(
+        self,
+        env: "LightweightEnv",
+        episode: int,
+        level: int,
+        result: str,
+        goal_pose: np.ndarray,
+        poses: list[np.ndarray],
+        actions: list[str],
+    ) -> None:
+        """Save episode visualization if under limit.
+
+        Args:
+            env: Environment instance for rendering.
+            episode: Episode number.
+            level: Curriculum level index.
+            result: Episode result ("success", "collision", "timeout").
+            goal_pose: Target pose array.
+            poses: List of agent poses during episode.
+            actions: List of action description strings.
+        """
+        if not self.should_save(level, result):
+            return
+
+        key = f"level_{level}_{result}"
+        episode_id = f"ep_{episode + 1:05d}_L{level}_{result}"
+
+        save_episode_frames(
+            env=env,
+            goal_pose=goal_pose,
+            episode_poses=poses,
+            episode_actions=actions,
+            output_dir=self.output_dir,
+            episode_id=episode_id,
+            result=result,
+            timeout_frame_interval=self.timeout_frame_interval,
+        )
+        self.counts[key] += 1
+
+    def get_stats(self) -> dict[str, int]:
+        """Return current save counts."""
+        return dict(self.counts)

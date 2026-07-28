@@ -52,12 +52,12 @@ class PSACTrainer:
     MIN_LOG_ALPHA_TYPE = -2.0
     MAX_LOG_ALPHA_TYPE = 1.0
     MIN_LOG_ALPHA_PARAM = -2.0
-    MAX_LOG_ALPHA_PARAM = 0.0
+    MAX_LOG_ALPHA_PARAM = -1.0
 
     def __init__(
         self,
         state_dim: int = 15,
-        num_types: int = 9,
+        num_types: int = 8,
         max_params: int = 3,
         gamma: float = 0.99,
         tau: float = 0.005,
@@ -65,7 +65,7 @@ class PSACTrainer:
         lr_critic: float = 3e-4,
         lr_alpha: float = 3e-4,
         alpha_type_init: float = 0.2,
-        alpha_param_init: float = 0.2,
+        alpha_param_init: float = 0.1,
         batch_size: int = 256,
         buffer_capacity: int = 100_000,
         bc_lambda_init: float = 1.0,
@@ -779,6 +779,8 @@ class PSACTrainer:
         promote_threshold: float = 0.5,
         promote_window: int = 100,
         episode_pools: dict[str, Any] | None = None,
+        visualise: bool = False,
+        mesh_name: str = "",
     ) -> None:
         """Run SAC training loop.
 
@@ -795,8 +797,20 @@ class PSACTrainer:
             promote_threshold: Success rate for promotion.
             promote_window: Window size for promotion.
             episode_pools: Optional fixed episode pools.
+            visualise: If True, save episode visualizations.
+            mesh_name: Mesh name for visualization directory.
         """
         interpreter = ActionInterpreter(env)
+
+        # Visualization setup
+        visualizer = None
+        if visualise and save_dir:
+            from .visualize_env import EpisodeVisualizer
+            visualizer = EpisodeVisualizer(
+                output_dir=Path(save_dir),
+                mesh_name=mesh_name,
+                stage="sac_train",
+            )
 
         curr_level = 0
         success_window: list[bool] = []
@@ -860,6 +874,8 @@ class PSACTrainer:
 
             episode_reward = 0.0
             episode_success = False
+            current_poses: list[np.ndarray] = []
+            action_explanations: list[str] = []
 
             for step in range(self.max_steps_per_goal):
                 self.total_steps += 1
@@ -917,6 +933,17 @@ class PSACTrainer:
                     sensor_data=sensor_data,
                 )
 
+                # Collect visualization data
+                current_poses.append(current_pose.copy())
+                type_names = ExperienceExtractor.get_type_names()
+                act_name = type_names.get(
+                    action_type, f"type_{action_type}"
+                )
+                action_explanations.append(
+                    f"SAC: {act_name}, "
+                    f"dist={distance:.1f}mm"
+                )
+
                 action_params_norm = (
                     (action_params - self.param_mean)
                     / (self.param_std + 1e-8)
@@ -966,6 +993,25 @@ class PSACTrainer:
             self._mesh_episodes += 1
             self._episode_rewards.append(episode_reward)
             self._episode_steps.append(step + 1)
+
+            # Determine episode result and save visualization
+            if episode_success:
+                ep_result = "success"
+            elif step == (self.max_steps_per_goal - 1):
+                ep_result = "timeout"
+            else:
+                ep_result = "collision"
+
+            if visualizer:
+                visualizer.save_episode(
+                    env=env,
+                    episode=episode,
+                    level=curr_level,
+                    result=ep_result,
+                    goal_pose=goal_pose,
+                    poses=current_poses,
+                    actions=action_explanations,
+                )
 
             rolling_history.append(episode_success)
             if len(rolling_history) >= 50:

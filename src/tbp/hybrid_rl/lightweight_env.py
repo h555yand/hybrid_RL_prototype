@@ -141,7 +141,7 @@ class LightweightEnv:
             if hasattr(self, "_current_goal") and self._current_goal is not None:
                 self._detach_simple(
                     goal_pose=self._current_goal,
-                    detach_distance=action_space.free_step,
+                    detach_distance=action_space.free_step*2,
                 )
         elif action_info.name == "free_forward_small":
             self._move_forward(action_space.free_step_small)
@@ -662,12 +662,16 @@ class LightweightEnv:
                 return self.get_sensor_data()
 
         # Step 2: Orient gaze toward goal
+        # Blend goal direction with surface normal to avoid
+        # flying straight into the object on next free_forward
         goal_pos = goal_pose[:3]
         goal_dir = goal_pos - self.agent_pos
         goal_dist = np.linalg.norm(goal_dir)
         if goal_dist > 1e-8:
             goal_dir /= goal_dist
-            self.agent_rot = self._look_at_direction(goal_dir)
+            fly_direction = goal_dir + normal * 0.3
+            fly_direction /= (np.linalg.norm(fly_direction) + 1e-12)
+            self.agent_rot = self._look_at_direction(fly_direction)
 
         logger.debug(
             f"DETACH_SIMPLE_DONE: "

@@ -58,13 +58,7 @@ class ActionInterpreter:
 
         elif action_type == 7:
             if hasattr(self.env, "_current_goal") and self.env._current_goal is not None:
-                self.env._detach_and_fly_to_goal(
-                    goal_pose=self.env._current_goal,
-                )
-
-        elif action_type == 8:
-            if hasattr(self.env, "_current_goal") and self.env._current_goal is not None:
-                self.env._detach_and_fly_to_edge(
+                self.env._detach_simple(
                     goal_pose=self.env._current_goal,
                 )
 

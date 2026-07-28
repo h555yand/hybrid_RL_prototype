@@ -7,20 +7,20 @@ experiment:
   _target_: tbp.hybrid_rl.experiment.RLGoalApproachExperiment
   config:
     seed: 42
-    visualise: false
+    visualise: true
+    regenerate_scripts: true
     do_train: false
     do_eval: false
     do_bc_train: false
-    do_sac_train: false
-    do_sac_eval: false
-    do_adaptive: true
+    do_sac_train: true
+    do_sac_eval: true
+    do_adaptive: false
 
     train_seeds: [11]
     eval_seeds: [44]
     sac_eval_seeds: [77]
     sac_seed: 11
-    regenerate_scripts: true
-    promote_threshold: 0.65
+    promote_threshold: 0.6
     promote_window: 100
 
     curriculum_levels:
@@ -30,32 +30,32 @@ experiment:
 
     training_stages:
       - mesh: cube
-        episodes: 1000
-        epsilon_start: 0.1
-        epsilon_min: 0.05
-        load_mode: auto
-      - mesh: cylinder
         episodes: 2000
-        epsilon_start: 0.1
-        epsilon_min: 0.05
+        epsilon_start: 1.0
+        epsilon_min: 0.10
+        load_mode: null
+      - mesh: cylinder
+        episodes: 3000
+        epsilon_start: 1.0
+        epsilon_min: 0.10
         load_mode: auto
       - mesh: mug
-        episodes: 5000
-        epsilon_start: 0.1
-        epsilon_min: 0.05
+        episodes: 7000
+        epsilon_start: 1.0
+        epsilon_min: 0.10
         load_mode: auto
       - mesh: cup
         episodes: 5000
-        epsilon_start: 0.1
-        epsilon_min: 0.05
+        epsilon_start: 1.0
+        epsilon_min: 0.10
         load_mode: auto
 
     eval_meshes: [cube, cylinder, mug, cup]
-    eval_episodes_per_level: 1000
+    eval_episodes_per_level: 500
 
     rl_config:
       mode: train_adapt_epsilon
-      goal_threshold: 2.0
+      goal_threshold: 4.0
       max_points: 500000
       k_neighbors: 7
       max_steps_per_goal: 500
@@ -66,35 +66,37 @@ experiment:
       reward_timeout: -12.0
       reward_surface_violation: -12.0
       reward_step_penalty: -0.5
+      reward_near_goal_on_surface: 0.5
+      reward_progress: 3.0
       surface_step: 3.0
       free_step: 8.0
       free_step_small: 2.0
       rotation_step: 5.0
-      num_actions: 25
+      num_actions: 24
       rotation_step_big: 15.0
       free_step_backward: 2.0
 
     sac_config:
       load_mode: null
-      goal_threshold: 2.0
+      goal_threshold: 4.0
       gamma: 0.99
       tau: 0.005
-      lr_actor: 0.00001
+      lr_actor: 0.00003
       lr_critic: 0.0003
       batch_size: 256
       buffer_capacity: 500000
       bc_lambda_init: 5.0
-      bc_lambda_decay: 0.999999
-      max_steps_per_goal: 350
-      eval_interval: 200
-      eval_episodes: 100
+      bc_lambda_decay: 0.99999
+      max_steps_per_goal: 500
+      eval_interval: 500
+      eval_episodes: 50
 
     sac_meshes: [cube, cylinder, mug, cup]
     sac_episodes_per_mesh:
-      cube: 500
-      cylinder: 1000
-      mug: 2000
-      cup: 1500
+      cube: 1000
+      cylinder: 1500
+      mug: 2500
+      cup: 2000
     sac_eval_episodes_per_level: 500
 
     adaptive_mesh: vase

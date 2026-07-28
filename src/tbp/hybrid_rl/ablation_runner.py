@@ -56,6 +56,7 @@ def run_eval_per_seed(  # noqa: PLR0913
     collect_bc: bool = False,
     episodes_per_level: int | None = None,
     mesh_name: str = "",
+    visualise=False
 ) -> tuple[dict[str, Any], list[Any]]:
     """Run evaluation across seeds and curriculum levels.
 
@@ -105,6 +106,7 @@ def run_eval_per_seed(  # noqa: PLR0913
                 ),
                 episode_script=level_pool,
                 episodes_per_level=episodes_per_level,
+                visualise=visualise
             )
 
             if collect_bc:
@@ -114,9 +116,10 @@ def run_eval_per_seed(  # noqa: PLR0913
                         config=eval_cfg, mesh_name=mesh_name
                     )
                     for trail in trails:
-                        bc_transitions.extend(
-                            extractor.convert_trajectory(trail)
-                        )
+                        transitions = extractor.convert_trajectory(trail)
+                        for tr in transitions:
+                            tr.level = level_idx
+                        bc_transitions.extend(transitions)
 
             rates = metrics.get("stats", {}).get(
                 "termination_rates", {}
@@ -546,37 +549,51 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
     cfg = {**DEFAULT_CONFIG, **(config or {})}
 
     # Visualization setup
-    vis_counts = {"success": 0, "collision": 0, "timeout": 0}
-    vis_dir = Path(save_dir) / "visualizations" if visualise else None
-    vis_filter = (
-        (config or {}).get("visualise_filter", {
-            "actions": [
-                "move_tangentially",
-                "free_forward",
-                "free_backward",
-                "turn_left",
-                "turn_right",
-                "look_up",
-                "look_down",
-                "rotate_sensor_+",
-                "rotate_sensor_-",
-                "orient_horizontal",
-                "orient_vertical",
-                "detach",
-                "detach_edge",
-                "free_forward_small",
-                "look_up_big",
-                "look_down_big",
-                "turn_left_big",
-                "turn_right_big",
-            ],
-            "max_success": 5,
-            "max_collision": 5,
-            "max_timeout": 5,
-        })
-        if visualise
-        else None
-    )
+    visualizer = None
+    if visualise:
+        from .visualize_env import EpisodeVisualizer
+        mesh_label = Path(mesh_path).stem if mesh_path else "multi"
+        stage_label = "eval" if cfg.get("mode") == "eval" else "train"
+        visualizer = EpisodeVisualizer(
+            output_dir=Path(save_dir),
+            mesh_name=mesh_label,
+            stage=stage_label,
+        )
+    #vis_counts = {"success": 0, "collision": 0, "timeout": 0}
+    #if visualise:
+    #    mesh_label = Path(mesh_path).stem if mesh_path else "multi"
+    #    stage_label = "eval" if cfg.get("mode") == "eval" else "train"
+    #    vis_dir = Path(save_dir) / f"visualizations_{stage_label}_{mesh_label}"
+    #else:
+    #    vis_dir = None
+    #vis_filter = (
+    #    (config or {}).get("visualise_filter", {
+    #        "actions": [
+                #"move_tangentially",
+                #"free_forward",
+                #"free_backward",
+                #"turn_left",
+                #"turn_right",
+                #"look_up",
+                #"look_down",
+                #"rotate_sensor_+",
+                #"rotate_sensor_-",
+                #"orient_horizontal",
+                #"orient_vertical",
+                #"detach",
+                #"free_forward_small",
+                #"look_up_big",
+                #"look_down_big",
+                #"turn_left_big",
+                #"turn_right_big",
+        #    ],
+        #    "max_success": 5,
+        #    "max_collision": 5,
+        #    "max_timeout": 5,
+        #})
+        #if visualise
+        #else None
+    #)
 
     # Validate episode sources
     use_script = episode_script is not None
@@ -679,7 +696,7 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
         action_explanations: list[str] = []
         current_poses: list[np.ndarray] = []
 
-        for _ in range(controller.config["max_steps_per_goal"]):
+        for _step in range(controller.config["max_steps_per_goal"]):
             current_pose = env.get_pose()
             sensor_data = env.get_sensor_data()
             _, explanation = controller.step(current_pose, sensor_data)
@@ -710,7 +727,10 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
             success_actions.append(action_explanations)
             ep_result = "success"
         else:
-            ep_result = "collision/timeout"
+            if _step == (controller.config["max_steps_per_goal"] - 1):
+                ep_result = "timeout"
+            else:
+                ep_result = "collision"
 
         if visualise:
             start_rot = np.array([0.0, 0.0, 0.0])
@@ -718,18 +738,16 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
             #for pose in current_poses:
             #   visualize_agent_goal(env, pose, goal_pose)
 
-        if visualise and vis_dir and vis_filter:
-            _maybe_save_visualization(
-                controller=controller,
+        if visualizer:
+            level = curriculum.level_idx if curriculum else 0
+            visualizer.save_episode(
                 env=env,
                 episode=episode,
-                ep_result=ep_result,
+                level=level,
+                result=ep_result,
                 goal_pose=goal_pose,
-                current_poses=current_poses,
-                action_explanations=action_explanations,
-                vis_dir=vis_dir,
-                vis_filter=vis_filter,
-                vis_counts=vis_counts,
+                poses=current_poses,
+                actions=action_explanations,
             )
 
         if curriculum is not None:

@@ -21,6 +21,107 @@ import numpy as np
 import trimesh
 
 
+def create_thin_cylinder(
+    radius: float = 5.0,
+    height: float = 120.0,
+    sections: int = 32,
+) -> trimesh.Trimesh:
+    """Create a thin cylinder (pencil-like) mesh.
+
+    Locally extreme principal curvature due to small radius.
+
+    Args:
+        radius: Radius in mm (small for pencil-like shape).
+        height: Height in mm.
+        sections: Number of circumference segments.
+
+    Returns:
+        Thin cylinder trimesh.
+    """
+    return trimesh.primitives.Cylinder(
+        radius=radius, height=height, sections=sections
+    )
+
+
+def create_flat_square(
+    width: float = 100.0,
+    height: float = 100.0,
+    thickness: float = 3.0,
+) -> trimesh.Trimesh:
+    """Create a flat square (sheet of paper-like) mesh.
+
+    Locally flat surface with sharp edges.
+
+    Args:
+        width: Width in mm.
+        height: Height in mm.
+        thickness: Thickness in mm (thin).
+
+    Returns:
+        Flat square trimesh.
+    """
+    return trimesh.primitives.Box(
+        extents=[width, height, thickness]
+    )
+
+
+def create_cone(
+    radius: float = 40.0,
+    height: float = 80.0,
+    sections: int = 64,
+) -> trimesh.Trimesh:
+    """Create a cone mesh.
+
+    Varying curvature from tip to base.
+
+    Args:
+        radius: Base radius in mm.
+        height: Height in mm.
+        sections: Number of circumference segments.
+
+    Returns:
+        Cone trimesh.
+    """
+    # trimesh doesn't have a cone primitive,
+    # build from vertices
+    angles = np.linspace(0, 2 * np.pi, sections, endpoint=False)
+
+    # Apex at top
+    apex = np.array([[0.0, 0.0, height / 2]])
+
+    # Base circle at bottom
+    base_pts = np.column_stack([
+        radius * np.cos(angles),
+        radius * np.sin(angles),
+        np.full(sections, -height / 2),
+    ])
+
+    # Center of base
+    base_center = np.array([[0.0, 0.0, -height / 2]])
+
+    vertices = np.vstack([apex, base_pts, base_center])
+    apex_idx = 0
+    base_start = 1
+    center_idx = sections + 1
+
+    faces = []
+    # Side faces (apex to base edge)
+    for i in range(sections):
+        j = (i + 1) % sections
+        faces.append([apex_idx, base_start + i, base_start + j])
+
+    # Base faces (center to base edge)
+    for i in range(sections):
+        j = (i + 1) % sections
+        faces.append([center_idx, base_start + j, base_start + i])
+
+    mesh = trimesh.Trimesh(
+        vertices=vertices, faces=np.array(faces)
+    )
+    mesh.fix_normals()
+    return mesh
+
+
 def create_tea_cup(  # noqa: PLR0913
     bottom_radius: float = 25.0,
     top_radius: float = 42.0,
@@ -353,13 +454,14 @@ def create_vase(
 def prepare_demo_meshes(data_dir: Path) -> None:
     """Generate and save all demo meshes to a directory.
 
-    Creates cube, sphere, cylinder, mug, and cup STL files.
+    Creates geometric primitives and complex objects for training.
 
     Args:
         data_dir: Directory to save mesh files to.
     """
     data_dir.mkdir(parents=True, exist_ok=True)
 
+    # Basic primitives
     trimesh.primitives.Box(extents=[80, 80, 80]).export(
         str(data_dir / "cube.stl")
     )
@@ -369,9 +471,23 @@ def prepare_demo_meshes(data_dir: Path) -> None:
     trimesh.primitives.Cylinder(radius=35, height=100).export(
         str(data_dir / "cylinder.stl")
     )
+
+    # Additional primitives for diverse local geometry
+    create_thin_cylinder().export(
+        str(data_dir / "thin_cylinder.stl")
+    )
+    create_flat_square().export(
+        str(data_dir / "flat_square.stl")
+    )
+    create_cone().export(
+        str(data_dir / "cone.stl")
+    )
+
+    # Complex objects
     create_mug().export(str(data_dir / "mug.stl"))
     create_tea_cup().export(str(data_dir / "cup.stl"))
     create_vase().export(str(data_dir / "vase.stl"))
+
 
 # show objects
 # trimesh.primitives.Box(extents=[80, 80, 80]).show()

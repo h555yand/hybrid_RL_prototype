@@ -9,12 +9,12 @@ experiment:
     seed: 42
     visualise: true
     regenerate_scripts: true
-    do_train: false
-    do_eval: false
-    do_bc_train: false
-    do_sac_train: false
-    do_sac_eval: false
-    do_adaptive: true
+    do_train: true
+    do_eval: true
+    do_bc_train: true
+    do_sac_train: true
+    do_sac_eval: true
+    do_adaptive: false
 
     train_seeds: [11]
     eval_seeds: [44]
@@ -34,23 +34,13 @@ experiment:
         epsilon_start: 1.0
         epsilon_min: 0.10
         load_mode: null
-      - mesh: cylinder
-        episodes: 3000
-        epsilon_start: 1.0
-        epsilon_min: 0.10
-        load_mode: auto
       - mesh: mug
-        episodes: 7000
-        epsilon_start: 1.0
-        epsilon_min: 0.10
-        load_mode: auto
-      - mesh: cup
-        episodes: 7000
+        episodes: 5000
         epsilon_start: 1.0
         epsilon_min: 0.10
         load_mode: auto
 
-    eval_meshes: [cube, cylinder, mug, cup]
+    eval_meshes: [cube, mug]
     eval_episodes_per_level: 500
 
     rl_config:
@@ -72,7 +62,7 @@ experiment:
       free_step: 8.0
       free_step_small: 2.0
       rotation_step: 5.0
-      num_actions: 25
+      num_actions: 24
       rotation_step_big: 15.0
       free_step_backward: 2.0
 
@@ -81,22 +71,20 @@ experiment:
       goal_threshold: 4.0
       gamma: 0.99
       tau: 0.005
-      lr_actor: 0.00001
+      lr_actor: 0.00003
       lr_critic: 0.0003
       batch_size: 256
       buffer_capacity: 500000
       bc_lambda_init: 5.0
-      bc_lambda_decay: 0.999999
-      max_steps_per_goal: 300
-      eval_interval: 200
-      eval_episodes: 100
+      bc_lambda_decay: 0.99999
+      max_steps_per_goal: 500
+      eval_interval: 500
+      eval_episodes: 50
 
-    sac_meshes: [cube, cylinder, mug, cup]
+    sac_meshes: [cube, mug]
     sac_episodes_per_mesh:
       cube: 1000
-      cylinder: 1500
-      mug: 3000
-      cup: 2000
+      mug: 2000
     sac_eval_episodes_per_level: 500
 
     adaptive_mesh: vase

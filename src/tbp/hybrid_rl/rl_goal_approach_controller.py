@@ -816,7 +816,7 @@ class RLGoalApproachController:
             )
 
         # ────────────────────────────────────────────────────
-        # 0) SUPPRESS: suppress useless actions
+        # 0) SUPPRESS
         # ────────────────────────────────────────────────────
         suppress = np.zeros(self.num_actions, dtype=float)
         suppress[self.action_space.IDX_ROTATE_POS] -= 2.0
@@ -826,15 +826,12 @@ class RLGoalApproachController:
             suppress[self.action_space.IDX_ORIENT_HOR] -= 2.0
             suppress[self.action_space.IDX_ORIENT_VERT] -= 2.0
 
-        # Suppress detach in the air
         if on_object < 0.5:
             suppress[self.action_space.IDX_DETACH] -= 5.0
 
-        # Suppress detach in a row
         if self._last_action == self.action_space.IDX_DETACH:
             suppress[self.action_space.IDX_DETACH] -= 5.0
 
-        # Suppress detach if it was in the last 3 steps
         recent_detach = sum(
             1 for tr in self._episode_transitions[-3:]
             if tr["action"] == self.action_space.IDX_DETACH
@@ -842,15 +839,13 @@ class RLGoalApproachController:
         if recent_detach >= 1:
             suppress[self.action_space.IDX_DETACH] -= 5.0
 
-        # Suppress detach by default —
-        # Will be unblocked in the detach section if needed
         suppress[self.action_space.IDX_DETACH] -= 3.0
 
         bias += suppress
         components["suppress"] = suppress
 
         # ────────────────────────────────────────────────────
-        # 1) SURFACE MOVE: crawl along the surface toward the target
+        # 1) SURFACE MOVE
         # ────────────────────────────────────────────────────
         surface_move = np.zeros(self.num_actions, dtype=float)
 
@@ -862,33 +857,27 @@ class RLGoalApproachController:
                 n_len = float(np.linalg.norm(n_world))
                 if n_len > eps:
                     n_hat = n_world / n_len
-
                     e_world = rot.apply(local_pos_error)
                     e_t = e_world - np.dot(e_world, n_hat) * n_hat
                     step = float(self.action_space.surface_step)
-
                     tangential_dist = float(np.linalg.norm(e_t))
                     normal_dist = abs(float(np.dot(e_world, n_hat)))
-
                     should_crawl = not (normal_dist > tangential_dist * 2.0 and distance > 3 * step)
 
                     if should_crawl:
                         right_world = rot.apply([1.0, 0.0, 0.0])
                         tb1 = right_world - np.dot(right_world, n_hat) * n_hat
                         tb1_norm = np.linalg.norm(tb1)
-
                         if tb1_norm < 1e-8:
                             up_world = rot.apply([0.0, 1.0, 0.0])
                             tb1 = up_world - np.dot(up_world, n_hat) * n_hat
                             tb1_norm = np.linalg.norm(tb1)
-
                         if tb1_norm < 1e-8:
                             tmp = np.array([0.0, 1.0, 0.0])
                             if abs(np.dot(tmp, n_hat)) > 0.9:
                                 tmp = np.array([0.0, 0.0, 1.0])
                             tb1 = np.cross(n_hat, tmp)
                             tb1_norm = np.linalg.norm(tb1)
-
                         tb1 /= (tb1_norm + 1e-12)
                         tb2 = np.cross(n_hat, tb1)
                         tb2 /= (np.linalg.norm(tb2) + 1e-12)
@@ -896,7 +885,6 @@ class RLGoalApproachController:
                         best = None
                         best_score = -1e18
                         scores = np.full(8, -1e18, dtype=float)
-
                         for i, deg in enumerate(self.action_space.SURFACE_DIRECTIONS):
                             a = np.radians(deg)
                             v_world = np.cos(a) * tb1 + np.sin(a) * tb2
@@ -904,7 +892,6 @@ class RLGoalApproachController:
                             if v_norm < 1e-8:
                                 continue
                             v_world /= v_norm
-
                             new_e = e_t - step * v_world
                             score = float(np.dot(e_t, e_t) - np.dot(new_e, new_e))
                             scores[i] = score
@@ -925,7 +912,7 @@ class RLGoalApproachController:
         components["surface_move"] = surface_move
 
         # ────────────────────────────────────────────────────
-        # 2) STAGNATION: Stuck on the surface - call detach
+        # 2) STAGNATION
         # ────────────────────────────────────────────────────
         stagnation_override = np.zeros(self.num_actions, dtype=float)
         if on_object > 0.5 and alignment >= DETACH_ALIGN_THR:
@@ -943,12 +930,11 @@ class RLGoalApproachController:
         components["stagnation_override"] = stagnation_override
 
         # ────────────────────────────────────────────────────
-        # 3) DETACH: the goal is unreachable by surface — lift off
+        # 3) DETACH
         # ────────────────────────────────────────────────────
         detach = np.zeros(self.num_actions, dtype=float)
         if on_object > 0.5:
             need_detach = False
-
             n_world = sensor_data.get("point_normal")
             path_blocked = sensor_data.get("path_blocked", False)
 
@@ -979,7 +965,6 @@ class RLGoalApproachController:
                             f"tangential_dist={tangential_dist:.1f}"
                         )
 
-            # Also detach when alignment is negative
             if not need_detach:
                 if alignment < DETACH_ALIGN_THR and distance > 3.0 * self.action_space.surface_step:
                     need_detach = True
@@ -1004,7 +989,11 @@ class RLGoalApproachController:
         components["detach"] = detach
 
         # ────────────────────────────────────────────────────
-        # 4) STEER IN AIR: Air navigation to the target
+        # 4) STEER IN AIR
+        # Only small rotations (5°) get heuristic bias.
+        # Big rotations (15°) are available through Q-store
+        # and softmax exploration, but not recommended by
+        # heuristic to prevent overshooting the target angle.
         # ────────────────────────────────────────────────────
         steer = np.zeros(self.num_actions, dtype=float)
         if on_object <= 0.5:
@@ -1018,9 +1007,7 @@ class RLGoalApproachController:
 
             rot_current = R.from_euler("xyz", current_pose[3:6], degrees=True)
             forward_current = rot_current.apply([0, 0, -1])
-
             dot_current = np.dot(forward_current, goal_dir_world)
-
             angle_to_goal = np.degrees(np.arccos(np.clip(dot_current, -1, 1)))
             deviation = min(angle_to_goal / 45.0, 1.0)
 
@@ -1046,47 +1033,38 @@ class RLGoalApproachController:
             ).apply([0, 0, -1])
             improvement_right = np.dot(forward_right, goal_dir_world) - dot_current
 
+            # Pitch: only small rotations
             best_pitch_improvement = max(improvement_up, improvement_down)
             if best_pitch_improvement > 0.001:
                 pitch_bonus = STEER_STRENGTH * deviation
                 if improvement_up > improvement_down:
-                    if angle_to_goal > 30.0:
-                        steer[self.action_space.IDX_LOOK_UP_BIG] += pitch_bonus
-                    else:
-                        steer[self.action_space.IDX_LOOK_UP] += pitch_bonus
+                    steer[self.action_space.IDX_LOOK_UP] += pitch_bonus
                 else:
-                    if angle_to_goal > 30.0:
-                        steer[self.action_space.IDX_LOOK_DOWN_BIG] += pitch_bonus
-                    else:
-                        steer[self.action_space.IDX_LOOK_DOWN] += pitch_bonus
+                    steer[self.action_space.IDX_LOOK_DOWN] += pitch_bonus
 
+            # Yaw: only small rotations
             best_yaw_improvement = max(improvement_left, improvement_right)
             if best_yaw_improvement > 0.001:
                 h_ax = getattr(self, "height_axis_cache", 2)
                 horiz_components = [goal_dir_world[i] for i in range(3) if i != h_ax]
                 abs_horiz = np.sqrt(sum(c**2 for c in horiz_components))
-
                 yaw_reliable = abs_horiz > 0.3 and best_pitch_improvement < best_yaw_improvement * 2.0
 
                 if yaw_reliable:
                     yaw_bonus = STEER_STRENGTH * deviation
                     if improvement_left > improvement_right:
-                        if angle_to_goal > 30.0:
-                            steer[self.action_space.IDX_TURN_LEFT_BIG] += yaw_bonus
-                        else:
-                            steer[self.action_space.IDX_TURN_LEFT] += yaw_bonus
+                        steer[self.action_space.IDX_TURN_LEFT] += yaw_bonus
                     else:
-                        if angle_to_goal > 30.0:
-                            steer[self.action_space.IDX_TURN_RIGHT_BIG] += yaw_bonus
-                        else:
-                            steer[self.action_space.IDX_TURN_RIGHT] += yaw_bonus
+                        steer[self.action_space.IDX_TURN_RIGHT] += yaw_bonus
 
+            # Forward
             forward_weight = max(1.0 - deviation * 0.5, 0.5)
             steer[self.action_space.IDX_FREE_FORWARD] += STEER_STRENGTH * forward_weight
             steer[self.action_space.IDX_FREE_FORWARD_SMALL] += STEER_STRENGTH * forward_weight
 
             steer[self.action_space.IDX_FREE_BACKWARD] -= 2.0
 
+            # Suppress useless actions in the air
             for idx in range(8):
                 steer[idx] -= 3.0
             steer[self.action_space.IDX_ORIENT_HOR] -= 3.0
@@ -1094,17 +1072,11 @@ class RLGoalApproachController:
             steer[self.action_space.IDX_ROTATE_POS] -= 3.0
             steer[self.action_space.IDX_ROTATE_NEG] -= 3.0
 
-            if deviation < 0.3:
-                steer[self.action_space.IDX_LOOK_UP_BIG] -= 2.0
-                steer[self.action_space.IDX_LOOK_DOWN_BIG] -= 2.0
-                steer[self.action_space.IDX_TURN_LEFT_BIG] -= 2.0
-                steer[self.action_space.IDX_TURN_RIGHT_BIG] -= 2.0
-
         bias += steer
         components["steer_in_air"] = steer
 
         # ────────────────────────────────────────────────────
-        # 5) DAMP FREE: on the surface suppress free_forward/backward
+        # 5) DAMP FREE
         # ────────────────────────────────────────────────────
         damp_free = np.zeros(self.num_actions, dtype=float)
         if on_object > 0.5:
@@ -1119,7 +1091,7 @@ class RLGoalApproachController:
         components["damp_free_on_surface"] = damp_free
 
         return bias, components
-
+    
     # ══════════════════════════════════════════════════════════
     # COORDINATE TRANSFORMS
     # ══════════════════════════════════════════════════════════

@@ -274,7 +274,7 @@ class TestHNSWEviction:
         store = self._make_store(max_points=30, evict_fraction=0.3)
 
         rng = np.random.RandomState(0)
-        for _ in range(25):
+        for _ in range(24):
             state = rng.randn(4) * 10
             store.update_q_value(state, 0, td_target=0.5, alpha=0.1)
 

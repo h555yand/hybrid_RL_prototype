@@ -323,7 +323,7 @@ class Arbitrator:
         with torch.no_grad():
             state_t = torch.FloatTensor(state_norm.astype(np.float32)).unsqueeze(0)
 
-            action_type_t, action_params_t, _, type_probs = self.sac_actor.sample(state_t)
+            action_type_t, action_params_t, _, type_probs = self.sac_actor.sample_eval(state_t)
 
             action_type = action_type_t[0].item()
             action_params_norm = action_params_t[0].numpy()
