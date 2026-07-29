@@ -899,7 +899,12 @@ class RLGoalApproachController:
                                 best_score = score
                                 best = i
 
-                        HYST_ABS = 0.25
+                        # Increase hysteresis when close to goal
+                        # to prevent oscillation (step=3mm, dist=7mm)
+                        if distance < 3.0 * step:
+                            HYST_ABS = 1.0  # strong hysteresis near goal
+                        else:
+                            HYST_ABS = 0.25
                         if prev_action is not None and 0 <= prev_action < 8 and best is not None:
                             prev_score = scores[int(prev_action)]
                             if (best_score - prev_score) < HYST_ABS:
@@ -990,10 +995,6 @@ class RLGoalApproachController:
 
         # ────────────────────────────────────────────────────
         # 4) STEER IN AIR
-        # Only small rotations (5°) get heuristic bias.
-        # Big rotations (15°) are available through Q-store
-        # and softmax exploration, but not recommended by
-        # heuristic to prevent overshooting the target angle.
         # ────────────────────────────────────────────────────
         steer = np.zeros(self.num_actions, dtype=float)
         if on_object <= 0.5:
@@ -1033,34 +1034,128 @@ class RLGoalApproachController:
             ).apply([0, 0, -1])
             improvement_right = np.dot(forward_right, goal_dir_world) - dot_current
 
-            # Pitch: only small rotations
-            best_pitch_improvement = max(improvement_up, improvement_down)
-            if best_pitch_improvement > 0.001:
-                pitch_bonus = STEER_STRENGTH * deviation
-                if improvement_up > improvement_down:
-                    steer[self.action_space.IDX_LOOK_UP] += pitch_bonus
+            # ── EMERGENCY: distance much larger than best achieved ──
+            emergency_mode = False
+            if len(self._episode_transitions) >= 10:
+                all_dists = [
+                    float(tr["state"][13])
+                    for tr in self._episode_transitions
+                ]
+                min_dist_achieved = min(all_dists)
+                if distance > min_dist_achieved + 20.0:
+                    emergency_mode = True
+                    steer[self.action_space.IDX_FREE_FORWARD] -= STEER_STRENGTH * 2
+                    steer[self.action_space.IDX_FREE_FORWARD_SMALL] -= STEER_STRENGTH * 2
+
+            # ── P0-C: CLOSE APPROACH in air ──
+            CLOSE_AIR_THRESHOLD = 5.0 * self.action_space.free_step
+            if distance < CLOSE_AIR_THRESHOLD and not emergency_mode:
+                close_urgency = 1.0 - (distance / CLOSE_AIR_THRESHOLD)
+                close_bonus = STEER_STRENGTH * (1.0 + close_urgency * 2.0)
+
+                if angle_to_goal < 30.0:
+                    steer[self.action_space.IDX_FREE_FORWARD_SMALL] += close_bonus
+                    steer[self.action_space.IDX_FREE_FORWARD] += close_bonus * 0.5
+                    steer[self.action_space.IDX_LOOK_UP] -= close_bonus
+                    steer[self.action_space.IDX_LOOK_DOWN] -= close_bonus
+                    steer[self.action_space.IDX_TURN_LEFT] -= close_bonus
+                    steer[self.action_space.IDX_TURN_RIGHT] -= close_bonus
+                    steer[self.action_space.IDX_LOOK_UP_BIG] -= close_bonus
+                    steer[self.action_space.IDX_LOOK_DOWN_BIG] -= close_bonus
+                    steer[self.action_space.IDX_TURN_LEFT_BIG] -= close_bonus
+                    steer[self.action_space.IDX_TURN_RIGHT_BIG] -= close_bonus
                 else:
-                    steer[self.action_space.IDX_LOOK_DOWN] += pitch_bonus
+                    steer[self.action_space.IDX_FREE_FORWARD_SMALL] += close_bonus * 0.3
 
-            # Yaw: only small rotations
-            best_yaw_improvement = max(improvement_left, improvement_right)
-            if best_yaw_improvement > 0.001:
-                h_ax = getattr(self, "height_axis_cache", 2)
-                horiz_components = [goal_dir_world[i] for i in range(3) if i != h_ax]
-                abs_horiz = np.sqrt(sum(c**2 for c in horiz_components))
-                yaw_reliable = abs_horiz > 0.3 and best_pitch_improvement < best_yaw_improvement * 2.0
+            # ── P0-A: ALIGNED ENOUGH → FLY (threshold=45°) ──
+            ALIGNED_THRESHOLD = 45.0
+            if angle_to_goal < ALIGNED_THRESHOLD and not emergency_mode:
+                aligned_factor = 1.0 - (angle_to_goal / ALIGNED_THRESHOLD)
+                fly_bonus = STEER_STRENGTH * (1.0 + aligned_factor)
 
-                if yaw_reliable:
-                    yaw_bonus = STEER_STRENGTH * deviation
-                    if improvement_left > improvement_right:
-                        steer[self.action_space.IDX_TURN_LEFT] += yaw_bonus
+                steer[self.action_space.IDX_FREE_FORWARD] += fly_bonus
+                steer[self.action_space.IDX_FREE_FORWARD_SMALL] += fly_bonus * 0.8
+
+                rotation_suppress = -fly_bonus * aligned_factor * 0.5
+                steer[self.action_space.IDX_LOOK_UP] += rotation_suppress
+                steer[self.action_space.IDX_LOOK_DOWN] += rotation_suppress
+                steer[self.action_space.IDX_TURN_LEFT] += rotation_suppress
+                steer[self.action_space.IDX_TURN_RIGHT] += rotation_suppress
+                steer[self.action_space.IDX_LOOK_UP_BIG] += rotation_suppress
+                steer[self.action_space.IDX_LOOK_DOWN_BIG] += rotation_suppress
+                steer[self.action_space.IDX_TURN_LEFT_BIG] += rotation_suppress
+                steer[self.action_space.IDX_TURN_RIGHT_BIG] += rotation_suppress
+
+                best_pitch_improvement = max(improvement_up, improvement_down)
+                best_yaw_improvement = max(improvement_left, improvement_right)
+                correction_strength = STEER_STRENGTH * (1.0 - aligned_factor) * 0.5
+
+                if best_pitch_improvement > 0.001:
+                    if improvement_up > improvement_down:
+                        steer[self.action_space.IDX_LOOK_UP] += correction_strength
                     else:
-                        steer[self.action_space.IDX_TURN_RIGHT] += yaw_bonus
+                        steer[self.action_space.IDX_LOOK_DOWN] += correction_strength
 
-            # Forward
-            forward_weight = max(1.0 - deviation * 0.5, 0.5)
-            steer[self.action_space.IDX_FREE_FORWARD] += STEER_STRENGTH * forward_weight
-            steer[self.action_space.IDX_FREE_FORWARD_SMALL] += STEER_STRENGTH * forward_weight
+                if best_yaw_improvement > 0.001:
+                    if improvement_left > improvement_right:
+                        steer[self.action_space.IDX_TURN_LEFT] += correction_strength
+                    else:
+                        steer[self.action_space.IDX_TURN_RIGHT] += correction_strength
+
+            elif angle_to_goal >= ALIGNED_THRESHOLD:
+                # ── Standard rotation steering (angle > 45°) ──
+
+                if emergency_mode:
+                    deviation = min(deviation, 0.3)
+                    # Prefer BIG rotations to reorient faster
+                    best_pitch_improvement = max(improvement_up, improvement_down)
+                    best_yaw_improvement = max(improvement_left, improvement_right)
+                    if best_pitch_improvement > best_yaw_improvement:
+                        if improvement_up > improvement_down:
+                            steer[self.action_space.IDX_LOOK_UP_BIG] += STEER_STRENGTH
+                        else:
+                            steer[self.action_space.IDX_LOOK_DOWN_BIG] += STEER_STRENGTH
+                    else:
+                        if improvement_left > improvement_right:
+                            steer[self.action_space.IDX_TURN_LEFT_BIG] += STEER_STRENGTH
+                        else:
+                            steer[self.action_space.IDX_TURN_RIGHT_BIG] += STEER_STRENGTH
+
+                best_pitch_improvement = max(improvement_up, improvement_down)
+                if best_pitch_improvement > 0.001:
+                    pitch_bonus = STEER_STRENGTH * deviation
+                    if improvement_up > improvement_down:
+                        steer[self.action_space.IDX_LOOK_UP] += pitch_bonus
+                    else:
+                        steer[self.action_space.IDX_LOOK_DOWN] += pitch_bonus
+
+                best_yaw_improvement = max(improvement_left, improvement_right)
+                if best_yaw_improvement > 0.001:
+                    h_ax = getattr(self, "height_axis_cache", 2)
+                    horiz_components = [
+                        goal_dir_world[i] for i in range(3) if i != h_ax
+                    ]
+                    abs_horiz = np.sqrt(sum(c**2 for c in horiz_components))
+                    yaw_reliable = (
+                        abs_horiz > 0.3
+                        and best_pitch_improvement < best_yaw_improvement * 2.0
+                    )
+
+                    if yaw_reliable:
+                        yaw_bonus = STEER_STRENGTH * deviation
+                        if improvement_left > improvement_right:
+                            steer[self.action_space.IDX_TURN_LEFT] += yaw_bonus
+                        else:
+                            steer[self.action_space.IDX_TURN_RIGHT] += yaw_bonus
+
+                if not emergency_mode:
+                    forward_weight = max(1.0 - deviation * 0.8, 0.2)
+                    steer[self.action_space.IDX_FREE_FORWARD] += (
+                        STEER_STRENGTH * forward_weight
+                    )
+                    steer[self.action_space.IDX_FREE_FORWARD_SMALL] += (
+                        STEER_STRENGTH * forward_weight
+                    )
 
             steer[self.action_space.IDX_FREE_BACKWARD] -= 2.0
 
@@ -1074,15 +1169,22 @@ class RLGoalApproachController:
 
         bias += steer
         components["steer_in_air"] = steer
-
+                
         # ────────────────────────────────────────────────────
         # 5) DAMP FREE
         # ────────────────────────────────────────────────────
         damp_free = np.zeros(self.num_actions, dtype=float)
         if on_object > 0.5:
-            damp_free[self.action_space.IDX_FREE_FORWARD] -= 3.0
+            depth = sensor_data.get("depth", self.config["max_sensor_range"])
+            # Stronger suppression when close to surface
+            if depth < self.action_space.free_step:
+                # Very dangerous: depth < 8mm, free_forward would collide
+                damp_free[self.action_space.IDX_FREE_FORWARD] -= 8.0
+                damp_free[self.action_space.IDX_FREE_FORWARD_SMALL] -= 5.0
+            else:
+                damp_free[self.action_space.IDX_FREE_FORWARD] -= 3.0
+                damp_free[self.action_space.IDX_FREE_FORWARD_SMALL] -= 3.0
             damp_free[self.action_space.IDX_FREE_BACKWARD] -= 3.0
-            damp_free[self.action_space.IDX_FREE_FORWARD_SMALL] -= 3.0
             damp_free[self.action_space.IDX_LOOK_UP_BIG] -= 2.0
             damp_free[self.action_space.IDX_LOOK_DOWN_BIG] -= 2.0
             damp_free[self.action_space.IDX_TURN_LEFT_BIG] -= 2.0

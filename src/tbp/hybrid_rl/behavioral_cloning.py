@@ -137,22 +137,25 @@ class BCTrainer:
         self.val_types = torch.LongTensor(types[val_idx])
         self.val_params = torch.FloatTensor(params[val_idx])
 
-        self._type_weights = None  # No weighted loss, balanced by level+mesh
+        # Data already balanced by (mesh, level) upstream — no weighted loss
+        self._type_weights = None
 
+        # Log data distribution
         type_names = ExperienceExtractor.get_type_names()
-        type_dist = {}
-        weight_log = {}
+        type_counts: dict[str, int] = {}
         for t_id in range(self.num_types):
-            name = type_names.get(t_id, f"type_{t_id}")
-            type_dist[name] = int(type_counts[t_id])
-            weight_log[name] = round(float(weights[t_id]), 2)
+            count = int((types == t_id).sum())
+            if count > 0:
+                name = type_names.get(t_id, f"type_{t_id}")
+                type_counts[name] = count
 
         logger.info(
-            f"BC data: {len(train_idx)} train, {len(val_idx)} val, "
-            f"types: {type_dist}, "
-            f"weights: {weight_log}"
+            "BC data: %d train, %d val, types: %s",
+            len(train_idx),
+            len(val_idx),
+            type_counts,
         )
-
+        
     def _compute_loss(self, states, types, params):
         type_logits, predicted_params = self.actor(states)
 

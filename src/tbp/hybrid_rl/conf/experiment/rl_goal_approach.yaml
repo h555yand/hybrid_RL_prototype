@@ -11,17 +11,17 @@ experiment:
     regenerate_scripts: true
     do_train: true
     do_eval: true
-    do_bc_train: true
-    do_sac_train: true
-    do_sac_eval: true
+    do_bc_train: false
+    do_sac_train: false
+    do_sac_eval: false
     do_adaptive: false
 
     train_seeds: [11]
     eval_seeds: [44]
     sac_eval_seeds: [77]
     sac_seed: 11
-    promote_threshold: 0.6
-    promote_window: 100
+    promote_threshold: 0.35
+    promote_window: 150
 
     curriculum_levels:
       - [10.0, 40.0]
@@ -30,17 +30,17 @@ experiment:
 
     training_stages:
       - mesh: cube
-        episodes: 2000
-        epsilon_start: 1.0
-        epsilon_min: 0.10
-        load_mode: null
-      - mesh: mug
         episodes: 5000
         epsilon_start: 1.0
-        epsilon_min: 0.10
-        load_mode: auto
+        epsilon_min: 0.30
+        load_mode: null
+      #- mesh: mug
+      #  episodes: 5000
+      #  epsilon_start: 1.0
+      #  epsilon_min: 0.50
+      #  load_mode: auto
 
-    eval_meshes: [cube, mug]
+    eval_meshes: [cube]
     eval_episodes_per_level: 500
 
     rl_config:

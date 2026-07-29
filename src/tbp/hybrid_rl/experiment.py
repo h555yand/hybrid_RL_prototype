@@ -646,58 +646,94 @@ class RLGoalApproachExperiment:
         logger.info("BC Training")
         logger.info("=" * 60)
 
-        # Load Q-store eval BC data
-        bc_path = self.data_dir / "bc_data.pkl"
-        with bc_path.open("rb") as f:
-            q_store_transitions = pickle.load(f)  # noqa: S301
-
-        logger.info(
-            "Loaded %d Q-store eval transitions",
-            len(q_store_transitions),
-        )
-
-        # Collect heuristic expert data
-        heuristic_transitions = self._run_heuristic_eval()
-
-        # Balance Q-store data by (mesh, level)
-        q_store_balanced = self._filter_bc_transitions(
-            q_store_transitions,
-            target_per_group=3000,
-        )
-
-        # Heuristic data: keep natural distribution (no balancing)
-        # but limit total to match Q-store balanced size
-        max_heuristic = len(q_store_balanced)
-        if len(heuristic_transitions) > max_heuristic:
-            indices = np.random.permutation(
-                len(heuristic_transitions)
-            )[:max_heuristic]
-            heuristic_limited = [
-                heuristic_transitions[i] for i in indices
-            ]
+        # Collect heuristic expert data (with caching)
+        bc_data_combined_path = self.data_dir / "bc_data_combined.pkl"
+        if bc_data_combined_path.exists():
             logger.info(
-                "Heuristic data limited: %d → %d",
-                len(heuristic_transitions),
-                max_heuristic,
+                "Loading cached bc_data_combined data from %s",
+                bc_data_combined_path,
             )
+            with bc_data_combined_path.open("rb") as f:
+                bc_transitions = pickle.load(f)  # noqa: S301
+            logger.info(
+                "Loaded %d cached bc_data_combined transitions",
+                len(bc_transitions),
+            )
+            q_store_balanced = []
+            heuristic_limited = []
         else:
-            heuristic_limited = heuristic_transitions
+            # Load Q-store eval BC data
+            bc_path = self.data_dir / "bc_data.pkl"
+            with bc_path.open("rb") as f:
+                q_store_transitions = pickle.load(f)  # noqa: S301
 
-        # Combine 50/50
-        bc_transitions = q_store_balanced + heuristic_limited
-        np.random.shuffle(bc_transitions)
+            logger.info(
+                "Loaded %d Q-store eval transitions",
+                len(q_store_transitions),
+            )
 
-        logger.info(
-            "Combined BC data: %d Q-store + %d heuristic = %d total",
-            len(q_store_balanced),
-            len(heuristic_limited),
-            len(bc_transitions),
-        )
+            # Collect heuristic expert data (with caching)
+            heuristic_cache_path = self.data_dir / "bc_data_heuristic.pkl"
+            if heuristic_cache_path.exists():
+                logger.info(
+                    "Loading cached heuristic data from %s",
+                    heuristic_cache_path,
+                )
+                with heuristic_cache_path.open("rb") as f:
+                    heuristic_transitions = pickle.load(f)  # noqa: S301
+                logger.info(
+                    "Loaded %d cached heuristic transitions",
+                    len(heuristic_transitions),
+                )
+            else:
+                heuristic_transitions = self._run_heuristic_eval()
+                with heuristic_cache_path.open("wb") as f:
+                    pickle.dump(heuristic_transitions, f)
+                logger.info(
+                    "Saved %d heuristic transitions to %s",
+                    len(heuristic_transitions),
+                    heuristic_cache_path,
+                )
 
-        # Save combined BC data
-        bc_combined_path = self.data_dir / "bc_data_combined.pkl"
-        with bc_combined_path.open("wb") as f:
-            pickle.dump(bc_transitions, f)
+            # Balance Q-store data by (mesh, level)
+            q_store_balanced = self._filter_bc_transitions(
+                q_store_transitions,
+                target_per_group=3000,
+            )
+
+            # Heuristic data: keep natural distribution (no balancing)
+            # but limit total to match Q-store balanced size
+            max_heuristic = len(q_store_balanced)
+            if len(heuristic_transitions) > max_heuristic:
+                indices = np.random.permutation(
+                    len(heuristic_transitions)
+                )[:max_heuristic]
+                heuristic_limited = [
+                    heuristic_transitions[i] for i in indices
+                ]
+                logger.info(
+                    "Heuristic data limited: %d → %d",
+                    len(heuristic_transitions),
+                    max_heuristic,
+                )
+            else:
+                heuristic_limited = heuristic_transitions
+
+            # Combine 50/50
+            bc_transitions = q_store_balanced + heuristic_limited
+            np.random.shuffle(bc_transitions)
+
+            logger.info(
+                "Combined BC data: %d Q-store + %d heuristic = %d total",
+                len(q_store_balanced),
+                len(heuristic_limited),
+                len(bc_transitions),
+            )
+
+            # Save combined BC data
+            bc_combined_path = self.data_dir / "bc_data_combined.pkl"
+            with bc_combined_path.open("wb") as f:
+                pickle.dump(bc_transitions, f)
 
         # Train BC
         num_types = len(
