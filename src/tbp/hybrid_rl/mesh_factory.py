@@ -495,3 +495,4 @@ def prepare_demo_meshes(data_dir: Path) -> None:
 # create_mug().show()
 # create_tea_cup().show()
 # create_vase().show()
+# create_flat_square().show()

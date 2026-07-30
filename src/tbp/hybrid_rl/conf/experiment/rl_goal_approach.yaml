@@ -29,18 +29,13 @@ experiment:
       - [40.0, 120.0]
 
     training_stages:
-      - mesh: cube
+      - mesh: sphere
         episodes: 5000
-        epsilon_start: 1.0
-        epsilon_min: 0.30
-        load_mode: null
-      #- mesh: mug
-      #  episodes: 5000
-      #  epsilon_start: 1.0
-      #  epsilon_min: 0.50
-      #  load_mode: auto
+        epsilon_start: 0.50
+        epsilon_min: 0.15
+        load_mode: auto
 
-    eval_meshes: [cube]
+    eval_meshes: [cube, sphere]
     eval_episodes_per_level: 500
 
     rl_config:
