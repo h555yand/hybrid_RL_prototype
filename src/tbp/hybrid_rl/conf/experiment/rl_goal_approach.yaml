@@ -8,9 +8,10 @@ experiment:
   config:
     seed: 42
     visualise: true
-    regenerate_scripts: true
+    regenerate_scripts: false
     do_train: true
     do_eval: true
+    do_heur_eval: false
     do_bc_train: false
     do_sac_train: false
     do_sac_eval: false
@@ -31,11 +32,11 @@ experiment:
     training_stages:
       - mesh: sphere
         episodes: 5000
-        epsilon_start: 0.50
-        epsilon_min: 0.15
-        load_mode: auto
+        epsilon_start: 1.0
+        epsilon_min: 0.1
+        load_mode: null
 
-    eval_meshes: [cube, sphere]
+    eval_meshes: [sphere]
     eval_episodes_per_level: 500
 
     rl_config:

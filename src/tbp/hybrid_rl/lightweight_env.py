@@ -141,7 +141,7 @@ class LightweightEnv:
             if hasattr(self, "_current_goal") and self._current_goal is not None:
                 self._detach_simple(
                     goal_pose=self._current_goal,
-                    detach_distance=action_space.free_step*2,
+                    detach_distance=action_space.free_step * 4,
                 )
         elif action_info.name == "free_forward_small":
             self._move_forward(action_space.free_step_small)
@@ -186,22 +186,20 @@ class LightweightEnv:
             _, _, gf_id = self.mesh.nearest.on_surface([goal_pos])
             goal_normal = self.mesh.face_normals[gf_id[0]].tolist()
 
-        # ═══ path_blocked: the agent and the target are on different sides of the wall ═══
+        # ═══ path_blocked ═══
         path_blocked = False
         if hasattr(self, "_current_goal") and self._current_goal is not None:
             goal_pos = self._current_goal[:3]
             center = (self.mesh.bounds[0] + self.mesh.bounds[1]) / 2.0
             h = self.height_axis
 
-            # Vector from the center (horizontal projection)
             agent_from_center = self.agent_pos - center
             agent_from_center[h] = 0.0
 
             goal_from_center = goal_pos - center
             goal_from_center[h] = 0.0
 
-            # determine inside/outside by the agent's normal
-            agent_outside = True  # fallback
+            agent_outside = True
             if point_normal is not None:
                 n = np.array(point_normal)
                 n_horiz = n.copy()
@@ -209,8 +207,7 @@ class LightweightEnv:
                 if np.linalg.norm(n_horiz) > 0.1:
                     agent_outside = np.dot(n_horiz, agent_from_center) > 0
 
-            # determine inside/outside by the target normal
-            goal_outside = True  # fallback
+            goal_outside = True
             if goal_normal is not None:
                 gn = np.array(goal_normal)
                 gn_horiz = gn.copy()
@@ -220,9 +217,15 @@ class LightweightEnv:
 
             path_blocked = (agent_outside != goal_outside)
 
+        # ═══ Curvature ═══
+        curvature_data = self._estimate_curvature()
+
         return {
             "point_normal": point_normal,
-            "principal_curvatures": self._estimate_curvature(),
+            "k1": curvature_data["k1"],
+            "k2": curvature_data["k2"],
+            # Keep backward compatibility
+            "principal_curvatures": [curvature_data["k1"], curvature_data["k2"]],
             "on_object": on_object,
             "depth": depth,
             "passed_through": getattr(self, "_passed_through", False),
@@ -231,7 +234,7 @@ class LightweightEnv:
             "detach_sub_steps": getattr(self, "_last_detach_sub_steps", 1),
             "path_blocked": path_blocked,
         }
-
+    
     def get_pose(self):
         """The agent's current pose."""
         return np.concatenate([self.agent_pos, self.agent_rot])
@@ -306,6 +309,67 @@ class LightweightEnv:
         return np.concatenate([position, rotation])
 
     def _estimate_curvature(self):
+        """Estimate principal curvatures k1, k2 at the point the agent is looking at.
+
+        Uses discrete mean and Gaussian curvature to recover principal curvatures:
+            k1 = H + sqrt(H² - K)
+            k2 = H - sqrt(H² - K)
+        where H = mean curvature, K = Gaussian curvature.
+
+        Convention: |k1| >= |k2| (k1 is the curvature of maximum bending).
+
+        Returns:
+            dict with 'k1' and 'k2' (floats), or {'k1': 0.0, 'k2': 0.0}
+            if no surface is visible.
+        """
+        rot = R.from_euler("xyz", self.agent_rot, degrees=True)
+        ray_direction = rot.apply([0, 0, -1])
+        locations, index_ray, index_tri = self.mesh.ray.intersects_location(
+            ray_origins=[self.agent_pos],
+            ray_directions=[ray_direction],
+        )
+        if len(locations) == 0:
+            return {"k1": 0.0, "k2": 0.0}
+
+        distances = np.linalg.norm(locations - self.agent_pos, axis=1)
+        nearest_idx = np.argmin(distances)
+        face_idx = index_tri[nearest_idx]
+        vertex_indices = self.mesh.faces[face_idx]
+
+        if not hasattr(self, "_vertex_mean_curvature"):
+            self._vertex_mean_curvature = (
+                trimesh.curvature.discrete_mean_curvature_measure(
+                    self.mesh, self.mesh.vertices, radius=5.0
+                )
+            )
+            self._vertex_gaussian_curvature = (
+                trimesh.curvature.discrete_gaussian_curvature_measure(
+                    self.mesh, self.mesh.vertices, radius=5.0
+                )
+            )
+
+        H = float(np.mean(self._vertex_mean_curvature[vertex_indices]))
+        K = float(np.mean(self._vertex_gaussian_curvature[vertex_indices]))
+
+        # Principal curvatures from H and K:
+        # k1, k2 are roots of: t² - 2Ht + K = 0
+        # k1 = H + sqrt(H² - K), k2 = H - sqrt(H² - K)
+        discriminant = H * H - K
+        if discriminant < 0:
+            # Numerical noise — clamp to zero
+            discriminant = 0.0
+
+        sqrt_disc = np.sqrt(discriminant)
+        k1 = H + sqrt_disc
+        k2 = H - sqrt_disc
+
+        # Convention: |k1| >= |k2|
+        if abs(k1) < abs(k2):
+            k1, k2 = k2, k1
+
+        return {"k1": float(k1), "k2": float(k2)}
+
+    def _estimate_curvature_mean_gaus(self):
         rot = R.from_euler("xyz", self.agent_rot, degrees=True)
         ray_direction = rot.apply([0, 0, -1])
         locations, index_ray, index_tri = self.mesh.ray.intersects_location(
@@ -662,17 +726,36 @@ class LightweightEnv:
                 return self.get_sensor_data()
 
         # Step 2: Orient gaze toward goal
-        # Blend goal direction with surface normal to avoid
-        # flying straight into the object on next free_forward
+        # Adapt fly direction based on whether goal is behind surface
         goal_pos = goal_pose[:3]
         goal_dir = goal_pos - self.agent_pos
         goal_dist = np.linalg.norm(goal_dir)
         if goal_dist > 1e-8:
             goal_dir /= goal_dist
-            fly_direction = goal_dir + normal * 0.3
-            fly_direction /= (np.linalg.norm(fly_direction) + 1e-12)
-            self.agent_rot = self._look_at_direction(fly_direction)
+            dot_goal_normal = float(np.dot(goal_dir, normal))
 
+            if dot_goal_normal < -0.2:
+                # Goal is behind surface — fly sideways to go around
+                # Project goal_dir onto tangent plane
+                tangent_to_goal = goal_dir - dot_goal_normal * normal
+                tangent_len = float(np.linalg.norm(tangent_to_goal))
+
+                if tangent_len > 1e-8:
+                    tangent_to_goal /= tangent_len
+                    # Fly: away from surface + sideways toward goal
+                    fly_direction = normal * 0.7 + tangent_to_goal * 0.7
+                else:
+                    # Goal exactly behind normal — fly away from surface
+                    fly_direction = normal
+
+                fly_direction /= (np.linalg.norm(fly_direction) + 1e-12)
+            else:
+                # Goal is in front of or beside surface — standard blend
+                fly_direction = goal_dir + normal * 0.3
+                fly_direction /= (np.linalg.norm(fly_direction) + 1e-12)
+
+            self.agent_rot = self._look_at_direction(fly_direction)
+            
         logger.debug(
             f"DETACH_SIMPLE_DONE: "
             f"old_pos={old_pos.tolist()}, "

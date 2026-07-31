@@ -106,7 +106,8 @@ def run_eval_per_seed(  # noqa: PLR0913
                 ),
                 episode_script=level_pool,
                 episodes_per_level=episodes_per_level,
-                visualise=visualise
+                visualise=visualise,
+                level_idx=level_idx
             )
 
             if collect_bc:
@@ -487,6 +488,7 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
     episode_pools: list[list[dict[str, Any]]] | None = None,
     visualise: bool = False,
     episodes_per_level: int | None = None,
+    level_idx = 0
 ) -> int | dict[str, Any]:
     """Run Q-learning episodes in train or eval mode.
 
@@ -739,7 +741,7 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
             #   visualize_agent_goal(env, pose, goal_pose)
 
         if visualizer:
-            level = curriculum.level_idx if curriculum else 0
+            level = curriculum.level_idx if curriculum else level_idx
             visualizer.save_episode(
                 env=env,
                 episode=episode,

@@ -105,8 +105,9 @@ class RLGoalApproachExperiment:
         self.scripts_dir = self.data_dir / "episode_scripts"
 
         # Pipeline stages
-        self.do_train = self.config.get("do_train", True)
+        self.do_train = self.config.get("do_train", False)
         self.do_eval = self.config.get("do_eval", False)
+        self.do_heur_eval = self.config.get("do_heur_eval", False)
         self.do_bc_train = self.config.get("do_bc_train", False)
         self.do_sac_train = self.config.get(
             "do_sac_train", False
@@ -325,6 +326,8 @@ class RLGoalApproachExperiment:
             self._run_train()
         if self.do_eval:
             self._run_eval()
+        if self.do_heur_eval:
+            self._run_heuristic_eval()
         if self.do_bc_train:
             self._run_bc_train()
         if self.do_sac_train:
@@ -618,6 +621,7 @@ class RLGoalApproachExperiment:
                         self.eval_episodes_per_level
                     ),
                     mesh_name=mesh_name,
+                    visualise=self.visualise
                 )
             )
 
@@ -630,6 +634,14 @@ class RLGoalApproachExperiment:
                 len(heuristic_transitions),
             )
 
+        heuristic_cache_path = self.data_dir / "bc_data_heuristic.pkl"
+        with heuristic_cache_path.open("wb") as f:
+            pickle.dump(heuristic_transitions, f)
+            logger.info(
+                "Saved %d heuristic transitions to %s",
+                len(heuristic_transitions),
+                heuristic_cache_path,
+            )
         logger.info(
             "Total heuristic transitions: %d",
             len(all_heuristic_transitions),
@@ -687,12 +699,9 @@ class RLGoalApproachExperiment:
                 )
             else:
                 heuristic_transitions = self._run_heuristic_eval()
-                with heuristic_cache_path.open("wb") as f:
-                    pickle.dump(heuristic_transitions, f)
                 logger.info(
-                    "Saved %d heuristic transitions to %s",
+                    "Calculated %d heuristic transitions",
                     len(heuristic_transitions),
-                    heuristic_cache_path,
                 )
 
             # Balance Q-store data by (mesh, level)
