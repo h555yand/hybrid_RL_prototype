@@ -129,6 +129,7 @@ def generate_episode_pools(
             require_same_side = (
                 use_curriculum and level_idx == 0
             )
+            require_same_side = False # делает еще сложнее, много примеров когда что-то на дне, надо его тоже исключать
 
             if use_curriculum:
                 max_goal_attempts = (

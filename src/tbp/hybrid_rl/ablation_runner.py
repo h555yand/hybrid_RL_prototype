@@ -561,41 +561,6 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
             mesh_name=mesh_label,
             stage=stage_label,
         )
-    #vis_counts = {"success": 0, "collision": 0, "timeout": 0}
-    #if visualise:
-    #    mesh_label = Path(mesh_path).stem if mesh_path else "multi"
-    #    stage_label = "eval" if cfg.get("mode") == "eval" else "train"
-    #    vis_dir = Path(save_dir) / f"visualizations_{stage_label}_{mesh_label}"
-    #else:
-    #    vis_dir = None
-    #vis_filter = (
-    #    (config or {}).get("visualise_filter", {
-    #        "actions": [
-                #"move_tangentially",
-                #"free_forward",
-                #"free_backward",
-                #"turn_left",
-                #"turn_right",
-                #"look_up",
-                #"look_down",
-                #"rotate_sensor_+",
-                #"rotate_sensor_-",
-                #"orient_horizontal",
-                #"orient_vertical",
-                #"detach",
-                #"free_forward_small",
-                #"look_up_big",
-                #"look_down_big",
-                #"turn_left_big",
-                #"turn_right_big",
-        #    ],
-        #    "max_success": 5,
-        #    "max_collision": 5,
-        #    "max_timeout": 5,
-        #})
-        #if visualise
-        #else None
-    #)
 
     # Validate episode sources
     use_script = episode_script is not None
@@ -736,10 +701,9 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
 
         if visualise:
             start_rot = np.array([0.0, 0.0, 0.0])
-            # visualize_agent_goal(env, np.concatenate([start_pos, start_rot]), goal_pose)
+            #visualize_agent_goal(env, np.concatenate([start_pos, start_rot]), goal_pose)
             #for pose in current_poses:
             #   visualize_agent_goal(env, pose, goal_pose)
-
         if visualizer:
             level = curriculum.level_idx if curriculum else level_idx
             visualizer.save_episode(

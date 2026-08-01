@@ -134,6 +134,9 @@ class RLGoalApproachController:
         self._consecutive_detach_count = 0
         self._global_action_counts: Dict[str, int] = {}
         self._flyby_count = 0
+        self._cached_fly_direction = None
+        self._fly_direction_age = 0
+        self._air_phase = "DIRECT"
 
         logger.info(
             f"RLGoalApproachController initialized: "
@@ -172,6 +175,9 @@ class RLGoalApproachController:
         self._last_detach_sub_steps = 1
         self._consecutive_detach_count = 0
         self._flyby_count = 0
+        self._cached_fly_direction = None
+        self._fly_direction_age = 0
+        self._air_phase = "DIRECT"
         if self.is_training:
             self.epsilon = max(
                 self.epsilon_min,
@@ -916,6 +922,45 @@ class RLGoalApproachController:
                 f"distance={state[13]:.1f}"
             )
 
+        # ── Air phase management ──
+        if on_object < 0.5:
+            path_blocked_now = sensor_data.get("path_blocked", False)
+
+            # Initialize at detach
+            if self._last_action == self.action_space.IDX_DETACH:
+                self._cached_fly_direction = self._compute_detach_fly_direction(
+                    current_pose, sensor_data
+                )
+                self._fly_direction_age = 0
+                self._air_phase = "FLY" if path_blocked_now else "DIRECT"
+
+            # Track age of current fly direction
+            self._fly_direction_age = getattr(
+                self, '_fly_direction_age', 0
+            ) + 1
+
+            # State transitions
+            if not path_blocked_now:
+                self._air_phase = "DIRECT"
+                self._cached_fly_direction = None
+            elif (
+                self._air_phase == "FLY"
+                and self._fly_direction_age > 15
+            ):
+                self._air_phase = "REORIENT"
+                self._fly_direction_age = 0
+            elif self._air_phase == "REORIENT":
+                if sensor_data.get("point_normal") is not None:
+                    new_dir = self._compute_detach_fly_direction(
+                        current_pose, sensor_data
+                    )
+                    if new_dir is not None:
+                        self._cached_fly_direction = new_dir
+                    self._air_phase = "FLY"
+                    self._fly_direction_age = 0
+        else:
+            self._air_phase = "DIRECT"
+
         # ────────────────────────────────────────────────────
         # 0) SUPPRESS
         # ────────────────────────────────────────────────────
@@ -1211,9 +1256,10 @@ class RLGoalApproachController:
         # ────────────────────────────────────────────────────
         steer = np.zeros(self.num_actions, dtype=float)
         if on_object <= 0.5:
-            STEER_STRENGTH = 4.0
+            STEER_STRENGTH = 8.0
             rotation_step = self.action_space.rotation_step
 
+            # ── Determine effective goal direction ──
             goal_dir_world = self._current_goal[:3] - current_pose[:3]
             goal_dist_world = np.linalg.norm(goal_dir_world)
             if goal_dist_world > 1e-8:
@@ -1223,60 +1269,40 @@ class RLGoalApproachController:
                 "xyz", current_pose[3:6], degrees=True
             )
             forward_current = rot_current.apply([0, 0, -1])
-            dot_current = np.dot(forward_current, goal_dir_world)
+
+            air_phase = getattr(self, '_air_phase', 'DIRECT')
+
+            if air_phase == "FLY" and self._cached_fly_direction is not None:
+                effective_goal = self._cached_fly_direction
+            elif air_phase == "REORIENT":
+                effective_goal = goal_dir_world
+            else:
+                effective_goal = goal_dir_world
+
+            dot_current = float(np.dot(forward_current, effective_goal))
             angle_to_goal = np.degrees(
                 np.arccos(np.clip(dot_current, -1, 1))
             )
-            deviation = min(angle_to_goal / 45.0, 1.0)
 
             pose_angles = current_pose[3:6]
 
-            # ── PATH BLOCKED: steer toward subgoal instead of goal ──
-            path_blocked = sensor_data.get("path_blocked", False)
-            if path_blocked:
-                pn = sensor_data.get("point_normal")
-                if pn is not None:
-                    subgoal_dir = self._compute_subgoal_direction(
-                        current_pose, sensor_data
-                    )
-                    if subgoal_dir is not None:
-                        n_world_air = np.asarray(pn, dtype=float)
-                        n_world_air = n_world_air / (
-                            np.linalg.norm(n_world_air) + 1e-12
-                        )
-                        effective_goal_dir = (
-                            subgoal_dir * 0.8 + n_world_air * 0.4
-                        )
-                        effective_goal_dir /= (
-                            np.linalg.norm(effective_goal_dir) + 1e-12
-                        )
-                        goal_dir_world = effective_goal_dir
-                        dot_current = np.dot(
-                            forward_current, goal_dir_world
-                        )
-                        angle_to_goal = np.degrees(
-                            np.arccos(np.clip(dot_current, -1, 1))
-                        )
-                        deviation = min(angle_to_goal / 45.0, 1.0)
-
-                steer[self.action_space.IDX_FREE_FORWARD] -= (
-                    STEER_STRENGTH * 0.5
-                )
-
+            # ── Compute improvement for each rotation direction ──
             forward_up = R.from_euler(
                 "xyz",
                 pose_angles + np.array([rotation_step, 0, 0]),
                 degrees=True,
             ).apply([0, 0, -1])
-            improvement_up = np.dot(forward_up, goal_dir_world) - dot_current
+            improvement_up = float(
+                np.dot(forward_up, effective_goal) - dot_current
+            )
 
             forward_down = R.from_euler(
                 "xyz",
                 pose_angles + np.array([-rotation_step, 0, 0]),
                 degrees=True,
             ).apply([0, 0, -1])
-            improvement_down = (
-                np.dot(forward_down, goal_dir_world) - dot_current
+            improvement_down = float(
+                np.dot(forward_down, effective_goal) - dot_current
             )
 
             forward_left = R.from_euler(
@@ -1284,8 +1310,8 @@ class RLGoalApproachController:
                 pose_angles + np.array([0, rotation_step, 0]),
                 degrees=True,
             ).apply([0, 0, -1])
-            improvement_left = (
-                np.dot(forward_left, goal_dir_world) - dot_current
+            improvement_left = float(
+                np.dot(forward_left, effective_goal) - dot_current
             )
 
             forward_right = R.from_euler(
@@ -1293,12 +1319,11 @@ class RLGoalApproachController:
                 pose_angles + np.array([0, -rotation_step, 0]),
                 degrees=True,
             ).apply([0, 0, -1])
-            improvement_right = (
-                np.dot(forward_right, goal_dir_world) - dot_current
+            improvement_right = float(
+                np.dot(forward_right, effective_goal) - dot_current
             )
 
-            # Zero out improvement if rotation didn't actually change forward
-            # (e.g. pitch at ±90° limit, gimbal lock)
+            # Zero out improvement if rotation didn't change forward
             if np.linalg.norm(forward_up - forward_current) < 1e-4:
                 improvement_up = 0.0
             if np.linalg.norm(forward_down - forward_current) < 1e-4:
@@ -1308,208 +1333,156 @@ class RLGoalApproachController:
             if np.linalg.norm(forward_right - forward_current) < 1e-4:
                 improvement_right = 0.0
 
-            # ── EMERGENCY ──
-            emergency_mode = False
-            if len(self._episode_transitions) >= 10:
-                all_dists = [
-                    float(tr["state"][13])
-                    for tr in self._episode_transitions
-                ]
-                min_dist_achieved = min(all_dists)
-                if distance > min_dist_achieved + 20.0:
-                    emergency_mode = True
-                    steer[
-                        self.action_space.IDX_FREE_FORWARD
-                    ] -= STEER_STRENGTH * 2
-                    steer[
-                        self.action_space.IDX_FREE_FORWARD_SMALL
-                    ] -= STEER_STRENGTH * 2
+            # ── Thresholds based on action space ──
+            TURN_ONLY = 3.0 * self.action_space.rotation_step_big
+            FLY_THR = 4.0 * self.action_space.rotation_step
 
-            # ── CLOSE APPROACH in air ──
-            CLOSE_AIR_THRESHOLD = 5.0 * self.action_space.free_step
-            if distance < CLOSE_AIR_THRESHOLD and not emergency_mode:
-                close_urgency = 1.0 - (distance / CLOSE_AIR_THRESHOLD)
-                close_bonus = STEER_STRENGTH * (
-                    1.0 + close_urgency * 2.0
-                )
-
-                if angle_to_goal < 30.0:
-                    steer[
-                        self.action_space.IDX_FREE_FORWARD_SMALL
-                    ] += close_bonus
-                    steer[
-                        self.action_space.IDX_FREE_FORWARD
-                    ] += close_bonus * 0.5
-                    for idx in [
-                        self.action_space.IDX_LOOK_UP,
-                        self.action_space.IDX_LOOK_DOWN,
-                        self.action_space.IDX_TURN_LEFT,
-                        self.action_space.IDX_TURN_RIGHT,
-                        self.action_space.IDX_LOOK_UP_BIG,
-                        self.action_space.IDX_LOOK_DOWN_BIG,
-                        self.action_space.IDX_TURN_LEFT_BIG,
-                        self.action_space.IDX_TURN_RIGHT_BIG,
-                    ]:
-                        steer[idx] -= close_bonus
-                else:
-                    steer[
-                        self.action_space.IDX_FREE_FORWARD_SMALL
-                    ] += close_bonus * 0.3
-
-            # ── ALIGNED → FLY ──
-            ALIGNED_THRESHOLD = 45.0
-            if angle_to_goal < ALIGNED_THRESHOLD and not emergency_mode:
-                aligned_factor = 1.0 - (
-                    angle_to_goal / ALIGNED_THRESHOLD
-                )
-                fly_bonus = STEER_STRENGTH * (1.0 + aligned_factor)
-
-                steer[self.action_space.IDX_FREE_FORWARD] += fly_bonus
+            # ── REORIENT phase: only turn, no forward ──
+            if air_phase == "REORIENT":
+                steer[self.action_space.IDX_FREE_FORWARD] -= STEER_STRENGTH
                 steer[
                     self.action_space.IDX_FREE_FORWARD_SMALL
-                ] += fly_bonus * 0.8
+                ] -= STEER_STRENGTH
 
-                rotation_suppress = (
-                    -fly_bonus * aligned_factor * 0.5
-                )
-                for idx in [
-                    self.action_space.IDX_LOOK_UP,
-                    self.action_space.IDX_LOOK_DOWN,
-                    self.action_space.IDX_TURN_LEFT,
-                    self.action_space.IDX_TURN_RIGHT,
-                    self.action_space.IDX_LOOK_UP_BIG,
-                    self.action_space.IDX_LOOK_DOWN_BIG,
-                    self.action_space.IDX_TURN_LEFT_BIG,
-                    self.action_space.IDX_TURN_RIGHT_BIG,
-                ]:
-                    steer[idx] += rotation_suppress
+                best_pitch = max(improvement_up, improvement_down)
+                best_yaw = max(improvement_left, improvement_right)
 
-                best_pitch_improvement = max(
-                    improvement_up, improvement_down
-                )
-                best_yaw_improvement = max(
-                    improvement_left, improvement_right
-                )
-                correction_strength = (
-                    STEER_STRENGTH * (1.0 - aligned_factor) * 0.5
-                )
-
-                if best_pitch_improvement > 0.001:
+                if best_pitch >= best_yaw and best_pitch > 0.001:
                     if improvement_up > improvement_down:
-                        steer[
-                            self.action_space.IDX_LOOK_UP
-                        ] += correction_strength
+                        steer[self.action_space.IDX_LOOK_UP] += STEER_STRENGTH
                     else:
                         steer[
                             self.action_space.IDX_LOOK_DOWN
-                        ] += correction_strength
-
-                if best_yaw_improvement > 0.001:
+                        ] += STEER_STRENGTH
+                if best_yaw >= best_pitch and best_yaw > 0.001:
                     if improvement_left > improvement_right:
                         steer[
                             self.action_space.IDX_TURN_LEFT
-                        ] += correction_strength
+                        ] += STEER_STRENGTH
                     else:
                         steer[
                             self.action_space.IDX_TURN_RIGHT
-                        ] += correction_strength
+                        ] += STEER_STRENGTH
 
-            elif angle_to_goal >= ALIGNED_THRESHOLD:
-                if emergency_mode:
-                    deviation = min(deviation, 0.3)
-                    best_pitch_improvement = max(
-                        improvement_up, improvement_down
-                    )
-                    best_yaw_improvement = max(
-                        improvement_left, improvement_right
-                    )
-                    if best_pitch_improvement > best_yaw_improvement:
-                        if improvement_up > improvement_down:
-                            steer[
-                                self.action_space.IDX_LOOK_UP_BIG
-                            ] += STEER_STRENGTH
-                        else:
-                            steer[
-                                self.action_space.IDX_LOOK_DOWN_BIG
-                            ] += STEER_STRENGTH
-                    else:
-                        if improvement_left > improvement_right:
-                            steer[
-                                self.action_space.IDX_TURN_LEFT_BIG
-                            ] += STEER_STRENGTH
-                        else:
-                            steer[
-                                self.action_space.IDX_TURN_RIGHT_BIG
-                            ] += STEER_STRENGTH
+            # ── Phase 1: FAR FROM ALIGNED (angle > 45°) ──
+            elif angle_to_goal > TURN_ONLY:
+                steer[self.action_space.IDX_FREE_FORWARD] -= STEER_STRENGTH
+                steer[
+                    self.action_space.IDX_FREE_FORWARD_SMALL
+                ] -= STEER_STRENGTH
 
-                best_pitch_improvement = max(
-                    improvement_up, improvement_down
-                )
-                if best_pitch_improvement > 0.001:
-                    pitch_bonus = STEER_STRENGTH * deviation
+                best_pitch = max(improvement_up, improvement_down)
+                best_yaw = max(improvement_left, improvement_right)
+
+                if best_pitch >= best_yaw and best_pitch > 0.001:
                     if improvement_up > improvement_down:
+                        steer[self.action_space.IDX_LOOK_UP] += STEER_STRENGTH
                         steer[
-                            self.action_space.IDX_LOOK_UP
-                        ] += pitch_bonus
+                            self.action_space.IDX_LOOK_UP_BIG
+                        ] += STEER_STRENGTH * 0.5
                     else:
                         steer[
                             self.action_space.IDX_LOOK_DOWN
-                        ] += pitch_bonus
+                        ] += STEER_STRENGTH
+                        steer[
+                            self.action_space.IDX_LOOK_DOWN_BIG
+                        ] += STEER_STRENGTH * 0.5
 
-                best_yaw_improvement = max(
-                    improvement_left, improvement_right
-                )
-                if best_yaw_improvement > 0.001:
-                    h_ax = getattr(self, "height_axis_cache", 2)
-                    horiz_components = [
-                        goal_dir_world[i]
-                        for i in range(3)
-                        if i != h_ax
-                    ]
-                    abs_horiz = np.sqrt(
-                        sum(c**2 for c in horiz_components)
-                    )
-                    yaw_reliable = (
-                        abs_horiz > 0.3
-                        and best_pitch_improvement
-                        < best_yaw_improvement * 2.0
-                    )
+                if best_yaw >= best_pitch and best_yaw > 0.001:
+                    if improvement_left > improvement_right:
+                        steer[
+                            self.action_space.IDX_TURN_LEFT
+                        ] += STEER_STRENGTH
+                        steer[
+                            self.action_space.IDX_TURN_LEFT_BIG
+                        ] += STEER_STRENGTH * 0.5
+                    else:
+                        steer[
+                            self.action_space.IDX_TURN_RIGHT
+                        ] += STEER_STRENGTH
+                        steer[
+                            self.action_space.IDX_TURN_RIGHT_BIG
+                        ] += STEER_STRENGTH * 0.5
 
-                    if yaw_reliable:
-                        yaw_bonus = STEER_STRENGTH * deviation
-                        if improvement_left > improvement_right:
-                            steer[
-                                self.action_space.IDX_TURN_LEFT
-                            ] += yaw_bonus
-                        else:
-                            steer[
-                                self.action_space.IDX_TURN_RIGHT
-                            ] += yaw_bonus
+            # ── Phase 2: PARTIALLY ALIGNED (20° < angle <= 45°) ──
+            elif angle_to_goal > FLY_THR:
+                steer[
+                    self.action_space.IDX_FREE_FORWARD_SMALL
+                ] += STEER_STRENGTH * 0.5
+                steer[
+                    self.action_space.IDX_FREE_FORWARD
+                ] -= STEER_STRENGTH * 0.5
 
-                if not emergency_mode:
-                    forward_weight = max(1.0 - deviation * 0.8, 0.2)
-                    steer[self.action_space.IDX_FREE_FORWARD] += (
-                        STEER_STRENGTH * forward_weight
-                    )
+                turn_strength = STEER_STRENGTH * 0.7
+
+                best_pitch = max(improvement_up, improvement_down)
+                best_yaw = max(improvement_left, improvement_right)
+
+                if best_pitch > 0.001:
+                    if improvement_up > improvement_down:
+                        steer[
+                            self.action_space.IDX_LOOK_UP
+                        ] += turn_strength
+                    else:
+                        steer[
+                            self.action_space.IDX_LOOK_DOWN
+                        ] += turn_strength
+
+                if best_yaw > 0.001:
+                    if improvement_left > improvement_right:
+                        steer[
+                            self.action_space.IDX_TURN_LEFT
+                        ] += turn_strength
+                    else:
+                        steer[
+                            self.action_space.IDX_TURN_RIGHT
+                        ] += turn_strength
+
+            # ── Phase 3: WELL ALIGNED (angle <= 20°) ──
+            else:
+                if distance > 8.0 * self.action_space.free_step:
+                    steer[
+                        self.action_space.IDX_FREE_FORWARD
+                    ] += STEER_STRENGTH
                     steer[
                         self.action_space.IDX_FREE_FORWARD_SMALL
-                    ] += STEER_STRENGTH * forward_weight
+                    ] += STEER_STRENGTH * 0.5
+                else:
+                    steer[
+                        self.action_space.IDX_FREE_FORWARD_SMALL
+                    ] += STEER_STRENGTH
+                    steer[
+                        self.action_space.IDX_FREE_FORWARD
+                    ] += STEER_STRENGTH * 0.3
 
-            # ── After many orientation steps without progress, boost forward ──
-            if len(self._distance_history) >= 8:
-                recent_dists = self._distance_history[-8:]
-                dist_range = max(recent_dists) - min(recent_dists)
-                if dist_range < 1.0:
-                    steer[self.action_space.IDX_FREE_FORWARD] += (
-                        STEER_STRENGTH * 2
-                    )
-                    steer[self.action_space.IDX_FREE_FORWARD_SMALL] += (
-                        STEER_STRENGTH * 2
-                    )
+                correction = STEER_STRENGTH * 0.3
 
+                best_pitch = max(improvement_up, improvement_down)
+                best_yaw = max(improvement_left, improvement_right)
+
+                if best_pitch > 0.01:
+                    if improvement_up > improvement_down:
+                        steer[
+                            self.action_space.IDX_LOOK_UP
+                        ] += correction
+                    else:
+                        steer[
+                            self.action_space.IDX_LOOK_DOWN
+                        ] += correction
+
+                if best_yaw > 0.01:
+                    if improvement_left > improvement_right:
+                        steer[
+                            self.action_space.IDX_TURN_LEFT
+                        ] += correction
+                    else:
+                        steer[
+                            self.action_space.IDX_TURN_RIGHT
+                        ] += correction
+
+            # ── Always suppress backward and surface/utility actions ──
             steer[self.action_space.IDX_FREE_BACKWARD] -= 8.0
 
-            # Suppress surface/utility actions in air
             for idx in range(8):
                 steer[idx] -= 8.0
             steer[self.action_space.IDX_ORIENT_HOR] -= 8.0
@@ -1915,6 +1888,45 @@ class RLGoalApproachController:
     # ══════════════════════════════════════════════════════════
     # SUBGOAL HELPERS
     # ══════════════════════════════════════════════════════════
+    def _compute_detach_fly_direction(
+        self,
+        current_pose: np.ndarray,
+        sensor_data: Dict[str, Any],
+    ) -> Optional[np.ndarray]:
+        """Compute fly direction for obstacle avoidance after detach.
+
+        Projects goal direction onto tangent plane of nearest surface,
+        adds normal component for clearance.
+
+        Returns:
+            Unit vector in world space, or None if no normal available.
+        """
+        goal_pos = self._current_goal[:3]
+        goal_dir = goal_pos - current_pose[:3]
+        goal_dist = np.linalg.norm(goal_dir)
+        if goal_dist < 1e-8:
+            return None
+        goal_dir /= goal_dist
+
+        normal = sensor_data.get("point_normal")
+        if normal is None:
+            return None
+        n = np.asarray(normal, dtype=float)
+        n_len = np.linalg.norm(n)
+        if n_len < 1e-8:
+            return None
+        n /= n_len
+
+        tangent = goal_dir - np.dot(goal_dir, n) * n
+        tangent_len = np.linalg.norm(tangent)
+        if tangent_len < 1e-8:
+            return n.copy()
+        tangent /= tangent_len
+
+        fly_dir = tangent * 0.9 + n * 0.3
+        fly_dir /= (np.linalg.norm(fly_dir) + 1e-12)
+        return fly_dir
+            
     def _compute_subgoal_direction(
         self,
         current_pose: np.ndarray,
@@ -2109,6 +2121,9 @@ class RLGoalApproachController:
         self._episode_transitions = []
         self._distance_history = []
         self._flyby_count = 0
+        self._cached_fly_direction = None
+        self._fly_direction_age = 0
+        self._air_phase = "DIRECT"
 
     # ══════════════════════════════════════════════════════════
     # DIAGNOSTICS

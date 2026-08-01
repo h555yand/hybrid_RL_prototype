@@ -141,7 +141,7 @@ class LightweightEnv:
             if hasattr(self, "_current_goal") and self._current_goal is not None:
                 self._detach_simple(
                     goal_pose=self._current_goal,
-                    detach_distance=action_space.free_step * 4,
+                    detach_distance=action_space.free_step * 6,
                 )
         elif action_info.name == "free_forward_small":
             self._move_forward(action_space.free_step_small)
@@ -233,6 +233,8 @@ class LightweightEnv:
             "detach_had_collision": getattr(self, "_detach_had_collision", False),
             "detach_sub_steps": getattr(self, "_last_detach_sub_steps", 1),
             "path_blocked": path_blocked,
+            "up_direction": self.up_direction.tolist(),
+            "object_center": self.mesh.centroid.tolist(),
         }
     
     def get_pose(self):
