@@ -94,7 +94,7 @@ def run_eval_per_seed(  # noqa: PLR0913
             metrics = run_episodes(
                 mesh_dir=str(data_dir),
                 save_dir=load_dir,
-                num_episodes=len(level_pool),
+                num_episodes=episodes_per_level,
                 config=eval_cfg,
                 mesh_path=mesh_path,
                 load_dir=load_dir,

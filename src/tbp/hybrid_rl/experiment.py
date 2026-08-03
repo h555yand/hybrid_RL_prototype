@@ -602,7 +602,7 @@ class RLGoalApproachExperiment:
                 ),
                 scripts_dir=self.scripts_dir,
                 curriculum_levels=self.curriculum_levels,
-                regenerate=False,
+                regenerate=self.regenerate_scripts,
                 prefix=f"heuristic_{mesh_name}",
             )
 

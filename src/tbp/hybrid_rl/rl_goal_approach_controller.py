@@ -175,9 +175,9 @@ class RLGoalApproachController:
         self._last_detach_sub_steps = 1
         self._consecutive_detach_count = 0
         self._flyby_count = 0
-        self._cached_fly_direction = None
         self._fly_direction_age = 0
         self._air_phase = "DIRECT"
+        self._cached_fly_direction = None
         if self.is_training:
             self.epsilon = max(
                 self.epsilon_min,
@@ -210,6 +210,23 @@ class RLGoalApproachController:
             f"depth={sensor_data.get('depth',0):.1f}, "
             f"pos={current_pose[:3]}"
         )
+
+        # Cache fly direction while on surface — used after detach
+        # when point_normal may be None
+        if sensor_data.get("on_object", False):
+            if not sensor_data.get("same_side", True):
+                cached = self._compute_detach_fly_direction(
+                    current_pose, sensor_data
+                )
+                if cached is not None:
+                    self._cached_fly_direction = cached
+                    logger.debug(
+                        f"CACHE_UPDATE: step={self._steps}, "
+                        f"pos={[round(x,1) for x in current_pose[:3].tolist()]}, "
+                        f"cached_dir={[round(x,3) for x in cached.tolist()]}, "
+                        f"same_side=False, "
+                        f"on_horizontal={self._is_on_horizontal_surface(sensor_data)}"
+                    )
 
         collision = self._detect_collision(sensor_data)
         if collision:
@@ -925,39 +942,70 @@ class RLGoalApproachController:
         # ── Air phase management ──
         if on_object < 0.5:
             path_blocked_now = sensor_data.get("path_blocked", False)
+            same_side_now = sensor_data.get("same_side", True)
 
             # Initialize at detach
             if self._last_action == self.action_space.IDX_DETACH:
-                self._cached_fly_direction = self._compute_detach_fly_direction(
-                    current_pose, sensor_data
-                )
+                # Don't overwrite cache — keep direction from on-surface step
                 self._fly_direction_age = 0
-                self._air_phase = "FLY" if path_blocked_now else "DIRECT"
-
+                self._air_phase = (
+                    "FLY"
+                    if self._cached_fly_direction is not None
+                    else "DIRECT"
+                )
+                logger.debug(
+                    f"DETACH_INIT: step={self._steps}, "
+                    f"air_phase={self._air_phase}, "
+                    f"cached={self._cached_fly_direction is not None}, "
+                    f"cached_dir={[round(x,3) for x in self._cached_fly_direction] if self._cached_fly_direction is not None else None}, "
+                    f"same_side={sensor_data.get('same_side', True)}, "
+                    f"path_blocked={sensor_data.get('path_blocked', False)}, "
+                    f"pos={[round(x,1) for x in current_pose[:3].tolist()]}"
+                )
             # Track age of current fly direction
             self._fly_direction_age = getattr(
                 self, '_fly_direction_age', 0
             ) + 1
 
             # State transitions
-            if not path_blocked_now:
+            if self._air_phase == "FLY":
+                if same_side_now and not path_blocked_now:
+                    self._air_phase = "DIRECT"
+                    self._cached_fly_direction = None
+                    logger.debug(
+                        f"FLY_TO_DIRECT: step={self._steps}, "
+                        f"reason=same_side_clear, "
+                        f"same_side={same_side_now}, "
+                        f"path_blocked={path_blocked_now}"
+                    )
+                else:
+                    # Safety: abort FLY if agent flew too far from object
+                    center_raw = sensor_data.get("object_center")
+                    extents_raw = sensor_data.get("object_extents")
+                    if center_raw is not None and extents_raw is not None:
+                        center = np.asarray(center_raw, dtype=float)
+                        dist_from_center = float(np.linalg.norm(
+                            current_pose[:3] - center
+                        ))
+                        max_extent = float(max(extents_raw))
+                        if dist_from_center > max_extent * 2.0:
+                            logger.debug(
+                                f"FLY_SAFETY_ABORT: "
+                                f"dist_from_center={dist_from_center:.1f}, "
+                                f"max_extent={max_extent:.1f}, "
+                                f"threshold={max_extent * 2.0:.1f}"
+                            )
+                            logger.debug(
+                                f"FLY_TO_DIRECT: step={self._steps}, "
+                                f"reason=safety_abort, "
+                                f"dist_from_center={dist_from_center:.1f}, "
+                                f"threshold={max_extent * 2.0:.1f}"
+                            )
+                            self._air_phase = "DIRECT"
+                            self._cached_fly_direction = None
+            elif not path_blocked_now:
                 self._air_phase = "DIRECT"
                 self._cached_fly_direction = None
-            elif (
-                self._air_phase == "FLY"
-                and self._fly_direction_age > 15
-            ):
-                self._air_phase = "REORIENT"
-                self._fly_direction_age = 0
-            elif self._air_phase == "REORIENT":
-                if sensor_data.get("point_normal") is not None:
-                    new_dir = self._compute_detach_fly_direction(
-                        current_pose, sensor_data
-                    )
-                    if new_dir is not None:
-                        self._cached_fly_direction = new_dir
-                    self._air_phase = "FLY"
-                    self._fly_direction_age = 0
         else:
             self._air_phase = "DIRECT"
 
@@ -1016,6 +1064,7 @@ class RLGoalApproachController:
                             gn = gn / gn_len
                             gc_axis = np.cross(n_hat, gn)
                             gc_len = float(np.linalg.norm(gc_axis))
+
                             if gc_len > 0.01:
                                 gc_axis /= gc_len
                                 geodesic_dir = np.cross(gc_axis, n_hat)
@@ -1026,6 +1075,10 @@ class RLGoalApproachController:
                                         e_world
                                         - np.dot(e_world, n_hat) * n_hat
                                     )
+                                    # Fix sign for concave surfaces:
+                                    # cross product may invert direction
+                                    if np.dot(geodesic_dir, e_t_flat) < 0:
+                                        geodesic_dir = -geodesic_dir
                                     e_t = geodesic_dir * float(
                                         np.linalg.norm(e_t_flat)
                                     )
@@ -1195,7 +1248,19 @@ class RLGoalApproachController:
                     tangential_dist = float(np.linalg.norm(e_t))
                     normal_dist = abs(float(np.dot(e_world, n_hat)))
 
-                    if path_blocked:
+                    on_horizontal = self._is_on_horizontal_surface(
+                        sensor_data
+                    )
+                    if on_horizontal:
+                        # Bottom/top face: only detach if agent and goal
+                        # on different sides (same_side=False).
+                        # Uses nearest.on_surface (view-independent),
+                        # more reliable than path_blocked on horizontal
+                        # surfaces where ray-based normal is unreliable.
+                        same_side_val = sensor_data.get("same_side", True)
+                        if not same_side_val:
+                            need_detach = True
+                    elif path_blocked:
                         need_detach = True
                     elif alignment < DETACH_ALIGN_THR:
                         if alignment < -0.5:
@@ -1282,6 +1347,14 @@ class RLGoalApproachController:
             dot_current = float(np.dot(forward_current, effective_goal))
             angle_to_goal = np.degrees(
                 np.arccos(np.clip(dot_current, -1, 1))
+            )
+
+            logger.debug(
+                f"STEER_DEBUG: step={self._steps}, "
+                f"air_phase={air_phase}, "
+                f"effective_goal={[round(x,3) for x in effective_goal.tolist()]}, "
+                f"forward={[round(x,3) for x in forward_current.tolist()]}, "
+                f"angle_to_goal={angle_to_goal:.1f}"
             )
 
             pose_angles = current_pose[3:6]
@@ -1379,14 +1452,14 @@ class RLGoalApproachController:
                         steer[self.action_space.IDX_LOOK_UP] += STEER_STRENGTH
                         steer[
                             self.action_space.IDX_LOOK_UP_BIG
-                        ] += STEER_STRENGTH * 0.5
+                        ] += STEER_STRENGTH
                     else:
                         steer[
                             self.action_space.IDX_LOOK_DOWN
                         ] += STEER_STRENGTH
                         steer[
                             self.action_space.IDX_LOOK_DOWN_BIG
-                        ] += STEER_STRENGTH * 0.5
+                        ] += STEER_STRENGTH
 
                 if best_yaw >= best_pitch and best_yaw > 0.001:
                     if improvement_left > improvement_right:
@@ -1395,14 +1468,14 @@ class RLGoalApproachController:
                         ] += STEER_STRENGTH
                         steer[
                             self.action_space.IDX_TURN_LEFT_BIG
-                        ] += STEER_STRENGTH * 0.5
+                        ] += STEER_STRENGTH
                     else:
                         steer[
                             self.action_space.IDX_TURN_RIGHT
                         ] += STEER_STRENGTH
                         steer[
                             self.action_space.IDX_TURN_RIGHT_BIG
-                        ] += STEER_STRENGTH * 0.5
+                        ] += STEER_STRENGTH
 
             # ── Phase 2: PARTIALLY ALIGNED (20° < angle <= 45°) ──
             elif angle_to_goal > FLY_THR:
@@ -1532,10 +1605,16 @@ class RLGoalApproachController:
             )
 
             if on_object > 0.5:
+                on_horizontal = self._is_on_horizontal_surface(
+                    sensor_data
+                )
                 should_boost_detach = (
-                    alignment < -0.5
-                    or distance
-                    > 15.0 * self.action_space.surface_step
+                    not on_horizontal
+                    and (
+                        alignment < -0.5
+                        or distance
+                        > 15.0 * self.action_space.surface_step
+                    )
                 )
 
                 if should_boost_detach:
@@ -1782,7 +1861,8 @@ class RLGoalApproachController:
         # ────────────────────────────────────────────────────
         landing_bias = np.zeros(self.num_actions, dtype=float)
 
-        if on_object < 0.5:
+        if on_object < 0.5 and getattr(self, '_air_phase', 'DIRECT') != "FLY":
+        # if on_object < 0.5:
             LANDING_THRESHOLD = 8.0 * self.action_space.free_step
             path_blocked_now = sensor_data.get("path_blocked", False)
 
@@ -1895,8 +1975,12 @@ class RLGoalApproachController:
     ) -> Optional[np.ndarray]:
         """Compute fly direction for obstacle avoidance after detach.
 
-        Projects goal direction onto tangent plane of nearest surface,
-        adds normal component for clearance.
+        When same_side=False (agent and goal on opposite sides of wall):
+        fly toward open edge (rim) using up_direction projected onto
+        tangent plane. For horizontal surfaces, fly away from center.
+
+        When same_side=True: original tangent projection toward goal.
+        Works for all solid objects and same-side hollow cases.
 
         Returns:
             Unit vector in world space, or None if no normal available.
@@ -1910,6 +1994,10 @@ class RLGoalApproachController:
 
         normal = sensor_data.get("point_normal")
         if normal is None:
+            logger.debug(
+                "DETACH_FLY_DIR: point_normal is None, "
+                f"agent_pos={current_pose[:3].tolist()}"
+            )
             return None
         n = np.asarray(normal, dtype=float)
         n_len = np.linalg.norm(n)
@@ -1917,16 +2005,96 @@ class RLGoalApproachController:
             return None
         n /= n_len
 
+        same_side = sensor_data.get("same_side", True)
+
+        logger.debug(
+            f"DETACH_FLY_DIR: "
+            f"same_side={same_side}, "
+            f"normal={[round(x, 3) for x in n.tolist()]}, "
+            f"goal_dir={[round(x, 3) for x in goal_dir.tolist()]}, "
+            f"agent_pos={[round(x, 1) for x in current_pose[:3].tolist()]}, "
+            f"goal_pos={[round(x, 1) for x in goal_pos.tolist()]}, "
+            f"distance={goal_dist:.1f}"
+        )
+
+        if not same_side:
+            # Different sides of wall — fly toward open edge (rim)
+            up_raw = sensor_data.get("up_direction")
+            up = (
+                np.asarray(up_raw, dtype=float)
+                if up_raw is not None
+                else np.array([0.0, 0.0, 1.0])
+            )
+
+            # Project up onto tangent plane
+            up_tangent = up - np.dot(up, n) * n
+            up_tangent_len = np.linalg.norm(up_tangent)
+
+            if up_tangent_len > 0.3:
+                # Wall: fly along surface toward rim + away from surface
+                #up_tangent /= up_tangent_len
+                #fly_dir = up_tangent * 0.8 + n * 0.4
+                #fly_dir /= (np.linalg.norm(fly_dir) + 1e-12)
+                # Wall: fly along surface toward rim (straight up)
+                up_tangent /= up_tangent_len
+                fly_dir = up_tangent
+                logger.debug(
+                    f"DETACH_FLY_DIR: opposite sides, wall, "
+                    f"up_tangent={[round(x, 3) for x in up_tangent.tolist()]}, "
+                    f"fly_dir={[round(x, 3) for x in fly_dir.tolist()]}"
+                )
+                return fly_dir
+            else:
+                # Horizontal surface (bottom/top): fly away from center
+                center_raw = sensor_data.get("object_center")
+                if center_raw is not None:
+                    center = np.asarray(center_raw, dtype=float)
+                    away = current_pose[:3] - center
+                    away_t = away - np.dot(away, n) * n
+                    away_len = np.linalg.norm(away_t)
+                    if away_len > 1e-8:
+                        away_t /= away_len
+                        logger.debug(
+                            f"DETACH_FLY_DIR: opposite sides, horizontal, "
+                            f"fly_dir={[round(x, 3) for x in away_t.tolist()]}"
+                        )
+                        return away_t
+
+                logger.debug(
+                    "DETACH_FLY_DIR: opposite sides, fallback to normal"
+                )
+                return n.copy()
+
+        # Same side — original tangent logic
         tangent = goal_dir - np.dot(goal_dir, n) * n
         tangent_len = np.linalg.norm(tangent)
-        if tangent_len < 1e-8:
-            return n.copy()
-        tangent /= tangent_len
 
-        fly_dir = tangent * 0.9 + n * 0.3
+        up_raw = sensor_data.get("up_direction")
+        if up_raw is not None:
+            up = np.asarray(up_raw, dtype=float)
+            normal_horizontality = 1.0 - abs(float(np.dot(n, up)))
+        else:
+            normal_horizontality = 1.0
+
+        if tangent_len < 1e-8:
+            fly_dir = n.copy()
+            logger.debug(
+                f"DETACH_FLY_DIR: same_side, tangent degenerate, "
+                f"fly_dir=normal={[round(x, 3) for x in fly_dir.tolist()]}"
+            )
+            return fly_dir
+
+        tangent /= tangent_len
+        fly_dir = tangent * 0.9 + n * 0.3 * normal_horizontality
         fly_dir /= (np.linalg.norm(fly_dir) + 1e-12)
+        logger.debug(
+            f"DETACH_FLY_DIR: same_side, "
+            f"tangent={[round(x, 3) for x in tangent.tolist()]}, "
+            f"normal_horizontality={normal_horizontality:.2f}, "
+            f"fly_dir={[round(x, 3) for x in fly_dir.tolist()]}"
+        )
         return fly_dir
-            
+                
     def _compute_subgoal_direction(
         self,
         current_pose: np.ndarray,
@@ -2018,6 +2186,28 @@ class RLGoalApproachController:
                 best_idx = i
 
         return best_idx
+
+    def _is_on_horizontal_surface(self, sensor_data: dict) -> bool:
+        """Check if agent is on a horizontal surface (bottom/top face).
+
+        Used to suppress detach on horizontal surfaces where the agent
+        can crawl to the edge and transition to a vertical wall.
+
+        Returns:
+            True if surface normal is within ~30° of up_direction.
+        """
+        point_normal = sensor_data.get("point_normal")
+        if point_normal is None:
+            return False
+        n = np.asarray(point_normal, dtype=float)
+        n_len = np.linalg.norm(n)
+        if n_len < 1e-8:
+            return False
+        up_dir = np.asarray(
+            sensor_data.get("up_direction", [0, 0, 1]),
+            dtype=float,
+        )
+        return abs(float(np.dot(n / n_len, up_dir))) > 0.85
 
     # ══════════════════════════════════════════════════════════
     # COORDINATE TRANSFORMS

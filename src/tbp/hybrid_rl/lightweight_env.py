@@ -141,7 +141,7 @@ class LightweightEnv:
             if hasattr(self, "_current_goal") and self._current_goal is not None:
                 self._detach_simple(
                     goal_pose=self._current_goal,
-                    detach_distance=action_space.free_step * 6,
+                    detach_distance=action_space.free_step * 5,
                 )
         elif action_info.name == "free_forward_small":
             self._move_forward(action_space.free_step_small)
@@ -220,6 +220,12 @@ class LightweightEnv:
         # ═══ Curvature ═══
         curvature_data = self._estimate_curvature()
 
+        same_side = True
+        if hasattr(self, "_current_goal") and self._current_goal is not None:
+            same_side = _is_reachable_by_surface(
+                self, self.agent_pos, self._current_goal[:3]
+            )
+
         return {
             "point_normal": point_normal,
             "k1": curvature_data["k1"],
@@ -235,6 +241,8 @@ class LightweightEnv:
             "path_blocked": path_blocked,
             "up_direction": self.up_direction.tolist(),
             "object_center": self.mesh.centroid.tolist(),
+            "same_side": same_side,
+            "object_extents": (self.mesh.bounds[1] - self.mesh.bounds[0]).tolist(),
         }
     
     def get_pose(self):
@@ -1116,3 +1124,164 @@ def is_on_same_cube_side(pos_a, pos_b, cube_side=42.0, atol=1e-5):
                 return True
 
     return False
+
+
+def _is_reachable_by_surface_old(
+    env: LightweightEnv,
+    start_pos: np.ndarray,
+    goal_pos: np.ndarray,
+) -> bool:
+    """Check if start and goal are on the same side of the object.
+
+    Uses surface normal directions relative to object centroid.
+    For vertical surfaces (walls): normal pointing outward from center
+    means external side, inward means internal side.
+    For horizontal surfaces (bottom/top): normal pointing against
+    up_direction means external (bottom exterior), normal pointing
+    with up_direction means internal (bottom interior).
+
+    Args:
+        env: Environment with mesh.
+        start_pos: Start position [x, y, z].
+        goal_pos: Goal position [x, y, z].
+
+    Returns:
+        True if both points are on the same side.
+    """
+    center = np.array(env.mesh.centroid, dtype=float)
+    height_axis = env.height_axis
+    up = env.up_direction
+
+    # Get normals at nearest surface points
+    _, _, start_face = env.mesh.nearest.on_surface([start_pos])
+    _, _, goal_face = env.mesh.nearest.on_surface([goal_pos])
+
+    start_normal = env.mesh.face_normals[start_face[0]]
+    goal_normal = env.mesh.face_normals[goal_face[0]]
+
+    # Horizontal components (ignore height axis)
+    start_n = start_normal.copy()
+    start_n[height_axis] = 0.0
+
+    goal_n = goal_normal.copy()
+    goal_n[height_axis] = 0.0
+
+    # Direction from center to each point (horizontal)
+    start_from_center = start_pos - center
+    start_from_center[height_axis] = 0.0
+
+    goal_from_center = goal_pos - center
+    goal_from_center[height_axis] = 0.0
+
+    # Determine side for each point
+    if np.linalg.norm(start_n) >= 0.3:
+        # Wall: outward = normal points same direction as center→point
+        start_outward = np.dot(start_n, start_from_center) > 0
+    else:
+        # Horizontal surface (bottom/top): use vertical normal component
+        # Normal against up = outside (bottom exterior)
+        # Normal with up = inside (bottom interior)
+        start_outward = np.dot(start_normal, up) < 0
+
+    if np.linalg.norm(goal_n) >= 0.3:
+        goal_outward = np.dot(goal_n, goal_from_center) > 0
+    else:
+        goal_outward = np.dot(goal_normal, up) < 0
+
+    result = start_outward == goal_outward
+    logger.info(
+        f"REACHABLE_CHECK: "
+        f"start={[round(x,1) for x in start_pos.tolist()]}, "
+        f"goal={[round(x,1) for x in goal_pos.tolist()]}, "
+        f"start_normal={[round(x,3) for x in start_normal.tolist()]}, "
+        f"goal_normal={[round(x,3) for x in goal_normal.tolist()]}, "
+        f"start_outward={start_outward}, "
+        f"goal_outward={goal_outward}, "
+        f"result={result}"
+    )
+    return result
+
+def _is_reachable_by_surface(
+    env: LightweightEnv,
+    start_pos: np.ndarray,
+    goal_pos: np.ndarray,
+) -> bool:
+    """Check if start and goal are on the same side of the object.
+
+    Uses surface normal directions relative to object centroid.
+    For vertical surfaces (walls): normal pointing outward from center
+    means external side, inward means internal side.
+    For horizontal surfaces (bottom/top): normal pointing against
+    up_direction means external (bottom exterior), normal pointing
+    with up_direction means internal (bottom interior).
+    For points far from surface: considered outside (nearest.on_surface
+    is unreliable when far from object).
+
+    Args:
+        env: Environment with mesh.
+        start_pos: Start position [x, y, z].
+        goal_pos: Goal position [x, y, z].
+
+    Returns:
+        True if both points are on the same side.
+    """
+    center = np.array(env.mesh.centroid, dtype=float)
+    height_axis = env.height_axis
+    up = env.up_direction
+
+    # Max wall thickness — points farther than this from surface
+    # are reliably outside the object
+    FAR_THRESHOLD = 10.0
+
+    # Get normals at nearest surface points
+    _, start_dist, start_face = env.mesh.nearest.on_surface([start_pos])
+    _, goal_dist, goal_face = env.mesh.nearest.on_surface([goal_pos])
+
+    start_normal = env.mesh.face_normals[start_face[0]]
+    goal_normal = env.mesh.face_normals[goal_face[0]]
+
+    # Horizontal components (ignore height axis)
+    start_n = start_normal.copy()
+    start_n[height_axis] = 0.0
+
+    goal_n = goal_normal.copy()
+    goal_n[height_axis] = 0.0
+
+    # Direction from center to each point (horizontal)
+    start_from_center = start_pos - center
+    start_from_center[height_axis] = 0.0
+
+    goal_from_center = goal_pos - center
+    goal_from_center[height_axis] = 0.0
+
+    # Determine side for start point
+    if start_dist[0] > FAR_THRESHOLD:
+        # Far from surface — reliably outside
+        start_outward = True
+    elif np.linalg.norm(start_n) >= 0.3:
+        # Wall: outward = normal points same direction as center→point
+        start_outward = np.dot(start_n, start_from_center) > 0
+    else:
+        # Horizontal surface (bottom/top): use vertical normal component
+        start_outward = np.dot(start_normal, up) < 0
+
+    # Determine side for goal point
+    if goal_dist[0] > FAR_THRESHOLD:
+        goal_outward = True
+    elif np.linalg.norm(goal_n) >= 0.3:
+        goal_outward = np.dot(goal_n, goal_from_center) > 0
+    else:
+        goal_outward = np.dot(goal_normal, up) < 0
+
+    result = start_outward == goal_outward
+    logger.debug(
+        f"REACHABLE_CHECK: "
+        f"start={[round(x,1) for x in start_pos.tolist()]}, "
+        f"goal={[round(x,1) for x in goal_pos.tolist()]}, "
+        f"start_normal={[round(x,3) for x in start_normal.tolist()]}, "
+        f"goal_normal={[round(x,3) for x in goal_normal.tolist()]}, "
+        f"start_outward={start_outward}, "
+        f"goal_outward={goal_outward}, "
+        f"result={result}"
+    )
+    return result

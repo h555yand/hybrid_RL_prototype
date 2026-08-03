@@ -23,64 +23,9 @@ from typing import Any
 
 import numpy as np
 
-from tbp.hybrid_rl.lightweight_env import LightweightEnv
+from tbp.hybrid_rl.lightweight_env import LightweightEnv, _is_reachable_by_surface
 
 logger = logging.getLogger(__name__)
-
-
-def _is_reachable_by_surface(
-    env: LightweightEnv,
-    start_pos: np.ndarray,
-    goal_pos: np.ndarray,
-) -> bool:
-    """Check if start and goal are on the same side of the object.
-
-    Uses surface normal directions relative to object centroid.
-    Both normals pointing outward = external side.
-    Both normals pointing inward = internal side.
-    Mixed = different sides, path blocked by wall.
-
-    Args:
-        env: Environment with mesh.
-        start_pos: Start position [x, y, z].
-        goal_pos: Goal position [x, y, z].
-
-    Returns:
-        True if both points are on the same side.
-    """
-    center = np.array(env.mesh.centroid, dtype=float)
-    height_axis = env.height_axis
-
-    # Get normals at nearest surface points
-    _, _, start_face = env.mesh.nearest.on_surface([start_pos])
-    _, _, goal_face = env.mesh.nearest.on_surface([goal_pos])
-
-    start_normal = env.mesh.face_normals[start_face[0]]
-    goal_normal = env.mesh.face_normals[goal_face[0]]
-
-    # Horizontal components (ignore height axis)
-    start_n = start_normal.copy()
-    start_n[height_axis] = 0.0
-
-    goal_n = goal_normal.copy()
-    goal_n[height_axis] = 0.0
-
-    # If either normal is mostly vertical (top/bottom surface) — allow
-    if np.linalg.norm(start_n) < 0.3 or np.linalg.norm(goal_n) < 0.3:
-        return True
-
-    # Direction from center to each point (horizontal)
-    start_from_center = start_pos - center
-    start_from_center[height_axis] = 0.0
-
-    goal_from_center = goal_pos - center
-    goal_from_center[height_axis] = 0.0
-
-    # Outward = normal points same direction as center→point
-    start_outward = np.dot(start_n, start_from_center) > 0
-    goal_outward = np.dot(goal_n, goal_from_center) > 0
-
-    return start_outward == goal_outward
 
 
 def generate_episode_pools(
