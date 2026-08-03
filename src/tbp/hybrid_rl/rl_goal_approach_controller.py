@@ -136,7 +136,9 @@ class RLGoalApproachController:
         self._flyby_count = 0
         self._cached_fly_direction = None
         self._fly_direction_age = 0
-        self._air_phase = "DIRECT"
+        self._cached_orbit_direction = None
+        self._orbit_direction_age = 0
+        self._current_phase = "CRAWL_TO_GOAL"
 
         logger.info(
             f"RLGoalApproachController initialized: "
@@ -176,8 +178,10 @@ class RLGoalApproachController:
         self._consecutive_detach_count = 0
         self._flyby_count = 0
         self._fly_direction_age = 0
-        self._air_phase = "DIRECT"
         self._cached_fly_direction = None
+        self._cached_orbit_direction = None
+        self._orbit_direction_age = 0
+        self._current_phase = "CRAWL_TO_GOAL"
         if self.is_training:
             self.epsilon = max(
                 self.epsilon_min,
@@ -212,7 +216,6 @@ class RLGoalApproachController:
         )
 
         # Cache fly direction while on surface — used after detach
-        # when point_normal may be None
         if sensor_data.get("on_object", False):
             if not sensor_data.get("same_side", True):
                 cached = self._compute_detach_fly_direction(
@@ -220,13 +223,6 @@ class RLGoalApproachController:
                 )
                 if cached is not None:
                     self._cached_fly_direction = cached
-                    logger.debug(
-                        f"CACHE_UPDATE: step={self._steps}, "
-                        f"pos={[round(x,1) for x in current_pose[:3].tolist()]}, "
-                        f"cached_dir={[round(x,3) for x in cached.tolist()]}, "
-                        f"same_side=False, "
-                        f"on_horizontal={self._is_on_horizontal_surface(sensor_data)}"
-                    )
 
         collision = self._detect_collision(sensor_data)
         if collision:
@@ -240,7 +236,9 @@ class RLGoalApproachController:
 
         if self._prev_state is not None:
             reward, done, termination_reason = self._compute_reward(
-                state, self._prev_state, self._last_action, collision
+                state, self._prev_state, self._last_action, collision,
+                sensor_data=sensor_data,
+                prev_sensor_data=self._prev_sensor_data,
             )
             self._episode_reward += reward
             self._episode_transitions.append(
@@ -410,41 +408,19 @@ class RLGoalApproachController:
         sensor_data: Dict[str, Any],
         current_pose: np.ndarray,
     ) -> Tuple[str, Optional[np.ndarray], str]:
-        """Determine current navigation phase and subgoal direction.
-
-        Phases:
-            CRAWL_TO_GOAL: On surface, goal reachable by crawling.
-                Subgoal = goal position (handled by surface_move).
-            DETACH_NEEDED: On surface, must detach to reach goal.
-                Subgoal = detach direction (normal or cached fly dir).
-            FLY_TO_EDGE: In air, need to bypass obstacle before heading
-                to goal. Subgoal = cached fly direction toward rim/edge.
-            FLY_TO_GOAL: In air, path to goal is clear.
-                Subgoal = goal position.
-            LAND: In air, close to goal, should approach surface.
-                Subgoal = goal position with approach angle correction.
-
-        Args:
-            state: Current state vector (15D).
-            sensor_data: Current sensor readings.
-            current_pose: Agent pose [x, y, z, rx, ry, rz].
-
-        Returns:
-            Tuple of (phase_name, subgoal_direction, description).
-            subgoal_direction is a unit vector in world space, or None
-            when the default goal direction should be used.
-        """
         on_object = float(state[11]) > 0.5
         same_side = sensor_data.get("same_side", True)
         path_blocked = sensor_data.get("path_blocked", False)
         distance = float(state[13])
+        depth = sensor_data.get("depth", 100.0)
 
         goal_pos = self._current_goal[:3]
 
         # ═══ ON SURFACE ═══
         if on_object:
+            self._cached_orbit_direction = None
+            self._orbit_direction_age = 0
 
-            # Priority 1: different sides → must detach
             if not same_side:
                 fly_dir = self._compute_detach_fly_direction(
                     current_pose, sensor_data
@@ -455,7 +431,6 @@ class RLGoalApproachController:
                     f"opposite side, need detach (dist={distance:.0f})",
                 )
 
-            # Priority 2: path blocked → check if making progress
             if path_blocked:
                 making_progress = self._is_making_progress(window=10)
                 if not making_progress:
@@ -468,8 +443,6 @@ class RLGoalApproachController:
                         f"path blocked + no progress, detach "
                         f"(dist={distance:.0f})",
                     )
-                # Still making progress despite blocked path
-                # (e.g., crawling around edge) → keep crawling
                 return (
                     "CRAWL_TO_GOAL",
                     None,
@@ -477,7 +450,6 @@ class RLGoalApproachController:
                     f"(dist={distance:.0f})",
                 )
 
-            # Default: crawl to goal
             return (
                 "CRAWL_TO_GOAL",
                 None,
@@ -488,31 +460,104 @@ class RLGoalApproachController:
         else:
             landing_threshold = 8.0 * self.action_space.free_step
 
+            # EMERGENCY LANDING: very close to surface — land immediately
+            # depth < 5mm means we're about to hit surface
+            # Better to land than to crash
+            if depth < 5.0:
+                return (
+                    "LAND",
+                    None,
+                    f"emergency landing, depth={depth:.1f}mm "
+                    f"(dist={distance:.0f})",
+                )
+
             # Close to goal + path clear → land
             if distance < landing_threshold and not path_blocked:
+                self._cached_orbit_direction = None
+                self._orbit_direction_age = 0
                 return (
                     "LAND",
                     None,
                     f"near goal, landing (dist={distance:.0f})",
                 )
 
-            # Still need to bypass obstacle → fly to edge
-            if not same_side or path_blocked:
+            # Path blocked → must bypass obstacle
+            if path_blocked:
                 fly_dir = getattr(self, "_cached_fly_direction", None)
-                if fly_dir is not None:
+
+                extents = sensor_data.get("object_extents", [84, 84, 84])
+                max_extent = float(max(extents))
+
+                center_raw = sensor_data.get("object_center")
+                too_far = False
+                dist_from_center = 0.0
+                if center_raw is not None:
+                    center = np.asarray(center_raw, dtype=float)
+                    dist_from_center = float(
+                        np.linalg.norm(current_pose[:3] - center)
+                    )
+                    too_far = dist_from_center > max_extent * 1.5
+
+                if fly_dir is not None and not too_far:
                     return (
                         "FLY_TO_EDGE",
                         fly_dir.copy(),
-                        f"bypassing obstacle (dist={distance:.0f})",
+                        f"bypassing, cached dir "
+                        f"(dist={distance:.0f}, "
+                        f"from_center={dist_from_center:.0f})",
+                    )
+                else:
+                    orbit_age = getattr(self, "_orbit_direction_age", 0)
+                    cached_orbit = getattr(
+                        self, "_cached_orbit_direction", None
                     )
 
-            # Path clear → fly directly to goal
+                    if cached_orbit is None or orbit_age > 10:
+                        orbit_dir = self._compute_orbit_direction(
+                            current_pose, sensor_data
+                        )
+                        if orbit_dir is not None:
+                            self._cached_orbit_direction = orbit_dir
+                            self._orbit_direction_age = 0
+                            self._cached_fly_direction = None
+                        else:
+                            orbit_dir = cached_orbit
+                    else:
+                        orbit_dir = cached_orbit
+                        self._orbit_direction_age = orbit_age + 1
+
+                    if orbit_dir is not None:
+                        return (
+                            "FLY_TO_EDGE",
+                            orbit_dir.copy(),
+                            f"orbiting, age={self._orbit_direction_age} "
+                            f"(dist={distance:.0f}, "
+                            f"from_center={dist_from_center:.0f})",
+                        )
+
+                    return (
+                        "FLY_TO_GOAL",
+                        None,
+                        f"bypass fallback (dist={distance:.0f})",
+                    )
+
+            if not same_side:
+                self._cached_orbit_direction = None
+                self._orbit_direction_age = 0
+                return (
+                    "FLY_TO_GOAL",
+                    None,
+                    f"different side but path clear "
+                    f"(dist={distance:.0f})",
+                )
+
+            self._cached_orbit_direction = None
+            self._orbit_direction_age = 0
             return (
                 "FLY_TO_GOAL",
                 None,
                 f"path clear, fly to goal (dist={distance:.0f})",
             )
-        
     # ══════════════════════════════════════════════════════════
     # COLLISION DETECTION
     # ══════════════════════════════════════════════════════════
@@ -570,7 +615,15 @@ class RLGoalApproachController:
     # ══════════════════════════════════════════════════════════
     # REWARD
     # ══════════════════════════════════════════════════════════
-    def _compute_reward(self, state, prev_state, action, collision):
+    def _compute_reward(
+        self,
+        state,
+        prev_state,
+        action,
+        collision,
+        sensor_data=None,
+        prev_sensor_data=None,
+    ):
         cfg = self.config
         reward = 0.0
         done = False
@@ -579,10 +632,30 @@ class RLGoalApproachController:
         distance = state[13]
         prev_distance = prev_state[13]
         on_object = state[11]
-        prev_alignment = prev_state[12]
         prev_on_object = prev_state[11]
+        prev_alignment = prev_state[12]
 
         surface_step = self.action_space.surface_step
+
+        # Extract side/phase info
+        curr_same_side = (
+            sensor_data.get("same_side", True)
+            if sensor_data is not None
+            else True
+        )
+        prev_same_side = (
+            prev_sensor_data.get("same_side", True)
+            if prev_sensor_data is not None
+            else True
+        )
+        curr_path_blocked = (
+            sensor_data.get("path_blocked", False)
+            if sensor_data is not None
+            else False
+        )
+
+        # Determine current phase for strategy-aware rewards
+        phase = getattr(self, "_current_phase", "CRAWL_TO_GOAL")
 
         # ═══ 1. Progress toward goal ═══
         progress_raw = prev_distance - distance
@@ -599,7 +672,7 @@ class RLGoalApproachController:
 
         reward += progress / surface_step * cfg["reward_progress"]
 
-        # ═══ 1.5 Subgoal shaping (potential-based, Ng 1999) ═══
+        # ═══ 1.5 Subgoal shaping (potential-based) ═══
         phi_current = self._subgoal_potential(state)
         phi_prev = self._subgoal_potential(prev_state)
         subgoal_shaping = self.gamma * phi_current - phi_prev
@@ -644,13 +717,6 @@ class RLGoalApproachController:
             self._collision_stats[action_name] = (
                 self._collision_stats.get(action_name, 0) + 1
             )
-            logger.debug(
-                f"COLLISION_DETAIL: action={action_name}, "
-                f"depth={state[14]*100:.1f}mm, "
-                f"on_object={state[11]:.0f}, "
-                f"alignment={state[12]:.3f}, "
-                f"distance={state[13]:.1f}, "
-            )
         elif collision == "detach_collision":
             reward += cfg["reward_surface_violation"]
             done = True
@@ -662,10 +728,6 @@ class RLGoalApproachController:
             )
             self._collision_stats[action_name] = (
                 self._collision_stats.get(action_name, 0) + 1
-            )
-            logger.debug(
-                f"DETACH_COLLISION: action={action_name}, "
-                f"distance={state[13]:.1f}, progress={progress_raw:.2f}"
             )
         elif collision == "lost_object":
             if action != self.action_space.IDX_DETACH:
@@ -681,7 +743,102 @@ class RLGoalApproachController:
         if distance < near_radius and on_object > 0.5:
             reward += cfg["reward_near_goal_on_surface"]
 
-        # ═══ 6. Timeout ═══
+        # ═══════════════════════════════════════════════════
+        # 6. PHASE BONUSES — strategy-aware rewards
+        # ═══════════════════════════════════════════════════
+
+        # ── 6.1 Successful detach when needed ──
+        # Agent was on surface, now in air, no collision,
+        # and detach was strategically correct
+        successful_detach = (
+            prev_on_object > 0.5
+            and on_object < 0.5
+            and collision is None
+            and not prev_same_side
+        )
+        # Also reward detach when path was blocked
+        if not successful_detach:
+            prev_path_blocked = (
+                prev_sensor_data.get("path_blocked", False)
+                if prev_sensor_data is not None
+                else False
+            )
+            successful_detach = (
+                prev_on_object > 0.5
+                and on_object < 0.5
+                and collision is None
+                and prev_path_blocked
+            )
+
+        if successful_detach:
+            reward += 3.0
+            logger.debug(
+                f"PHASE_BONUS: successful detach, "
+                f"prev_same_side={prev_same_side}, "
+                f"dist={distance:.1f}"
+            )
+
+        # ── 6.2 Successful landing near goal ──
+        # Agent was in air, now on surface, no collision,
+        # landed on correct side
+        successful_landing = (
+            prev_on_object < 0.5
+            and on_object > 0.5
+            and collision is None
+            and curr_same_side
+        )
+        if successful_landing:
+            # Bonus proportional to how close to goal
+            landing_radius = 8.0 * surface_step
+            landing_quality = max(0.0, 1.0 - distance / landing_radius)
+            landing_bonus = 3.0 * landing_quality
+            reward += landing_bonus
+            logger.debug(
+                f"PHASE_BONUS: successful landing, "
+                f"quality={landing_quality:.2f}, "
+                f"bonus={landing_bonus:.2f}, "
+                f"dist={distance:.1f}"
+            )
+
+        # ── 6.3 Side transition bonus ──
+        # Agent moved from wrong side to correct side
+        if not prev_same_side and curr_same_side:
+            reward += 2.0
+            logger.debug(
+                f"PHASE_BONUS: side transition, "
+                f"dist={distance:.1f}"
+            )
+
+        # ── 6.4 Wrong strategy penalty ──
+        # Crawling on surface when should be flying
+        # (same_side=False or path_blocked+far)
+        goal_threshold = cfg.get("goal_threshold", 2.0)
+        wrong_strategy = (
+            on_object > 0.5
+            and phase == "DETACH_NEEDED"
+            and distance > goal_threshold * 3
+        )
+        if wrong_strategy:
+            reward += -0.3
+            logger.debug(
+                f"PHASE_PENALTY: wrong strategy (crawl in DETACH_NEEDED), "
+                f"dist={distance:.1f}, phase={phase}"
+            )
+
+        # ── 6.5 Correct crawl bonus ──
+        # Small bonus for productive crawling when it's the right strategy
+        if (
+            on_object > 0.5
+            and phase == "CRAWL_TO_GOAL"
+            and progress_raw > 0.1
+        ):
+            reward += 0.2
+            logger.debug(
+                f"PHASE_BONUS: productive crawl, "
+                f"progress={progress_raw:.2f}, dist={distance:.1f}"
+            )
+
+        # ═══ 7. Timeout ═══
         if self._steps >= cfg["max_steps_per_goal"]:
             reward += cfg["reward_timeout"]
             done = True
@@ -1093,6 +1250,14 @@ class RLGoalApproachController:
         if recent_detach >= 1:
             suppress[self.action_space.IDX_DETACH] -= 5.0
 
+        # Suppress detach when close to goal on correct side
+        if (
+            on_object > 0.5
+            and phase == "CRAWL_TO_GOAL"
+            and distance < 5.0 * self.action_space.surface_step
+        ):
+            suppress[self.action_space.IDX_DETACH] -= 8.0
+
         bias += suppress
         components["suppress"] = suppress
 
@@ -1282,7 +1447,7 @@ class RLGoalApproachController:
 
         bias += stagnation
         components["stagnation"] = stagnation
-        
+
         # ────────────────────────────────────────────────────
         # 3) DETACH — phase-driven
         # ────────────────────────────────────────────────────
@@ -1651,7 +1816,7 @@ class RLGoalApproachController:
         components["orientation_cooldown"] = cooldown_bias
 
         # ────────────────────────────────────────────────────
-        # 8) LANDING — phase-driven
+        # 8) LANDING — simple approach
         # ────────────────────────────────────────────────────
         landing_bias = np.zeros(self.num_actions, dtype=float)
 
@@ -1659,24 +1824,48 @@ class RLGoalApproachController:
             LANDING_THRESHOLD = 8.0 * self.action_space.free_step
             CLOSE_LANDING = 3.0 * self.action_space.free_step
 
-            if phase == "LAND":
-                # Active landing phase
-                goal_dir_land = self._current_goal[:3] - current_pose[:3]
-                goal_dist_land = np.linalg.norm(goal_dir_land)
-                if goal_dist_land > 1e-8:
-                    goal_dir_land /= goal_dist_land
-                forward_land = rot.apply([0, 0, -1])
-                dot_land = np.dot(forward_land, goal_dir_land)
-                angle_to_goal_land = np.degrees(
-                    np.arccos(np.clip(dot_land, -1, 1))
-                )
+            goal_dir_land = self._current_goal[:3] - current_pose[:3]
+            goal_dist_land = np.linalg.norm(goal_dir_land)
+            if goal_dist_land > 1e-8:
+                goal_dir_land /= goal_dist_land
+            forward_land = rot.apply([0, 0, -1])
+            dot_land = float(np.dot(forward_land, goal_dir_land))
+            angle_to_goal_land = np.degrees(
+                np.arccos(np.clip(dot_land, -1, 1))
+            )
 
-                if distance < CLOSE_LANDING:
+            depth = sensor_data.get("depth", 100.0)
+
+            if phase == "LAND":
+                # Emergency: very close to surface — only tiny steps
+                if depth < 5.0:
+                    landing_bias[
+                        self.action_space.IDX_FREE_FORWARD
+                    ] -= 15.0
+                    landing_bias[
+                        self.action_space.IDX_FREE_FORWARD_SMALL
+                    ] += 8.0
+                    # Suppress all turns — just land
+                    for idx in [
+                        self.action_space.IDX_LOOK_UP,
+                        self.action_space.IDX_LOOK_DOWN,
+                        self.action_space.IDX_TURN_LEFT,
+                        self.action_space.IDX_TURN_RIGHT,
+                        self.action_space.IDX_LOOK_UP_BIG,
+                        self.action_space.IDX_LOOK_DOWN_BIG,
+                        self.action_space.IDX_TURN_LEFT_BIG,
+                        self.action_space.IDX_TURN_RIGHT_BIG,
+                    ]:
+                        landing_bias[idx] -= 8.0
+
+                elif distance < CLOSE_LANDING:
                     if angle_to_goal_land < 30.0:
                         landing_bias[
                             self.action_space.IDX_FREE_FORWARD_SMALL
                         ] += 10.0
-                        landing_bias[self.action_space.IDX_FREE_FORWARD] -= 5.0
+                        landing_bias[
+                            self.action_space.IDX_FREE_FORWARD
+                        ] -= 5.0
                         for idx in [
                             self.action_space.IDX_LOOK_UP,
                             self.action_space.IDX_LOOK_DOWN,
@@ -1689,12 +1878,17 @@ class RLGoalApproachController:
                         ]:
                             landing_bias[idx] -= 5.0
                     else:
-                        landing_bias[self.action_space.IDX_FREE_FORWARD] -= 15.0
+                        landing_bias[
+                            self.action_space.IDX_FREE_FORWARD
+                        ] -= 15.0
                         landing_bias[
                             self.action_space.IDX_FREE_FORWARD_SMALL
                         ] -= 10.0
                 else:
-                    landing_urgency = 1.0 - (distance / LANDING_THRESHOLD)
+                    landing_urgency = max(
+                        0.0, 1.0 - (distance / LANDING_THRESHOLD)
+                    )
+
                     landing_bias[
                         self.action_space.IDX_FREE_FORWARD
                     ] -= 4.0 * landing_urgency
@@ -1702,10 +1896,14 @@ class RLGoalApproachController:
                         self.action_space.IDX_FREE_FORWARD_SMALL
                     ] += 3.0 * landing_urgency
 
-                    if norm_depth < 0.3:
+                    if depth < 10.0:
+                        # Close to surface — prefer small steps
                         landing_bias[
                             self.action_space.IDX_FREE_FORWARD_SMALL
-                        ] += 4.0 * landing_urgency
+                        ] += 4.0
+                        landing_bias[
+                            self.action_space.IDX_FREE_FORWARD
+                        ] -= 4.0
 
                     if distance < 4.0 * self.action_space.free_step:
                         for idx in [
@@ -1716,7 +1914,7 @@ class RLGoalApproachController:
                         ]:
                             landing_bias[idx] -= 3.0
 
-            # Flyby detection during landing approach
+            # ── Flyby detection ──
             if not sensor_data.get("path_blocked", False):
                 if len(self._distance_history) >= 10:
                     min_recent_10 = min(self._distance_history[-10:])
@@ -1725,18 +1923,118 @@ class RLGoalApproachController:
                         overshoot > 1.0 * self.action_space.free_step
                         and min_recent_10 < LANDING_THRESHOLD
                     ):
-                        landing_bias[self.action_space.IDX_FREE_FORWARD] -= 20.0
+                        landing_bias[
+                            self.action_space.IDX_FREE_FORWARD
+                        ] -= 20.0
                         landing_bias[
                             self.action_space.IDX_FREE_FORWARD_SMALL
                         ] -= 15.0
 
         bias += landing_bias
         components["landing"] = landing_bias
-
+        
         return bias, components
+    
     # ══════════════════════════════════════════════════════════
     # SUBGOAL HELPERS
     # ══════════════════════════════════════════════════════════
+    def _compute_orbit_direction(
+        self,
+        current_pose: np.ndarray,
+        sensor_data: Dict[str, Any],
+    ) -> Optional[np.ndarray]:
+        """Compute direction to orbit/bypass around object toward goal.
+
+        Strategy depends on relative positions:
+        - Goal farther from center: orbit around with outward radial
+        - Goal closer to center: orbit around with inward radial
+        (to fly over edge and descend inside)
+
+        Args:
+            current_pose: Agent pose [x, y, z, rx, ry, rz].
+            sensor_data: Current sensor readings.
+
+        Returns:
+            Unit vector in world space, or None if cannot compute.
+        """
+        center_raw = sensor_data.get("object_center")
+        if center_raw is None:
+            return None
+
+        center = np.asarray(center_raw, dtype=float)
+        goal_pos = self._current_goal[:3]
+
+        up_dir_raw = sensor_data.get("up_direction", [0, 0, 1])
+        up_dir = np.asarray(up_dir_raw, dtype=float)
+        height_axis = int(np.argmax(np.abs(up_dir)))
+
+        # Horizontal vectors
+        center_to_agent = current_pose[:3] - center
+        center_to_agent[height_axis] = 0.0
+        ca_len = np.linalg.norm(center_to_agent)
+        if ca_len < 1e-8:
+            return None
+        radial_outward = center_to_agent / ca_len
+
+        center_to_goal = goal_pos - center
+        center_to_goal[height_axis] = 0.0
+        cg_len = np.linalg.norm(center_to_goal)
+
+        # Determine if goal is inside or outside relative to agent
+        goal_is_inside = cg_len < ca_len * 0.8
+
+        # Radial direction: outward or inward depending on goal
+        if goal_is_inside:
+            radial = -radial_outward
+        else:
+            radial = radial_outward
+
+        # Two tangent directions
+        tangent1 = np.cross(up_dir, center_to_agent)
+        t1_len = np.linalg.norm(tangent1)
+        if t1_len < 1e-8:
+            return radial
+        tangent1 /= t1_len
+        tangent2 = -tangent1
+
+        # Pick tangent closer to goal direction
+        if cg_len > 1e-8:
+            dot1 = float(np.dot(tangent1, center_to_goal))
+            dot2 = float(np.dot(tangent2, center_to_goal))
+            tangent = tangent1 if dot1 >= dot2 else tangent2
+        else:
+            tangent = tangent1
+
+        # Blend: tangent + radial
+        radial_dot_goal = float(np.dot(radial_outward, center_to_goal))
+        goal_alignment = abs(radial_dot_goal) / (cg_len + 1e-8)
+
+        if goal_is_inside:
+            # Flying inward — more radial to cross over edge
+            orbit_dir = tangent * 0.5 + radial * 0.7
+        elif goal_alignment > 0.7:
+            # Goal directly behind — need strong orbit
+            orbit_dir = tangent * 0.8 + radial * 0.3
+        else:
+            # Goal to the side — balanced
+            orbit_dir = tangent * 0.7 + radial * 0.5
+
+        orbit_len = np.linalg.norm(orbit_dir)
+        if orbit_len < 1e-8:
+            return radial
+        orbit_dir /= orbit_len
+
+        logger.debug(
+            f"ORBIT_DIR: "
+            f"goal_is_inside={goal_is_inside}, "
+            f"ca_len={ca_len:.1f}, cg_len={cg_len:.1f}, "
+            f"radial={[round(x, 3) for x in radial.tolist()]}, "
+            f"tangent={[round(x, 3) for x in tangent.tolist()]}, "
+            f"orbit_dir={[round(x, 3) for x in orbit_dir.tolist()]}"
+        )
+
+        return orbit_dir
+
     def _compute_detach_fly_direction(
         self,
         current_pose: np.ndarray,
@@ -2103,7 +2401,9 @@ class RLGoalApproachController:
         self._flyby_count = 0
         self._cached_fly_direction = None
         self._fly_direction_age = 0
-        self._air_phase = "DIRECT"
+        self._cached_orbit_direction = None
+        self._orbit_direction_age = 0
+        self._current_phase = "CRAWL_TO_GOAL"
 
     # ══════════════════════════════════════════════════════════
     # DIAGNOSTICS
@@ -2196,7 +2496,9 @@ class RLGoalApproachController:
             next_store = self._select_store(state)
 
             reward, done, termination_reason = self._compute_reward(
-                state, self._prev_state, self._last_action, collision
+                state, self._prev_state, self._last_action, collision,
+                sensor_data=sensor_data,
+                prev_sensor_data=self._prev_sensor_data,
             )
             self._episode_reward += reward
             self._episode_transitions.append(
