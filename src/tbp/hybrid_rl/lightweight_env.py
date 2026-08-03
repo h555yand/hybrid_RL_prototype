@@ -186,36 +186,26 @@ class LightweightEnv:
             _, _, gf_id = self.mesh.nearest.on_surface([goal_pos])
             goal_normal = self.mesh.face_normals[gf_id[0]].tolist()
 
-        # ═══ path_blocked ═══
+        # ═══ path_blocked (ray cast) ═══
         path_blocked = False
         if hasattr(self, "_current_goal") and self._current_goal is not None:
             goal_pos = self._current_goal[:3]
-            center = (self.mesh.bounds[0] + self.mesh.bounds[1]) / 2.0
-            h = self.height_axis
+            direction = goal_pos - self.agent_pos
+            dist_to_goal = np.linalg.norm(direction)
 
-            agent_from_center = self.agent_pos - center
-            agent_from_center[h] = 0.0
-
-            goal_from_center = goal_pos - center
-            goal_from_center[h] = 0.0
-
-            agent_outside = True
-            if point_normal is not None:
-                n = np.array(point_normal)
-                n_horiz = n.copy()
-                n_horiz[h] = 0.0
-                if np.linalg.norm(n_horiz) > 0.1:
-                    agent_outside = np.dot(n_horiz, agent_from_center) > 0
-
-            goal_outside = True
-            if goal_normal is not None:
-                gn = np.array(goal_normal)
-                gn_horiz = gn.copy()
-                gn_horiz[h] = 0.0
-                if np.linalg.norm(gn_horiz) > 0.1:
-                    goal_outside = np.dot(gn_horiz, goal_from_center) > 0
-
-            path_blocked = (agent_outside != goal_outside)
+            if dist_to_goal > 1e-8:
+                direction_norm = direction / dist_to_goal
+                bl_locations, _, _ = self.mesh.ray.intersects_location(
+                    ray_origins=[self.agent_pos],
+                    ray_directions=[direction_norm],
+                )
+                if len(bl_locations) > 0:
+                    hit_distances = np.linalg.norm(
+                        bl_locations - self.agent_pos, axis=1
+                    )
+                    # Blocked if any intersection is closer than goal
+                    # margin 2.0mm to avoid counting the goal surface itself
+                    path_blocked = bool(np.min(hit_distances) < dist_to_goal - 2.0)
 
         # ═══ Curvature ═══
         curvature_data = self._estimate_curvature()
@@ -230,7 +220,6 @@ class LightweightEnv:
             "point_normal": point_normal,
             "k1": curvature_data["k1"],
             "k2": curvature_data["k2"],
-            # Keep backward compatibility
             "principal_curvatures": [curvature_data["k1"], curvature_data["k2"]],
             "on_object": on_object,
             "depth": depth,
@@ -494,9 +483,13 @@ class LightweightEnv:
             if np.dot(hit_n, n) < 0:
                 hit_n = -hit_n
 
-            same_face = np.dot(hit_n, n) > 0.5
+            # Allow edge transitions: normal can change up to ~95°
+            # Old threshold 0.5 blocked 90° transitions (bottom→wall)
+            # New threshold -0.1 allows smooth edge crawling
+            # but still blocks pass-through (dot ≈ -1)
+            can_transition = np.dot(hit_n, n) > -0.1
 
-            if same_face:
+            if can_transition:
                 self.agent_pos = closest[0] + hit_n * 2.0
                 self.agent_rot = self._look_at_direction(-hit_n)
             else:

@@ -7,8 +7,8 @@ experiment:
   _target_: tbp.hybrid_rl.experiment.RLGoalApproachExperiment
   config:
     seed: 42
-    visualise: false
-    regenerate_scripts: true
+    visualise: true
+    regenerate_scripts: false
     do_train: false
     do_eval: false
     do_heur_eval: true
