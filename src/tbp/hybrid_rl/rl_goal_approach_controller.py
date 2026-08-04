@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 class RLGoalApproachController:
     """Q-learning controller that moves agent toward goal pose.
 
-    State vector (15D):
+    State vector (18D):
         local_pos_error  [3D]: direction to goal in agent's local frame
         rot_error        [3D]: orientation error (normalized angles)
         local_normal     [3D]: surface normal in agent's local frame
@@ -42,6 +42,7 @@ class RLGoalApproachController:
         alignment        [1D]: dot(goal_direction, point_normal)
         distance         [1D]: Euclidean distance to goal
         norm_depth       [1D]: normalized depth to nearest surface
+        goal_normal_local[3D]: goal surface normal in agent's local frame
     """
 
     def __init__(self, agent_id: str, config: Optional[Dict] = None):
@@ -341,30 +342,38 @@ class RLGoalApproachController:
         # Principal curvatures
         k1_raw = float(sensor_data.get("k1", 0.0))
         k2_raw = float(sensor_data.get("k2", 0.0))
-        # Convention: |k1| >= |k2|
         if abs(k1_raw) < abs(k2_raw):
             k1, k2 = k2_raw, k1_raw
         else:
             k1, k2 = k1_raw, k2_raw
-        # In air, curvature is undefined
         if on_object < 0.5:
             k1, k2 = 0.0, 0.0
 
+        # Goal normal in agent's local frame
+        raw_goal_normal = sensor_data.get("goal_normal", None)
+        if raw_goal_normal is not None:
+            goal_normal_local = self._world_to_local(
+                np.array(raw_goal_normal), current_pose
+            )
+        else:
+            goal_normal_local = np.zeros(3)
+
         state = np.concatenate(
             [
-                local_pos_error,  # [0:3]   3D
-                rot_error_deg,    # [3:6]   3D
-                local_normal,     # [6:9]   3D
-                [k1],             # [9]     1D  principal curvature max
-                [k2],             # [10]    1D  principal curvature min
-                [on_object],      # [11]    1D
-                [alignment],      # [12]    1D
-                [distance],       # [13]    1D
-                [norm_depth],     # [14]    1D
+                local_pos_error,      # [0:3]   3D
+                rot_error_deg,        # [3:6]   3D
+                local_normal,         # [6:9]   3D
+                [k1],                 # [9]     1D
+                [k2],                 # [10]    1D
+                [on_object],          # [11]    1D
+                [alignment],          # [12]    1D
+                [distance],           # [13]    1D
+                [norm_depth],         # [14]    1D
+                goal_normal_local,    # [15:18] 3D
             ]
         )
 
-        # Track distance for flyby detection (used by heuristic)
+        # Track distance for flyby detection
         self._distance_history.append(distance)
 
         # Track no-effect orientation actions for cooldown
@@ -388,7 +397,6 @@ class RLGoalApproachController:
                 self.action_space.IDX_ROTATE_POS,
                 self.action_space.IDX_ROTATE_NEG,
             }
-            # Only count no-effect on surface; in air turns are needed
             if (
                 action in orientation_actions
                 and dist_change < 0.1
@@ -748,15 +756,12 @@ class RLGoalApproachController:
         # ═══════════════════════════════════════════════════
 
         # ── 6.1 Successful detach when needed ──
-        # Agent was on surface, now in air, no collision,
-        # and detach was strategically correct
         successful_detach = (
             prev_on_object > 0.5
             and on_object < 0.5
             and collision is None
             and not prev_same_side
         )
-        # Also reward detach when path was blocked
         if not successful_detach:
             prev_path_blocked = (
                 prev_sensor_data.get("path_blocked", False)
@@ -771,16 +776,14 @@ class RLGoalApproachController:
             )
 
         if successful_detach:
-            reward += 3.0
+            reward += 10.0
             logger.debug(
-                f"PHASE_BONUS: successful detach, "
+                f"PHASE_BONUS: successful detach +10.0, "
                 f"prev_same_side={prev_same_side}, "
                 f"dist={distance:.1f}"
             )
 
         # ── 6.2 Successful landing near goal ──
-        # Agent was in air, now on surface, no collision,
-        # landed on correct side
         successful_landing = (
             prev_on_object < 0.5
             and on_object > 0.5
@@ -788,30 +791,25 @@ class RLGoalApproachController:
             and curr_same_side
         )
         if successful_landing:
-            # Bonus proportional to how close to goal
             landing_radius = 8.0 * surface_step
             landing_quality = max(0.0, 1.0 - distance / landing_radius)
-            landing_bonus = 3.0 * landing_quality
+            landing_bonus = 8.0 * landing_quality
             reward += landing_bonus
             logger.debug(
-                f"PHASE_BONUS: successful landing, "
+                f"PHASE_BONUS: successful landing +{landing_bonus:.1f}, "
                 f"quality={landing_quality:.2f}, "
-                f"bonus={landing_bonus:.2f}, "
                 f"dist={distance:.1f}"
             )
 
         # ── 6.3 Side transition bonus ──
-        # Agent moved from wrong side to correct side
         if not prev_same_side and curr_same_side:
-            reward += 2.0
+            reward += 5.0
             logger.debug(
-                f"PHASE_BONUS: side transition, "
+                f"PHASE_BONUS: side transition +5.0, "
                 f"dist={distance:.1f}"
             )
 
         # ── 6.4 Wrong strategy penalty ──
-        # Crawling on surface when should be flying
-        # (same_side=False or path_blocked+far)
         goal_threshold = cfg.get("goal_threshold", 2.0)
         wrong_strategy = (
             on_object > 0.5
@@ -819,24 +817,20 @@ class RLGoalApproachController:
             and distance > goal_threshold * 3
         )
         if wrong_strategy:
-            reward += -0.3
+            reward += -0.5
             logger.debug(
-                f"PHASE_PENALTY: wrong strategy (crawl in DETACH_NEEDED), "
+                f"PHASE_PENALTY: wrong strategy -0.5, "
                 f"dist={distance:.1f}, phase={phase}"
             )
 
         # ── 6.5 Correct crawl bonus ──
-        # Small bonus for productive crawling when it's the right strategy
         if (
             on_object > 0.5
             and phase == "CRAWL_TO_GOAL"
             and progress_raw > 0.1
         ):
             reward += 0.2
-            logger.debug(
-                f"PHASE_BONUS: productive crawl, "
-                f"progress={progress_raw:.2f}, dist={distance:.1f}"
-            )
+
 
         # ═══ 7. Timeout ═══
         if self._steps >= cfg["max_steps_per_goal"]:
@@ -882,11 +876,22 @@ class RLGoalApproachController:
         return self.alpha * self.eval_alpha_multiplier
 
     def _apply_success_backup_updates(self) -> None:
+        """Apply backward updates along successful trajectory.
+
+        Two mechanisms:
+        1. Standard lambda-return: propagates discounted return backward
+        through the trajectory with exponential decay.
+        2. Critical Action Bonus: directly boosts Q-values for strategic
+        actions (detach) that enabled the success, regardless of
+        their position in the trajectory. Solves credit assignment
+        for early-episode decisions.
+        """
         if not self.success_backup_enabled:
             return
         if not self._episode_transitions:
             return
 
+        # ═══ Standard lambda-return backup ═══
         if self.success_backup_steps > 0:
             k = min(
                 self.success_backup_steps, len(self._episode_transitions)
@@ -904,7 +909,7 @@ class RLGoalApproachController:
         g_return = 0.0
         for depth, tr in enumerate(reversed(tail)):
             g_return = tr["reward"] + self.gamma * g_return
-            lr = base_alpha * (self.success_backup_lambda**depth)
+            lr = base_alpha * (self.success_backup_lambda ** depth)
             store = self._select_store(tr["state"])
             store.update_q_value(
                 tr["state"],
@@ -914,14 +919,38 @@ class RLGoalApproachController:
                 count_visit=False,
             )
 
+        # ═══ Critical Action Bonus ═══
+        # Directly boost Q-values for detach actions in successful
+        # episodes. Detach is typically at the start of the episode,
+        # far from goal_reached reward. Lambda-return gives it almost
+        # zero credit. This bonus ensures detach learns its true value.
+        critical_bonus = self.config.get("reward_goal_reached", 30.0) * 0.3
+        critical_lr = self._get_learning_rate() * 0.2
+
+        detach_count = 0
+        for tr in self._episode_transitions:
+            action = tr["action"]
+            if action == self.action_space.IDX_DETACH:
+                store = self._select_store(tr["state"])
+                store.update_q_value(
+                    tr["state"],
+                    action,
+                    critical_bonus,
+                    critical_lr,
+                    count_visit=False,
+                )
+                detach_count += 1
+
         logger.debug(
-            "Applied success backup updates: k=%d, base_alpha=%.4f, "
-            "lambda=%.3f",
+            "Applied success backup: k=%d, base_alpha=%.4f, "
+            "lambda=%.3f, critical_bonus=%.1f, detach_count=%d",
             k,
             base_alpha,
             self.success_backup_lambda,
+            critical_bonus,
+            detach_count,
         )
-
+        
     def _get_current_epsilon(self):
         if self.is_training:
             return self.epsilon
