@@ -26,6 +26,7 @@ DEFAULT_CONFIG = {
     "norm_warmup_steps": 5000,          # how many raw states to accumulate for freezing
     "norm_min_std": 1e-4,               # zero dispersion protection
     "rebuild_on_freeze": True,          # rebuild index after freeze
+    "feature_weights": None,
     # Actions
     "num_actions": 24,
     "free_step_small": 2.0,

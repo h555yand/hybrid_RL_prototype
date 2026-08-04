@@ -128,6 +128,15 @@ class HNSWStateStore:
         self._norm_update_interval: int = 50
         self._norm_min_samples: int = 50
 
+        # Feature weights for distance computation
+        # Boost strategic features so HNSW distinguishes
+        # crawl vs detach states better
+        self._feature_weights = np.ones(self.state_dim)
+        feature_weights_config = self.config.get("feature_weights", None)
+        if feature_weights_config is not None:
+            for idx, weight in feature_weights_config.items():
+                self._feature_weights[int(idx)] = float(weight)
+
     def _update_normalization(self, state: np.ndarray):
         self._state_buffer.append(state.copy())
 
@@ -232,7 +241,7 @@ class HNSWStateStore:
     # NORMALIZATION
     # ══════════════════════════════════════════════════════════
 
-    def _normalize(self, state: np.ndarray) -> np.ndarray:
+    def _normalize_old(self, state: np.ndarray) -> np.ndarray:
         """Normalize raw state for HNSW distance computation.
 
         Without normalization, features with larger scale (e.g. position
@@ -244,6 +253,11 @@ class HNSWStateStore:
             zero mean and unit variance.
         """
         return (state - self._state_mean) / (self._state_std + 1e-8)
+    
+    def _normalize(self, state: np.ndarray) -> np.ndarray:
+        normalized = (state - self._state_mean) / (self._state_std + 1e-8)
+        normalized *= self._feature_weights
+        return normalized
 
     def _rebuild_index_with_renorm(self):
         """Rebuild HNSW index after normalization is frozen/changed.
@@ -839,6 +853,7 @@ class HNSWStateStore:
                 sigma=np.array([self.sigma]),
                 state_mean=self._state_mean,
                 state_std=self._state_std,
+                feature_weights=self._feature_weights,
             )
             return
 
@@ -862,6 +877,7 @@ class HNSWStateStore:
             ]),
             sigma=np.array([self.sigma]),
             state_mean=self._state_mean,
+            feature_weights=self._feature_weights,
             state_std=self._state_std,
             point_ids=np.array(ids),
             norm_states=norm_states,
@@ -970,6 +986,9 @@ class HNSWStateStore:
         store.global_step = global_step
         store._state_mean = data["state_mean"]
         store._state_std = data["state_std"]
+        # Restore feature weights
+        if "feature_weights" in data:
+            store._feature_weights = data["feature_weights"]
 
         # Load native HNSW index
         try:
@@ -1075,6 +1094,9 @@ class HNSWStateStore:
         store.global_step = global_step
         store._state_mean = data["state_mean"]
         store._state_std = data["state_std"]
+        # Restore feature weights
+        if "feature_weights" in data:
+            store._feature_weights = data["feature_weights"]
 
         # Restore points and rebuild index
         if "norm_states" in data:
