@@ -25,6 +25,7 @@ from scipy.spatial.transform import Rotation as R
 from .action_space import ActionSpace
 from .config import DEFAULT_CONFIG
 from .hnsw_state_store import HNSWStateStore
+from .transition_memory import TransitionMemory
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +71,25 @@ class RLGoalApproachController:
         # HNSW Q-store
         self.q_store_free = HNSWStateStore(config=self.config, name="free")
         self.q_store_surface = HNSWStateStore(config=self.config, name="surface")
+        # Strategic transition memories
+        self.transition_detach = TransitionMemory(
+            state_dim=3,  # было 5
+            max_points=self.config.get("transition_max_points", 10000),
+            k_neighbors=self.config.get("transition_k_neighbors", 5),
+            insert_threshold=self.config.get(
+                "transition_insert_threshold", 0.5
+            ),
+            name="detach",
+        )
+        self.transition_direction = TransitionMemory(
+            state_dim=4,  # было 6
+            max_points=self.config.get("transition_max_points", 10000),
+            k_neighbors=self.config.get("transition_k_neighbors", 5),
+            insert_threshold=self.config.get(
+                "transition_insert_threshold", 0.5
+            ),
+            name="direction",
+        )
 
         # Q-learning parameters
         self.gamma = self.config["gamma"]
@@ -112,6 +132,9 @@ class RLGoalApproachController:
         self._episode_transitions: List[Dict[str, Any]] = []
         self.success_trails = []
         self.start_pos: Optional[np.ndarray] = None
+        self._pending_detach_states: List[np.ndarray] = []
+        self._pending_direction_state: Optional[np.ndarray] = None
+        self._prev_phase: Optional[str] = None
 
         # Distance tracking for flyby detection
         self._distance_history: List[float] = []
@@ -140,6 +163,24 @@ class RLGoalApproachController:
         self._cached_orbit_direction = None
         self._orbit_direction_age = 0
         self._current_phase = "CRAWL_TO_GOAL"
+        self._strategic_stats = {
+            # Detach decisions
+            "detach_memory_triggered": 0,
+            "detach_memory_suppressed": 0,
+            "detach_heuristic_fallback": 0,
+            "detach_total": 0,
+            # Direction decisions
+            "direction_memory_to_goal": 0,
+            "direction_memory_keep_edge": 0,
+            "direction_heuristic_fallback": 0,
+            # Outcomes
+            "detach_led_to_success": 0,
+            "detach_led_to_collision": 0,
+            "detach_led_to_timeout": 0,
+            # Phase counts per episode (reset each episode)
+            "phase_counts": {},
+        }
+        self._episode_phase_counts: Dict[str, int] = {}
 
         logger.info(
             f"RLGoalApproachController initialized: "
@@ -183,15 +224,15 @@ class RLGoalApproachController:
         self._cached_orbit_direction = None
         self._orbit_direction_age = 0
         self._current_phase = "CRAWL_TO_GOAL"
+        self._prev_phase = None
+        self._pending_detach_states = []
+        self._pending_direction_state = None
         if self.is_training:
             self.epsilon = max(
                 self.epsilon_min,
                 self.epsilon * self.epsilon_decay,
             )
-        logger.debug(
-            f"New goal set (episode {self._total_episodes}): "
-            f"pos={goal_pose[:3]}, rot={np.degrees(goal_pose[3:])}°"
-        )
+        self._episode_phase_counts = {}
 
     def step(
         self,
@@ -410,6 +451,137 @@ class RLGoalApproachController:
 
         return state
 
+    def _compute_detach_transition_state(
+        self,
+        state: np.ndarray,
+        sensor_data: Dict[str, Any],
+    ) -> np.ndarray:
+        """Compact state for detach decision (3D).
+
+        Only geometric features that determine whether detach
+        is beneficial. No dynamic features (progress, stagnation).
+
+        Features:
+            normal_agreement: dot(agent_normal, goal_normal)
+            alignment: dot(goal_dir, agent_normal)
+            norm_distance: distance / object_extent
+
+        Args:
+            state: Full 18D state vector.
+            sensor_data: Current sensor readings.
+
+        Returns:
+            3D compact state vector.
+        """
+        agent_normal = state[6:9]
+        goal_normal = state[15:18]
+
+        an_len = np.linalg.norm(agent_normal)
+        gn_len = np.linalg.norm(goal_normal)
+        if an_len > 1e-8 and gn_len > 1e-8:
+            normal_agreement = float(
+                np.dot(agent_normal / an_len, goal_normal / gn_len)
+            )
+        else:
+            normal_agreement = 0.0
+
+        alignment = float(state[12])
+
+        extents = sensor_data.get("object_extents", [84, 84, 84])
+        max_extent = float(max(extents))
+        norm_distance = float(state[13]) / max(max_extent, 1.0)
+
+        return np.array([
+            normal_agreement,
+            alignment,
+            norm_distance,
+        ], dtype=float)
+    
+    def _compute_direction_transition_state(
+    self,
+    state: np.ndarray,
+    sensor_data: Dict[str, Any],
+    current_pose: np.ndarray,
+) -> np.ndarray:
+        """Compact state for direction decision in air (4D).
+
+        Captures whether agent has bypassed obstacle and can
+        fly directly to goal.
+
+        Features:
+            normal_agreement: dot(agent_normal, goal_normal)
+            alignment: dot(goal_dir, agent_normal)
+            norm_distance: distance / object_extent
+            angle_to_goal: dot(forward, goal_dir)
+
+        Args:
+            state: Full 18D state vector.
+            sensor_data: Current sensor readings.
+            current_pose: Agent pose [x, y, z, rx, ry, rz].
+
+        Returns:
+            4D compact state vector.
+        """
+        agent_normal = state[6:9]
+        goal_normal = state[15:18]
+
+        an_len = np.linalg.norm(agent_normal)
+        gn_len = np.linalg.norm(goal_normal)
+        if an_len > 1e-8 and gn_len > 1e-8:
+            normal_agreement = float(
+                np.dot(agent_normal / an_len, goal_normal / gn_len)
+            )
+        else:
+            normal_agreement = 0.0
+
+        alignment = float(state[12])
+
+        extents = sensor_data.get("object_extents", [84, 84, 84])
+        max_extent = float(max(extents))
+        norm_distance = float(state[13]) / max(max_extent, 1.0)
+
+        # Angle between forward and goal direction
+        rot = R.from_euler("xyz", current_pose[3:6], degrees=True)
+        forward = rot.apply([0, 0, -1])
+        goal_dir = self._current_goal[:3] - current_pose[:3]
+        goal_dist = np.linalg.norm(goal_dir)
+        if goal_dist > 1e-8:
+            goal_dir /= goal_dist
+        angle_to_goal = float(np.dot(forward, goal_dir))
+
+        return np.array([
+            normal_agreement,
+            alignment,
+            norm_distance,
+            angle_to_goal,
+        ], dtype=float)
+
+    def _compute_detach_state_from_full(
+        self,
+        full_state: np.ndarray,
+    ) -> np.ndarray:
+        """Compute detach transition state from stored full state."""
+        agent_normal = full_state[6:9]
+        goal_normal = full_state[15:18]
+
+        an_len = np.linalg.norm(agent_normal)
+        gn_len = np.linalg.norm(goal_normal)
+        if an_len > 1e-8 and gn_len > 1e-8:
+            normal_agreement = float(
+                np.dot(agent_normal / an_len, goal_normal / gn_len)
+            )
+        else:
+            normal_agreement = 0.0
+
+        alignment = float(full_state[12])
+        norm_distance = float(full_state[13]) / 84.0
+
+        return np.array([
+            normal_agreement,
+            alignment,
+            norm_distance,
+        ], dtype=float)
+    
     def _determine_phase(
         self,
         state: np.ndarray,
@@ -1034,7 +1206,7 @@ class RLGoalApproachController:
             combined[self.action_space.IDX_DETACH] = -1e9
         if self._consecutive_detach_count >= 3:
             combined[self.action_space.IDX_DETACH] = -1e9
-        if state[11] > 0.5:  # on surface
+        if state[11] > 0.5:
             combined[self.action_space.IDX_FREE_FORWARD] = -1e9
             combined[self.action_space.IDX_FREE_FORWARD_SMALL] = -1e9
             combined[self.action_space.IDX_FREE_BACKWARD] = -1e9
@@ -1042,40 +1214,150 @@ class RLGoalApproachController:
         is_random_override = False
         is_heuristic_override = False
         action_index = None
+        strategic_source = None
 
-        v = combined / temperature
-        v = v - np.max(v)
-        exp_v = np.exp(v)
-        probs = exp_v / exp_v.sum()
+        # ═══ STRATEGIC LEVEL: transition memories ═══
+        current_phase = getattr(self, "_current_phase", "CRAWL_TO_GOAL")
+        on_object = state[11] > 0.5
 
-        p_random = 0.02 * eps
-        if np.random.random() < p_random:
-            is_random_override = True
-            valid_mask = np.ones(self.num_actions, dtype=bool)
-            if state[11] < 0.5:
-                valid_mask[self.action_space.IDX_DETACH] = False
-                # Don't randomly do surface actions in air
-                for idx in range(8):
-                    valid_mask[idx] = False
-            if self._consecutive_detach_count >= 3:
-                valid_mask[self.action_space.IDX_DETACH] = False
-            if state[11] > 0.5:
-                valid_mask[self.action_space.IDX_FREE_FORWARD] = False
-                valid_mask[self.action_space.IDX_FREE_FORWARD_SMALL] = False
-                valid_mask[self.action_space.IDX_FREE_BACKWARD] = False
-            # Don't randomly detach when close to goal on surface
-            if (
-                state[11] > 0.5
-                and state[13] < 5.0 * self.action_space.surface_step
-            ):
-                valid_mask[self.action_space.IDX_DETACH] = False
+        # Track phase
+        self._episode_phase_counts[current_phase] = (
+            self._episode_phase_counts.get(current_phase, 0) + 1
+        )
 
-            valid_indices = np.where(valid_mask)[0]
-            action_index = int(np.random.choice(valid_indices))
+        if on_object:
+            t_state = self._compute_detach_transition_state(
+                state, sensor_data
+            )
+            recommendation, confidence = (
+                self.transition_detach.query(t_state)
+            )
+
+            if confidence > 0.7 and recommendation > 0.5:
+                if self._can_detach(state):
+                    action_index = self.action_space.IDX_DETACH
+                    is_heuristic_override = True
+                    strategic_source = (
+                        f"detach_memory(rec={recommendation:.2f},"
+                        f"conf={confidence:.2f})"
+                    )
+                    self._strategic_stats["detach_memory_triggered"] += 1
+            elif confidence > 0.8 and recommendation < -0.7:
+                # Memory very confident detach is bad here
+                combined[self.action_space.IDX_DETACH] = -1e9
+                strategic_source = (
+                    f"detach_memory_suppress(rec={recommendation:.2f},"
+                    f"conf={confidence:.2f})"
+                )
+                self._strategic_stats["detach_memory_suppressed"] += 1
+            elif confidence < 0.3:
+                if (
+                    current_phase == "DETACH_NEEDED"
+                    and self._can_detach(state)
+                ):
+                    action_index = self.action_space.IDX_DETACH
+                    is_heuristic_override = True
+                    strategic_source = "heuristic_fallback_detach"
+                    self._strategic_stats["detach_heuristic_fallback"] += 1
+
+        elif not on_object:
+            # Ask direction memory
+            d_state = self._compute_direction_transition_state(
+                state, sensor_data, current_pose
+            )
+            recommendation, confidence = (
+                self.transition_direction.query(d_state)
+            )
+
+            if confidence > 0.5 and recommendation > 0.5:
+                # Memory says: switch to FLY_TO_GOAL worked here
+                self._current_phase = "FLY_TO_GOAL"
+                self._cached_fly_direction = None
+                strategic_source = (
+                    f"direction_memory_to_goal"
+                    f"(rec={recommendation:.2f},"
+                    f"conf={confidence:.2f})"
+                )
+                self._strategic_stats["direction_memory_to_goal"] += 1
+            elif confidence > 0.5 and recommendation < -0.5:
+                # Memory says: keep bypassing
+                if current_phase != "FLY_TO_EDGE":
+                    self._current_phase = "FLY_TO_EDGE"
+                strategic_source = (
+                    f"direction_memory_keep_edge"
+                    f"(rec={recommendation:.2f},"
+                    f"conf={confidence:.2f})"
+                )
+                self._strategic_stats["direction_memory_keep_edge"] += 1
+            else:
+                self._strategic_stats["direction_heuristic_fallback"] += 1
+
+        # ═══ SOFTMAX SAMPLING (tactical level) ═══
+        if action_index is None:
+            v = combined / temperature
+            v = v - np.max(v)
+            exp_v = np.exp(v)
+            probs = exp_v / exp_v.sum()
+
+            p_random = 0.02 * eps
+            if np.random.random() < p_random:
+                is_random_override = True
+                valid_mask = np.ones(self.num_actions, dtype=bool)
+                if state[11] < 0.5:
+                    valid_mask[self.action_space.IDX_DETACH] = False
+                    for idx in range(8):
+                        valid_mask[idx] = False
+                if self._consecutive_detach_count >= 3:
+                    valid_mask[self.action_space.IDX_DETACH] = False
+                if state[11] > 0.5:
+                    valid_mask[self.action_space.IDX_FREE_FORWARD] = False
+                    valid_mask[
+                        self.action_space.IDX_FREE_FORWARD_SMALL
+                    ] = False
+                    valid_mask[self.action_space.IDX_FREE_BACKWARD] = False
+                if (
+                    state[11] > 0.5
+                    and state[13] < 5.0 * self.action_space.surface_step
+                ):
+                    valid_mask[self.action_space.IDX_DETACH] = False
+
+                valid_indices = np.where(valid_mask)[0]
+                action_index = int(np.random.choice(valid_indices))
+                probs = np.zeros(self.num_actions)
+                probs[action_index] = 1.0
+            else:
+                action_index = int(
+                    np.random.choice(len(probs), p=probs)
+                )
+        else:
             probs = np.zeros(self.num_actions)
             probs[action_index] = 1.0
-        else:
-            action_index = int(np.random.choice(len(probs), p=probs))
+
+        # ═══ RECORD PENDING TRANSITIONS ═══
+        # Record detach state ONLY when phase says detach is needed
+        # This prevents polluting memory with unnecessary detach attempts
+        if (
+            action_index == self.action_space.IDX_DETACH
+            and on_object
+            and current_phase == "DETACH_NEEDED"
+        ):
+            t_state = self._compute_detach_transition_state(
+                state, sensor_data
+            )
+            self._pending_detach_states.append(t_state.copy())
+
+        # Record direction transition (FLY_TO_EDGE → FLY_TO_GOAL)
+        prev_phase = getattr(self, "_prev_phase", None)
+        if (
+            prev_phase == "FLY_TO_EDGE"
+            and current_phase in ("FLY_TO_GOAL", "LAND")
+        ):
+            d_state = self._compute_direction_transition_state(
+                state, sensor_data, current_pose
+            )
+            self._pending_direction_state = d_state.copy()
+
+        self._prev_phase = current_phase
 
         if not explain:
             return action_index, None
@@ -1099,10 +1381,13 @@ class RLGoalApproachController:
                 "probability": confidence,
             },
             "sampling_method": (
-                "random_exploration"
+                "strategic_override"
+                if is_heuristic_override
+                else "random_exploration"
                 if is_random_override
                 else "softmax_sampling"
             ),
+            "strategic_source": strategic_source,
             "temperature": temperature,
             "epsilon": eps,
             "has_q_data": has_q_data,
@@ -1157,26 +1442,27 @@ class RLGoalApproachController:
         else:
             self._consecutive_detach_count = 0
 
-        if self._consecutive_detach_count > 2:
-            h_best = self.action_space.get_info(best_h_action).name
-            q_best = self.action_space.get_info(best_q_action).name
-            logger.warning(
-                f"DETACH_SPAM x{self._consecutive_detach_count}: "
-                f"step={self._steps}, "
-                f"chosen={chosen_name}, "
-                f"q_recommends={q_best}, h_recommends={h_best}, "
-                f"eps={eps:.3f}, temp={temperature:.4f}, "
-                f"has_q={has_q_data}, "
-                f"random={is_random_override}, "
-                f"transitions={len(self._episode_transitions)}, "
-                f"last_action={self._last_action}, "
-                f"on_object={state[11]:.0f}, "
-                f"distance={state[13]:.1f}, "
-                f"alignment={state[12]:.3f}, "
-                f"depth={state[14]*100:.1f}"
-            )
         return action_index, explanation
 
+    def _can_detach(self, state: np.ndarray) -> bool:
+        """Check if detach is allowed (anti-spam guards)."""
+        recent_detach = sum(
+            1
+            for tr in self._episode_transitions[-5:]
+            if tr["action"] == self.action_space.IDX_DETACH
+        )
+        last_was_detach = (
+            self._last_action == self.action_space.IDX_DETACH
+        )
+        close_to_goal = (
+            float(state[13]) < 3.0 * self.action_space.surface_step
+        )
+        return (
+            recent_detach < 1
+            and not last_was_detach
+            and not close_to_goal
+        )
+    
     # ══════════════════════════════════════════════════════════
     # HEURISTIC BIAS
     # ══════════════════════════════════════════════════════════
@@ -2375,6 +2661,96 @@ class RLGoalApproachController:
         if goal_reached:
             self._total_goals_reached += 1
 
+        # ═══ Update transition memories ═══
+        # Detach outcome: evaluate based on what happened AFTER detach
+        # not just final episode result
+        for i, pending_state in enumerate(self._pending_detach_states):
+            # Find the detach action in transitions
+            detach_indices = [
+                j for j, tr in enumerate(self._episode_transitions)
+                if tr["action"] == self.action_space.IDX_DETACH
+            ]
+
+            if i < len(detach_indices):
+                detach_idx = detach_indices[i]
+
+                # Check if agent reached correct side after detach
+                reached_correct_side = False
+                for j in range(
+                    detach_idx + 1, len(self._episode_transitions)
+                ):
+                    future_state = self._episode_transitions[j]["state"]
+                    if future_state[11] > 0.5:  # back on surface
+                        future_an = future_state[6:9]
+                        future_gn = future_state[15:18]
+                        an_len = np.linalg.norm(future_an)
+                        gn_len = np.linalg.norm(future_gn)
+                        if an_len > 1e-8 and gn_len > 1e-8:
+                            agreement = float(np.dot(
+                                future_an / an_len,
+                                future_gn / gn_len,
+                            ))
+                            if agreement > 0.3:
+                                reached_correct_side = True
+                        break
+
+                if reached_correct_side or goal_reached:
+                    detach_outcome = 1.0
+                elif termination_reason == "collision_surface_violation":
+                    detach_outcome = -0.5
+                else:
+                    detach_outcome = -0.3
+            else:
+                # Fallback
+                if goal_reached:
+                    detach_outcome = 1.0
+                elif termination_reason == "collision_surface_violation":
+                    detach_outcome = -1.0
+                else:
+                    detach_outcome = -0.3
+
+            self.transition_detach.record(pending_state, detach_outcome)
+
+        # Direction transition outcome — keep simple
+        if self._pending_direction_state is not None:
+            if goal_reached:
+                direction_outcome = 1.0
+            elif termination_reason == "collision_surface_violation":
+                direction_outcome = -1.0
+            else:
+                direction_outcome = -0.3
+            self.transition_direction.record(
+                self._pending_direction_state, direction_outcome
+            )
+
+        # Track detach outcomes
+        if self._pending_detach_states:
+            self._strategic_stats["detach_total"] += len(
+                self._pending_detach_states
+            )
+            if goal_reached:
+                self._strategic_stats["detach_led_to_success"] += len(
+                    self._pending_detach_states
+                )
+            elif termination_reason == "collision_surface_violation":
+                self._strategic_stats["detach_led_to_collision"] += len(
+                    self._pending_detach_states
+                )
+            else:
+                self._strategic_stats["detach_led_to_timeout"] += len(
+                    self._pending_detach_states
+                )
+
+        # Accumulate phase counts
+        for phase, count in self._episode_phase_counts.items():
+            key = f"phase_{phase}"
+            self._strategic_stats["phase_counts"][key] = (
+                self._strategic_stats["phase_counts"].get(key, 0)
+                + count
+            )
+        self._episode_phase_counts = {}
+
+        # ═══ Existing episode done logic ═══
         if goal_reached:
             reason = "GOAL_REACHED!!!"
             reason_key = "goal_reached"
@@ -2429,10 +2805,13 @@ class RLGoalApproachController:
         self._distance_history = []
         self._flyby_count = 0
         self._cached_fly_direction = None
-        self._fly_direction_age = 0
         self._cached_orbit_direction = None
         self._orbit_direction_age = 0
+        self._fly_direction_age = 0
         self._current_phase = "CRAWL_TO_GOAL"
+        self._prev_phase = None
+        self._pending_detach_states = []
+        self._pending_direction_state = None
 
     # ══════════════════════════════════════════════════════════
     # DIAGNOSTICS
@@ -2502,6 +2881,98 @@ class RLGoalApproachController:
                 "surface_ratio": float(surface_steps) / total_nav_steps,
                 "air_ratio": float(air_steps) / total_nav_steps,
             },
+        }
+        stats["transition_detach"] = self.transition_detach.get_stats()
+        stats["transition_direction"] = (
+            self.transition_direction.get_stats()
+        )
+
+        # Strategic level stats
+        total_detach_decisions = max(
+            self._strategic_stats["detach_memory_triggered"]
+            + self._strategic_stats["detach_memory_suppressed"]
+            + self._strategic_stats["detach_heuristic_fallback"],
+            1,
+        )
+        total_direction_decisions = max(
+            self._strategic_stats["direction_memory_to_goal"]
+            + self._strategic_stats["direction_memory_keep_edge"]
+            + self._strategic_stats["direction_heuristic_fallback"],
+            1,
+        )
+        total_detach_outcomes = max(
+            self._strategic_stats["detach_total"], 1
+        )
+
+        stats["strategic"] = {
+            "detach_decisions": {
+                "memory_triggered": self._strategic_stats[
+                    "detach_memory_triggered"
+                ],
+                "memory_suppressed": self._strategic_stats[
+                    "detach_memory_suppressed"
+                ],
+                "heuristic_fallback": self._strategic_stats[
+                    "detach_heuristic_fallback"
+                ],
+                "memory_usage_rate": round(
+                    (
+                        self._strategic_stats["detach_memory_triggered"]
+                        + self._strategic_stats["detach_memory_suppressed"]
+                    )
+                    / total_detach_decisions,
+                    3,
+                ),
+            },
+            "detach_outcomes": {
+                "total": self._strategic_stats["detach_total"],
+                "success": self._strategic_stats[
+                    "detach_led_to_success"
+                ],
+                "collision": self._strategic_stats[
+                    "detach_led_to_collision"
+                ],
+                "timeout": self._strategic_stats[
+                    "detach_led_to_timeout"
+                ],
+                "success_rate": round(
+                    self._strategic_stats["detach_led_to_success"]
+                    / total_detach_outcomes,
+                    3,
+                ),
+            },
+            "direction_decisions": {
+                "memory_to_goal": self._strategic_stats[
+                    "direction_memory_to_goal"
+                ],
+                "memory_keep_edge": self._strategic_stats[
+                    "direction_memory_keep_edge"
+                ],
+                "heuristic_fallback": self._strategic_stats[
+                    "direction_heuristic_fallback"
+                ],
+                "memory_usage_rate": round(
+                    (
+                        self._strategic_stats[
+                            "direction_memory_to_goal"
+                        ]
+                        + self._strategic_stats[
+                            "direction_memory_keep_edge"
+                        ]
+                    )
+                    / total_direction_decisions,
+                    3,
+                ),
+            },
+            "phase_distribution": self._strategic_stats[
+                "phase_counts"
+            ],
+            "transition_detach_store": (
+                self.transition_detach.get_stats()
+            ),
+            "transition_direction_store": (
+                self.transition_direction.get_stats()
+            ),
         }
 
         return stats
@@ -2584,6 +3055,14 @@ class RLGoalApproachController:
             os.path.join(dirpath, "q_store_surface")
         )
 
+        # Save transition memories
+        self.transition_detach.save(
+            os.path.join(dirpath, "transition_detach.npz")
+        )
+        self.transition_direction.save(
+            os.path.join(dirpath, "transition_direction.npz")
+        )
+
         controller_state = {
             "epsilon": self.epsilon,
             "total_episodes": self._total_episodes,
@@ -2629,6 +3108,23 @@ class RLGoalApproachController:
             os.path.join(dirpath, "q_store_surface"), extra_cfg=config
         )
 
+        # Load transition memories
+        detach_path = os.path.join(
+            dirpath, "transition_detach.npz"
+        )
+        if pathlib.Path(detach_path).exists():
+            controller.transition_detach = TransitionMemory.load(
+                detach_path, name="detach"
+            )
+
+        direction_path = os.path.join(
+            dirpath, "transition_direction.npz"
+        )
+        if pathlib.Path(direction_path).exists():
+            controller.transition_direction = TransitionMemory.load(
+                direction_path, name="direction"
+            )
+
         state_data = np.load(
             os.path.join(dirpath, "controller_state.npz"),
             allow_pickle=False,
@@ -2642,14 +3138,14 @@ class RLGoalApproachController:
 
         logger.info(
             f"Controller loaded from {dirpath}: "
-            f"{loaded_total_episodes} loaded_total_episodes, "
-            f"{loaded_total_steps} loaded_total_steps, "
-            f"{loaded_total_goals_reached} loaded_total_goals_reached, "
-            f"loaded_epsilon={loaded_epsilon:.3f}, "
-            f"loaded Q-store surface="
-            f"{controller.q_store_surface.get_stats()['num_points']} points, "
-            f"loaded Q-store free="
-            f"{controller.q_store_free.get_stats()['num_points']} points"
+            f"{loaded_total_episodes} episodes, "
+            f"{loaded_total_steps} steps, "
+            f"{loaded_total_goals_reached} goals, "
+            f"epsilon={loaded_epsilon:.3f}, "
+            f"transition_detach="
+            f"{controller.transition_detach.get_stats()}, "
+            f"transition_direction="
+            f"{controller.transition_direction.get_stats()}"
         )
 
         return controller

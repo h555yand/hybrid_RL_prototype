@@ -61,11 +61,6 @@ experiment:
       num_actions: 24
       rotation_step_big: 15.0
       free_step_backward: 2.0
-      feature_weights:
-        12: 1.5   # alignment — strategic signal
-        15: 2.0   # goal_normal_local[0]
-        16: 2.0   # goal_normal_local[1]
-        17: 2.0   # goal_normal_local[2]
 
     sac_config:
       load_mode: null
