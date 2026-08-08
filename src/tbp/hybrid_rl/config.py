@@ -53,6 +53,17 @@ DEFAULT_CONFIG = {
     "reward_oscillation": -0.5,
     "reward_timeout": -12.0,
     "reward_detach_collision": -3.0,
+    # Strategic Q-store
+    "strategic_epsilon_start": 1.0,
+    "strategic_epsilon_min": 0.3,
+    "strategic_eval_epsilon": 0.3,
+    "strategic_reward_switch_success": 1.0,
+    "strategic_reward_switch_wrong_side": -0.3,
+    "strategic_reward_switch_collision": -0.5,
+    "strategic_reward_stay_when_needed": -0.1,
+    "strategic_reward_stay_correct": 0.3,
+    "strategic_alpha_stay_multiplier": 0.1,
+    "strategic_alpha_switch_multiplier": 1.0,
     # Detour shaping: if goal is behind surface, clip negative progress penalty
     # to avoid over-penalizing necessary face-to-face transitions on polyhedra.
     "detour_alignment_threshold": -0.2,

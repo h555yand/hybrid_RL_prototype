@@ -25,7 +25,7 @@ from scipy.spatial.transform import Rotation as R
 from .action_space import ActionSpace
 from .config import DEFAULT_CONFIG
 from .hnsw_state_store import HNSWStateStore
-from .transition_memory import TransitionMemory
+from .strategic_sac import StrategicSAC
 
 logger = logging.getLogger(__name__)
 
@@ -71,25 +71,56 @@ class RLGoalApproachController:
         # HNSW Q-store
         self.q_store_free = HNSWStateStore(config=self.config, name="free")
         self.q_store_surface = HNSWStateStore(config=self.config, name="surface")
-        # Strategic transition memories
-        self.transition_detach = TransitionMemory(
-            state_dim=3,  # было 5
-            max_points=self.config.get("transition_max_points", 10000),
-            k_neighbors=self.config.get("transition_k_neighbors", 5),
-            insert_threshold=self.config.get(
+
+        # Strategic Q-stores (2 actions: stay=0, switch=1)
+        strategic_detach_config = {
+            **self.config,
+            "state_dim": 3,
+            "num_actions": 2,
+            "max_points": self.config.get("transition_max_points", 10000),
+            "k_neighbors": self.config.get("transition_k_neighbors", 5),
+            "insert_threshold": self.config.get(
                 "transition_insert_threshold", 0.5
             ),
-            name="detach",
+        }
+        self.strategic_detach = HNSWStateStore(
+            config=strategic_detach_config, name="strategic_detach"
         )
-        self.transition_direction = TransitionMemory(
-            state_dim=4,  # было 6
-            max_points=self.config.get("transition_max_points", 10000),
-            k_neighbors=self.config.get("transition_k_neighbors", 5),
-            insert_threshold=self.config.get(
+
+        strategic_direction_config = {
+            **self.config,
+            "state_dim": 5,
+            "num_actions": 2,
+            "max_points": self.config.get("transition_max_points", 10000),
+            "k_neighbors": self.config.get("transition_k_neighbors", 5),
+            "insert_threshold": self.config.get(
                 "transition_insert_threshold", 0.5
             ),
-            name="direction",
+        }
+        self.strategic_direction = HNSWStateStore(
+            config=strategic_direction_config, name="strategic_direction"
         )
+
+        # Strategic epsilon
+        self.strategic_epsilon = float(
+            self.config.get("strategic_epsilon_start", 1.0)
+        )
+        self.strategic_epsilon_min = float(
+            self.config.get("strategic_epsilon_min", 0.3)
+        )
+        self.strategic_epsilon_decay = None
+        if self.mode == "train_adapt_epsilon":
+            total_episodes = max(1, int(self.config.get("num_episodes", 1)))
+            s_start = self.strategic_epsilon
+            s_min = self.strategic_epsilon_min
+            if s_start > s_min > 0.0:
+                self.strategic_epsilon_decay = (
+                    s_min / s_start
+                ) ** (1.0 / total_episodes)
+
+        # Strategic SAC (optional, created when available)
+        self.strategic_sac: Optional[StrategicSAC] = None
+        self._strategic_sac_pending: List[Dict[str, Any]] = []
 
         # Q-learning parameters
         self.gamma = self.config["gamma"]
@@ -117,9 +148,13 @@ class RLGoalApproachController:
             eps_start = float(self.config.get("epsilon_start", self.epsilon))
             eps_min = float(self.config.get("epsilon_min", self.epsilon_min))
             if eps_start > eps_min > 0.0:
-                self.epsilon_decay = (eps_min / eps_start) ** (
-                    1.0 / total_episodes
-                )
+                self.epsilon_decay = (eps_min / eps_start) ** (1.0 / total_episodes)
+
+            # Strategic epsilon: same schedule but higher minimum
+            s_start = float(self.config.get("strategic_epsilon_start", 1.0))
+            s_min = float(self.config.get("strategic_epsilon_min", 0.3))
+            if s_start > s_min > 0.0:
+                self.strategic_epsilon_decay = (s_min / s_start) ** (1.0 / total_episodes)
 
         # Episode state (reset each new goal)
         self._prev_state: Optional[np.ndarray] = None
@@ -132,9 +167,10 @@ class RLGoalApproachController:
         self._episode_transitions: List[Dict[str, Any]] = []
         self.success_trails = []
         self.start_pos: Optional[np.ndarray] = None
-        self._pending_detach_states: List[np.ndarray] = []
-        self._pending_direction_state: Optional[np.ndarray] = None
         self._prev_phase: Optional[str] = None
+        self._pending_strategic_detach: List[Dict[str, Any]] = []
+        self._pending_strategic_direction: Optional[Dict[str, Any]] = None
+        self._path_clear_streak: int = 0
 
         # Distance tracking for flyby detection
         self._distance_history: List[float] = []
@@ -225,14 +261,22 @@ class RLGoalApproachController:
         self._orbit_direction_age = 0
         self._current_phase = "CRAWL_TO_GOAL"
         self._prev_phase = None
-        self._pending_detach_states = []
-        self._pending_direction_state = None
+        self._pending_strategic_detach = []
+        self._pending_strategic_direction = None
+        self._path_clear_streak = 0
         if self.is_training:
             self.epsilon = max(
                 self.epsilon_min,
                 self.epsilon * self.epsilon_decay,
             )
+            # Strategic epsilon decays together with tactical
+            if self.strategic_epsilon_decay is not None:
+                self.strategic_epsilon = max(
+                    self.strategic_epsilon_min,
+                    self.strategic_epsilon * self.strategic_epsilon_decay,
+                )
         self._episode_phase_counts = {}
+        self._strategic_sac_pending = []
 
     def step(
         self,
@@ -330,6 +374,7 @@ class RLGoalApproachController:
 
         if not self.is_training:
             self.epsilon = self.eval_epsilon
+            self.strategic_epsilon = self.config.get("strategic_eval_epsilon", 0.3)
 
         action_info = self.action_space.get_info(action_index)
         action = action_info.name
@@ -498,29 +543,19 @@ class RLGoalApproachController:
         ], dtype=float)
     
     def _compute_direction_transition_state(
-    self,
-    state: np.ndarray,
-    sensor_data: Dict[str, Any],
-    current_pose: np.ndarray,
-) -> np.ndarray:
-        """Compact state for direction decision in air (4D).
-
-        Captures whether agent has bypassed obstacle and can
-        fly directly to goal.
+        self,
+        state: np.ndarray,
+        sensor_data: Dict[str, Any],
+        current_pose: np.ndarray,
+    ) -> np.ndarray:
+        """Compact state for direction decision in air (5D).
 
         Features:
             normal_agreement: dot(agent_normal, goal_normal)
             alignment: dot(goal_dir, agent_normal)
             norm_distance: distance / object_extent
             angle_to_goal: dot(forward, goal_dir)
-
-        Args:
-            state: Full 18D state vector.
-            sensor_data: Current sensor readings.
-            current_pose: Agent pose [x, y, z, rx, ry, rz].
-
-        Returns:
-            4D compact state vector.
+            path_blocked: is direct path to goal blocked
         """
         agent_normal = state[6:9]
         goal_normal = state[15:18]
@@ -540,7 +575,6 @@ class RLGoalApproachController:
         max_extent = float(max(extents))
         norm_distance = float(state[13]) / max(max_extent, 1.0)
 
-        # Angle between forward and goal direction
         rot = R.from_euler("xyz", current_pose[3:6], degrees=True)
         forward = rot.apply([0, 0, -1])
         goal_dir = self._current_goal[:3] - current_pose[:3]
@@ -549,11 +583,14 @@ class RLGoalApproachController:
             goal_dir /= goal_dist
         angle_to_goal = float(np.dot(forward, goal_dir))
 
+        path_blocked = float(sensor_data.get("path_blocked", False))
+
         return np.array([
             normal_agreement,
             alignment,
             norm_distance,
             angle_to_goal,
+            path_blocked,
         ], dtype=float)
 
     def _compute_detach_state_from_full(
@@ -581,7 +618,100 @@ class RLGoalApproachController:
             alignment,
             norm_distance,
         ], dtype=float)
+
+    def _compute_strategic_heuristic(
+        self,
+        current_phase: str,
+        on_object: bool,
+    ) -> np.ndarray:
+        """Heuristic bias for strategic decision [stay, switch].
+
+        On surface: stay=crawl, switch=detach
+        In air: stay=FLY_TO_EDGE, switch=FLY_TO_GOAL
+
+        Args:
+            current_phase: Current phase from _determine_phase.
+            on_object: Whether agent is on surface.
+
+        Returns:
+            Array [2]: [H_stay, H_switch].
+        """
+        h = np.zeros(2, dtype=float)
+
+        if on_object:
+            if current_phase == "DETACH_NEEDED":
+                h[1] += 5.0
+                h[0] -= 2.0
+            elif current_phase == "CRAWL_TO_GOAL":
+                h[0] += 3.0
+                h[1] -= 3.0
+        else:
+            if current_phase == "FLY_TO_GOAL" or current_phase == "LAND":
+                h[1] += 3.0
+                h[0] -= 1.0
+            elif current_phase == "FLY_TO_EDGE":
+                h[0] += 3.0
+                h[1] -= 1.0
+
+        return h
     
+    def _compute_strategic_state(
+        self,
+        state: np.ndarray,
+        sensor_data: Dict[str, Any],
+    ) -> np.ndarray:
+        """Compact state for Strategic SAC (6D).
+
+        Used by Strategic SAC to decide phase transitions.
+        Same features visible to both TransitionMemory and
+        Strategic SAC, enabling fair arbitration.
+
+        Features:
+            normal_agreement: dot(agent_normal, goal_normal)
+            alignment: dot(goal_dir, agent_normal)
+            norm_distance: distance / object_extent
+            path_blocked: is direct path blocked (0/1)
+            on_object: on surface or in air (0/1)
+            norm_depth: normalized depth to surface
+
+        Args:
+            state: Full 18D state vector.
+            sensor_data: Current sensor readings.
+
+        Returns:
+            6D strategic state vector.
+        """
+        agent_normal = state[6:9]
+        goal_normal = state[15:18]
+
+        an_len = np.linalg.norm(agent_normal)
+        gn_len = np.linalg.norm(goal_normal)
+        if an_len > 1e-8 and gn_len > 1e-8:
+            normal_agreement = float(
+                np.dot(agent_normal / an_len, goal_normal / gn_len)
+            )
+        else:
+            normal_agreement = 0.0
+
+        alignment = float(state[12])
+
+        extents = sensor_data.get("object_extents", [84, 84, 84])
+        max_extent = float(max(extents))
+        norm_distance = float(state[13]) / max(max_extent, 1.0)
+
+        path_blocked = float(sensor_data.get("path_blocked", False))
+        on_object = float(state[11])
+        norm_depth = float(state[14])
+
+        return np.array([
+            normal_agreement,
+            alignment,
+            norm_distance,
+            path_blocked,
+            on_object,
+            norm_depth,
+        ], dtype=float)    
+
     def _determine_phase(
         self,
         state: np.ndarray,
@@ -1202,11 +1332,14 @@ class RLGoalApproachController:
             temperature = self.temperature_override
 
         # ═══ ACTION MASK ═══
-        if state[11] < 0.5:
+        if state[11] < 0.5:  # in air
             combined[self.action_space.IDX_DETACH] = -1e9
+            # Mask surface actions in air
+            for idx in range(8):
+                combined[idx] = -1e9
         if self._consecutive_detach_count >= 3:
             combined[self.action_space.IDX_DETACH] = -1e9
-        if state[11] > 0.5:
+        if state[11] > 0.5:  # on surface
             combined[self.action_space.IDX_FREE_FORWARD] = -1e9
             combined[self.action_space.IDX_FREE_FORWARD_SMALL] = -1e9
             combined[self.action_space.IDX_FREE_BACKWARD] = -1e9
@@ -1216,81 +1349,157 @@ class RLGoalApproachController:
         action_index = None
         strategic_source = None
 
-        # ═══ STRATEGIC LEVEL: transition memories ═══
+        # ═══ STRATEGIC LEVEL: Q-store blend ═══
         current_phase = getattr(self, "_current_phase", "CRAWL_TO_GOAL")
         on_object = state[11] > 0.5
 
-        # Track phase
         self._episode_phase_counts[current_phase] = (
             self._episode_phase_counts.get(current_phase, 0) + 1
         )
+
+        s_eps = self.strategic_epsilon
+        strategic_source = None
+        cfg = self.config
 
         if on_object:
             t_state = self._compute_detach_transition_state(
                 state, sensor_data
             )
-            recommendation, confidence = (
-                self.transition_detach.query(t_state)
+            strategic_q = self.strategic_detach.get_q_values(t_state)
+            strategic_h = self._compute_strategic_heuristic(
+                current_phase, on_object=True
             )
 
-            if confidence > 0.7 and recommendation > 0.5:
-                if self._can_detach(state):
-                    action_index = self.action_space.IDX_DETACH
-                    is_heuristic_override = True
-                    strategic_source = (
-                        f"detach_memory(rec={recommendation:.2f},"
-                        f"conf={confidence:.2f})"
-                    )
-                    self._strategic_stats["detach_memory_triggered"] += 1
-            elif confidence > 0.8 and recommendation < -0.7:
-                # Memory very confident detach is bad here
-                combined[self.action_space.IDX_DETACH] = -1e9
-                strategic_source = (
-                    f"detach_memory_suppress(rec={recommendation:.2f},"
-                    f"conf={confidence:.2f})"
+            has_data = (
+                self.strategic_detach.next_id > 0
+                and np.max(np.abs(strategic_q)) > 1e-6
+            )
+            if has_data:
+                sq_norm = self._normalize_values(strategic_q)
+                sh_norm = self._normalize_values(strategic_h)
+                strategic_combined = (
+                    (1 - s_eps) * sq_norm + s_eps * sh_norm
                 )
-                self._strategic_stats["detach_memory_suppressed"] += 1
-            elif confidence < 0.3:
-                if (
-                    current_phase == "DETACH_NEEDED"
-                    and self._can_detach(state)
-                ):
-                    action_index = self.action_space.IDX_DETACH
-                    is_heuristic_override = True
-                    strategic_source = "heuristic_fallback_detach"
-                    self._strategic_stats["detach_heuristic_fallback"] += 1
+            else:
+                strategic_combined = strategic_h.copy()
+
+            should_switch = strategic_combined[1] > strategic_combined[0]
+
+            if should_switch and self._can_detach(state):
+                action_index = self.action_space.IDX_DETACH
+                is_heuristic_override = True
+                strategic_source = (
+                    f"detach_switch("
+                    f"q=[{strategic_q[0]:.2f},{strategic_q[1]:.2f}],"
+                    f"h=[{strategic_h[0]:.1f},{strategic_h[1]:.1f}],"
+                    f"eps={s_eps:.2f})"
+                )
+                self._strategic_stats["detach_memory_triggered"] += 1
+
+                # Record pending for outcome evaluation
+                self._pending_strategic_detach.append({
+                    "state": t_state.copy(),
+                    "step": len(self._episode_transitions),
+                })
+            else:
+                if current_phase == "DETACH_NEEDED":
+                    strategic_source = (
+                        f"detach_stay("
+                        f"q=[{strategic_q[0]:.2f},{strategic_q[1]:.2f}],"
+                        f"eps={s_eps:.2f})"
+                    )
+                    self._strategic_stats[
+                        "detach_heuristic_fallback"
+                    ] += 1
+
+            # Stay penalty: on surface in DETACH_NEEDED but didn't detach
+            if (
+                current_phase == "DETACH_NEEDED"
+                and self._can_detach(state)
+                and action_index != self.action_space.IDX_DETACH
+            ):
+                stay_alpha = (
+                    self._get_learning_rate()
+                    * cfg.get("strategic_alpha_stay_multiplier", 0.1)
+                )
+                self.strategic_detach.update_q_value(
+                    t_state, action=0,
+                    td_target=cfg.get(
+                        "strategic_reward_stay_when_needed", -0.1
+                    ),
+                    alpha=stay_alpha,
+                    count_visit=True,
+                )
 
         elif not on_object:
-            # Ask direction memory
             d_state = self._compute_direction_transition_state(
                 state, sensor_data, current_pose
             )
-            recommendation, confidence = (
-                self.transition_direction.query(d_state)
+            strategic_q = self.strategic_direction.get_q_values(d_state)
+            strategic_h = self._compute_strategic_heuristic(
+                current_phase, on_object=False
             )
 
-            if confidence > 0.5 and recommendation > 0.5:
-                # Memory says: switch to FLY_TO_GOAL worked here
+            has_data = (
+                self.strategic_direction.next_id > 0
+                and np.max(np.abs(strategic_q)) > 1e-6
+            )
+            if has_data:
+                sq_norm = self._normalize_values(strategic_q)
+                sh_norm = self._normalize_values(strategic_h)
+                dir_combined = (
+                    (1 - s_eps) * sq_norm + s_eps * sh_norm
+                )
+            else:
+                dir_combined = strategic_h.copy()
+
+            if dir_combined[1] > dir_combined[0]:
                 self._current_phase = "FLY_TO_GOAL"
                 self._cached_fly_direction = None
                 strategic_source = (
-                    f"direction_memory_to_goal"
-                    f"(rec={recommendation:.2f},"
-                    f"conf={confidence:.2f})"
+                    f"direction_switch("
+                    f"q=[{strategic_q[0]:.2f},{strategic_q[1]:.2f}],"
+                    f"eps={s_eps:.2f})"
                 )
                 self._strategic_stats["direction_memory_to_goal"] += 1
-            elif confidence > 0.5 and recommendation < -0.5:
-                # Memory says: keep bypassing
-                if current_phase != "FLY_TO_EDGE":
-                    self._current_phase = "FLY_TO_EDGE"
-                strategic_source = (
-                    f"direction_memory_keep_edge"
-                    f"(rec={recommendation:.2f},"
-                    f"conf={confidence:.2f})"
-                )
-                self._strategic_stats["direction_memory_keep_edge"] += 1
+
+                # Record pending
+                prev_phase = getattr(self, "_prev_phase", None)
+                if prev_phase == "FLY_TO_EDGE":
+                    self._pending_strategic_direction = {
+                        "state": d_state.copy(),
+                        "step": len(self._episode_transitions),
+                    }
             else:
-                self._strategic_stats["direction_heuristic_fallback"] += 1
+                self._strategic_stats[
+                    "direction_heuristic_fallback"
+                ] += 1
+
+            # Stay penalty: path clear but didn't switch
+            path_clear = not sensor_data.get("path_blocked", True)
+            if path_clear:
+                self._path_clear_streak += 1
+            else:
+                self._path_clear_streak = 0
+
+            if (
+                current_phase == "FLY_TO_EDGE"
+                and self._path_clear_streak >= 3
+            ):
+                stay_alpha = (
+                    self._get_learning_rate()
+                    * cfg.get("strategic_alpha_stay_multiplier", 0.1)
+                )
+                self.strategic_direction.update_q_value(
+                    d_state, action=0,
+                    td_target=cfg.get(
+                        "strategic_reward_stay_when_needed", -0.1
+                    ),
+                    alpha=stay_alpha,
+                    count_visit=True,
+                )
+
+        self._prev_phase = current_phase
 
         # ═══ SOFTMAX SAMPLING (tactical level) ═══
         if action_index is None:
@@ -1344,7 +1553,10 @@ class RLGoalApproachController:
             t_state = self._compute_detach_transition_state(
                 state, sensor_data
             )
-            self._pending_detach_states.append(t_state.copy())
+            self._pending_strategic_detach.append({
+                "state": t_state.copy(),
+                "step": len(self._episode_transitions),
+            })
 
         # Record direction transition (FLY_TO_EDGE → FLY_TO_GOAL)
         prev_phase = getattr(self, "_prev_phase", None)
@@ -1355,7 +1567,10 @@ class RLGoalApproachController:
             d_state = self._compute_direction_transition_state(
                 state, sensor_data, current_pose
             )
-            self._pending_direction_state = d_state.copy()
+            self._pending_strategic_direction = {
+                "state": d_state.copy(),
+                "step": len(self._episode_transitions),
+            }
 
         self._prev_phase = current_phase
 
@@ -1442,6 +1657,33 @@ class RLGoalApproachController:
         else:
             self._consecutive_detach_count = 0
 
+        # Add phase info to interpretation
+        explanation["interpretation"] = (
+            f"[phase={current_phase}] "
+            + explanation["interpretation"]
+        )
+        if strategic_source:
+            explanation["interpretation"] = (
+                f"[strategic={strategic_source}] "
+                + explanation["interpretation"]
+            )
+        # Add debug info to interpretation
+        path_blocked = sensor_data.get("path_blocked", False)
+        same_side = sensor_data.get("same_side", True)
+        depth = sensor_data.get("depth", 100.0)
+        
+        debug_prefix = (
+            f"[phase={current_phase}|"
+            f"ss={int(same_side)}|"
+            f"pb={int(path_blocked)}|"
+            f"d={depth:.1f}]"
+        )
+        if strategic_source:
+            debug_prefix += f"[strat={strategic_source}]"
+        
+        explanation["interpretation"] = (
+            debug_prefix + " " + explanation["interpretation"]
+        )
         return action_index, explanation
 
     def _can_detach(self, state: np.ndarray) -> bool:
@@ -1582,7 +1824,7 @@ class RLGoalApproachController:
         surface_move = np.zeros(self.num_actions, dtype=float)
 
         if on_object > 0.5 and phase == "CRAWL_TO_GOAL":
-            SURFACE_STRENGTH = 4.0  # increased from 2.0
+            SURFACE_STRENGTH = 4.0
 
             n_world = sensor_data.get("point_normal")
             if n_world is not None:
@@ -1693,26 +1935,20 @@ class RLGoalApproachController:
         if on_object > 0.5:
 
             if phase == "CRAWL_TO_GOAL":
-                # Phase 1: randomize direction (10 steps without progress)
-                # Works at ANY distance — fixes stuck-at-edge-near-goal
                 if len(self._distance_history) >= 10:
                     dist_10_ago = self._distance_history[-10]
                     dist_progress_10 = dist_10_ago - distance
                     if dist_progress_10 < self.action_space.surface_step * 0.5:
-                        # Suppress current direction, boost perpendicular
                         if prev_action is not None and 0 <= prev_action < 8:
                             stagnation[prev_action] -= 2.0
                             perp1 = (prev_action + 2) % 8
                             perp2 = (prev_action + 6) % 8
                             stagnation[perp1] += 2.0
                             stagnation[perp2] += 2.0
-                        # Also boost opposite direction
                         if prev_action is not None and 0 <= prev_action < 8:
                             opposite = (prev_action + 4) % 8
                             stagnation[opposite] += 1.0
 
-                # Phase 2: detach safety valve (20 steps without progress)
-                # Reduced from 30 to 20 — faster escape from dead ends
                 if len(self._distance_history) >= 20:
                     dist_20_ago = self._distance_history[-20]
                     dist_progress_20 = dist_20_ago - distance
@@ -1730,7 +1966,6 @@ class RLGoalApproachController:
                             for idx in range(8):
                                 stagnation[idx] -= 2.0
 
-                # Phase 3: strong detach (40 steps without progress)
                 if len(self._distance_history) >= 40:
                     dist_40_ago = self._distance_history[-40]
                     dist_progress_40 = dist_40_ago - distance
@@ -1749,7 +1984,6 @@ class RLGoalApproachController:
                                 stagnation[idx] -= 3.0
 
             elif phase == "DETACH_NEEDED":
-                # Already determined we need detach — boost it
                 if len(self._episode_transitions) >= 3:
                     recent_dists = [
                         float(tr["state"][13])
@@ -1789,7 +2023,6 @@ class RLGoalApproachController:
                     detach[self.action_space.IDX_LOOK_DOWN] -= 1.0
 
             elif phase == "CRAWL_TO_GOAL":
-                # Suppress detach in crawl mode
                 detach[self.action_space.IDX_DETACH] -= 3.0
 
         bias += detach
@@ -1867,7 +2100,6 @@ class RLGoalApproachController:
                 np.dot(forward_right, effective_goal) - dot_current
             )
 
-            # Zero out if rotation didn't change forward
             if np.linalg.norm(forward_up - forward_current) < 1e-4:
                 improvement_up = 0.0
             if np.linalg.norm(forward_down - forward_current) < 1e-4:
@@ -1880,7 +2112,7 @@ class RLGoalApproachController:
             TURN_ONLY = 3.0 * self.action_space.rotation_step_big
             FLY_THR = 4.0 * self.action_space.rotation_step
 
-            # Phase 1: FAR FROM ALIGNED (angle > 45°) — only turn
+            # Phase 1: FAR FROM ALIGNED (angle > 45°)
             if angle_to_goal > TURN_ONLY:
                 steer[self.action_space.IDX_FREE_FORWARD] -= STEER_STRENGTH
                 steer[self.action_space.IDX_FREE_FORWARD_SMALL] -= STEER_STRENGTH
@@ -1888,21 +2120,23 @@ class RLGoalApproachController:
                 best_pitch = max(improvement_up, improvement_down)
                 best_yaw = max(improvement_left, improvement_right)
 
+                big_multiplier = min(angle_to_goal / 45.0, 2.0)
+
                 if best_pitch >= best_yaw and best_pitch > 0.001:
                     if improvement_up > improvement_down:
                         steer[self.action_space.IDX_LOOK_UP] += STEER_STRENGTH
-                        steer[self.action_space.IDX_LOOK_UP_BIG] += STEER_STRENGTH
+                        steer[self.action_space.IDX_LOOK_UP_BIG] += STEER_STRENGTH * big_multiplier
                     else:
                         steer[self.action_space.IDX_LOOK_DOWN] += STEER_STRENGTH
-                        steer[self.action_space.IDX_LOOK_DOWN_BIG] += STEER_STRENGTH
+                        steer[self.action_space.IDX_LOOK_DOWN_BIG] += STEER_STRENGTH * big_multiplier
 
                 if best_yaw >= best_pitch and best_yaw > 0.001:
                     if improvement_left > improvement_right:
                         steer[self.action_space.IDX_TURN_LEFT] += STEER_STRENGTH
-                        steer[self.action_space.IDX_TURN_LEFT_BIG] += STEER_STRENGTH
+                        steer[self.action_space.IDX_TURN_LEFT_BIG] += STEER_STRENGTH * big_multiplier
                     else:
                         steer[self.action_space.IDX_TURN_RIGHT] += STEER_STRENGTH
-                        steer[self.action_space.IDX_TURN_RIGHT_BIG] += STEER_STRENGTH
+                        steer[self.action_space.IDX_TURN_RIGHT_BIG] += STEER_STRENGTH * big_multiplier
 
             # Phase 2: PARTIALLY ALIGNED (20° < angle <= 45°)
             elif angle_to_goal > FLY_THR:
@@ -1919,12 +2153,16 @@ class RLGoalApproachController:
                         steer[self.action_space.IDX_LOOK_UP] += turn_strength
                     else:
                         steer[self.action_space.IDX_LOOK_DOWN] += turn_strength
+                steer[self.action_space.IDX_LOOK_UP_BIG] -= 3.0
+                steer[self.action_space.IDX_LOOK_DOWN_BIG] -= 3.0
 
                 if best_yaw > 0.001:
                     if improvement_left > improvement_right:
                         steer[self.action_space.IDX_TURN_LEFT] += turn_strength
                     else:
                         steer[self.action_space.IDX_TURN_RIGHT] += turn_strength
+                steer[self.action_space.IDX_TURN_LEFT_BIG] -= 3.0
+                steer[self.action_space.IDX_TURN_RIGHT_BIG] -= 3.0
 
             # Phase 3: WELL ALIGNED (angle <= 20°)
             else:
@@ -1951,6 +2189,20 @@ class RLGoalApproachController:
                         steer[self.action_space.IDX_TURN_LEFT] += correction
                     else:
                         steer[self.action_space.IDX_TURN_RIGHT] += correction
+
+            # ── Boost look_up when trapped inside hollow object ──
+            if (
+                phase == "FLY_TO_EDGE"
+                and sensor_data.get("path_blocked", False)
+                and norm_depth < 0.2
+            ):
+                TRAPPED_BOOST = 4.0
+                steer[self.action_space.IDX_LOOK_UP] += TRAPPED_BOOST
+                steer[self.action_space.IDX_LOOK_UP_BIG] += TRAPPED_BOOST
+                steer[self.action_space.IDX_TURN_LEFT] -= TRAPPED_BOOST * 0.5
+                steer[self.action_space.IDX_TURN_RIGHT] -= TRAPPED_BOOST * 0.5
+                steer[self.action_space.IDX_TURN_LEFT_BIG] -= TRAPPED_BOOST * 0.5
+                steer[self.action_space.IDX_TURN_RIGHT_BIG] -= TRAPPED_BOOST * 0.5
 
             # Suppress surface/utility actions in air
             steer[self.action_space.IDX_FREE_BACKWARD] -= 8.0
@@ -1998,7 +2250,7 @@ class RLGoalApproachController:
                 self._distance_history[-1] - self._distance_history[-3]
             )
 
-            if on_object < 0.5:
+            if on_object < 0.5 and phase != "FLY_TO_EDGE":
                 forward_current = rot.apply([0, 0, -1])
                 goal_dir_world_fb = self._current_goal[:3] - current_pose[:3]
                 goal_dist_world_fb = float(np.linalg.norm(goal_dir_world_fb))
@@ -2043,7 +2295,6 @@ class RLGoalApproachController:
                             self.action_space.IDX_FREE_FORWARD
                         ] -= FLYBY_STRENGTH
 
-                    # Steer back toward goal
                     pose_angles_fb = current_pose[3:6]
                     rotation_step_fb = self.action_space.rotation_step
 
@@ -2097,7 +2348,6 @@ class RLGoalApproachController:
                             ] += FLYBY_STRENGTH
 
             elif on_object > 0.5 and phase == "CRAWL_TO_GOAL":
-                # On surface in crawl mode: if distance growing, boost detach
                 if len(self._distance_history) >= 6 and dist_trend_3 > 3.0:
                     trend_5 = (
                         self._distance_history[-1] - self._distance_history[-6]
@@ -2131,11 +2381,11 @@ class RLGoalApproachController:
         components["orientation_cooldown"] = cooldown_bias
 
         # ────────────────────────────────────────────────────
-        # 8) LANDING — simple approach
+        # 8) LANDING — with emergency for all air phases
         # ────────────────────────────────────────────────────
         landing_bias = np.zeros(self.num_actions, dtype=float)
 
-        if on_object < 0.5 and phase in ("LAND", "FLY_TO_GOAL"):
+        if on_object < 0.5 and phase in ("LAND", "FLY_TO_GOAL", "FLY_TO_EDGE"):
             LANDING_THRESHOLD = 8.0 * self.action_space.free_step
             CLOSE_LANDING = 3.0 * self.action_space.free_step
 
@@ -2151,29 +2401,28 @@ class RLGoalApproachController:
 
             depth = sensor_data.get("depth", 100.0)
 
-            if phase == "LAND":
-                # Emergency: very close to surface — only tiny steps
-                if depth < 5.0:
-                    landing_bias[
-                        self.action_space.IDX_FREE_FORWARD
-                    ] -= 15.0
-                    landing_bias[
-                        self.action_space.IDX_FREE_FORWARD_SMALL
-                    ] += 8.0
-                    # Suppress all turns — just land
-                    for idx in [
-                        self.action_space.IDX_LOOK_UP,
-                        self.action_space.IDX_LOOK_DOWN,
-                        self.action_space.IDX_TURN_LEFT,
-                        self.action_space.IDX_TURN_RIGHT,
-                        self.action_space.IDX_LOOK_UP_BIG,
-                        self.action_space.IDX_LOOK_DOWN_BIG,
-                        self.action_space.IDX_TURN_LEFT_BIG,
-                        self.action_space.IDX_TURN_RIGHT_BIG,
-                    ]:
-                        landing_bias[idx] -= 8.0
+            # Emergency: very close to surface in ANY air phase
+            if depth < 5.0:
+                landing_bias[
+                    self.action_space.IDX_FREE_FORWARD
+                ] -= 15.0
+                landing_bias[
+                    self.action_space.IDX_FREE_FORWARD_SMALL
+                ] += 8.0
+                for idx in [
+                    self.action_space.IDX_LOOK_UP,
+                    self.action_space.IDX_LOOK_DOWN,
+                    self.action_space.IDX_TURN_LEFT,
+                    self.action_space.IDX_TURN_RIGHT,
+                    self.action_space.IDX_LOOK_UP_BIG,
+                    self.action_space.IDX_LOOK_DOWN_BIG,
+                    self.action_space.IDX_TURN_LEFT_BIG,
+                    self.action_space.IDX_TURN_RIGHT_BIG,
+                ]:
+                    landing_bias[idx] -= 8.0
 
-                elif distance < CLOSE_LANDING:
+            elif phase == "LAND":
+                if distance < CLOSE_LANDING:
                     if angle_to_goal_land < 30.0:
                         landing_bias[
                             self.action_space.IDX_FREE_FORWARD_SMALL
@@ -2212,7 +2461,6 @@ class RLGoalApproachController:
                     ] += 3.0 * landing_urgency
 
                     if depth < 10.0:
-                        # Close to surface — prefer small steps
                         landing_bias[
                             self.action_space.IDX_FREE_FORWARD_SMALL
                         ] += 4.0
@@ -2247,9 +2495,9 @@ class RLGoalApproachController:
 
         bias += landing_bias
         components["landing"] = landing_bias
-        
+
         return bias, components
-    
+        
     # ══════════════════════════════════════════════════════════
     # SUBGOAL HELPERS
     # ══════════════════════════════════════════════════════════
@@ -2661,84 +2909,142 @@ class RLGoalApproachController:
         if goal_reached:
             self._total_goals_reached += 1
 
-        # ═══ Update transition memories ═══
-        # Detach outcome: evaluate based on what happened AFTER detach
-        # not just final episode result
-        for i, pending_state in enumerate(self._pending_detach_states):
-            # Find the detach action in transitions
-            detach_indices = [
-                j for j, tr in enumerate(self._episode_transitions)
-                if tr["action"] == self.action_space.IDX_DETACH
-            ]
+        # ═══ Update strategic Q-stores ═══
+        cfg = self.config
+        switch_alpha = (
+            self._get_learning_rate()
+            * cfg.get("strategic_alpha_switch_multiplier", 1.0)
+        )
 
-            if i < len(detach_indices):
-                detach_idx = detach_indices[i]
+        # Detach outcomes
+        for pending in self._pending_strategic_detach:
+            t_state = pending["state"]
+            detach_step = pending["step"]
 
-                # Check if agent reached correct side after detach
-                reached_correct_side = False
-                for j in range(
-                    detach_idx + 1, len(self._episode_transitions)
-                ):
-                    future_state = self._episode_transitions[j]["state"]
-                    if future_state[11] > 0.5:  # back on surface
-                        future_an = future_state[6:9]
-                        future_gn = future_state[15:18]
-                        an_len = np.linalg.norm(future_an)
-                        gn_len = np.linalg.norm(future_gn)
-                        if an_len > 1e-8 and gn_len > 1e-8:
-                            agreement = float(np.dot(
-                                future_an / an_len,
-                                future_gn / gn_len,
-                            ))
-                            if agreement > 0.3:
-                                reached_correct_side = True
-                        break
+            # Check: did detach execute?
+            if detach_step + 1 < len(self._episode_transitions):
+                next_s = self._episode_transitions[detach_step + 1]["state"]
+                if next_s[11] > 0.5:
+                    continue  # didn't execute, skip
 
-                if reached_correct_side or goal_reached:
-                    detach_outcome = 1.0
-                elif termination_reason == "collision_surface_violation":
-                    detach_outcome = -0.5
-                else:
-                    detach_outcome = -0.3
+            # Find landing after detach
+            reached_correct_side = False
+            landed = False
+            for j in range(
+                detach_step + 1, len(self._episode_transitions)
+            ):
+                future_state = self._episode_transitions[j]["state"]
+                if future_state[11] > 0.5:
+                    landed = True
+                    future_an = future_state[6:9]
+                    future_gn = future_state[15:18]
+                    an_len = np.linalg.norm(future_an)
+                    gn_len = np.linalg.norm(future_gn)
+                    if an_len > 1e-8 and gn_len > 1e-8:
+                        agreement = float(np.dot(
+                            future_an / an_len,
+                            future_gn / gn_len,
+                        ))
+                        if agreement > 0.3:
+                            reached_correct_side = True
+                    break
+
+            if reached_correct_side or goal_reached:
+                self.strategic_detach.update_q_value(
+                    t_state, action=1,
+                    td_target=cfg.get(
+                        "strategic_reward_switch_success", 1.0
+                    ),
+                    alpha=switch_alpha,
+                )
+            elif landed:
+                self.strategic_detach.update_q_value(
+                    t_state, action=1,
+                    td_target=cfg.get(
+                        "strategic_reward_switch_wrong_side", -0.3
+                    ),
+                    alpha=switch_alpha,
+                )
+                self.strategic_detach.update_q_value(
+                    t_state, action=0,
+                    td_target=cfg.get(
+                        "strategic_reward_stay_correct", 0.3
+                    ),
+                    alpha=switch_alpha,
+                )
             else:
-                # Fallback
-                if goal_reached:
-                    detach_outcome = 1.0
-                elif termination_reason == "collision_surface_violation":
-                    detach_outcome = -1.0
-                else:
-                    detach_outcome = -0.3
+                self.strategic_detach.update_q_value(
+                    t_state, action=1,
+                    td_target=cfg.get(
+                        "strategic_reward_switch_collision", -0.5
+                    ),
+                    alpha=switch_alpha,
+                )
 
-            self.transition_detach.record(pending_state, detach_outcome)
-
-        # Direction transition outcome — keep simple
-        if self._pending_direction_state is not None:
+        # Direction outcomes
+        if self._pending_strategic_direction is not None:
+            d_state = self._pending_strategic_direction["state"]
             if goal_reached:
-                direction_outcome = 1.0
+                self.strategic_direction.update_q_value(
+                    d_state, action=1,
+                    td_target=cfg.get(
+                        "strategic_reward_switch_success", 1.0
+                    ),
+                    alpha=switch_alpha,
+                )
             elif termination_reason == "collision_surface_violation":
-                direction_outcome = -1.0
+                self.strategic_direction.update_q_value(
+                    d_state, action=1,
+                    td_target=cfg.get(
+                        "strategic_reward_switch_collision", -0.5
+                    ),
+                    alpha=switch_alpha,
+                )
             else:
-                direction_outcome = -0.3
-            self.transition_direction.record(
-                self._pending_direction_state, direction_outcome
-            )
+                self.strategic_direction.update_q_value(
+                    d_state, action=1,
+                    td_target=-0.3,
+                    alpha=switch_alpha,
+                )
 
-        # Track detach outcomes
-        if self._pending_detach_states:
+        # Timeout penalty: agent was on surface with opposite normals
+        if termination_reason == "timeout":
+            for tr in reversed(self._episode_transitions):
+                s = tr["state"]
+                if s[11] > 0.5:
+                    an = s[6:9]
+                    gn = s[15:18]
+                    an_len = np.linalg.norm(an)
+                    gn_len = np.linalg.norm(gn)
+                    if an_len > 1e-8 and gn_len > 1e-8:
+                        agreement = float(np.dot(
+                            an / an_len, gn / gn_len
+                        ))
+                        if agreement < -0.3:
+                            t_state = self._compute_detach_state_from_full(s)
+                            self.strategic_detach.update_q_value(
+                                t_state, action=1,
+                                td_target=0.5,
+                                alpha=switch_alpha,
+                            )
+                            break
+
+        # Track detach outcomes for stats
+        if self._pending_strategic_detach:
             self._strategic_stats["detach_total"] += len(
-                self._pending_detach_states
+                self._pending_strategic_detach
             )
             if goal_reached:
                 self._strategic_stats["detach_led_to_success"] += len(
-                    self._pending_detach_states
+                    self._pending_strategic_detach
                 )
             elif termination_reason == "collision_surface_violation":
                 self._strategic_stats["detach_led_to_collision"] += len(
-                    self._pending_detach_states
+                    self._pending_strategic_detach
                 )
             else:
                 self._strategic_stats["detach_led_to_timeout"] += len(
-                    self._pending_detach_states
+                    self._pending_strategic_detach
                 )
 
         # Accumulate phase counts
@@ -2750,7 +3056,39 @@ class RLGoalApproachController:
             )
         self._episode_phase_counts = {}
 
-        # ═══ Existing episode done logic ═══
+        # ═══ Update Strategic SAC ═══
+        if self.strategic_sac is not None and self._strategic_sac_pending:
+            for pending in self._strategic_sac_pending:
+                s_state = pending["state"]
+                action = pending["action"]
+
+                if pending["phase"] == "detach":
+                    if action == 1.0:
+                        if goal_reached:
+                            reward = 1.0
+                        elif termination_reason == "collision_surface_violation":
+                            reward = -0.5
+                        else:
+                            reward = -0.2
+                    else:
+                        if goal_reached:
+                            reward = 0.5
+                        else:
+                            reward = -0.3
+
+                next_s_state = s_state
+
+                self.strategic_sac.add_transition(
+                    state=s_state,
+                    action=action,
+                    reward=reward,
+                    next_state=next_s_state,
+                    done=True,
+                )
+
+            self._strategic_sac_pending = []
+
+        # ═══ Episode done logic ═══
         if goal_reached:
             reason = "GOAL_REACHED!!!"
             reason_key = "goal_reached"
@@ -2761,6 +3099,7 @@ class RLGoalApproachController:
                 f"reward={self._episode_reward:.1f}, "
                 f"final_dist={distance:.1f}mm, "
                 f"epsilon={self.epsilon:.3f}, "
+                f"strategic_eps={self.strategic_epsilon:.3f}, "
                 f"success_rate="
                 f"{self._total_goals_reached}/{self._total_episodes}"
             )
@@ -2810,8 +3149,10 @@ class RLGoalApproachController:
         self._fly_direction_age = 0
         self._current_phase = "CRAWL_TO_GOAL"
         self._prev_phase = None
-        self._pending_detach_states = []
-        self._pending_direction_state = None
+        self._pending_strategic_detach = []
+        self._pending_strategic_direction = None
+        self._path_clear_streak = 0
+        self._strategic_sac_pending = []
 
     # ══════════════════════════════════════════════════════════
     # DIAGNOSTICS
@@ -2865,6 +3206,7 @@ class RLGoalApproachController:
             "total_goals_reached": self._total_goals_reached,
             "success_rate": success_rate,
             "epsilon": self.epsilon,
+            "strategic_epsilon": self.strategic_epsilon,
             "current_episode_steps": self._steps,
             "current_episode_reward": self._episode_reward,
             "termination_counts": dict(self._termination_counts),
@@ -2882,11 +3224,113 @@ class RLGoalApproachController:
                 "air_ratio": float(air_steps) / total_nav_steps,
             },
         }
-        stats["transition_detach"] = self.transition_detach.get_stats()
-        stats["transition_direction"] = (
-            self.transition_direction.get_stats()
-        )
 
+        stats["strategic_detach"] = self.strategic_detach.get_stats()
+        stats["strategic_direction"] = self.strategic_direction.get_stats()
+
+        # Strategic Q-store diagnostic
+        if self.strategic_detach.next_id > 0:
+            detach_diag = {"zones": {}}
+            
+            # Analyze Q-values by normal_agreement zones
+            zones = [
+                ("opposite", -1.0, -0.3),    # same_side=False
+                ("perpendicular", -0.3, 0.3), # edge/corner
+                ("same", 0.3, 1.0),           # same_side=True
+            ]
+            
+            for zone_name, na_min, na_max in zones:
+                zone_points = []
+                for pid, point in self.strategic_detach.points.items():
+                    na = point.raw_state[0]  # normal_agreement
+                    if na_min <= na < na_max:
+                        zone_points.append(point)
+                
+                if zone_points:
+                    q_stays = [p.q_values[0] for p in zone_points]
+                    q_switches = [p.q_values[1] for p in zone_points]
+                    switch_preferred = sum(
+                        1 for p in zone_points
+                        if p.q_values[1] > p.q_values[0]
+                    )
+                    
+                    detach_diag["zones"][zone_name] = {
+                        "count": len(zone_points),
+                        "q_stay_mean": round(float(np.mean(q_stays)), 4),
+                        "q_switch_mean": round(float(np.mean(q_switches)), 4),
+                        "switch_preferred_ratio": round(
+                            switch_preferred / len(zone_points), 3
+                        ),
+                        "na_range": [na_min, na_max],
+                    }
+            
+            stats["strategic_detach_diagnostic"] = detach_diag
+
+        if self.strategic_direction.next_id > 0:
+            direction_diag = {"zones": {}}
+
+            # By path_blocked
+            for pb_name, pb_val in [("blocked", 1.0), ("clear", 0.0)]:
+                zone_points = []
+                for pid, point in self.strategic_direction.points.items():
+                    # path_blocked is index 4 in direction state (5D)
+                    if len(point.raw_state) > 4:
+                        pb = point.raw_state[4]
+                        if abs(pb - pb_val) < 0.5:
+                            zone_points.append(point)
+
+                if zone_points:
+                    q_stays = [p.q_values[0] for p in zone_points]
+                    q_switches = [p.q_values[1] for p in zone_points]
+                    switch_preferred = sum(
+                        1 for p in zone_points
+                        if p.q_values[1] > p.q_values[0]
+                    )
+
+                    direction_diag["zones"][pb_name] = {
+                        "count": len(zone_points),
+                        "q_stay_mean": round(float(np.mean(q_stays)), 4),
+                        "q_switch_mean": round(float(np.mean(q_switches)), 4),
+                        "switch_preferred_ratio": round(
+                            switch_preferred / len(zone_points), 3
+                        ),
+                    }
+
+            # By angle_to_goal zones
+            angle_zones = [
+                ("away", -1.0, 0.0),      # flying away from goal
+                ("sideways", 0.0, 0.5),    # flying sideways
+                ("toward", 0.5, 1.0),      # flying toward goal
+            ]
+
+            for zone_name, angle_min, angle_max in angle_zones:
+                zone_points = []
+                for pid, point in self.strategic_direction.points.items():
+                    # angle_to_goal is index 3 in direction state (5D)
+                    if len(point.raw_state) > 3:
+                        angle = point.raw_state[3]
+                        if angle_min <= angle < angle_max:
+                            zone_points.append(point)
+
+                if zone_points:
+                    q_stays = [p.q_values[0] for p in zone_points]
+                    q_switches = [p.q_values[1] for p in zone_points]
+                    switch_preferred = sum(
+                        1 for p in zone_points
+                        if p.q_values[1] > p.q_values[0]
+                    )
+
+                    direction_diag["zones"][f"angle_{zone_name}"] = {
+                        "count": len(zone_points),
+                        "q_stay_mean": round(float(np.mean(q_stays)), 4),
+                        "q_switch_mean": round(float(np.mean(q_switches)), 4),
+                        "switch_preferred_ratio": round(
+                            switch_preferred / len(zone_points), 3
+                        ),
+                    }
+
+            stats["strategic_direction_diagnostic"] = direction_diag
+            
         # Strategic level stats
         total_detach_decisions = max(
             self._strategic_stats["detach_memory_triggered"]
@@ -2967,13 +3411,16 @@ class RLGoalApproachController:
             "phase_distribution": self._strategic_stats[
                 "phase_counts"
             ],
-            "transition_detach_store": (
-                self.transition_detach.get_stats()
+            "strategic_detach_store": (
+                self.strategic_detach.get_stats()
             ),
-            "transition_direction_store": (
-                self.transition_direction.get_stats()
+            "strategic_direction_store": (
+                self.strategic_direction.get_stats()
             ),
         }
+
+        if self.strategic_sac is not None:
+            stats["strategic_sac"] = self.strategic_sac.get_stats()
 
         return stats
 
@@ -3039,6 +3486,7 @@ class RLGoalApproachController:
 
         if not self.is_training:
             self.epsilon = self.eval_epsilon
+            self.strategic_epsilon = self.config.get("strategic_eval_epsilon", 0.3)
 
         return state, False
 
@@ -3056,11 +3504,11 @@ class RLGoalApproachController:
         )
 
         # Save transition memories
-        self.transition_detach.save(
-            os.path.join(dirpath, "transition_detach.npz")
+        self.strategic_detach.save_with_index(
+            os.path.join(dirpath, "strategic_detach")
         )
-        self.transition_direction.save(
-            os.path.join(dirpath, "transition_direction.npz")
+        self.strategic_direction.save_with_index(
+            os.path.join(dirpath, "strategic_direction")
         )
 
         controller_state = {
@@ -3087,6 +3535,11 @@ class RLGoalApproachController:
         ).open("w") as f:
             json.dump(self.config, f, indent=2)
 
+        if self.strategic_sac is not None:
+            self.strategic_sac.save(
+                os.path.join(dirpath, "strategic_sac")
+            )
+
         logger.info("Controller saved to %s", dirpath)
 
     @classmethod
@@ -3109,20 +3562,30 @@ class RLGoalApproachController:
         )
 
         # Load transition memories
-        detach_path = os.path.join(
-            dirpath, "transition_detach.npz"
-        )
-        if pathlib.Path(detach_path).exists():
-            controller.transition_detach = TransitionMemory.load(
-                detach_path, name="detach"
+        detach_base = os.path.join(dirpath, "strategic_detach")
+        if pathlib.Path(detach_base + ".npz").exists():
+            s_detach_cfg = {
+                **(config or {}),
+                "state_dim": 3,
+                "num_actions": 2,
+                "max_points": cfg.get("transition_max_points", 10000),
+                "k_neighbors": cfg.get("transition_k_neighbors", 5),
+            }
+            controller.strategic_detach = HNSWStateStore.load_with_index(
+                detach_base, extra_cfg=s_detach_cfg
             )
 
-        direction_path = os.path.join(
-            dirpath, "transition_direction.npz"
-        )
-        if pathlib.Path(direction_path).exists():
-            controller.transition_direction = TransitionMemory.load(
-                direction_path, name="direction"
+        direction_base = os.path.join(dirpath, "strategic_direction")
+        if pathlib.Path(direction_base + ".npz").exists():
+            s_dir_cfg = {
+                **(config or {}),
+                "state_dim": 5,
+                "num_actions": 2,
+                "max_points": cfg.get("transition_max_points", 10000),
+                "k_neighbors": cfg.get("transition_k_neighbors", 5),
+            }
+            controller.strategic_direction = HNSWStateStore.load_with_index(
+                direction_base, extra_cfg=s_dir_cfg
             )
 
         state_data = np.load(
@@ -3135,6 +3598,20 @@ class RLGoalApproachController:
         loaded_total_goals_reached = int(
             state_data["total_goals_reached"]
         )
+        strategic_sac_path = os.path.join(
+            dirpath, "strategic_sac"
+        )
+
+        if (
+            pathlib.Path(strategic_sac_path).exists()
+            and (
+                pathlib.Path(strategic_sac_path)
+                / "strategic_actor.pt"
+            ).exists()
+        ):
+            controller.strategic_sac = StrategicSAC.load(
+                strategic_sac_path
+            )
 
         logger.info(
             f"Controller loaded from {dirpath}: "
@@ -3142,10 +3619,10 @@ class RLGoalApproachController:
             f"{loaded_total_steps} steps, "
             f"{loaded_total_goals_reached} goals, "
             f"epsilon={loaded_epsilon:.3f}, "
-            f"transition_detach="
-            f"{controller.transition_detach.get_stats()}, "
-            f"transition_direction="
-            f"{controller.transition_direction.get_stats()}"
+            f"strategic_detach="
+            f"{controller.strategic_detach.get_stats()}, "
+            f"strategic_direction="
+            f"{controller.strategic_direction.get_stats()}"
         )
 
         return controller

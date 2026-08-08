@@ -706,15 +706,16 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
             #   visualize_agent_goal(env, pose, goal_pose)
         if visualizer:
             level = curriculum.level_idx if curriculum else level_idx
-            visualizer.save_episode(
-                env=env,
-                episode=episode,
-                level=level,
-                result=ep_result,
-                goal_pose=goal_pose,
-                poses=current_poses,
-                actions=action_explanations,
-            )
+            if level == 2:
+                visualizer.save_episode(
+                    env=env,
+                    episode=episode,
+                    level=level,
+                    result=ep_result,
+                    goal_pose=goal_pose,
+                    poses=current_poses,
+                    actions=action_explanations,
+                )
 
         if curriculum is not None:
             curriculum.on_episode_end(

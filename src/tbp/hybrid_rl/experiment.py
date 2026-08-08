@@ -47,6 +47,7 @@ from tbp.hybrid_rl.rl_goal_approach_controller import (
 )
 from tbp.hybrid_rl.sac_trainer import PSACTrainer
 from tbp.hybrid_rl.ablation_runner import _maybe_save_visualization, visualize_agent_goal
+from tbp.hybrid_rl.strategic_sac import StrategicSAC, StrategicBCTrainer
 
 logger = logging.getLogger(__name__)
 
@@ -766,6 +767,66 @@ class RLGoalApproachExperiment:
         with bc_stats_path.open("w") as f:
             json.dump(bc_stats, f, indent=2)
 
+        # ═══ Strategic BC Training ═══
+        # Train Strategic SAC actor from TransitionMemory data
+        # collected during Q-learning training
+        logger.info("=" * 40)
+        logger.info("Strategic BC Training")
+        logger.info("=" * 40)
+
+        # Load controller to access TransitionMemory
+        for seed in self.train_seeds:
+            q_dir = self._q_model_dir(seed)
+            if not (Path(q_dir) / "config.json").exists():
+                logger.warning(
+                    "Q-store not found at %s, skipping Strategic BC",
+                    q_dir,
+                )
+                continue
+
+            controller = RLGoalApproachController.load(
+                q_dir,
+                agent_id=f"strategic_bc_seed_{seed}",
+                config={**self.rl_config, "mode": "eval"},
+            )
+
+            strategic_bc = StrategicBCTrainer(state_dim=6)
+            has_data = strategic_bc.prepare_data_from_transition_memory(
+                controller.transition_detach,
+                controller.transition_direction,
+            )
+
+            if has_data:
+                strategic_bc.train(num_epochs=100)
+
+                # Save Strategic BC model
+                strategic_bc_dir = str(
+                    self.runs_dir / "strategic_bc_model"
+                )
+                Path(strategic_bc_dir).mkdir(
+                    parents=True, exist_ok=True
+                )
+                torch.save(
+                    strategic_bc.get_actor_weights(),
+                    Path(strategic_bc_dir) / "strategic_actor.pt",
+                )
+                state_mean, state_std = (
+                    strategic_bc.get_normalization()
+                )
+                np.savez(
+                    Path(strategic_bc_dir) / "strategic_normalization.npz",
+                    state_mean=state_mean,
+                    state_std=state_std,
+                )
+                logger.info(
+                    "Strategic BC saved to %s",
+                    strategic_bc_dir,
+                )
+            else:
+                logger.warning(
+                    "No TransitionMemory data for Strategic BC"
+                )
+
         self._save_meta(
             "bc",
             None,
@@ -843,6 +904,41 @@ class RLGoalApproachExperiment:
             )
 
         sac_model_dir = self._sac_model_dir(self.sac_seed)
+
+        # Load Strategic BC into controller's Strategic SAC
+        strategic_bc_dir = str(
+            self.runs_dir / "strategic_bc_model"
+        )
+        if (
+            Path(strategic_bc_dir) / "strategic_actor.pt"
+        ).exists():
+            from tbp.hybrid_rl.strategic_sac import StrategicSAC
+
+            strategic_sac = StrategicSAC(state_dim=6)
+            strategic_sac.actor.load_state_dict(
+                torch.load(
+                    Path(strategic_bc_dir) / "strategic_actor.pt",
+                    weights_only=True,
+                )
+            )
+            norm = np.load(
+                Path(strategic_bc_dir)
+                / "strategic_normalization.npz"
+            )
+            strategic_sac._state_mean = norm["state_mean"]
+            strategic_sac._state_std = norm["state_std"]
+            strategic_sac._norm_frozen = True
+
+            logger.info(
+                "Strategic SAC loaded with BC warm start from %s",
+                strategic_bc_dir,
+            )
+        else:
+            strategic_sac = None
+            logger.info(
+                "No Strategic BC model found, "
+                "Strategic SAC will start without warm start"
+            )
 
         for mesh_name in self.sac_meshes:
             mesh_path = str(
@@ -1291,6 +1387,71 @@ class RLGoalApproachExperiment:
             logger.info(
                 "Loading SAC from training: %s",
                 self._sac_model_dir(self.sac_seed),
+            )
+
+        # Load or create Strategic SAC
+        strategic_bc_dir = str(
+            self.runs_dir / "strategic_bc_model"
+        )
+        adaptive_strategic_dir = str(
+            self.runs_dir
+            / f"adaptive_strategic_sac_seed_{adapt_seed}"
+        )
+
+        if (
+            Path(adaptive_strategic_dir)
+            / "strategic_actor.pt"
+        ).exists():
+            controller.strategic_sac = StrategicSAC.load(
+                adaptive_strategic_dir
+            )
+            logger.info(
+                "Strategic SAC loaded from adaptive: %s",
+                adaptive_strategic_dir,
+            )
+        elif (
+            Path(strategic_bc_dir) / "strategic_actor.pt"
+        ).exists():
+            from tbp.hybrid_rl.strategic_sac import StrategicSAC
+
+            controller.strategic_sac = StrategicSAC(state_dim=6)
+            controller.strategic_sac.actor.load_state_dict(
+                torch.load(
+                    Path(strategic_bc_dir) / "strategic_actor.pt",
+                    weights_only=True,
+                )
+            )
+            norm = np.load(
+                Path(strategic_bc_dir)
+                / "strategic_normalization.npz"
+            )
+            controller.strategic_sac._state_mean = norm["state_mean"]
+            controller.strategic_sac._state_std = norm["state_std"]
+            controller.strategic_sac._norm_frozen = True
+
+            # Warm start buffer from TransitionMemory
+            controller.strategic_sac.warm_start_from_transition_memory(
+                controller.transition_detach,
+                controller.transition_direction,
+            )
+            if (
+                controller.strategic_sac.buffer_size
+                >= controller.strategic_sac.batch_size
+            ):
+                controller.strategic_sac.update(num_steps=50)
+
+            logger.info(
+                "Strategic SAC created with BC warm start"
+            )
+        else:
+            controller.strategic_sac = StrategicSAC(state_dim=6)
+            controller.strategic_sac.warm_start_from_transition_memory(
+                controller.transition_detach,
+                controller.transition_direction,
+            )
+            logger.info(
+                "Strategic SAC created without BC "
+                "(warm start from TransitionMemory only)"
             )
 
         manager = AdaptiveTrainingManager(
@@ -2015,6 +2176,16 @@ class RLGoalApproachExperiment:
             "Adaptive results saved to %s", results_path
         )
 
+        # Save Strategic SAC
+        if controller.strategic_sac is not None:
+            controller.strategic_sac.save(
+                adaptive_strategic_dir
+            )
+            logger.info(
+                "Adaptive Strategic SAC saved to %s",
+                adaptive_strategic_dir,
+            )
+        
         # Save meta
         self._save_meta(
             f"adaptive_{self.adaptive_mesh}",

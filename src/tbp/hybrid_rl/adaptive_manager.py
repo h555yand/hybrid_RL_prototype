@@ -222,6 +222,19 @@ class AdaptiveTrainingManager:
             self.controller.epsilon = 0.1
             self._collect_transitions(success, transitions)
             self._maybe_online_sac_update()
+            # Update Strategic SAC
+            if (
+                self.controller.strategic_sac is not None
+                and self.controller.strategic_sac.buffer_size
+                >= self.controller.strategic_sac.batch_size
+                and self.total_episodes % 100 == 0
+            ):
+                stats = self.controller.strategic_sac.update(
+                    num_steps=20
+                )
+                logger.debug(
+                    "Strategic SAC update: %s", stats
+                )
 
         if self.mode == "offline":
             self._trigger_offline()

@@ -442,32 +442,26 @@ class HNSWStateStore:
     # POINT INSERTION
     # ══════════════════════════════════════════════════════════
     def _insert_point(self, raw_state: np.ndarray, norm_state: np.ndarray, action: int, td_target: float, alpha: float):
-        """Insert a new state point into the HNSW index.
-
-        Q-values are initialized by interpolating from existing neighbors
-        (if any), then the current Q-update is applied. This gives new
-        points a reasonable starting estimate instead of zeros.
-
-        Triggers eviction if index is at capacity.
-        """
         if len(self.points) >= self.max_points:
             self._evict_points()
 
-        # Initialize Q-values from neighbors
         q_init = self._interpolate_q_init(norm_state)
-
-        # Apply current Q-update
         q_init[action] += alpha * (td_target - q_init[action])
 
-        # Create and store point
         point_id = self.next_id
+
+        if len(raw_state) > 11:
+            on_obj = int(raw_state[11] > 0.5)
+        else:
+            on_obj = 0
+
         point = StatePoint(
             raw_state=np.array(raw_state, copy=True),
             norm_state=norm_state.copy(),
             q_values=q_init,
             visit_count=1,
             last_step=self.global_step,
-            on_object=int(raw_state[11] > 0.5),
+            on_object=on_obj,
         )
 
         do_replace = self._deleted_count > 0
@@ -933,36 +927,17 @@ class HNSWStateStore:
     def load_with_index(
         cls, filepath: str, extra_cfg
     ) -> "HNSWStateStore":
-        """Load store with pre-built HNSW index (fast path).
-
-        Expects files produced by save_with_index():
-            - <filepath>.npz  — points & config
-            - <filepath>.hnsw — native index binary
-            - <filepath>.cal.npz — calibration state (optional)
-
-        If the .hnsw file is missing or fails to load, falls back to
-        the standard load() which rebuilds the index from points.
-
-        Args:
-            filepath: Base path (same as passed to save_with_index).
-            extra_cfg: Override config parameters.
-
-        Returns:
-            Restored HNSWStateStore.
-        """
         base = filepath[:-4] if filepath.endswith(".npz") else filepath
         npz_path = base + ".npz"
         hnsw_path = base + ".hnsw"
         calibration_path = base + ".cal.npz"
 
-        # --- Fallback: no native index → rebuild from points ----------
         if not pathlib.Path(hnsw_path).exists():
             logger.warning(
                 "No HNSW index file at %s, falling back to rebuild from points", hnsw_path
             )
             return cls.load(npz_path, extra_cfg)
 
-        # --- Fast path: load .npz metadata + native index -------------
         data = np.load(npz_path, allow_pickle=False)
 
         config = data["config"]
@@ -986,11 +961,9 @@ class HNSWStateStore:
         store.global_step = global_step
         store._state_mean = data["state_mean"]
         store._state_std = data["state_std"]
-        # Restore feature weights
         if "feature_weights" in data:
             store._feature_weights = data["feature_weights"]
 
-        # Load native HNSW index
         try:
             store._index = hnswlib.Index(space="l2", dim=state_dim)
             store._index.load_index(
@@ -1005,7 +978,6 @@ class HNSWStateStore:
             )
             return cls.load(npz_path, extra_cfg)
 
-        # Restore StatePoint objects (without re-inserting into index)
         if "norm_states" in data:
             norm_states = data["norm_states"]
             q_values = data["q_values"]
@@ -1013,32 +985,30 @@ class HNSWStateStore:
             last_steps = data["last_steps"]
             raw_states = data["raw_states"] if "raw_states" in data else None
 
-            # Use saved IDs to match native HNSW index labels.
-            # Without this, sequential 0..N-1 IDs mismatch the HNSW
-            # labels after incremental eviction (mark_deleted), causing
-            # KeyError or silent wrong Q-value reads.
             if "point_ids" in data:
                 point_ids = data["point_ids"]
             else:
-                # Legacy files without point_ids: assume sequential.
-                # Safe only if no evictions happened before save.
                 point_ids = np.arange(len(norm_states))
 
             for i in range(len(norm_states)):
                 pid = int(point_ids[i])
+                rs = raw_states[i] if raw_states is not None else norm_states[i].copy()
+                if len(rs) > 11:
+                    on_obj = int(rs[11] > 0.5)
+                else:
+                    on_obj = 0
                 store.points[pid] = StatePoint(
-                    raw_state=raw_states[i] if raw_states is not None else norm_states[i].copy(),
+                    raw_state=rs,
                     norm_state=norm_states[i],
                     q_values=q_values[i],
                     visit_count=int(visit_counts[i]),
                     last_step=int(last_steps[i]),
-                    on_object=int((raw_states[i][11] if raw_states is not None else 0.0) > 0.5)
+                    on_object=on_obj,
                 )
             store.next_id = next_id
             store._norm_frozen = True
             store._freeze_done = True
 
-        # Restore calibration state
         if pathlib.Path(calibration_path).exists():
             try:
                 cal = np.load(calibration_path, allow_pickle=False)
@@ -1058,19 +1028,9 @@ class HNSWStateStore:
             f"from {npz_path} + {hnsw_path}"
         )
         return store
-
+    
     @classmethod
     def load(cls, filepath: str, extra_cfg) -> "HNSWStateStore":
-        """Load store state from disk and rebuild HNSW index.
-
-        Args:
-            filepath: Path to .npz file saved by save().
-            extra_cfg: Override any config parameter
-                (e.g. max_points=100000 to increase capacity).
-
-        Returns:
-            Restored HNSWStateStore with rebuilt index.
-        """
         data = np.load(filepath, allow_pickle=False)
 
         config = data["config"]
@@ -1080,7 +1040,6 @@ class HNSWStateStore:
         k_neighbors = int(config[3])
         global_step = int(config[4])
 
-        # Create store with saved or overridden config
         store_cfg = {
             "state_dim": state_dim,
             "num_actions": num_actions,
@@ -1094,11 +1053,9 @@ class HNSWStateStore:
         store.global_step = global_step
         store._state_mean = data["state_mean"]
         store._state_std = data["state_std"]
-        # Restore feature weights
         if "feature_weights" in data:
             store._feature_weights = data["feature_weights"]
 
-        # Restore points and rebuild index
         if "norm_states" in data:
             norm_states = data["norm_states"]
             q_values = data["q_values"]
@@ -1109,19 +1066,22 @@ class HNSWStateStore:
             if "point_ids" in data:
                 point_ids = data["point_ids"]
             else:
-                # Legacy files without point_ids: assume sequential.
-                # Safe only if no evictions happened before save.
                 point_ids = np.arange(len(norm_states))
 
             for i in range(len(norm_states)):
                 pid = int(point_ids[i])
+                rs = raw_states[i] if raw_states is not None else norm_states[i].copy()
+                if len(rs) > 11:
+                    on_obj = int(rs[11] > 0.5)
+                else:
+                    on_obj = 0
                 store.points[pid] = StatePoint(
-                    raw_state=raw_states[i] if raw_states is not None else norm_states[i].copy(),
+                    raw_state=rs,
                     norm_state=norm_states[i],
                     q_values=q_values[i],
                     visit_count=int(visit_counts[i]),
                     last_step=int(last_steps[i]),
-                    on_object=int((raw_states[i][11] if raw_states is not None else 0.0) > 0.5)
+                    on_object=on_obj,
                 )
 
                 store._index.add_items(

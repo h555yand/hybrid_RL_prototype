@@ -30,14 +30,14 @@ experiment:
       - [40.0, 120.0]
 
     training_stages:
-      - mesh: cube
-        episodes: 5000
+      - mesh: mug
+        episodes: 2000
         epsilon_start: 1.0
         epsilon_min: 0.1
         load_mode: null
 
-    eval_meshes: [cube]
-    eval_episodes_per_level: 300
+    eval_meshes: [mug]
+    eval_episodes_per_level: 100
 
     rl_config:
       mode: train_adapt_epsilon
