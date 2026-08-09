@@ -2760,7 +2760,8 @@ class RLGoalApproachController:
 
         When same_side=False (agent and goal on opposite sides of wall):
         fly toward open edge (rim) using up_direction projected onto
-        tangent plane. For horizontal surfaces, fly away from center.
+        tangent plane. For horizontal surfaces, fly away from center
+        with vertical component toward rim.
 
         When same_side=True: original tangent projection toward goal.
         Works for all solid objects and same-side hollow cases.
@@ -2795,7 +2796,8 @@ class RLGoalApproachController:
             f"same_side={same_side}, "
             f"normal={[round(x, 3) for x in n.tolist()]}, "
             f"goal_dir={[round(x, 3) for x in goal_dir.tolist()]}, "
-            f"agent_pos={[round(x, 1) for x in current_pose[:3].tolist()]}, "
+            f"agent_pos="
+            f"{[round(x, 1) for x in current_pose[:3].tolist()]}, "
             f"goal_pos={[round(x, 1) for x in goal_pos.tolist()]}, "
             f"distance={goal_dist:.1f}"
         )
@@ -2814,21 +2816,20 @@ class RLGoalApproachController:
             up_tangent_len = np.linalg.norm(up_tangent)
 
             if up_tangent_len > 0.3:
-                # Wall: fly along surface toward rim + away from surface
-                #up_tangent /= up_tangent_len
-                #fly_dir = up_tangent * 0.8 + n * 0.4
-                #fly_dir /= (np.linalg.norm(fly_dir) + 1e-12)
                 # Wall: fly along surface toward rim (straight up)
                 up_tangent /= up_tangent_len
                 fly_dir = up_tangent
                 logger.debug(
                     f"DETACH_FLY_DIR: opposite sides, wall, "
-                    f"up_tangent={[round(x, 3) for x in up_tangent.tolist()]}, "
-                    f"fly_dir={[round(x, 3) for x in fly_dir.tolist()]}"
+                    f"up_tangent="
+                    f"{[round(x, 3) for x in up_tangent.tolist()]}, "
+                    f"fly_dir="
+                    f"{[round(x, 3) for x in fly_dir.tolist()]}"
                 )
                 return fly_dir
             else:
-                # Horizontal surface (bottom/top): fly away from center
+                # Horizontal surface (bottom/top):
+                # fly away from center + toward open edge (rim)
                 center_raw = sensor_data.get("object_center")
                 if center_raw is not None:
                     center = np.asarray(center_raw, dtype=float)
@@ -2837,16 +2838,27 @@ class RLGoalApproachController:
                     away_len = np.linalg.norm(away_t)
                     if away_len > 1e-8:
                         away_t /= away_len
-                        logger.debug(
-                            f"DETACH_FLY_DIR: opposite sides, horizontal, "
-                            f"fly_dir={[round(x, 3) for x in away_t.tolist()]}"
+                        # Add vertical component toward open edge
+                        fly_dir = away_t * 0.5 + up * 0.8
+                        fly_dir /= (
+                            np.linalg.norm(fly_dir) + 1e-12
                         )
-                        return away_t
+                        logger.debug(
+                            f"DETACH_FLY_DIR: opposite sides, "
+                            f"horizontal, "
+                            f"away={[round(x, 3) for x in away_t.tolist()]}, "
+                            f"up={[round(x, 3) for x in up.tolist()]}, "
+                            f"fly_dir="
+                            f"{[round(x, 3) for x in fly_dir.tolist()]}"
+                        )
+                        return fly_dir
 
+                # Fallback: fly toward rim (up direction)
                 logger.debug(
-                    "DETACH_FLY_DIR: opposite sides, fallback to normal"
+                    "DETACH_FLY_DIR: opposite sides, "
+                    "horizontal fallback to up"
                 )
-                return n.copy()
+                return up.copy()
 
         # Same side — original tangent logic
         tangent = goal_dir - np.dot(goal_dir, n) * n
@@ -2855,7 +2867,9 @@ class RLGoalApproachController:
         up_raw = sensor_data.get("up_direction")
         if up_raw is not None:
             up = np.asarray(up_raw, dtype=float)
-            normal_horizontality = 1.0 - abs(float(np.dot(n, up)))
+            normal_horizontality = 1.0 - abs(
+                float(np.dot(n, up))
+            )
         else:
             normal_horizontality = 1.0
 
@@ -2863,7 +2877,8 @@ class RLGoalApproachController:
             fly_dir = n.copy()
             logger.debug(
                 f"DETACH_FLY_DIR: same_side, tangent degenerate, "
-                f"fly_dir=normal={[round(x, 3) for x in fly_dir.tolist()]}"
+                f"fly_dir=normal="
+                f"{[round(x, 3) for x in fly_dir.tolist()]}"
             )
             return fly_dir
 
@@ -2877,7 +2892,7 @@ class RLGoalApproachController:
             f"fly_dir={[round(x, 3) for x in fly_dir.tolist()]}"
         )
         return fly_dir
-                
+                    
     def _compute_subgoal_direction(
         self,
         current_pose: np.ndarray,

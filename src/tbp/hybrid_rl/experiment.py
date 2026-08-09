@@ -583,6 +583,7 @@ class RLGoalApproachExperiment:
             "mode": "eval",
             "eval_epsilon": 1.0,
             "temperature_override": 0.01,
+            "strategic_eval_epsilon": 1.0,
         }
 
         all_heuristic_transitions: list[Any] = []

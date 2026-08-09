@@ -8,7 +8,7 @@ experiment:
   config:
     seed: 42
     visualise: true
-    regenerate_scripts: true
+    regenerate_scripts: false
     do_train: false
     do_eval: false
     do_heur_eval: true
@@ -37,7 +37,7 @@ experiment:
         load_mode: null
 
     eval_meshes: [mug]
-    eval_episodes_per_level: 300
+    eval_episodes_per_level: 30
 
     rl_config:
       mode: train_adapt_epsilon
@@ -61,6 +61,22 @@ experiment:
       num_actions: 24
       rotation_step_big: 15.0
       free_step_backward: 2.0
+      # Strategic Q-store
+      strategic_epsilon_start: 1.0
+      strategic_epsilon_min: 0.3
+      strategic_eval_epsilon: 0.3
+      strategic_reward_switch_success: 1.0
+      strategic_reward_switch_wrong_side: -0.3
+      strategic_reward_switch_collision: -0.5
+      strategic_reward_stay_when_needed: -0.1
+      strategic_reward_stay_correct: 0.3
+      strategic_alpha_stay_multiplier: 0.1
+      strategic_alpha_switch_multiplier: 1.0
+      strategic_reward_stay_when_clear: -0.3
+      strategic_reward_switch_when_clear: 0.3
+      strategic_reward_stay_orbit_progress: 0.1
+      strategic_reward_stay_orbit_stuck: -0.05
+      strategic_reward_stay_should_have: 0.2
 
     sac_config:
       load_mode: null
