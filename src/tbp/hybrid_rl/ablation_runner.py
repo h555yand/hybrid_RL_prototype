@@ -31,9 +31,7 @@ from tbp.hybrid_rl.lightweight_env import LightweightEnv
 from tbp.hybrid_rl.rl_goal_approach_controller import RLGoalApproachController
 from tbp.hybrid_rl.visualize_env import save_episode_frames, visualize_agent_goal
 
-GOAL_THRESHOLD_PER_LEVEL = [5.0, 3.0, 2.0]
-
-_LOG_INTERVAL = 1000
+_LOG_INTERVAL = 100
 
 logger = logging.getLogger(__name__)
 
@@ -820,7 +818,7 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
             level = (
                 curriculum.level_idx if curriculum else level_idx
             )
-            if (episode+1) == 25:
+            if (episode + 1) % _LOG_INTERVAL == 0:
                 visualizer.save_episode(
                     env=env,
                     episode=episode,

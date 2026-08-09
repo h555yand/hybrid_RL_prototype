@@ -75,7 +75,7 @@ class RLGoalApproachController:
         # Strategic Q-stores (2 actions: stay=0, switch=1)
         strategic_detach_config = {
             **self.config,
-            "state_dim": 3,
+            "state_dim": 4,
             "num_actions": 2,
             "max_points": self.config.get("transition_max_points", 10000),
             "k_neighbors": self.config.get("transition_k_neighbors", 5),
@@ -325,6 +325,7 @@ class RLGoalApproachController:
                 state, self._prev_state, self._last_action, collision,
                 sensor_data=sensor_data,
                 prev_sensor_data=self._prev_sensor_data,
+                current_pose=current_pose,
             )
             self._episode_reward += reward
             self._episode_transitions.append(
@@ -501,22 +502,20 @@ class RLGoalApproachController:
         state: np.ndarray,
         sensor_data: Dict[str, Any],
     ) -> np.ndarray:
-        """Compact state for detach decision (3D).
-
-        Only geometric features that determine whether detach
-        is beneficial. No dynamic features (progress, stagnation).
+        """Compact state for detach decision (4D).
 
         Features:
             normal_agreement: dot(agent_normal, goal_normal)
             alignment: dot(goal_dir, agent_normal)
             norm_distance: distance / object_extent
+            path_blocked: is direct path to goal blocked (0/1)
 
         Args:
             state: Full 18D state vector.
             sensor_data: Current sensor readings.
 
         Returns:
-            3D compact state vector.
+            4D compact state vector.
         """
         agent_normal = state[6:9]
         goal_normal = state[15:18]
@@ -536,12 +535,17 @@ class RLGoalApproachController:
         max_extent = float(max(extents))
         norm_distance = float(state[13]) / max(max_extent, 1.0)
 
+        path_blocked = float(
+            sensor_data.get("path_blocked", False)
+        )
+
         return np.array([
             normal_agreement,
             alignment,
             norm_distance,
+            path_blocked,
         ], dtype=float)
-    
+
     def _compute_direction_transition_state(
         self,
         state: np.ndarray,
@@ -597,7 +601,11 @@ class RLGoalApproachController:
         self,
         full_state: np.ndarray,
     ) -> np.ndarray:
-        """Compute detach transition state from stored full state."""
+        """Compute detach transition state from stored full state.
+
+        Note: path_blocked not available from stored state,
+        defaults to 1.0 (assume blocked — conservative).
+        """
         agent_normal = full_state[6:9]
         goal_normal = full_state[15:18]
 
@@ -617,8 +625,9 @@ class RLGoalApproachController:
             normal_agreement,
             alignment,
             norm_distance,
+            1.0,  # assume path_blocked (conservative)
         ], dtype=float)
-
+    
     def _compute_strategic_heuristic(
         self,
         current_phase: str,
@@ -963,6 +972,7 @@ class RLGoalApproachController:
         collision,
         sensor_data=None,
         prev_sensor_data=None,
+        current_pose=None,
     ):
         cfg = self.config
         reward = 0.0
@@ -988,11 +998,6 @@ class RLGoalApproachController:
             if prev_sensor_data is not None
             else True
         )
-        curr_path_blocked = (
-            sensor_data.get("path_blocked", False)
-            if sensor_data is not None
-            else False
-        )
 
         # Determine current phase for strategy-aware rewards
         phase = getattr(self, "_current_phase", "CRAWL_TO_GOAL")
@@ -1000,13 +1005,23 @@ class RLGoalApproachController:
         # ═══ 1. Progress toward goal ═══
         progress_raw = prev_distance - distance
         progress = progress_raw
+
+        # Reduce negative progress penalty during bypass flight
+        if (
+            on_object < 0.5
+            and phase == "FLY_TO_EDGE"
+            and progress_raw < 0
+        ):
+            progress = progress_raw * 0.2
+
         detour_mode = (
             prev_alignment < cfg["detour_alignment_threshold"]
             and (prev_on_object > 0.5 or collision == "lost_object")
         )
         if detour_mode and progress_raw < 0.0:
             min_progress = (
-                -surface_step * cfg["detour_negative_progress_clip_steps"]
+                -surface_step
+                * cfg["detour_negative_progress_clip_steps"]
             )
             progress = max(progress_raw, min_progress)
 
@@ -1043,6 +1058,15 @@ class RLGoalApproachController:
             and prev_on_object > 0.5
         ):
             reward += -2.0
+
+        # ═══ 3.6 Penalty for flying too far from object ═══
+        if on_object < 0.5 and sensor_data is not None:
+            extents = sensor_data.get(
+                "object_extents", [84, 84, 84]
+            )
+            max_extent = float(max(extents))
+            if distance > max_extent * 1.5:
+                reward += -2.0
 
         # ═══ 4. Collisions ═══
         if collision == "surface_violation":
@@ -1084,36 +1108,8 @@ class RLGoalApproachController:
             reward += cfg["reward_near_goal_on_surface"]
 
         # ═══════════════════════════════════════════════════
-        # 6. PHASE BONUSES — strategy-aware rewards
+        # 6. PHASE BONUSES — tactical rewards only
         # ═══════════════════════════════════════════════════
-
-        # ── 6.1 Successful detach when needed ──
-        successful_detach = (
-            prev_on_object > 0.5
-            and on_object < 0.5
-            and collision is None
-            and not prev_same_side
-        )
-        if not successful_detach:
-            prev_path_blocked = (
-                prev_sensor_data.get("path_blocked", False)
-                if prev_sensor_data is not None
-                else False
-            )
-            successful_detach = (
-                prev_on_object > 0.5
-                and on_object < 0.5
-                and collision is None
-                and prev_path_blocked
-            )
-
-        if successful_detach:
-            reward += 10.0
-            logger.debug(
-                f"PHASE_BONUS: successful detach +10.0, "
-                f"prev_same_side={prev_same_side}, "
-                f"dist={distance:.1f}"
-            )
 
         # ── 6.2 Successful landing near goal ──
         successful_landing = (
@@ -1124,35 +1120,16 @@ class RLGoalApproachController:
         )
         if successful_landing:
             landing_radius = 8.0 * surface_step
-            landing_quality = max(0.0, 1.0 - distance / landing_radius)
+            landing_quality = max(
+                0.0, 1.0 - distance / landing_radius
+            )
             landing_bonus = 8.0 * landing_quality
             reward += landing_bonus
             logger.debug(
-                f"PHASE_BONUS: successful landing +{landing_bonus:.1f}, "
+                f"PHASE_BONUS: successful landing "
+                f"+{landing_bonus:.1f}, "
                 f"quality={landing_quality:.2f}, "
                 f"dist={distance:.1f}"
-            )
-
-        # ── 6.3 Side transition bonus ──
-        if not prev_same_side and curr_same_side:
-            reward += 5.0
-            logger.debug(
-                f"PHASE_BONUS: side transition +5.0, "
-                f"dist={distance:.1f}"
-            )
-
-        # ── 6.4 Wrong strategy penalty ──
-        goal_threshold = cfg.get("goal_threshold", 2.0)
-        wrong_strategy = (
-            on_object > 0.5
-            and phase == "DETACH_NEEDED"
-            and distance > goal_threshold * 3
-        )
-        if wrong_strategy:
-            reward += -0.5
-            logger.debug(
-                f"PHASE_PENALTY: wrong strategy -0.5, "
-                f"dist={distance:.1f}, phase={phase}"
             )
 
         # ── 6.5 Correct crawl bonus ──
@@ -1163,6 +1140,72 @@ class RLGoalApproachController:
         ):
             reward += 0.2
 
+        # ── 6.6 FLY_TO_EDGE: alignment with subgoal direction ──
+        if (
+            on_object < 0.5
+            and phase == "FLY_TO_EDGE"
+            and current_pose is not None
+        ):
+            subgoal_dir = getattr(
+                self, "_current_subgoal_dir", None
+            )
+            if subgoal_dir is not None:
+                rot = R.from_euler(
+                    "xyz", current_pose[3:6], degrees=True
+                )
+                forward = rot.apply([0, 0, -1])
+                curr_alignment = float(
+                    np.dot(forward, subgoal_dir)
+                )
+
+                prev_subgoal_alignment = getattr(
+                    self, "_prev_subgoal_alignment", None
+                )
+                if prev_subgoal_alignment is not None:
+                    align_improvement = (
+                        curr_alignment - prev_subgoal_alignment
+                    )
+                    reward += align_improvement * 2.0
+
+                self._prev_subgoal_alignment = curr_alignment
+            else:
+                self._prev_subgoal_alignment = None
+        elif (
+            on_object < 0.5
+            and phase in ("FLY_TO_GOAL", "LAND")
+            and current_pose is not None
+        ):
+            # ── 6.7 FLY_TO_GOAL/LAND: alignment with goal ──
+            goal_dir = (
+                self._current_goal[:3] - current_pose[:3]
+            )
+            goal_dist = np.linalg.norm(goal_dir)
+            if goal_dist > 1e-8:
+                goal_dir = goal_dir / goal_dist
+                rot = R.from_euler(
+                    "xyz", current_pose[3:6], degrees=True
+                )
+                forward = rot.apply([0, 0, -1])
+                curr_alignment = float(
+                    np.dot(forward, goal_dir)
+                )
+
+                prev_goal_alignment = getattr(
+                    self, "_prev_goal_alignment", None
+                )
+                if prev_goal_alignment is not None:
+                    align_improvement = (
+                        curr_alignment - prev_goal_alignment
+                    )
+                    reward += align_improvement * 2.0
+
+                self._prev_goal_alignment = curr_alignment
+            else:
+                self._prev_goal_alignment = None
+            self._prev_subgoal_alignment = None
+        else:
+            self._prev_subgoal_alignment = None
+            self._prev_goal_alignment = None
 
         # ═══ 7. Timeout ═══
         if self._steps >= cfg["max_steps_per_goal"]:
@@ -1430,6 +1473,9 @@ class RLGoalApproachController:
                 self._pending_strategic_detach.append({
                     "state": t_state.copy(),
                     "step": len(self._episode_transitions),
+                    "phase_was_detach_needed": (
+                        current_phase == "DETACH_NEEDED"
+                    ),
                 })
             else:
                 if current_phase == "DETACH_NEEDED":
@@ -1547,7 +1593,7 @@ class RLGoalApproachController:
                             d_state, action=0,
                             td_target=cfg.get(
                                 "strategic_reward_stay_orbit_progress",
-                                0.1,
+                                0.02,
                             ),
                             alpha=stay_alpha,
                         )
@@ -1631,6 +1677,7 @@ class RLGoalApproachController:
             self._pending_strategic_detach.append({
                 "state": t_state.copy(),
                 "step": len(self._episode_transitions),
+                "phase_was_detach_needed": True,
             })
 
         # Record direction transition (FLY_TO_EDGE → FLY_TO_GOAL)
@@ -1783,11 +1830,6 @@ class RLGoalApproachController:
     def _is_making_orbit_progress(self, window: int = 5) -> bool:
         """Check if agent is making progress while orbiting.
 
-        Progress in orbit means the angle between agent's forward
-        direction and goal direction is improving, OR the agent is
-        successfully moving around the object (distance to goal
-        oscillates but doesn't grow unboundedly).
-
         Uses distance history: if min distance in last N steps
         is less than min distance in N steps before that,
         the orbit is productive.
@@ -1799,7 +1841,7 @@ class RLGoalApproachController:
             True if orbit is productive.
         """
         if len(self._distance_history) < window * 2:
-            return True  # Not enough data, assume progress
+            return False  # Not enough data, don't assume progress
 
         recent = self._distance_history[-window:]
         previous = self._distance_history[-window * 2:-window]
@@ -1807,9 +1849,8 @@ class RLGoalApproachController:
         min_recent = min(recent)
         min_previous = min(previous)
 
-        # Orbit is productive if we got closer at some point
-        # Allow small tolerance (1 free_step)
-        return min_recent < min_previous + self.action_space.free_step
+        # Require real improvement, no tolerance
+        return min_recent < min_previous
     
     # ══════════════════════════════════════════════════════════
     # HEURISTIC BIAS
@@ -3093,7 +3134,7 @@ class RLGoalApproachController:
             if detach_step + 1 < len(self._episode_transitions):
                 next_s = self._episode_transitions[detach_step + 1]["state"]
                 if next_s[11] > 0.5:
-                    continue  # didn't execute, skip
+                    continue
 
             # Find landing after detach
             reached_correct_side = False
@@ -3141,13 +3182,22 @@ class RLGoalApproachController:
                     alpha=switch_alpha,
                 )
             else:
-                self.strategic_detach.update_q_value(
-                    t_state, action=1,
-                    td_target=cfg.get(
-                        "strategic_reward_switch_collision", -0.5
-                    ),
-                    alpha=switch_alpha,
+                # Timeout/collision — navigation failed
+                was_detach_needed = pending.get(
+                    "phase_was_detach_needed", False
                 )
+                if was_detach_needed:
+                    # Detach was correct decision, navigation
+                    # failed. Don't punish switch — neutral.
+                    pass
+                else:
+                    # Detach was questionable — reward stay
+                    self.strategic_detach.update_q_value(
+                        t_state, action=0,
+                        td_target=0.3,
+                        alpha=switch_alpha,
+                    )
+
         # ═══ Evaluate cached fly direction quality ═══
         if self._pending_strategic_detach:
             for pending in self._pending_strategic_detach:
@@ -3356,6 +3406,8 @@ class RLGoalApproachController:
         self._pending_strategic_direction = None
         self._path_clear_streak = 0
         self._strategic_sac_pending = []
+        self._prev_subgoal_alignment = None
+        self._prev_goal_alignment = None
 
     # ══════════════════════════════════════════════════════════
     # DIAGNOSTICS
@@ -3671,6 +3723,7 @@ class RLGoalApproachController:
                 state, self._prev_state, self._last_action, collision,
                 sensor_data=sensor_data,
                 prev_sensor_data=self._prev_sensor_data,
+                current_pose=current_pose,
             )
             self._episode_reward += reward
             self._episode_transitions.append(
@@ -3791,7 +3844,7 @@ class RLGoalApproachController:
         if pathlib.Path(detach_base + ".npz").exists():
             s_detach_cfg = {
                 **(config or {}),
-                "state_dim": 3,
+                "state_dim": 4,  # CHANGED: was 3
                 "num_actions": 2,
                 "max_points": cfg.get("transition_max_points", 10000),
                 "k_neighbors": cfg.get("transition_k_neighbors", 5),

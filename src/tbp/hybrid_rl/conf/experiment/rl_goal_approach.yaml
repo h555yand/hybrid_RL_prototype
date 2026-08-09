@@ -9,9 +9,9 @@ experiment:
     seed: 42
     visualise: true
     regenerate_scripts: false
-    do_train: false
-    do_eval: false
-    do_heur_eval: true
+    do_train: true
+    do_eval: true
+    do_heur_eval: false
     do_bc_train: false
     do_sac_train: false
     do_sac_eval: false
@@ -21,17 +21,17 @@ experiment:
     eval_seeds: [44]
     sac_eval_seeds: [77]
     sac_seed: 11
-    promote_threshold: 0.35
-    promote_window: 150
+    promote_threshold: 0.5
+    promote_window: 100
 
     curriculum_levels:
       - [10.0, 40.0]
       - [20.0, 80.0]
-      - [40.0, 120.0]
+      - [30.0, 120.0]
 
     training_stages:
       - mesh: mug
-        episodes: 3000
+        episodes: 500
         epsilon_start: 1.0
         epsilon_min: 0.1
         load_mode: null
@@ -61,10 +61,12 @@ experiment:
       num_actions: 24
       rotation_step_big: 15.0
       free_step_backward: 2.0
+      # Tactical Q-store rewrite
+      eval_epsilon: 0.02 # 0.02
       # Strategic Q-store
       strategic_epsilon_start: 1.0
       strategic_epsilon_min: 0.3
-      strategic_eval_epsilon: 0.3
+      strategic_eval_epsilon: 0.3 # 0.3
       strategic_reward_switch_success: 1.0
       strategic_reward_switch_wrong_side: -0.3
       strategic_reward_switch_collision: -0.5
@@ -74,7 +76,7 @@ experiment:
       strategic_alpha_switch_multiplier: 1.0
       strategic_reward_stay_when_clear: -0.3
       strategic_reward_switch_when_clear: 0.3
-      strategic_reward_stay_orbit_progress: 0.1
+      strategic_reward_stay_orbit_progress: 0.02
       strategic_reward_stay_orbit_stuck: -0.05
       strategic_reward_stay_should_have: 0.2
 

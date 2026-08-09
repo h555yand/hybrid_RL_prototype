@@ -66,7 +66,7 @@ DEFAULT_CONFIG = {
     "strategic_alpha_switch_multiplier": 1.0,
     "strategic_reward_stay_when_clear": -0.3,
     "strategic_reward_switch_when_clear": 0.3,
-    "strategic_reward_stay_orbit_progress": 0.1,
+    "strategic_reward_stay_orbit_progress": 0.02,
     "strategic_reward_stay_orbit_stuck": -0.05,
     "strategic_reward_stay_should_have": 0.2,
     # Detour shaping: if goal is behind surface, clip negative progress penalty

@@ -56,7 +56,7 @@ _ADAPTIVE_MAX_DIST = 120.0
 _ADAPTIVE_LOG_INTERVAL = 100
 _SAC_WARMUP_STEPS = 5000
 _BC_NUM_EPOCHS = 200
-_EVAL_EPSILON = 0.02
+# _EVAL_EPSILON = 0.02
 _COLLISION_DEPTH_THRESHOLD = 0.5
 
 
@@ -487,7 +487,6 @@ class RLGoalApproachExperiment:
         eval_cfg = {
             **self.rl_config,
             "mode": "eval",
-            "eval_epsilon": _EVAL_EPSILON,
         }
 
         all_bc_transitions: list[Any] = []
