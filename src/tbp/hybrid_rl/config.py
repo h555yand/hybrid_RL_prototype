@@ -64,6 +64,11 @@ DEFAULT_CONFIG = {
     "strategic_reward_stay_correct": 0.3,
     "strategic_alpha_stay_multiplier": 0.1,
     "strategic_alpha_switch_multiplier": 1.0,
+    "strategic_reward_stay_when_clear": -0.3,
+    "strategic_reward_switch_when_clear": 0.3,
+    "strategic_reward_stay_orbit_progress": 0.1,
+    "strategic_reward_stay_orbit_stuck": -0.05,
+    "strategic_reward_stay_should_have": 0.2,
     # Detour shaping: if goal is behind surface, clip negative progress penalty
     # to avoid over-penalizing necessary face-to-face transitions on polyhedra.
     "detour_alignment_threshold": -0.2,

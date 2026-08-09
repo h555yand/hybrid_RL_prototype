@@ -851,23 +851,53 @@ class RLGoalApproachController:
                         f"bypass fallback (dist={distance:.0f})",
                     )
 
-            if not same_side:
+            # ═══ Hysteresis: require sustained path_clear ═══
+            path_clear_streak = getattr(
+                self, "_path_clear_streak", 0
+            )
+
+            # Quick transition if path is clearly open
+            if path_clear_streak >= 3:
                 self._cached_orbit_direction = None
                 self._orbit_direction_age = 0
                 return (
                     "FLY_TO_GOAL",
                     None,
-                    f"different side but path clear "
+                    f"path clear {path_clear_streak} steps "
                     f"(dist={distance:.0f})",
                 )
 
+            # Single step clear — stay in current phase
+            # to avoid oscillation
+            # Single step clear — stay in current phase
+            # to avoid oscillation
+            prev_phase = getattr(self, "_prev_phase", None)
+            if prev_phase == "FLY_TO_EDGE":
+                cached_dir = getattr(
+                    self, "_cached_fly_direction", None
+                )
+                if cached_dir is None:
+                    cached_dir = getattr(
+                        self, "_cached_orbit_direction", None
+                    )
+                return (
+                    "FLY_TO_EDGE",
+                    cached_dir,
+                    f"path clear but hysteresis "
+                    f"(streak={path_clear_streak}, "
+                    f"dist={distance:.0f})",
+                )        
+            
+            # ═══ Default: fly to goal ═══
             self._cached_orbit_direction = None
             self._orbit_direction_age = 0
             return (
                 "FLY_TO_GOAL",
                 None,
-                f"path clear, fly to goal (dist={distance:.0f})",
+                f"path clear, fly to goal "
+                f"(dist={distance:.0f})",
             )
+        
     # ══════════════════════════════════════════════════════════
     # COLLISION DETECTION
     # ══════════════════════════════════════════════════════════
@@ -1476,28 +1506,73 @@ class RLGoalApproachController:
                 ] += 1
 
             # Stay penalty: path clear but didn't switch
+            # ═══ Direction store per-step updates ═══
             path_clear = not sensor_data.get("path_blocked", True)
             if path_clear:
                 self._path_clear_streak += 1
             else:
                 self._path_clear_streak = 0
 
-            if (
-                current_phase == "FLY_TO_EDGE"
-                and self._path_clear_streak >= 3
-            ):
-                stay_alpha = (
-                    self._get_learning_rate()
-                    * cfg.get("strategic_alpha_stay_multiplier", 0.1)
-                )
-                self.strategic_direction.update_q_value(
-                    d_state, action=0,
-                    td_target=cfg.get(
-                        "strategic_reward_stay_when_needed", -0.1
-                    ),
-                    alpha=stay_alpha,
-                    count_visit=True,
-                )
+            stay_alpha = (
+                self._get_learning_rate()
+                * cfg.get("strategic_alpha_stay_multiplier", 0.1)
+            )
+
+            if current_phase == "FLY_TO_EDGE":
+                if path_clear and self._path_clear_streak >= 3:
+                    # Path is clear — should switch to FLY_TO_GOAL
+                    # Penalize stay, reward switch
+                    self.strategic_direction.update_q_value(
+                        d_state, action=0,
+                        td_target=cfg.get(
+                            "strategic_reward_stay_when_clear", -0.3
+                        ),
+                        alpha=stay_alpha,
+                    )
+                    self.strategic_direction.update_q_value(
+                        d_state, action=1,
+                        td_target=cfg.get(
+                            "strategic_reward_switch_when_clear", 0.3
+                        ),
+                        alpha=stay_alpha,
+                    )
+                elif not path_clear:
+                    # Path blocked — evaluate orbit progress
+                    orbit_progress = self._is_making_orbit_progress(
+                        window=5
+                    )
+                    if orbit_progress:
+                        # Good orbit — reward staying in FLY_TO_EDGE
+                        self.strategic_direction.update_q_value(
+                            d_state, action=0,
+                            td_target=cfg.get(
+                                "strategic_reward_stay_orbit_progress",
+                                0.1,
+                            ),
+                            alpha=stay_alpha,
+                        )
+                    else:
+                        # Stuck in orbit — small penalty for stay
+                        self.strategic_direction.update_q_value(
+                            d_state, action=0,
+                            td_target=cfg.get(
+                                "strategic_reward_stay_orbit_stuck",
+                                -0.05,
+                            ),
+                            alpha=stay_alpha,
+                        )
+
+            elif current_phase == "FLY_TO_GOAL":
+                if not path_clear:
+                    # Flying to goal but path blocked — should have
+                    # stayed in FLY_TO_EDGE
+                    self.strategic_direction.update_q_value(
+                        d_state, action=0,
+                        td_target=cfg.get(
+                            "strategic_reward_stay_should_have", 0.2
+                        ),
+                        alpha=stay_alpha,
+                    )
 
         self._prev_phase = current_phase
 
@@ -1704,6 +1779,37 @@ class RLGoalApproachController:
             and not last_was_detach
             and not close_to_goal
         )
+    
+    def _is_making_orbit_progress(self, window: int = 5) -> bool:
+        """Check if agent is making progress while orbiting.
+
+        Progress in orbit means the angle between agent's forward
+        direction and goal direction is improving, OR the agent is
+        successfully moving around the object (distance to goal
+        oscillates but doesn't grow unboundedly).
+
+        Uses distance history: if min distance in last N steps
+        is less than min distance in N steps before that,
+        the orbit is productive.
+
+        Args:
+            window: Number of steps to check.
+
+        Returns:
+            True if orbit is productive.
+        """
+        if len(self._distance_history) < window * 2:
+            return True  # Not enough data, assume progress
+
+        recent = self._distance_history[-window:]
+        previous = self._distance_history[-window * 2:-window]
+
+        min_recent = min(recent)
+        min_previous = min(previous)
+
+        # Orbit is productive if we got closer at some point
+        # Allow small tolerance (1 free_step)
+        return min_recent < min_previous + self.action_space.free_step
     
     # ══════════════════════════════════════════════════════════
     # HEURISTIC BIAS
@@ -2492,6 +2598,27 @@ class RLGoalApproachController:
                         landing_bias[
                             self.action_space.IDX_FREE_FORWARD_SMALL
                         ] -= 15.0
+        # ═══ Approach speed control during LAND ═══
+        if phase == "LAND" and on_object < 0.5:
+            depth = sensor_data.get("depth", 100.0)
+            
+            # Progressive speed reduction as depth decreases
+            if depth < 3.0 * self.action_space.free_step:
+                # Very close to surface — only small steps
+                landing_bias[
+                    self.action_space.IDX_FREE_FORWARD
+                ] -= 20.0
+                landing_bias[
+                    self.action_space.IDX_FREE_FORWARD_SMALL
+                ] += 5.0
+            elif depth < 6.0 * self.action_space.free_step:
+                # Approaching — prefer small steps
+                landing_bias[
+                    self.action_space.IDX_FREE_FORWARD
+                ] -= 10.0
+                landing_bias[
+                    self.action_space.IDX_FREE_FORWARD_SMALL
+                ] += 3.0
 
         bias += landing_bias
         components["landing"] = landing_bias
@@ -2595,6 +2722,32 @@ class RLGoalApproachController:
             f"tangent={[round(x, 3) for x in tangent.tolist()]}, "
             f"orbit_dir={[round(x, 3) for x in orbit_dir.tolist()]}"
         )
+
+        # ═══ Vertical escape when orbit stalls ═══
+        orbit_age = getattr(self, "_orbit_direction_age", 0)
+        if orbit_age > 15:
+            # Orbit has been going too long — add vertical
+            # component to escape over/under obstacle
+            up = np.asarray(up_dir_raw, dtype=float)
+            
+            # Check if goal is above or below agent
+            goal_height = goal_pos[height_axis]
+            agent_height = current_pose[height_axis]
+            
+            if goal_height > agent_height:
+                vertical = up * 0.5
+            else:
+                vertical = -up * 0.5
+            
+            orbit_dir = orbit_dir + vertical
+            orbit_len = np.linalg.norm(orbit_dir)
+            if orbit_len > 1e-8:
+                orbit_dir /= orbit_len
+            
+            logger.debug(
+                f"ORBIT_VERTICAL_ESCAPE: age={orbit_age}, "
+                f"added vertical component"
+            )
 
         return orbit_dir
 
@@ -2980,8 +3133,43 @@ class RLGoalApproachController:
                     ),
                     alpha=switch_alpha,
                 )
+        # ═══ Evaluate cached fly direction quality ═══
+        if self._pending_strategic_detach:
+            for pending in self._pending_strategic_detach:
+                detach_step = pending["step"]
+                
+                # Count steps spent in air after detach
+                air_steps_after = 0
+                landed_successfully = False
+                for j in range(
+                    detach_step + 1,
+                    len(self._episode_transitions),
+                ):
+                    future_state = self._episode_transitions[j][
+                        "state"
+                    ]
+                    if future_state[11] > 0.5:
+                        landed_successfully = True
+                        break
+                    air_steps_after += 1
+                
+                max_reasonable_air = 50
+                if (
+                    air_steps_after > max_reasonable_air
+                    and not landed_successfully
+                ):
+                    t_state = pending["state"]
+                    self.strategic_detach.update_q_value(
+                        t_state,
+                        action=1,
+                        td_target=cfg.get(
+                            "strategic_reward_switch_long_air",
+                            -0.2,
+                        ),
+                        alpha=switch_alpha * 0.5,
+                    )
 
-        # Direction outcomes
+        # ═══ Direction outcomes (OUTSIDE detach loop) ═══
         if self._pending_strategic_direction is not None:
             d_state = self._pending_strategic_direction["state"]
             if goal_reached:
@@ -3294,6 +3482,17 @@ class RLGoalApproachController:
                         "switch_preferred_ratio": round(
                             switch_preferred / len(zone_points), 3
                         ),
+                        # ═══ NEW: Q_stay breakdown ═══
+                        "q_stay_positive_count": sum(
+                            1 for q in q_stays if q > 0.01
+                        ),
+                        "q_stay_negative_count": sum(
+                            1 for q in q_stays if q < -0.01
+                        ),
+                        "q_stay_zero_count": sum(
+                            1 for q in q_stays
+                            if abs(q) <= 0.01
+                        ),
                     }
 
             # By angle_to_goal zones
@@ -3327,10 +3526,21 @@ class RLGoalApproachController:
                         "switch_preferred_ratio": round(
                             switch_preferred / len(zone_points), 3
                         ),
+                        # ═══ NEW: Q_stay breakdown ═══
+                        "q_stay_positive_count": sum(
+                            1 for q in q_stays if q > 0.01
+                        ),
+                        "q_stay_negative_count": sum(
+                            1 for q in q_stays if q < -0.01
+                        ),
+                        "q_stay_zero_count": sum(
+                            1 for q in q_stays
+                            if abs(q) <= 0.01
+                        ),
                     }
 
             stats["strategic_direction_diagnostic"] = direction_diag
-            
+
         # Strategic level stats
         total_detach_decisions = max(
             self._strategic_stats["detach_memory_triggered"]

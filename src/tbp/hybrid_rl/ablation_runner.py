@@ -145,8 +145,22 @@ def run_eval_per_seed(  # noqa: PLR0913
                 "surface_air_ratio": stats.get(
                     "surface_air_ratio", {}
                 ),
+                # ═══ NEW ═══
+                "phase_metrics": metrics.get(
+                    "phase_metrics", {}
+                ),
+                "strategic": {
+                    "strategic_detach_diagnostic": stats.get(
+                        "strategic_detach_diagnostic", {}
+                    ),
+                    "strategic_direction_diagnostic": stats.get(
+                        "strategic_direction_diagnostic", {}
+                    ),
+                    "strategic_decisions": stats.get(
+                        "strategic", {}
+                    ),
+                },
             }
-
         seed_key = f"train_{train_seed}_eval_{eval_seed}"
         results_per_seed[seed_key] = seed_results
 
@@ -601,6 +615,12 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
     goals_reached = 0
     success_trails: list[Any] = []
     success_actions: list[list[str]] = []
+    # ═══ NEW: Aggregate tracking across episodes ═══
+    _all_phase_counts: dict[str, int] = {}
+    _phase_transitions: dict[str, int] = {}
+    _orbit_ages: list[int] = []
+    _detach_outcomes: list[dict[str, Any]] = []
+    _collision_per_phase: dict[str, int] = {}
 
     for episode in range(num_episodes):
         if episodes_per_level is not None and episode >= episodes_per_level:
@@ -662,6 +682,15 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
         # Run episode steps
         action_explanations: list[str] = []
         current_poses: list[np.ndarray] = []
+        # Run episode steps
+        action_explanations: list[str] = []
+        current_poses: list[np.ndarray] = []
+
+        # ═══ NEW: Phase & detach tracking ═══
+        ep_phase_counts: dict[str, int] = {}
+        ep_prev_phase: str | None = None
+        ep_detach_start_step: int | None = None
+        ep_detach_start_dist: float | None = None
 
         for _step in range(controller.config["max_steps_per_goal"]):
             current_pose = env.get_pose()
@@ -672,6 +701,75 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
                     explanation["interpretation"]
                 )
             current_poses.append(env.get_pose())
+            
+            _, explanation = controller.step(current_pose, sensor_data)
+            if explanation is not None:
+                action_explanations.append(
+                    explanation["interpretation"]
+                )
+            current_poses.append(env.get_pose())
+
+            # ═══ NEW: Track phase ═══
+            cur_phase = getattr(
+                controller, "_current_phase", "UNKNOWN"
+            )
+            ep_phase_counts[cur_phase] = (
+                ep_phase_counts.get(cur_phase, 0) + 1
+            )
+            if (
+                ep_prev_phase is not None
+                and ep_prev_phase != cur_phase
+            ):
+                t_key = f"{ep_prev_phase}→{cur_phase}"
+                _phase_transitions[t_key] = (
+                    _phase_transitions.get(t_key, 0) + 1
+                )
+                # Track orbit age when leaving FLY_TO_EDGE
+                if ep_prev_phase == "FLY_TO_EDGE":
+                    o_age = getattr(
+                        controller, "_orbit_direction_age", 0
+                    )
+                    _orbit_ages.append(o_age)
+            ep_prev_phase = cur_phase
+
+            # Track detach outcomes
+            if (
+                controller._last_action is not None
+                and controller.action_space.get_info(
+                    controller._last_action
+                ).name == "detach"
+            ):
+                cur_pose = env.get_pose()
+                ep_detach_start_step = _step
+                ep_detach_start_dist = float(
+                    np.linalg.norm(
+                        goal_pose[:3] - cur_pose[:3]
+                    )
+                )
+
+            # Detect landing after detach
+            if ep_detach_start_step is not None:
+                s_data = env.get_sensor_data()
+                if s_data.get("on_object", False):
+                    air_steps = _step - ep_detach_start_step
+                    cur_pose = env.get_pose()
+                    cur_dist = float(
+                        np.linalg.norm(
+                            goal_pose[:3] - cur_pose[:3]
+                        )
+                    )
+                    dist_impr = (
+                        ep_detach_start_dist - cur_dist
+                    )
+                    _detach_outcomes.append({
+                        "air_steps": air_steps,
+                        "dist_improvement": round(
+                            dist_impr, 1
+                        ),
+                        "landed": True,
+                    })
+                    ep_detach_start_step = None
+                    ep_detach_start_dist = None
 
             if controller._current_goal is None:
                 goals_reached = max(
@@ -698,6 +796,27 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
                 ep_result = "timeout"
             else:
                 ep_result = "collision"
+
+        # ═══ NEW: Aggregate phase counts ═══
+        for phase, count in ep_phase_counts.items():
+            _all_phase_counts[phase] = (
+                _all_phase_counts.get(phase, 0) + count
+            )
+
+        # Track collision phase
+        if ep_result == "collision" and ep_prev_phase:
+            _collision_per_phase[ep_prev_phase] = (
+                _collision_per_phase.get(ep_prev_phase, 0) + 1
+            )
+
+        # Handle unresolved detach (episode ended in air)
+        if ep_detach_start_step is not None:
+            air_steps = _step - ep_detach_start_step
+            _detach_outcomes.append({
+                "air_steps": air_steps,
+                "dist_improvement": 0.0,
+                "landed": False,
+            })
 
         if visualise:
             start_rot = np.array([0.0, 0.0, 0.0])
@@ -751,6 +870,62 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
             "final_level": 0,
             "fallback_rate": 0.0,
         }
+    # ═══ NEW: Build extended metrics ═══
+    phase_metrics = {
+        "phase_distribution": _all_phase_counts,
+        "phase_transitions": _phase_transitions,
+        "collision_per_phase": _collision_per_phase,
+    }
+
+    if _orbit_ages:
+        phase_metrics["orbit_stats"] = {
+            "mean_orbit_age": round(
+                float(np.mean(_orbit_ages)), 1
+            ),
+            "median_orbit_age": round(
+                float(np.median(_orbit_ages)), 1
+            ),
+            "max_orbit_age": int(np.max(_orbit_ages)),
+            "orbits_over_15": sum(
+                1 for a in _orbit_ages if a > 15
+            ),
+            "total_orbits": len(_orbit_ages),
+        }
+
+    if _detach_outcomes:
+        air_steps_list = [
+            d["air_steps"] for d in _detach_outcomes
+        ]
+        landed = [
+            d for d in _detach_outcomes if d["landed"]
+        ]
+        phase_metrics["detach_analysis"] = {
+            "total_detaches": len(_detach_outcomes),
+            "mean_air_steps": round(
+                float(np.mean(air_steps_list)), 1
+            ),
+            "median_air_steps": round(
+                float(np.median(air_steps_list)), 1
+            ),
+            "max_air_steps": int(np.max(air_steps_list)),
+            "landed_count": len(landed),
+            "landed_rate": round(
+                len(landed)
+                / max(len(_detach_outcomes), 1),
+                3,
+            ),
+            "mean_dist_improvement": round(
+                float(
+                    np.mean(
+                        [d["dist_improvement"] for d in landed]
+                    )
+                ),
+                1,
+            )
+            if landed
+            else 0,
+        }
+
     return {
         "goals_reached": goals_reached,
         "num_episodes": num_episodes,
@@ -759,4 +934,5 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
         "curriculum_stats": curriculum_stats,
         "success_trails": success_trails,
         "success_actions": success_actions,
+        "phase_metrics": phase_metrics,  # NEW
     }
