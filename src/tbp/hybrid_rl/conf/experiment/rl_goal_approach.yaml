@@ -9,9 +9,9 @@ experiment:
     seed: 42
     visualise: true
     regenerate_scripts: true
-    do_train: true
-    do_eval: true
-    do_heur_eval: false
+    do_train: false
+    do_eval: false
+    do_heur_eval: true
     do_bc_train: false
     do_sac_train: false
     do_sac_eval: false
