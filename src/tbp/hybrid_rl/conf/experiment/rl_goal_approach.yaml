@@ -8,7 +8,7 @@ experiment:
   config:
     seed: 42
     visualise: true
-    regenerate_scripts: true
+    regenerate_scripts: false
     do_train: true
     do_eval: true
     do_heur_eval: false
@@ -31,13 +31,13 @@ experiment:
 
     training_stages:
       - mesh: mug
-        episodes: 5000
+        episodes: 1000
         epsilon_start: 1.0
         epsilon_min: 0.1
         load_mode: null
 
     eval_meshes: [mug]
-    eval_episodes_per_level: 500
+    eval_episodes_per_level: 100
 
     rl_config:
       mode: train_adapt_epsilon

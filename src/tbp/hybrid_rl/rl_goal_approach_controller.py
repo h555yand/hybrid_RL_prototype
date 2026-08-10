@@ -277,6 +277,8 @@ class RLGoalApproachController:
                 )
         self._episode_phase_counts = {}
         self._strategic_sac_pending = []
+        self._prev_subgoal_alignment = None
+        self._prev_goal_alignment = None
 
     def step(
         self,
@@ -654,6 +656,9 @@ class RLGoalApproachController:
             elif current_phase == "CRAWL_TO_GOAL":
                 h[0] += 3.0
                 h[1] -= 3.0
+            elif current_phase == "CRAWL_TO_EDGE":
+                h[0] += 3.0   # stay — crawling to edge is productive
+                h[1] -= 3.0   # don't detach while making progress to edge
         else:
             if current_phase == "FLY_TO_GOAL" or current_phase == "LAND":
                 h[1] += 3.0
@@ -740,82 +745,131 @@ class RLGoalApproachController:
             self._cached_orbit_direction = None
             self._orbit_direction_age = 0
 
-            if not same_side:
-                fly_dir = self._compute_detach_fly_direction(
-                    current_pose, sensor_data
-                )
-                return (
-                    "DETACH_NEEDED",
-                    fly_dir,
-                    f"opposite side, need detach (dist={distance:.0f})",
-                )
-
-            if path_blocked:
-                making_progress = self._is_making_progress(window=10)
-                if not making_progress:
+            if not same_side or path_blocked:
+                # Goal unreachable directly — crawl to nearest edge/rim
+                # But first check if stuck (fallback to DETACH_NEEDED)
+                if self._is_crawl_to_edge_stuck(window=50):
                     fly_dir = self._compute_detach_fly_direction(
                         current_pose, sensor_data
                     )
                     return (
                         "DETACH_NEEDED",
                         fly_dir,
-                        f"path blocked + no progress, detach "
-                        f"(dist={distance:.0f})",
+                        f"stuck crawling to edge, "
+                        f"consider detach "
+                        f"(dist={distance:.0f}, "
+                        f"ss={same_side}, "
+                        f"pb={path_blocked})",
                     )
+
+                edge_dir = self._compute_crawl_to_edge_direction(
+                    current_pose, sensor_data
+                )
                 return (
-                    "CRAWL_TO_GOAL",
-                    None,
-                    f"path blocked but progressing, crawl "
-                    f"(dist={distance:.0f})",
+                    "CRAWL_TO_EDGE",
+                    edge_dir,
+                    f"crawling to edge "
+                    f"(dist={distance:.0f}, ss={same_side}, "
+                    f"pb={path_blocked})",
                 )
 
             return (
                 "CRAWL_TO_GOAL",
                 None,
-                f"same side, crawl (dist={distance:.0f})",
+                f"crawl to goal "
+                f"(dist={distance:.0f}, ss={same_side}, "
+                f"pb={path_blocked})",
             )
-
+        
         # ═══ IN AIR ═══
         else:
-            landing_threshold = 8.0 * self.action_space.free_step
+            landing_threshold = (
+                8.0 * self.action_space.free_step
+            )
 
-            # EMERGENCY LANDING: very close to surface — land immediately
-            # depth < 5mm means we're about to hit surface
-            # Better to land than to crash
+            # EMERGENCY LANDING
             if depth < 5.0:
                 return (
                     "LAND",
                     None,
-                    f"emergency landing, depth={depth:.1f}mm "
+                    f"emergency landing, "
+                    f"depth={depth:.1f}mm "
                     f"(dist={distance:.0f})",
                 )
 
             # Close to goal + path clear → land
-            if distance < landing_threshold and not path_blocked:
+            if (
+                distance < landing_threshold
+                and not path_blocked
+            ):
                 self._cached_orbit_direction = None
                 self._orbit_direction_age = 0
                 return (
                     "LAND",
                     None,
-                    f"near goal, landing (dist={distance:.0f})",
+                    f"near goal, landing "
+                    f"(dist={distance:.0f})",
                 )
 
             # Path blocked → must bypass obstacle
             if path_blocked:
-                fly_dir = getattr(self, "_cached_fly_direction", None)
+                fly_dir = getattr(
+                    self, "_cached_fly_direction", None
+                )
 
-                extents = sensor_data.get("object_extents", [84, 84, 84])
+                extents = sensor_data.get(
+                    "object_extents", [84, 84, 84]
+                )
                 max_extent = float(max(extents))
 
-                center_raw = sensor_data.get("object_center")
+                center_raw = sensor_data.get(
+                    "object_center"
+                )
                 too_far = False
                 dist_from_center = 0.0
                 if center_raw is not None:
-                    center = np.asarray(center_raw, dtype=float)
-                    dist_from_center = float(
-                        np.linalg.norm(current_pose[:3] - center)
+                    center = np.asarray(
+                        center_raw, dtype=float
                     )
-                    too_far = dist_from_center > max_extent * 1.5
+                    dist_from_center = float(
+                        np.linalg.norm(
+                            current_pose[:3] - center
+                        )
+                    )
+                    too_far = (
+                        dist_from_center
+                        > max_extent * 1.5
+                    )
+
+                # Fallback: clear stale cache
+                if fly_dir is not None and not too_far:
+                    depth_now = sensor_data.get(
+                        "depth", 100.0
+                    )
+                    if (
+                        depth_now >= 100.0
+                        and len(self._distance_history)
+                        > 30
+                    ):
+                        recent_min = min(
+                            self._distance_history[-30:]
+                        )
+                        if distance > recent_min + 10.0:
+                            logger.debug(
+                                f"FLY_CACHE_STALE: "
+                                f"depth=100, "
+                                f"dist={distance:.0f}, "
+                                f"recent_min="
+                                f"{recent_min:.0f}, "
+                                f"clearing cache"
+                            )
+                            self._cached_fly_direction = (
+                                None
+                            )
+                            self._cached_orbit_direction = (
+                                None
+                            )
+                            fly_dir = None
 
                 if fly_dir is not None and not too_far:
                     return (
@@ -823,71 +877,94 @@ class RLGoalApproachController:
                         fly_dir.copy(),
                         f"bypassing, cached dir "
                         f"(dist={distance:.0f}, "
-                        f"from_center={dist_from_center:.0f})",
+                        f"from_center="
+                        f"{dist_from_center:.0f})",
                     )
                 else:
-                    orbit_age = getattr(self, "_orbit_direction_age", 0)
+                    orbit_age = getattr(
+                        self,
+                        "_orbit_direction_age",
+                        0,
+                    )
                     cached_orbit = getattr(
-                        self, "_cached_orbit_direction", None
+                        self,
+                        "_cached_orbit_direction",
+                        None,
                     )
 
-                    if cached_orbit is None or orbit_age > 10:
-                        orbit_dir = self._compute_orbit_direction(
-                            current_pose, sensor_data
+                    if (
+                        cached_orbit is None
+                        or orbit_age > 10
+                    ):
+                        orbit_dir = (
+                            self._compute_orbit_direction(
+                                current_pose, sensor_data
+                            )
                         )
                         if orbit_dir is not None:
-                            self._cached_orbit_direction = orbit_dir
+                            self._cached_orbit_direction = (
+                                orbit_dir
+                            )
                             self._orbit_direction_age = 0
-                            self._cached_fly_direction = None
+                            self._cached_fly_direction = (
+                                None
+                            )
                         else:
                             orbit_dir = cached_orbit
                     else:
                         orbit_dir = cached_orbit
-                        self._orbit_direction_age = orbit_age + 1
+                        self._orbit_direction_age = (
+                            orbit_age + 1
+                        )
 
                     if orbit_dir is not None:
                         return (
                             "FLY_TO_EDGE",
                             orbit_dir.copy(),
-                            f"orbiting, age={self._orbit_direction_age} "
-                            f"(dist={distance:.0f}, "
-                            f"from_center={dist_from_center:.0f})",
+                            f"orbiting, age="
+                            f"{self._orbit_direction_age}"
+                            f" (dist={distance:.0f}, "
+                            f"from_center="
+                            f"{dist_from_center:.0f})",
                         )
 
                     return (
                         "FLY_TO_GOAL",
                         None,
-                        f"bypass fallback (dist={distance:.0f})",
+                        f"bypass fallback "
+                        f"(dist={distance:.0f})",
                     )
 
-            # ═══ Hysteresis: require sustained path_clear ═══
+            # ═══ Path NOT blocked — hysteresis ═══
             path_clear_streak = getattr(
                 self, "_path_clear_streak", 0
             )
 
-            # Quick transition if path is clearly open
             if path_clear_streak >= 3:
                 self._cached_orbit_direction = None
                 self._orbit_direction_age = 0
                 return (
                     "FLY_TO_GOAL",
                     None,
-                    f"path clear {path_clear_streak} steps "
+                    f"path clear "
+                    f"{path_clear_streak} steps "
                     f"(dist={distance:.0f})",
                 )
 
-            # Single step clear — stay in current phase
-            # to avoid oscillation
-            # Single step clear — stay in current phase
-            # to avoid oscillation
-            prev_phase = getattr(self, "_prev_phase", None)
+            prev_phase = getattr(
+                self, "_prev_phase", None
+            )
             if prev_phase == "FLY_TO_EDGE":
                 cached_dir = getattr(
-                    self, "_cached_fly_direction", None
+                    self,
+                    "_cached_fly_direction",
+                    None,
                 )
                 if cached_dir is None:
                     cached_dir = getattr(
-                        self, "_cached_orbit_direction", None
+                        self,
+                        "_cached_orbit_direction",
+                        None,
                     )
                 return (
                     "FLY_TO_EDGE",
@@ -895,9 +972,9 @@ class RLGoalApproachController:
                     f"path clear but hysteresis "
                     f"(streak={path_clear_streak}, "
                     f"dist={distance:.0f})",
-                )        
-            
-            # ═══ Default: fly to goal ═══
+                )
+
+            # Default: fly to goal
             self._cached_orbit_direction = None
             self._orbit_direction_age = 0
             return (
@@ -906,7 +983,7 @@ class RLGoalApproachController:
                 f"path clear, fly to goal "
                 f"(dist={distance:.0f})",
             )
-        
+                
     # ══════════════════════════════════════════════════════════
     # COLLISION DETECTION
     # ══════════════════════════════════════════════════════════
@@ -999,14 +1076,16 @@ class RLGoalApproachController:
             else True
         )
 
-        # Determine current phase for strategy-aware rewards
-        phase = getattr(self, "_current_phase", "CRAWL_TO_GOAL")
+        # Determine current phase
+        phase = getattr(
+            self, "_current_phase", "CRAWL_TO_GOAL"
+        )
 
         # ═══ 1. Progress toward goal ═══
         progress_raw = prev_distance - distance
         progress = progress_raw
 
-        # Reduce negative progress penalty during bypass flight
+        # Reduce negative progress during bypass flight
         if (
             on_object < 0.5
             and phase == "FLY_TO_EDGE"
@@ -1015,22 +1094,34 @@ class RLGoalApproachController:
             progress = progress_raw * 0.2
 
         detour_mode = (
-            prev_alignment < cfg["detour_alignment_threshold"]
-            and (prev_on_object > 0.5 or collision == "lost_object")
+            prev_alignment
+            < cfg["detour_alignment_threshold"]
+            and (
+                prev_on_object > 0.5
+                or collision == "lost_object"
+            )
         )
         if detour_mode and progress_raw < 0.0:
             min_progress = (
                 -surface_step
-                * cfg["detour_negative_progress_clip_steps"]
+                * cfg[
+                    "detour_negative_progress_clip_steps"
+                ]
             )
             progress = max(progress_raw, min_progress)
 
-        reward += progress / surface_step * cfg["reward_progress"]
+        reward += (
+            progress
+            / surface_step
+            * cfg["reward_progress"]
+        )
 
-        # ═══ 1.5 Subgoal shaping (potential-based) ═══
+        # ═══ 1.5 Subgoal shaping ═══
         phi_current = self._subgoal_potential(state)
         phi_prev = self._subgoal_potential(prev_state)
-        subgoal_shaping = self.gamma * phi_current - phi_prev
+        subgoal_shaping = (
+            self.gamma * phi_current - phi_prev
+        )
         reward += subgoal_shaping
 
         # ═══ 2. Goal reached ═══
@@ -1044,22 +1135,25 @@ class RLGoalApproachController:
 
         # ═══ 3.5 Risky free actions on surface ═══
         if (
-            action == self.action_space.IDX_FREE_FORWARD
+            action
+            == self.action_space.IDX_FREE_FORWARD
             and prev_on_object > 0.5
         ):
             reward += -2.0
         if (
-            action == self.action_space.IDX_FREE_BACKWARD
+            action
+            == self.action_space.IDX_FREE_BACKWARD
             and prev_on_object > 0.5
         ):
             reward += -2.0
         if (
-            action == self.action_space.IDX_FREE_FORWARD_SMALL
+            action
+            == self.action_space.IDX_FREE_FORWARD_SMALL
             and prev_on_object > 0.5
         ):
             reward += -2.0
 
-        # ═══ 3.6 Penalty for flying too far from object ═══
+        # ═══ 3.6 Penalty for flying too far ═══
         if on_object < 0.5 and sensor_data is not None:
             extents = sensor_data.get(
                 "object_extents", [84, 84, 84]
@@ -1072,29 +1166,42 @@ class RLGoalApproachController:
         if collision == "surface_violation":
             reward += cfg["reward_surface_violation"]
             done = True
-            termination_reason = "collision_surface_violation"
+            termination_reason = (
+                "collision_surface_violation"
+            )
             action_name = (
                 self.action_space.get_info(action).name
                 if action is not None
                 else "unknown"
             )
             self._collision_stats[action_name] = (
-                self._collision_stats.get(action_name, 0) + 1
+                self._collision_stats.get(
+                    action_name, 0
+                )
+                + 1
             )
         elif collision == "detach_collision":
             reward += cfg["reward_surface_violation"]
             done = True
-            termination_reason = "collision_surface_violation"
+            termination_reason = (
+                "collision_surface_violation"
+            )
             action_name = (
                 self.action_space.get_info(action).name
                 if action is not None
                 else "unknown"
             )
             self._collision_stats[action_name] = (
-                self._collision_stats.get(action_name, 0) + 1
+                self._collision_stats.get(
+                    action_name, 0
+                )
+                + 1
             )
         elif collision == "lost_object":
-            if action != self.action_space.IDX_DETACH:
+            if (
+                action
+                != self.action_space.IDX_DETACH
+            ):
                 reward += cfg["reward_drifted_away"]
 
         # ═══ 4.6 Detach while not on surface ═══
@@ -1104,12 +1211,17 @@ class RLGoalApproachController:
 
         # ═══ 5. Near goal on surface ═══
         near_radius = surface_step * 3
-        if distance < near_radius and on_object > 0.5:
-            reward += cfg["reward_near_goal_on_surface"]
+        if (
+            distance < near_radius
+            and on_object > 0.5
+        ):
+            reward += cfg[
+                "reward_near_goal_on_surface"
+            ]
 
-        # ═══════════════════════════════════════════════════
-        # 6. PHASE BONUSES — tactical rewards only
-        # ═══════════════════════════════════════════════════
+        # ═══════════════════════════════════════
+        # 6. PHASE BONUSES — tactical only
+        # ═══════════════════════════════════════
 
         # ── 6.2 Successful landing near goal ──
         successful_landing = (
@@ -1140,7 +1252,8 @@ class RLGoalApproachController:
         ):
             reward += 0.2
 
-        # ── 6.6 FLY_TO_EDGE: alignment with subgoal direction ──
+        # ── 6.6 FLY_TO_EDGE: alignment with
+        #        subgoal direction ──
         if (
             on_object < 0.5
             and phase == "FLY_TO_EDGE"
@@ -1151,7 +1264,9 @@ class RLGoalApproachController:
             )
             if subgoal_dir is not None:
                 rot = R.from_euler(
-                    "xyz", current_pose[3:6], degrees=True
+                    "xyz",
+                    current_pose[3:6],
+                    degrees=True,
                 )
                 forward = rot.apply([0, 0, -1])
                 curr_alignment = float(
@@ -1159,31 +1274,45 @@ class RLGoalApproachController:
                 )
 
                 prev_subgoal_alignment = getattr(
-                    self, "_prev_subgoal_alignment", None
+                    self,
+                    "_prev_subgoal_alignment",
+                    None,
                 )
-                if prev_subgoal_alignment is not None:
+                if (
+                    prev_subgoal_alignment is not None
+                ):
                     align_improvement = (
-                        curr_alignment - prev_subgoal_alignment
+                        curr_alignment
+                        - prev_subgoal_alignment
                     )
-                    reward += align_improvement * 2.0
+                    reward += (
+                        align_improvement * 2.0
+                    )
 
-                self._prev_subgoal_alignment = curr_alignment
+                self._prev_subgoal_alignment = (
+                    curr_alignment
+                )
             else:
                 self._prev_subgoal_alignment = None
+
+        # ── 6.7 FLY_TO_GOAL/LAND: alignment with
+        #        goal direction ──
         elif (
             on_object < 0.5
             and phase in ("FLY_TO_GOAL", "LAND")
             and current_pose is not None
         ):
-            # ── 6.7 FLY_TO_GOAL/LAND: alignment with goal ──
             goal_dir = (
-                self._current_goal[:3] - current_pose[:3]
+                self._current_goal[:3]
+                - current_pose[:3]
             )
             goal_dist = np.linalg.norm(goal_dir)
             if goal_dist > 1e-8:
                 goal_dir = goal_dir / goal_dist
                 rot = R.from_euler(
-                    "xyz", current_pose[3:6], degrees=True
+                    "xyz",
+                    current_pose[3:6],
+                    degrees=True,
                 )
                 forward = rot.apply([0, 0, -1])
                 curr_alignment = float(
@@ -1191,15 +1320,22 @@ class RLGoalApproachController:
                 )
 
                 prev_goal_alignment = getattr(
-                    self, "_prev_goal_alignment", None
+                    self,
+                    "_prev_goal_alignment",
+                    None,
                 )
                 if prev_goal_alignment is not None:
                     align_improvement = (
-                        curr_alignment - prev_goal_alignment
+                        curr_alignment
+                        - prev_goal_alignment
                     )
-                    reward += align_improvement * 2.0
+                    reward += (
+                        align_improvement * 2.0
+                    )
 
-                self._prev_goal_alignment = curr_alignment
+                self._prev_goal_alignment = (
+                    curr_alignment
+                )
             else:
                 self._prev_goal_alignment = None
             self._prev_subgoal_alignment = None
@@ -1375,11 +1511,13 @@ class RLGoalApproachController:
         store = self._select_store(state)
         q_values = store.get_q_values(state)
 
-        heuristic, heuristic_components = self._compute_heuristic_bias(
-            state=state,
-            current_pose=current_pose,
-            sensor_data=sensor_data,
-            prev_action=self._last_action,
+        heuristic, heuristic_components = (
+            self._compute_heuristic_bias(
+                state=state,
+                current_pose=current_pose,
+                sensor_data=sensor_data,
+                prev_action=self._last_action,
+            )
         )
 
         q_norm = self._normalize_values(q_values)
@@ -1391,7 +1529,8 @@ class RLGoalApproachController:
         eps = self._get_current_epsilon()
 
         has_q_data = (
-            store.next_id > 0 and np.max(np.abs(q_values)) > 1e-6
+            store.next_id > 0
+            and np.max(np.abs(q_values)) > 1e-6
         )
 
         if has_q_data:
@@ -1407,40 +1546,57 @@ class RLGoalApproachController:
         # ═══ ACTION MASK ═══
         if state[11] < 0.5:  # in air
             combined[self.action_space.IDX_DETACH] = -1e9
-            # Mask surface actions in air
             for idx in range(8):
                 combined[idx] = -1e9
         if self._consecutive_detach_count >= 3:
             combined[self.action_space.IDX_DETACH] = -1e9
         if state[11] > 0.5:  # on surface
-            combined[self.action_space.IDX_FREE_FORWARD] = -1e9
-            combined[self.action_space.IDX_FREE_FORWARD_SMALL] = -1e9
-            combined[self.action_space.IDX_FREE_BACKWARD] = -1e9
+            combined[
+                self.action_space.IDX_FREE_FORWARD
+            ] = -1e9
+            combined[
+                self.action_space.IDX_FREE_FORWARD_SMALL
+            ] = -1e9
+            combined[
+                self.action_space.IDX_FREE_BACKWARD
+            ] = -1e9
 
         is_random_override = False
         is_heuristic_override = False
         action_index = None
         strategic_source = None
 
-        # ═══ STRATEGIC LEVEL: Q-store blend ═══
-        current_phase = getattr(self, "_current_phase", "CRAWL_TO_GOAL")
+        # ═══ STRATEGIC LEVEL ═══
+        current_phase = getattr(
+            self, "_current_phase", "CRAWL_TO_GOAL"
+        )
         on_object = state[11] > 0.5
 
         self._episode_phase_counts[current_phase] = (
-            self._episode_phase_counts.get(current_phase, 0) + 1
+            self._episode_phase_counts.get(
+                current_phase, 0
+            )
+            + 1
         )
 
         s_eps = self.strategic_epsilon
-        strategic_source = None
         cfg = self.config
 
         if on_object:
-            t_state = self._compute_detach_transition_state(
-                state, sensor_data
+            t_state = (
+                self._compute_detach_transition_state(
+                    state, sensor_data
+                )
             )
-            strategic_q = self.strategic_detach.get_q_values(t_state)
-            strategic_h = self._compute_strategic_heuristic(
-                current_phase, on_object=True
+            strategic_q = (
+                self.strategic_detach.get_q_values(
+                    t_state
+                )
+            )
+            strategic_h = (
+                self._compute_strategic_heuristic(
+                    current_phase, on_object=True
+                )
             )
 
             has_data = (
@@ -1448,72 +1604,80 @@ class RLGoalApproachController:
                 and np.max(np.abs(strategic_q)) > 1e-6
             )
             if has_data:
-                sq_norm = self._normalize_values(strategic_q)
-                sh_norm = self._normalize_values(strategic_h)
+                sq_norm = self._normalize_values(
+                    strategic_q
+                )
+                sh_norm = self._normalize_values(
+                    strategic_h
+                )
                 strategic_combined = (
-                    (1 - s_eps) * sq_norm + s_eps * sh_norm
+                    (1 - s_eps) * sq_norm
+                    + s_eps * sh_norm
                 )
             else:
                 strategic_combined = strategic_h.copy()
 
-            should_switch = strategic_combined[1] > strategic_combined[0]
+            should_switch = (
+                strategic_combined[1]
+                > strategic_combined[0]
+            )
 
-            if should_switch and self._can_detach(state):
-                action_index = self.action_space.IDX_DETACH
+            # Override ONLY during stagnation
+            if (
+                current_phase == "DETACH_NEEDED"
+                and should_switch
+                and self._can_detach(state)
+            ):
+                action_index = (
+                    self.action_space.IDX_DETACH
+                )
                 is_heuristic_override = True
                 strategic_source = (
                     f"detach_switch("
-                    f"q=[{strategic_q[0]:.2f},{strategic_q[1]:.2f}],"
-                    f"h=[{strategic_h[0]:.1f},{strategic_h[1]:.1f}],"
+                    f"q=[{strategic_q[0]:.2f},"
+                    f"{strategic_q[1]:.2f}],"
+                    f"h=[{strategic_h[0]:.1f},"
+                    f"{strategic_h[1]:.1f}],"
                     f"eps={s_eps:.2f})"
                 )
-                self._strategic_stats["detach_memory_triggered"] += 1
+                self._strategic_stats[
+                    "detach_memory_triggered"
+                ] += 1
 
-                # Record pending for outcome evaluation
                 self._pending_strategic_detach.append({
                     "state": t_state.copy(),
-                    "step": len(self._episode_transitions),
-                    "phase_was_detach_needed": (
-                        current_phase == "DETACH_NEEDED"
+                    "step": len(
+                        self._episode_transitions
                     ),
+                    "phase_was_detach_needed": True,
                 })
             else:
                 if current_phase == "DETACH_NEEDED":
                     strategic_source = (
                         f"detach_stay("
-                        f"q=[{strategic_q[0]:.2f},{strategic_q[1]:.2f}],"
+                        f"q=[{strategic_q[0]:.2f},"
+                        f"{strategic_q[1]:.2f}],"
                         f"eps={s_eps:.2f})"
                     )
                     self._strategic_stats[
                         "detach_heuristic_fallback"
                     ] += 1
 
-            # Stay penalty: on surface in DETACH_NEEDED but didn't detach
-            if (
-                current_phase == "DETACH_NEEDED"
-                and self._can_detach(state)
-                and action_index != self.action_space.IDX_DETACH
-            ):
-                stay_alpha = (
-                    self._get_learning_rate()
-                    * cfg.get("strategic_alpha_stay_multiplier", 0.1)
-                )
-                self.strategic_detach.update_q_value(
-                    t_state, action=0,
-                    td_target=cfg.get(
-                        "strategic_reward_stay_when_needed", -0.1
-                    ),
-                    alpha=stay_alpha,
-                    count_visit=True,
-                )
-
         elif not on_object:
-            d_state = self._compute_direction_transition_state(
-                state, sensor_data, current_pose
+            d_state = (
+                self._compute_direction_transition_state(
+                    state, sensor_data, current_pose
+                )
             )
-            strategic_q = self.strategic_direction.get_q_values(d_state)
-            strategic_h = self._compute_strategic_heuristic(
-                current_phase, on_object=False
+            strategic_q = (
+                self.strategic_direction.get_q_values(
+                    d_state
+                )
+            )
+            strategic_h = (
+                self._compute_strategic_heuristic(
+                    current_phase, on_object=False
+                )
             )
 
             has_data = (
@@ -1521,10 +1685,15 @@ class RLGoalApproachController:
                 and np.max(np.abs(strategic_q)) > 1e-6
             )
             if has_data:
-                sq_norm = self._normalize_values(strategic_q)
-                sh_norm = self._normalize_values(strategic_h)
+                sq_norm = self._normalize_values(
+                    strategic_q
+                )
+                sh_norm = self._normalize_values(
+                    strategic_h
+                )
                 dir_combined = (
-                    (1 - s_eps) * sq_norm + s_eps * sh_norm
+                    (1 - s_eps) * sq_norm
+                    + s_eps * sh_norm
                 )
             else:
                 dir_combined = strategic_h.copy()
@@ -1534,26 +1703,33 @@ class RLGoalApproachController:
                 self._cached_fly_direction = None
                 strategic_source = (
                     f"direction_switch("
-                    f"q=[{strategic_q[0]:.2f},{strategic_q[1]:.2f}],"
+                    f"q=[{strategic_q[0]:.2f},"
+                    f"{strategic_q[1]:.2f}],"
                     f"eps={s_eps:.2f})"
                 )
-                self._strategic_stats["direction_memory_to_goal"] += 1
+                self._strategic_stats[
+                    "direction_memory_to_goal"
+                ] += 1
 
-                # Record pending
-                prev_phase = getattr(self, "_prev_phase", None)
+                prev_phase = getattr(
+                    self, "_prev_phase", None
+                )
                 if prev_phase == "FLY_TO_EDGE":
                     self._pending_strategic_direction = {
                         "state": d_state.copy(),
-                        "step": len(self._episode_transitions),
+                        "step": len(
+                            self._episode_transitions
+                        ),
                     }
             else:
                 self._strategic_stats[
                     "direction_heuristic_fallback"
                 ] += 1
 
-            # Stay penalty: path clear but didn't switch
-            # ═══ Direction store per-step updates ═══
-            path_clear = not sensor_data.get("path_blocked", True)
+            # Direction store per-step updates
+            path_clear = not sensor_data.get(
+                "path_blocked", True
+            )
             if path_clear:
                 self._path_clear_streak += 1
             else:
@@ -1561,36 +1737,45 @@ class RLGoalApproachController:
 
             stay_alpha = (
                 self._get_learning_rate()
-                * cfg.get("strategic_alpha_stay_multiplier", 0.1)
+                * cfg.get(
+                    "strategic_alpha_stay_multiplier",
+                    0.1,
+                )
             )
 
             if current_phase == "FLY_TO_EDGE":
-                if path_clear and self._path_clear_streak >= 3:
-                    # Path is clear — should switch to FLY_TO_GOAL
-                    # Penalize stay, reward switch
+                if (
+                    path_clear
+                    and self._path_clear_streak >= 3
+                ):
                     self.strategic_direction.update_q_value(
-                        d_state, action=0,
+                        d_state,
+                        action=0,
                         td_target=cfg.get(
-                            "strategic_reward_stay_when_clear", -0.3
+                            "strategic_reward_stay_when_clear",
+                            -0.3,
                         ),
                         alpha=stay_alpha,
                     )
                     self.strategic_direction.update_q_value(
-                        d_state, action=1,
+                        d_state,
+                        action=1,
                         td_target=cfg.get(
-                            "strategic_reward_switch_when_clear", 0.3
+                            "strategic_reward_switch_when_clear",
+                            0.3,
                         ),
                         alpha=stay_alpha,
                     )
                 elif not path_clear:
-                    # Path blocked — evaluate orbit progress
-                    orbit_progress = self._is_making_orbit_progress(
-                        window=5
+                    orbit_progress = (
+                        self._is_making_orbit_progress(
+                            window=5
+                        )
                     )
                     if orbit_progress:
-                        # Good orbit — reward staying in FLY_TO_EDGE
                         self.strategic_direction.update_q_value(
-                            d_state, action=0,
+                            d_state,
+                            action=0,
                             td_target=cfg.get(
                                 "strategic_reward_stay_orbit_progress",
                                 0.02,
@@ -1598,9 +1783,9 @@ class RLGoalApproachController:
                             alpha=stay_alpha,
                         )
                     else:
-                        # Stuck in orbit — small penalty for stay
                         self.strategic_direction.update_q_value(
-                            d_state, action=0,
+                            d_state,
+                            action=0,
                             td_target=cfg.get(
                                 "strategic_reward_stay_orbit_stuck",
                                 -0.05,
@@ -1610,12 +1795,12 @@ class RLGoalApproachController:
 
             elif current_phase == "FLY_TO_GOAL":
                 if not path_clear:
-                    # Flying to goal but path blocked — should have
-                    # stayed in FLY_TO_EDGE
                     self.strategic_direction.update_q_value(
-                        d_state, action=0,
+                        d_state,
+                        action=0,
                         td_target=cfg.get(
-                            "strategic_reward_stay_should_have", 0.2
+                            "strategic_reward_stay_should_have",
+                            0.2,
                         ),
                         alpha=stay_alpha,
                     )
@@ -1632,66 +1817,91 @@ class RLGoalApproachController:
             p_random = 0.02 * eps
             if np.random.random() < p_random:
                 is_random_override = True
-                valid_mask = np.ones(self.num_actions, dtype=bool)
+                valid_mask = np.ones(
+                    self.num_actions, dtype=bool
+                )
                 if state[11] < 0.5:
-                    valid_mask[self.action_space.IDX_DETACH] = False
+                    valid_mask[
+                        self.action_space.IDX_DETACH
+                    ] = False
                     for idx in range(8):
                         valid_mask[idx] = False
                 if self._consecutive_detach_count >= 3:
-                    valid_mask[self.action_space.IDX_DETACH] = False
+                    valid_mask[
+                        self.action_space.IDX_DETACH
+                    ] = False
                 if state[11] > 0.5:
-                    valid_mask[self.action_space.IDX_FREE_FORWARD] = False
+                    valid_mask[
+                        self.action_space.IDX_FREE_FORWARD
+                    ] = False
                     valid_mask[
                         self.action_space.IDX_FREE_FORWARD_SMALL
                     ] = False
-                    valid_mask[self.action_space.IDX_FREE_BACKWARD] = False
+                    valid_mask[
+                        self.action_space.IDX_FREE_BACKWARD
+                    ] = False
                 if (
                     state[11] > 0.5
-                    and state[13] < 5.0 * self.action_space.surface_step
+                    and state[13]
+                    < 5.0 * self.action_space.surface_step
                 ):
-                    valid_mask[self.action_space.IDX_DETACH] = False
+                    valid_mask[
+                        self.action_space.IDX_DETACH
+                    ] = False
 
                 valid_indices = np.where(valid_mask)[0]
-                action_index = int(np.random.choice(valid_indices))
+                action_index = int(
+                    np.random.choice(valid_indices)
+                )
                 probs = np.zeros(self.num_actions)
                 probs[action_index] = 1.0
             else:
                 action_index = int(
-                    np.random.choice(len(probs), p=probs)
+                    np.random.choice(
+                        len(probs), p=probs
+                    )
                 )
         else:
             probs = np.zeros(self.num_actions)
             probs[action_index] = 1.0
 
         # ═══ RECORD PENDING TRANSITIONS ═══
-        # Record detach state ONLY when phase says detach is needed
-        # This prevents polluting memory with unnecessary detach attempts
         if (
             action_index == self.action_space.IDX_DETACH
             and on_object
             and current_phase == "DETACH_NEEDED"
         ):
-            t_state = self._compute_detach_transition_state(
-                state, sensor_data
+            t_state = (
+                self._compute_detach_transition_state(
+                    state, sensor_data
+                )
             )
             self._pending_strategic_detach.append({
                 "state": t_state.copy(),
-                "step": len(self._episode_transitions),
+                "step": len(
+                    self._episode_transitions
+                ),
                 "phase_was_detach_needed": True,
             })
 
-        # Record direction transition (FLY_TO_EDGE → FLY_TO_GOAL)
-        prev_phase = getattr(self, "_prev_phase", None)
+        prev_phase = getattr(
+            self, "_prev_phase", None
+        )
         if (
             prev_phase == "FLY_TO_EDGE"
-            and current_phase in ("FLY_TO_GOAL", "LAND")
+            and current_phase
+            in ("FLY_TO_GOAL", "LAND")
         ):
-            d_state = self._compute_direction_transition_state(
-                state, sensor_data, current_pose
+            d_state = (
+                self._compute_direction_transition_state(
+                    state, sensor_data, current_pose
+                )
             )
             self._pending_strategic_direction = {
                 "state": d_state.copy(),
-                "step": len(self._episode_transitions),
+                "step": len(
+                    self._episode_transitions
+                ),
             }
 
         self._prev_phase = current_phase
@@ -1714,7 +1924,9 @@ class RLGoalApproachController:
         explanation = {
             "chosen_action": {
                 "index": action_index,
-                "name": self.action_space.get_info(action_index).name,
+                "name": self.action_space.get_info(
+                    action_index
+                ).name,
                 "probability": confidence,
             },
             "sampling_method": (
@@ -1729,13 +1941,16 @@ class RLGoalApproachController:
             "epsilon": eps,
             "has_q_data": has_q_data,
             "blend": (
-                f"{(1-eps)*100:.0f}% Q + {eps*100:.0f}% heuristic"
+                f"{(1-eps)*100:.0f}% Q + "
+                f"{eps*100:.0f}% heuristic"
                 if has_q_data
                 else "100% heuristic"
             ),
             "is_random_override": is_random_override,
             "action_probabilities": {
-                self.action_space.get_info(i).name: float(probs[i])
+                self.action_space.get_info(i).name: float(
+                    probs[i]
+                )
                 for i in range(self.num_actions)
             },
             "advice": {
@@ -1756,30 +1971,34 @@ class RLGoalApproachController:
             "heuristic_contributions": contributions,
             "confidence": confidence,
             "is_confident": confidence > 0.7,
-            "interpretation": self._generate_choice_interpretation(
-                action_index=action_index,
-                is_random=is_random_override,
-                q_recommends=best_q_action,
-                h_recommends=best_h_action,
-                dominant_heuristic=dominant_heuristic,
-                eps=eps,
-                confidence=confidence,
-                blend=(
-                    f"{(1-eps)*100:.0f}% Q + {eps*100:.0f}% heuristic"
-                    if has_q_data
-                    else "100% heuristic"
-                ),
-                is_heuristic_override=is_heuristic_override,
+            "interpretation": (
+                self._generate_choice_interpretation(
+                    action_index=action_index,
+                    is_random=is_random_override,
+                    q_recommends=best_q_action,
+                    h_recommends=best_h_action,
+                    dominant_heuristic=dominant_heuristic,
+                    eps=eps,
+                    confidence=confidence,
+                    blend=(
+                        f"{(1-eps)*100:.0f}% Q + "
+                        f"{eps*100:.0f}% heuristic"
+                        if has_q_data
+                        else "100% heuristic"
+                    ),
+                    is_heuristic_override=is_heuristic_override,
+                )
             ),
         }
 
-        chosen_name = self.action_space.get_info(action_index).name
+        chosen_name = self.action_space.get_info(
+            action_index
+        ).name
         if chosen_name == "detach":
             self._consecutive_detach_count += 1
         else:
             self._consecutive_detach_count = 0
 
-        # Add phase info to interpretation
         explanation["interpretation"] = (
             f"[phase={current_phase}] "
             + explanation["interpretation"]
@@ -1789,25 +2008,55 @@ class RLGoalApproachController:
                 f"[strategic={strategic_source}] "
                 + explanation["interpretation"]
             )
-        # Add debug info to interpretation
-        path_blocked = sensor_data.get("path_blocked", False)
+        path_blocked = sensor_data.get(
+            "path_blocked", False
+        )
         same_side = sensor_data.get("same_side", True)
         depth = sensor_data.get("depth", 100.0)
-        
+
+        subgoal_str = ""
+        if getattr(self, "_current_subgoal_dir", None) is not None:
+            sd = self._current_subgoal_dir
+            subgoal_str = (
+                f"|sd=[{sd[0]:.2f},{sd[1]:.2f},{sd[2]:.2f}]"
+            )
+
+        normal_str = ""
+        pn = sensor_data.get("point_normal")
+        if pn is not None:
+            normal_str = (
+                f"|n=[{pn[0]:.2f},{pn[1]:.2f},{pn[2]:.2f}]"
+            )
+
+        pos_str = (
+            f"|pos=[{current_pose[0]:.1f},"
+            f"{current_pose[1]:.1f},"
+            f"{current_pose[2]:.1f}]"
+        )
+
         debug_prefix = (
             f"[phase={current_phase}|"
             f"ss={int(same_side)}|"
             f"pb={int(path_blocked)}|"
-            f"d={depth:.1f}]"
+            f"d={depth:.1f}"
+            f"|al={float(state[12]):.2f}"
+            f"{subgoal_str}"
+            f"{normal_str}"
+            f"{pos_str}]"
         )
+
         if strategic_source:
-            debug_prefix += f"[strat={strategic_source}]"
-        
+            debug_prefix += (
+                f"[strat={strategic_source}]"
+            )
+
         explanation["interpretation"] = (
-            debug_prefix + " " + explanation["interpretation"]
+            debug_prefix
+            + " "
+            + explanation["interpretation"]
         )
         return action_index, explanation
-
+    
     def _can_detach(self, state: np.ndarray) -> bool:
         """Check if detach is allowed (anti-spam guards)."""
         recent_detach = sum(
@@ -1874,104 +2123,142 @@ class RLGoalApproachController:
         point_normal = sensor_data.get("point_normal")
 
         eps = 1e-8
-        rot = R.from_euler("xyz", current_pose[3:6], degrees=True)
+        rot = R.from_euler(
+            "xyz", current_pose[3:6], degrees=True
+        )
 
         # ═══ Determine phase ═══
-        phase, subgoal_dir, phase_desc = self._determine_phase(
-            state, sensor_data, current_pose
+        phase, subgoal_dir, phase_desc = (
+            self._determine_phase(
+                state, sensor_data, current_pose
+            )
         )
 
-        # Store phase for reward and logging
         self._current_phase = phase
         self._current_subgoal_dir = subgoal_dir
+        # Store for logging
+        self._current_phase_desc = phase_desc
 
         logger.debug(
-            f"PHASE: step={self._steps}, phase={phase}, "
-            f"desc={phase_desc}, on_object={on_object:.0f}, "
-            f"distance={distance:.1f}, alignment={alignment:.3f}"
+            f"PHASE: step={self._steps}, "
+            f"phase={phase}, "
+            f"desc={phase_desc}, "
+            f"on_object={on_object:.0f}, "
+            f"distance={distance:.1f}, "
+            f"alignment={alignment:.3f}"
         )
 
-        # Reset flyby count when on surface
         if on_object > 0.5:
             self._flyby_count = 0
 
-        # Cache fly direction while on surface for use after detach
         if on_object > 0.5 and phase == "DETACH_NEEDED":
-            cached = self._compute_detach_fly_direction(
-                current_pose, sensor_data
+            cached = (
+                self._compute_detach_fly_direction(
+                    current_pose, sensor_data
+                )
             )
             if cached is not None:
                 self._cached_fly_direction = cached
                 self._fly_direction_age = 0
 
-        # ── Air phase management (simplified) ──
         if on_object < 0.5:
             self._fly_direction_age = getattr(
                 self, "_fly_direction_age", 0
             ) + 1
 
-            # Safety: clear cache if too far from object
             if phase == "FLY_TO_EDGE":
-                center_raw = sensor_data.get("object_center")
-                extents_raw = sensor_data.get("object_extents")
-                if center_raw is not None and extents_raw is not None:
-                    center = np.asarray(center_raw, dtype=float)
+                center_raw = sensor_data.get(
+                    "object_center"
+                )
+                extents_raw = sensor_data.get(
+                    "object_extents"
+                )
+                if (
+                    center_raw is not None
+                    and extents_raw is not None
+                ):
+                    center = np.asarray(
+                        center_raw, dtype=float
+                    )
                     dist_from_center = float(
-                        np.linalg.norm(current_pose[:3] - center)
+                        np.linalg.norm(
+                            current_pose[:3] - center
+                        )
                     )
                     max_ext = float(max(extents_raw))
                     if dist_from_center > max_ext * 2.0:
                         self._cached_fly_direction = None
                         logger.debug(
-                            f"FLY_SAFETY_ABORT: dist_from_center="
+                            f"FLY_SAFETY_ABORT: "
+                            f"dist_from_center="
                             f"{dist_from_center:.1f}"
                         )
 
-        close_to_goal = distance < 3.0 * self.action_space.surface_step
+        close_to_goal = (
+            distance
+            < 3.0 * self.action_space.surface_step
+        )
 
-        # ────────────────────────────────────────────────────
+        # ────────────────────────────────────────
         # 0) SUPPRESS — always-on suppressions
-        # ────────────────────────────────────────────────────
-        suppress = np.zeros(self.num_actions, dtype=float)
+        # ────────────────────────────────────────
+        suppress = np.zeros(
+            self.num_actions, dtype=float
+        )
         suppress[self.action_space.IDX_ROTATE_POS] -= 2.0
         suppress[self.action_space.IDX_ROTATE_NEG] -= 2.0
 
         if not (on_object > 0.5 and close_to_goal):
-            suppress[self.action_space.IDX_ORIENT_HOR] -= 2.0
-            suppress[self.action_space.IDX_ORIENT_VERT] -= 2.0
+            suppress[
+                self.action_space.IDX_ORIENT_HOR
+            ] -= 2.0
+            suppress[
+                self.action_space.IDX_ORIENT_VERT
+            ] -= 2.0
 
-        if on_object < 0.5:
-            suppress[self.action_space.IDX_DETACH] -= 5.0
+        # supress as detach is strategic decision
+        suppress[self.action_space.IDX_DETACH] -= 5.0
 
-        if self._last_action == self.action_space.IDX_DETACH:
-            suppress[self.action_space.IDX_DETACH] -= 5.0
+        if (
+            self._last_action
+            == self.action_space.IDX_DETACH
+        ):
+            suppress[
+                self.action_space.IDX_DETACH
+            ] -= 5.0
 
         recent_detach = sum(
             1
             for tr in self._episode_transitions[-3:]
-            if tr["action"] == self.action_space.IDX_DETACH
+            if tr["action"]
+            == self.action_space.IDX_DETACH
         )
         if recent_detach >= 1:
-            suppress[self.action_space.IDX_DETACH] -= 5.0
+            suppress[
+                self.action_space.IDX_DETACH
+            ] -= 5.0
 
-        # Suppress detach when close to goal on correct side
         if (
             on_object > 0.5
             and phase == "CRAWL_TO_GOAL"
-            and distance < 5.0 * self.action_space.surface_step
+            and distance
+            < 5.0 * self.action_space.surface_step
         ):
-            suppress[self.action_space.IDX_DETACH] -= 8.0
+            suppress[
+                self.action_space.IDX_DETACH
+            ] -= 8.0
 
         bias += suppress
         components["suppress"] = suppress
 
-        # ────────────────────────────────────────────────────
+        # ────────────────────────────────────────
         # 1) SURFACE MOVE — phase-aware
-        # ────────────────────────────────────────────────────
-        surface_move = np.zeros(self.num_actions, dtype=float)
-
-        if on_object > 0.5 and phase == "CRAWL_TO_GOAL":
-            SURFACE_STRENGTH = 4.0
+        # ────────────────────────────────────────
+        surface_move = np.zeros(
+            self.num_actions, dtype=float
+        )
+        if on_object > 0.5 and phase == "CRAWL_TO_EDGE":
+            SURFACE_STRENGTH = 8.0  # было 5
 
             n_world = sensor_data.get("point_normal")
             if n_world is not None:
@@ -1979,463 +2266,906 @@ class RLGoalApproachController:
                 n_len = float(np.linalg.norm(n_world))
                 if n_len > eps:
                     n_hat = n_world / n_len
-                    e_world = rot.apply(local_pos_error)
                     step = float(self.action_space.surface_step)
 
-                    # Geodesic-aware crawl direction
-                    goal_normal_raw = sensor_data.get("goal_normal")
-                    use_geodesic = False
+                    if subgoal_dir is not None:
+                        e_t = subgoal_dir * step * 3.0
+                    else:
+                        e_t = None
 
-                    if goal_normal_raw is not None:
-                        gn = np.asarray(goal_normal_raw, dtype=float)
-                        gn_len = float(np.linalg.norm(gn))
-                        if gn_len > 1e-8:
-                            gn = gn / gn_len
-                            gc_axis = np.cross(n_hat, gn)
-                            gc_len = float(np.linalg.norm(gc_axis))
-
-                            if gc_len > 0.01:
-                                gc_axis /= gc_len
-                                geodesic_dir = np.cross(gc_axis, n_hat)
-                                geo_len = float(np.linalg.norm(geodesic_dir))
-                                if geo_len > 1e-8:
-                                    geodesic_dir /= geo_len
-                                    e_t_flat = (
-                                        e_world
-                                        - np.dot(e_world, n_hat) * n_hat
-                                    )
-                                    if np.dot(geodesic_dir, e_t_flat) < 0:
-                                        geodesic_dir = -geodesic_dir
-                                    e_t = geodesic_dir * float(
-                                        np.linalg.norm(e_t_flat)
-                                    )
-                                    use_geodesic = True
-
-                    if not use_geodesic:
-                        e_t = e_world - np.dot(e_world, n_hat) * n_hat
-
-                    tangential_dist = float(np.linalg.norm(e_t))
-
-                    if tangential_dist > 0.1:
-                        right_world = rot.apply([1.0, 0.0, 0.0])
-                        tb1 = right_world - np.dot(right_world, n_hat) * n_hat
-                        tb1_norm = np.linalg.norm(tb1)
-                        if tb1_norm < 1e-8:
-                            up_world = rot.apply([0.0, 1.0, 0.0])
-                            tb1 = up_world - np.dot(up_world, n_hat) * n_hat
+                    if e_t is not None:
+                        tangential_dist = float(np.linalg.norm(e_t))
+                        if tangential_dist > 0.1:
+                            # === Reuse existing scoring logic ===
+                            right_world = rot.apply([1.0, 0.0, 0.0])
+                            tb1 = right_world - np.dot(right_world, n_hat) * n_hat
                             tb1_norm = np.linalg.norm(tb1)
-                        if tb1_norm < 1e-8:
-                            tmp = np.array([0.0, 1.0, 0.0])
-                            if abs(np.dot(tmp, n_hat)) > 0.9:
-                                tmp = np.array([0.0, 0.0, 1.0])
-                            tb1 = np.cross(n_hat, tmp)
-                            tb1_norm = np.linalg.norm(tb1)
-                        tb1 /= (tb1_norm + 1e-12)
-                        tb2 = np.cross(n_hat, tb1)
-                        tb2 /= (np.linalg.norm(tb2) + 1e-12)
+                            if tb1_norm < 1e-8:
+                                up_world = rot.apply([0.0, 1.0, 0.0])
+                                tb1 = up_world - np.dot(up_world, n_hat) * n_hat
+                                tb1_norm = np.linalg.norm(tb1)
+                            if tb1_norm < 1e-8:
+                                tmp = np.array([0.0, 1.0, 0.0])
+                                if abs(np.dot(tmp, n_hat)) > 0.9:
+                                    tmp = np.array([0.0, 0.0, 1.0])
+                                tb1 = np.cross(n_hat, tmp)
+                                tb1_norm = np.linalg.norm(tb1)
+                            tb1 /= (tb1_norm + 1e-12)
+                            tb2 = np.cross(n_hat, tb1)
+                            tb2 /= (np.linalg.norm(tb2) + 1e-12)
 
-                        best = None
-                        best_score = -1e18
-                        scores = np.full(8, -1e18, dtype=float)
-                        for i, deg in enumerate(
-                            self.action_space.SURFACE_DIRECTIONS
-                        ):
-                            a = np.radians(deg)
-                            v_world = np.cos(a) * tb1 + np.sin(a) * tb2
-                            v_norm = float(np.linalg.norm(v_world))
-                            if v_norm < 1e-8:
-                                continue
-                            v_world /= v_norm
-                            new_e = e_t - step * v_world
-                            score = float(
-                                np.dot(e_t, e_t) - np.dot(new_e, new_e)
+                            best = None
+                            best_score = -1e18
+                            scores = np.full(8, -1e18, dtype=float)
+                            for i, deg in enumerate(
+                                self.action_space.SURFACE_DIRECTIONS
+                            ):
+                                a = np.radians(deg)
+                                v_world = np.cos(a) * tb1 + np.sin(a) * tb2
+                                v_norm = float(np.linalg.norm(v_world))
+                                if v_norm < 1e-8:
+                                    continue
+                                v_world /= v_norm
+                                new_e = e_t - step * v_world
+                                score = float(
+                                    np.dot(e_t, e_t) - np.dot(new_e, new_e)
+                                )
+                                scores[i] = score
+                                if score > best_score:
+                                    best_score = score
+                                    best = i
+
+                            if best is not None:
+                                surface_move[best] = SURFACE_STRENGTH
+
+        if on_object > 0.5 and phase == "CRAWL_TO_GOAL":
+            SURFACE_STRENGTH = 4.0
+
+            path_blocked_now = sensor_data.get(
+                "path_blocked", False
+            )
+
+            n_world = sensor_data.get("point_normal")
+            if n_world is not None:
+                n_world = np.asarray(
+                    n_world, dtype=float
+                )
+                n_len = float(np.linalg.norm(n_world))
+                if n_len > eps:
+                    n_hat = n_world / n_len
+                    step = float(
+                        self.action_space.surface_step
+                    )
+
+                    if path_blocked_now:
+                        # Path blocked — crawl toward
+                        # edge using fly direction
+                        edge_dir = (
+                            self._compute_detach_fly_direction(
+                                current_pose,
+                                sensor_data,
                             )
-                            scores[i] = score
-                            if score > best_score:
-                                best_score = score
-                                best = i
-
-                        if distance < 3.0 * step:
-                            HYST_ABS = 1.0
+                        )
+                        if edge_dir is not None:
+                            e_t = (
+                                edge_dir
+                                - np.dot(
+                                    edge_dir, n_hat
+                                )
+                                * n_hat
+                            )
+                            e_t_len = np.linalg.norm(
+                                e_t
+                            )
+                            if e_t_len > 1e-8:
+                                e_t = (
+                                    e_t
+                                    / e_t_len
+                                    * step
+                                    * 3.0
+                                )
+                            else:
+                                e_t = None
                         else:
-                            HYST_ABS = 0.25
-                        if (
-                            prev_action is not None
-                            and 0 <= prev_action < 8
-                            and best is not None
-                        ):
-                            prev_score = scores[int(prev_action)]
-                            if (best_score - prev_score) < HYST_ABS:
-                                best = int(prev_action)
+                            e_t = None
+                    else:
+                        # Path clear — crawl toward
+                        # goal with geodesic
+                        e_world = rot.apply(
+                            local_pos_error
+                        )
 
-                        if best is not None:
-                            surface_move[best] = SURFACE_STRENGTH
+                        goal_normal_raw = (
+                            sensor_data.get(
+                                "goal_normal"
+                            )
+                        )
+                        use_geodesic = False
+
+                        if (
+                            goal_normal_raw
+                            is not None
+                        ):
+                            gn = np.asarray(
+                                goal_normal_raw,
+                                dtype=float,
+                            )
+                            gn_len = float(
+                                np.linalg.norm(gn)
+                            )
+                            if gn_len > 1e-8:
+                                gn = gn / gn_len
+                                gc_axis = np.cross(
+                                    n_hat, gn
+                                )
+                                gc_len = float(
+                                    np.linalg.norm(
+                                        gc_axis
+                                    )
+                                )
+                                if gc_len > 0.01:
+                                    gc_axis /= (
+                                        gc_len
+                                    )
+                                    geodesic_dir = (
+                                        np.cross(
+                                            gc_axis,
+                                            n_hat,
+                                        )
+                                    )
+                                    geo_len = float(
+                                        np.linalg.norm(
+                                            geodesic_dir
+                                        )
+                                    )
+                                    if (
+                                        geo_len
+                                        > 1e-8
+                                    ):
+                                        geodesic_dir /= geo_len
+                                        e_t_flat = (
+                                            e_world
+                                            - np.dot(
+                                                e_world,
+                                                n_hat,
+                                            )
+                                            * n_hat
+                                        )
+                                        if (
+                                            np.dot(
+                                                geodesic_dir,
+                                                e_t_flat,
+                                            )
+                                            < 0
+                                        ):
+                                            geodesic_dir = -geodesic_dir
+                                        e_t = (
+                                            geodesic_dir
+                                            * float(
+                                                np.linalg.norm(
+                                                    e_t_flat
+                                                )
+                                            )
+                                        )
+                                        use_geodesic = True
+
+                        if not use_geodesic:
+                            e_t = (
+                                e_world
+                                - np.dot(
+                                    e_world, n_hat
+                                )
+                                * n_hat
+                            )
+
+                    # Score directions (shared logic)
+                    if e_t is not None:
+                        tangential_dist = float(
+                            np.linalg.norm(e_t)
+                        )
+
+                        if tangential_dist > 0.1:
+                            right_world = rot.apply(
+                                [1.0, 0.0, 0.0]
+                            )
+                            tb1 = (
+                                right_world
+                                - np.dot(
+                                    right_world,
+                                    n_hat,
+                                )
+                                * n_hat
+                            )
+                            tb1_norm = (
+                                np.linalg.norm(tb1)
+                            )
+                            if tb1_norm < 1e-8:
+                                up_world = (
+                                    rot.apply(
+                                        [
+                                            0.0,
+                                            1.0,
+                                            0.0,
+                                        ]
+                                    )
+                                )
+                                tb1 = (
+                                    up_world
+                                    - np.dot(
+                                        up_world,
+                                        n_hat,
+                                    )
+                                    * n_hat
+                                )
+                                tb1_norm = (
+                                    np.linalg.norm(
+                                        tb1
+                                    )
+                                )
+                            if tb1_norm < 1e-8:
+                                tmp = np.array(
+                                    [0.0, 1.0, 0.0]
+                                )
+                                if (
+                                    abs(
+                                        np.dot(
+                                            tmp,
+                                            n_hat,
+                                        )
+                                    )
+                                    > 0.9
+                                ):
+                                    tmp = np.array(
+                                        [
+                                            0.0,
+                                            0.0,
+                                            1.0,
+                                        ]
+                                    )
+                                tb1 = np.cross(
+                                    n_hat, tmp
+                                )
+                                tb1_norm = (
+                                    np.linalg.norm(
+                                        tb1
+                                    )
+                                )
+                            tb1 /= (
+                                tb1_norm + 1e-12
+                            )
+                            tb2 = np.cross(
+                                n_hat, tb1
+                            )
+                            tb2 /= (
+                                np.linalg.norm(tb2)
+                                + 1e-12
+                            )
+
+                            best = None
+                            best_score = -1e18
+                            scores = np.full(
+                                8,
+                                -1e18,
+                                dtype=float,
+                            )
+                            for (
+                                i,
+                                deg,
+                            ) in enumerate(
+                                self.action_space.SURFACE_DIRECTIONS
+                            ):
+                                a = np.radians(deg)
+                                v_world = (
+                                    np.cos(a) * tb1
+                                    + np.sin(a)
+                                    * tb2
+                                )
+                                v_norm = float(
+                                    np.linalg.norm(
+                                        v_world
+                                    )
+                                )
+                                if v_norm < 1e-8:
+                                    continue
+                                v_world /= v_norm
+                                new_e = (
+                                    e_t
+                                    - step * v_world
+                                )
+                                score = float(
+                                    np.dot(e_t, e_t)
+                                    - np.dot(
+                                        new_e,
+                                        new_e,
+                                    )
+                                )
+                                scores[i] = score
+                                if (
+                                    score
+                                    > best_score
+                                ):
+                                    best_score = (
+                                        score
+                                    )
+                                    best = i
+
+                            if (
+                                not path_blocked_now
+                            ):
+                                if (
+                                    distance
+                                    < 3.0 * step
+                                ):
+                                    HYST_ABS = 1.0
+                                else:
+                                    HYST_ABS = 0.25
+                                if (
+                                    prev_action
+                                    is not None
+                                    and 0
+                                    <= prev_action
+                                    < 8
+                                    and best
+                                    is not None
+                                ):
+                                    prev_score = (
+                                        scores[
+                                            int(
+                                                prev_action
+                                            )
+                                        ]
+                                    )
+                                    if (
+                                        best_score
+                                        - prev_score
+                                    ) < HYST_ABS:
+                                        best = int(
+                                            prev_action
+                                        )
+
+                            if best is not None:
+                                surface_move[
+                                    best
+                                ] = (
+                                    SURFACE_STRENGTH
+                                )
 
         bias += surface_move
         components["surface_move"] = surface_move
 
-        # ────────────────────────────────────────────────────
-        # 2) STAGNATION — phase-aware, no near_goal exemption
-        # ────────────────────────────────────────────────────
-        stagnation = np.zeros(self.num_actions, dtype=float)
+        # ────────────────────────────────────────
+        # 2) STAGNATION — crawl direction only
+        # ────────────────────────────────────────
+        stagnation = np.zeros(
+            self.num_actions, dtype=float
+        )
 
-        if on_object > 0.5:
-
-            if phase == "CRAWL_TO_GOAL":
-                if len(self._distance_history) >= 10:
-                    dist_10_ago = self._distance_history[-10]
-                    dist_progress_10 = dist_10_ago - distance
-                    if dist_progress_10 < self.action_space.surface_step * 0.5:
-                        if prev_action is not None and 0 <= prev_action < 8:
-                            stagnation[prev_action] -= 2.0
-                            perp1 = (prev_action + 2) % 8
-                            perp2 = (prev_action + 6) % 8
-                            stagnation[perp1] += 2.0
-                            stagnation[perp2] += 2.0
-                        if prev_action is not None and 0 <= prev_action < 8:
-                            opposite = (prev_action + 4) % 8
-                            stagnation[opposite] += 1.0
-
-                if len(self._distance_history) >= 20:
-                    dist_20_ago = self._distance_history[-20]
-                    dist_progress_20 = dist_20_ago - distance
-                    if dist_progress_20 < self.action_space.surface_step * 0.5:
-                        recent_detach_count = sum(
-                            1
-                            for tr in self._episode_transitions[-10:]
-                            if tr["action"] == self.action_space.IDX_DETACH
-                        )
-                        last_was_detach = (
-                            self._last_action == self.action_space.IDX_DETACH
-                        )
-                        if recent_detach_count < 1 and not last_was_detach:
-                            stagnation[self.action_space.IDX_DETACH] += 6.0
-                            for idx in range(8):
-                                stagnation[idx] -= 2.0
-
-                if len(self._distance_history) >= 40:
-                    dist_40_ago = self._distance_history[-40]
-                    dist_progress_40 = dist_40_ago - distance
-                    if dist_progress_40 < self.action_space.surface_step:
-                        recent_detach_count = sum(
-                            1
-                            for tr in self._episode_transitions[-15:]
-                            if tr["action"] == self.action_space.IDX_DETACH
-                        )
-                        last_was_detach = (
-                            self._last_action == self.action_space.IDX_DETACH
-                        )
-                        if recent_detach_count < 1 and not last_was_detach:
-                            stagnation[self.action_space.IDX_DETACH] += 10.0
-                            for idx in range(8):
-                                stagnation[idx] -= 3.0
-
-            elif phase == "DETACH_NEEDED":
-                if len(self._episode_transitions) >= 3:
-                    recent_dists = [
-                        float(tr["state"][13])
-                        for tr in self._episode_transitions[-5:]
-                    ]
-                    if len(recent_dists) >= 3:
-                        dist_reduction = recent_dists[0] - recent_dists[-1]
-                        if dist_reduction < self.action_space.surface_step * 0.5:
-                            stagnation[self.action_space.IDX_DETACH] += 3.0
+        if on_object > 0.5 and phase  in ("CRAWL_TO_GOAL", "CRAWL_TO_EDGE"):
+            if len(self._distance_history) >= 10:
+                dist_10_ago = self._distance_history[-10]
+                dist_progress_10 = dist_10_ago - distance
+                if (
+                    dist_progress_10
+                    < self.action_space.surface_step
+                    * 0.5
+                ):
+                    if (
+                        prev_action is not None
+                        and 0 <= prev_action < 8
+                    ):
+                        stagnation[prev_action] -= 2.0
+                        perp1 = (prev_action + 2) % 8
+                        perp2 = (prev_action + 6) % 8
+                        stagnation[perp1] += 2.0
+                        stagnation[perp2] += 2.0
+                    if (
+                        prev_action is not None
+                        and 0 <= prev_action < 8
+                    ):
+                        opposite = (
+                            prev_action + 4
+                        ) % 8
+                        stagnation[opposite] += 1.0
 
         bias += stagnation
         components["stagnation"] = stagnation
 
-        # ────────────────────────────────────────────────────
-        # 3) DETACH — phase-driven
-        # ────────────────────────────────────────────────────
-        detach = np.zeros(self.num_actions, dtype=float)
-
-        if on_object > 0.5:
-            if phase == "DETACH_NEEDED":
-                recent_detach_count = sum(
-                    1
-                    for tr in self._episode_transitions[-5:]
-                    if tr["action"] == self.action_space.IDX_DETACH
-                )
-                last_was_detach = (
-                    self._last_action == self.action_space.IDX_DETACH
-                )
-
-                if recent_detach_count < 1 and not last_was_detach and not close_to_goal:
-                    detach[self.action_space.IDX_DETACH] += 8.0
-                    for idx in range(8):
-                        detach[idx] -= 2.0
-                    detach[self.action_space.IDX_FREE_FORWARD] -= 2.0
-                    detach[self.action_space.IDX_FREE_BACKWARD] -= 2.0
-                    detach[self.action_space.IDX_LOOK_UP] -= 1.0
-                    detach[self.action_space.IDX_LOOK_DOWN] -= 1.0
-
-            elif phase == "CRAWL_TO_GOAL":
-                detach[self.action_space.IDX_DETACH] -= 3.0
-
-        bias += detach
-        components["detach"] = detach
-
-        # ────────────────────────────────────────────────────
-        # 4) STEER IN AIR — phase-driven
-        # ────────────────────────────────────────────────────
-        steer = np.zeros(self.num_actions, dtype=float)
+        # ────────────────────────────────────────
+        # 3) STEER IN AIR — phase-driven
+        # ────────────────────────────────────────
+        steer = np.zeros(
+            self.num_actions, dtype=float
+        )
 
         if on_object <= 0.5:
             STEER_STRENGTH = 8.0
-            rotation_step = self.action_space.rotation_step
+            rotation_step = (
+                self.action_space.rotation_step
+            )
 
-            # Determine effective goal direction based on phase
-            goal_dir_world = self._current_goal[:3] - current_pose[:3]
-            goal_dist_world = np.linalg.norm(goal_dir_world)
+            goal_dir_world = (
+                self._current_goal[:3]
+                - current_pose[:3]
+            )
+            goal_dist_world = np.linalg.norm(
+                goal_dir_world
+            )
             if goal_dist_world > 1e-8:
                 goal_dir_world /= goal_dist_world
 
-            if phase == "FLY_TO_EDGE" and subgoal_dir is not None:
+            if (
+                phase == "FLY_TO_EDGE"
+                and subgoal_dir is not None
+            ):
                 effective_goal = subgoal_dir
             else:
                 effective_goal = goal_dir_world
 
-            rot_current = R.from_euler("xyz", current_pose[3:6], degrees=True)
-            forward_current = rot_current.apply([0, 0, -1])
-            dot_current = float(np.dot(forward_current, effective_goal))
+            rot_current = R.from_euler(
+                "xyz", current_pose[3:6], degrees=True
+            )
+            forward_current = rot_current.apply(
+                [0, 0, -1]
+            )
+            dot_current = float(
+                np.dot(forward_current, effective_goal)
+            )
             angle_to_goal = np.degrees(
                 np.arccos(np.clip(dot_current, -1, 1))
             )
 
-            logger.debug(
-                f"STEER_DEBUG: step={self._steps}, phase={phase}, "
-                f"effective_goal={[round(x, 3) for x in effective_goal.tolist()]}, "
-                f"angle_to_goal={angle_to_goal:.1f}"
-            )
-
             pose_angles = current_pose[3:6]
 
-            # Compute improvement for each rotation direction
             forward_up = R.from_euler(
                 "xyz",
-                pose_angles + np.array([rotation_step, 0, 0]),
+                pose_angles
+                + np.array([rotation_step, 0, 0]),
                 degrees=True,
             ).apply([0, 0, -1])
             improvement_up = float(
-                np.dot(forward_up, effective_goal) - dot_current
+                np.dot(forward_up, effective_goal)
+                - dot_current
             )
 
             forward_down = R.from_euler(
                 "xyz",
-                pose_angles + np.array([-rotation_step, 0, 0]),
+                pose_angles
+                + np.array([-rotation_step, 0, 0]),
                 degrees=True,
             ).apply([0, 0, -1])
             improvement_down = float(
-                np.dot(forward_down, effective_goal) - dot_current
+                np.dot(forward_down, effective_goal)
+                - dot_current
             )
 
             forward_left = R.from_euler(
                 "xyz",
-                pose_angles + np.array([0, rotation_step, 0]),
+                pose_angles
+                + np.array([0, rotation_step, 0]),
                 degrees=True,
             ).apply([0, 0, -1])
             improvement_left = float(
-                np.dot(forward_left, effective_goal) - dot_current
+                np.dot(forward_left, effective_goal)
+                - dot_current
             )
 
             forward_right = R.from_euler(
                 "xyz",
-                pose_angles + np.array([0, -rotation_step, 0]),
+                pose_angles
+                + np.array([0, -rotation_step, 0]),
                 degrees=True,
             ).apply([0, 0, -1])
             improvement_right = float(
-                np.dot(forward_right, effective_goal) - dot_current
+                np.dot(forward_right, effective_goal)
+                - dot_current
             )
 
-            if np.linalg.norm(forward_up - forward_current) < 1e-4:
+            if (
+                np.linalg.norm(
+                    forward_up - forward_current
+                )
+                < 1e-4
+            ):
                 improvement_up = 0.0
-            if np.linalg.norm(forward_down - forward_current) < 1e-4:
+            if (
+                np.linalg.norm(
+                    forward_down - forward_current
+                )
+                < 1e-4
+            ):
                 improvement_down = 0.0
-            if np.linalg.norm(forward_left - forward_current) < 1e-4:
+            if (
+                np.linalg.norm(
+                    forward_left - forward_current
+                )
+                < 1e-4
+            ):
                 improvement_left = 0.0
-            if np.linalg.norm(forward_right - forward_current) < 1e-4:
+            if (
+                np.linalg.norm(
+                    forward_right - forward_current
+                )
+                < 1e-4
+            ):
                 improvement_right = 0.0
 
-            TURN_ONLY = 3.0 * self.action_space.rotation_step_big
-            FLY_THR = 4.0 * self.action_space.rotation_step
+            TURN_ONLY = (
+                3.0
+                * self.action_space.rotation_step_big
+            )
+            FLY_THR = (
+                4.0 * self.action_space.rotation_step
+            )
 
-            # Phase 1: FAR FROM ALIGNED (angle > 45°)
             if angle_to_goal > TURN_ONLY:
-                steer[self.action_space.IDX_FREE_FORWARD] -= STEER_STRENGTH
-                steer[self.action_space.IDX_FREE_FORWARD_SMALL] -= STEER_STRENGTH
+                steer[
+                    self.action_space.IDX_FREE_FORWARD
+                ] -= STEER_STRENGTH
+                steer[
+                    self.action_space.IDX_FREE_FORWARD_SMALL
+                ] -= STEER_STRENGTH
 
-                best_pitch = max(improvement_up, improvement_down)
-                best_yaw = max(improvement_left, improvement_right)
+                best_pitch = max(
+                    improvement_up, improvement_down
+                )
+                best_yaw = max(
+                    improvement_left, improvement_right
+                )
+                big_multiplier = min(
+                    angle_to_goal / 45.0, 2.0
+                )
 
-                big_multiplier = min(angle_to_goal / 45.0, 2.0)
-
-                if best_pitch >= best_yaw and best_pitch > 0.001:
-                    if improvement_up > improvement_down:
-                        steer[self.action_space.IDX_LOOK_UP] += STEER_STRENGTH
-                        steer[self.action_space.IDX_LOOK_UP_BIG] += STEER_STRENGTH * big_multiplier
+                if (
+                    best_pitch >= best_yaw
+                    and best_pitch > 0.001
+                ):
+                    if (
+                        improvement_up
+                        > improvement_down
+                    ):
+                        steer[
+                            self.action_space.IDX_LOOK_UP
+                        ] += STEER_STRENGTH
+                        steer[
+                            self.action_space.IDX_LOOK_UP_BIG
+                        ] += (
+                            STEER_STRENGTH
+                            * big_multiplier
+                        )
                     else:
-                        steer[self.action_space.IDX_LOOK_DOWN] += STEER_STRENGTH
-                        steer[self.action_space.IDX_LOOK_DOWN_BIG] += STEER_STRENGTH * big_multiplier
+                        steer[
+                            self.action_space.IDX_LOOK_DOWN
+                        ] += STEER_STRENGTH
+                        steer[
+                            self.action_space.IDX_LOOK_DOWN_BIG
+                        ] += (
+                            STEER_STRENGTH
+                            * big_multiplier
+                        )
 
-                if best_yaw >= best_pitch and best_yaw > 0.001:
-                    if improvement_left > improvement_right:
-                        steer[self.action_space.IDX_TURN_LEFT] += STEER_STRENGTH
-                        steer[self.action_space.IDX_TURN_LEFT_BIG] += STEER_STRENGTH * big_multiplier
+                if (
+                    best_yaw >= best_pitch
+                    and best_yaw > 0.001
+                ):
+                    if (
+                        improvement_left
+                        > improvement_right
+                    ):
+                        steer[
+                            self.action_space.IDX_TURN_LEFT
+                        ] += STEER_STRENGTH
+                        steer[
+                            self.action_space.IDX_TURN_LEFT_BIG
+                        ] += (
+                            STEER_STRENGTH
+                            * big_multiplier
+                        )
                     else:
-                        steer[self.action_space.IDX_TURN_RIGHT] += STEER_STRENGTH
-                        steer[self.action_space.IDX_TURN_RIGHT_BIG] += STEER_STRENGTH * big_multiplier
+                        steer[
+                            self.action_space.IDX_TURN_RIGHT
+                        ] += STEER_STRENGTH
+                        steer[
+                            self.action_space.IDX_TURN_RIGHT_BIG
+                        ] += (
+                            STEER_STRENGTH
+                            * big_multiplier
+                        )
 
-            # Phase 2: PARTIALLY ALIGNED (20° < angle <= 45°)
             elif angle_to_goal > FLY_THR:
-                steer[self.action_space.IDX_FREE_FORWARD_SMALL] += STEER_STRENGTH * 0.5
-                steer[self.action_space.IDX_FREE_FORWARD] -= STEER_STRENGTH * 0.5
+                steer[
+                    self.action_space.IDX_FREE_FORWARD_SMALL
+                ] += (STEER_STRENGTH * 0.5)
+                steer[
+                    self.action_space.IDX_FREE_FORWARD
+                ] -= (STEER_STRENGTH * 0.5)
 
                 turn_strength = STEER_STRENGTH * 0.7
-
-                best_pitch = max(improvement_up, improvement_down)
-                best_yaw = max(improvement_left, improvement_right)
+                best_pitch = max(
+                    improvement_up, improvement_down
+                )
+                best_yaw = max(
+                    improvement_left, improvement_right
+                )
 
                 if best_pitch > 0.001:
-                    if improvement_up > improvement_down:
-                        steer[self.action_space.IDX_LOOK_UP] += turn_strength
+                    if (
+                        improvement_up
+                        > improvement_down
+                    ):
+                        steer[
+                            self.action_space.IDX_LOOK_UP
+                        ] += turn_strength
                     else:
-                        steer[self.action_space.IDX_LOOK_DOWN] += turn_strength
-                steer[self.action_space.IDX_LOOK_UP_BIG] -= 3.0
-                steer[self.action_space.IDX_LOOK_DOWN_BIG] -= 3.0
+                        steer[
+                            self.action_space.IDX_LOOK_DOWN
+                        ] += turn_strength
+                steer[
+                    self.action_space.IDX_LOOK_UP_BIG
+                ] -= 3.0
+                steer[
+                    self.action_space.IDX_LOOK_DOWN_BIG
+                ] -= 3.0
 
                 if best_yaw > 0.001:
-                    if improvement_left > improvement_right:
-                        steer[self.action_space.IDX_TURN_LEFT] += turn_strength
+                    if (
+                        improvement_left
+                        > improvement_right
+                    ):
+                        steer[
+                            self.action_space.IDX_TURN_LEFT
+                        ] += turn_strength
                     else:
-                        steer[self.action_space.IDX_TURN_RIGHT] += turn_strength
-                steer[self.action_space.IDX_TURN_LEFT_BIG] -= 3.0
-                steer[self.action_space.IDX_TURN_RIGHT_BIG] -= 3.0
+                        steer[
+                            self.action_space.IDX_TURN_RIGHT
+                        ] += turn_strength
+                steer[
+                    self.action_space.IDX_TURN_LEFT_BIG
+                ] -= 3.0
+                steer[
+                    self.action_space.IDX_TURN_RIGHT_BIG
+                ] -= 3.0
 
-            # Phase 3: WELL ALIGNED (angle <= 20°)
             else:
-                if distance > 8.0 * self.action_space.free_step:
-                    steer[self.action_space.IDX_FREE_FORWARD] += STEER_STRENGTH
-                    steer[self.action_space.IDX_FREE_FORWARD_SMALL] += STEER_STRENGTH * 0.5
+                if (
+                    distance
+                    > 8.0 * self.action_space.free_step
+                ):
+                    steer[
+                        self.action_space.IDX_FREE_FORWARD
+                    ] += STEER_STRENGTH
+                    steer[
+                        self.action_space.IDX_FREE_FORWARD_SMALL
+                    ] += (STEER_STRENGTH * 0.5)
                 else:
-                    steer[self.action_space.IDX_FREE_FORWARD_SMALL] += STEER_STRENGTH
-                    steer[self.action_space.IDX_FREE_FORWARD] += STEER_STRENGTH * 0.3
+                    steer[
+                        self.action_space.IDX_FREE_FORWARD_SMALL
+                    ] += STEER_STRENGTH
+                    steer[
+                        self.action_space.IDX_FREE_FORWARD
+                    ] += (STEER_STRENGTH * 0.3)
 
                 correction = STEER_STRENGTH * 0.3
-
-                best_pitch = max(improvement_up, improvement_down)
-                best_yaw = max(improvement_left, improvement_right)
+                best_pitch = max(
+                    improvement_up, improvement_down
+                )
+                best_yaw = max(
+                    improvement_left, improvement_right
+                )
 
                 if best_pitch > 0.01:
-                    if improvement_up > improvement_down:
-                        steer[self.action_space.IDX_LOOK_UP] += correction
+                    if (
+                        improvement_up
+                        > improvement_down
+                    ):
+                        steer[
+                            self.action_space.IDX_LOOK_UP
+                        ] += correction
                     else:
-                        steer[self.action_space.IDX_LOOK_DOWN] += correction
+                        steer[
+                            self.action_space.IDX_LOOK_DOWN
+                        ] += correction
 
                 if best_yaw > 0.01:
-                    if improvement_left > improvement_right:
-                        steer[self.action_space.IDX_TURN_LEFT] += correction
+                    if (
+                        improvement_left
+                        > improvement_right
+                    ):
+                        steer[
+                            self.action_space.IDX_TURN_LEFT
+                        ] += correction
                     else:
-                        steer[self.action_space.IDX_TURN_RIGHT] += correction
+                        steer[
+                            self.action_space.IDX_TURN_RIGHT
+                        ] += correction
 
-            # ── Boost look_up when trapped inside hollow object ──
             if (
                 phase == "FLY_TO_EDGE"
-                and sensor_data.get("path_blocked", False)
+                and sensor_data.get(
+                    "path_blocked", False
+                )
                 and norm_depth < 0.2
             ):
                 TRAPPED_BOOST = 4.0
-                steer[self.action_space.IDX_LOOK_UP] += TRAPPED_BOOST
-                steer[self.action_space.IDX_LOOK_UP_BIG] += TRAPPED_BOOST
-                steer[self.action_space.IDX_TURN_LEFT] -= TRAPPED_BOOST * 0.5
-                steer[self.action_space.IDX_TURN_RIGHT] -= TRAPPED_BOOST * 0.5
-                steer[self.action_space.IDX_TURN_LEFT_BIG] -= TRAPPED_BOOST * 0.5
-                steer[self.action_space.IDX_TURN_RIGHT_BIG] -= TRAPPED_BOOST * 0.5
+                steer[
+                    self.action_space.IDX_LOOK_UP
+                ] += TRAPPED_BOOST
+                steer[
+                    self.action_space.IDX_LOOK_UP_BIG
+                ] += TRAPPED_BOOST
+                steer[
+                    self.action_space.IDX_TURN_LEFT
+                ] -= (TRAPPED_BOOST * 0.5)
+                steer[
+                    self.action_space.IDX_TURN_RIGHT
+                ] -= (TRAPPED_BOOST * 0.5)
+                steer[
+                    self.action_space.IDX_TURN_LEFT_BIG
+                ] -= (TRAPPED_BOOST * 0.5)
+                steer[
+                    self.action_space.IDX_TURN_RIGHT_BIG
+                ] -= (TRAPPED_BOOST * 0.5)
 
             # Suppress surface/utility actions in air
-            steer[self.action_space.IDX_FREE_BACKWARD] -= 8.0
+            steer[
+                self.action_space.IDX_FREE_BACKWARD
+            ] -= 8.0
             for idx in range(8):
                 steer[idx] -= 8.0
-            steer[self.action_space.IDX_ORIENT_HOR] -= 8.0
-            steer[self.action_space.IDX_ORIENT_VERT] -= 8.0
-            steer[self.action_space.IDX_ROTATE_POS] -= 8.0
-            steer[self.action_space.IDX_ROTATE_NEG] -= 8.0
+            steer[
+                self.action_space.IDX_ORIENT_HOR
+            ] -= 8.0
+            steer[
+                self.action_space.IDX_ORIENT_VERT
+            ] -= 8.0
+            steer[
+                self.action_space.IDX_ROTATE_POS
+            ] -= 8.0
+            steer[
+                self.action_space.IDX_ROTATE_NEG
+            ] -= 8.0
 
         bias += steer
         components["steer_in_air"] = steer
 
-        # ────────────────────────────────────────────────────
-        # 5) DAMP FREE ON SURFACE
-        # ────────────────────────────────────────────────────
-        damp_free = np.zeros(self.num_actions, dtype=float)
+        # ────────────────────────────────────────
+        # 4) DAMP FREE ON SURFACE
+        # ────────────────────────────────────────
+        damp_free = np.zeros(
+            self.num_actions, dtype=float
+        )
         if on_object > 0.5:
-            damp_free[self.action_space.IDX_FREE_FORWARD] -= 8.0
-            damp_free[self.action_space.IDX_FREE_FORWARD_SMALL] -= 8.0
-            damp_free[self.action_space.IDX_FREE_BACKWARD] -= 8.0
-            damp_free[self.action_space.IDX_LOOK_UP_BIG] -= 4.0
-            damp_free[self.action_space.IDX_LOOK_DOWN_BIG] -= 4.0
-            damp_free[self.action_space.IDX_TURN_LEFT_BIG] -= 4.0
-            damp_free[self.action_space.IDX_TURN_RIGHT_BIG] -= 4.0
-            damp_free[self.action_space.IDX_ORIENT_HOR] -= 4.0
-            damp_free[self.action_space.IDX_ORIENT_VERT] -= 4.0
-            damp_free[self.action_space.IDX_ROTATE_POS] -= 4.0
-            damp_free[self.action_space.IDX_ROTATE_NEG] -= 4.0
+            damp_free[
+                self.action_space.IDX_FREE_FORWARD
+            ] -= 8.0
+            damp_free[
+                self.action_space.IDX_FREE_FORWARD_SMALL
+            ] -= 8.0
+            damp_free[
+                self.action_space.IDX_FREE_BACKWARD
+            ] -= 8.0
+            damp_free[
+                self.action_space.IDX_LOOK_UP_BIG
+            ] -= 4.0
+            damp_free[
+                self.action_space.IDX_LOOK_DOWN_BIG
+            ] -= 4.0
+            damp_free[
+                self.action_space.IDX_TURN_LEFT_BIG
+            ] -= 4.0
+            damp_free[
+                self.action_space.IDX_TURN_RIGHT_BIG
+            ] -= 4.0
+            damp_free[
+                self.action_space.IDX_ORIENT_HOR
+            ] -= 4.0
+            damp_free[
+                self.action_space.IDX_ORIENT_VERT
+            ] -= 4.0
+            damp_free[
+                self.action_space.IDX_ROTATE_POS
+            ] -= 4.0
+            damp_free[
+                self.action_space.IDX_ROTATE_NEG
+            ] -= 4.0
         bias += damp_free
         components["damp_free_on_surface"] = damp_free
 
-        # ────────────────────────────────────────────────────
-        # 6) FLYBY CORRECTION
-        # ────────────────────────────────────────────────────
-        flyby_bias = np.zeros(self.num_actions, dtype=float)
+        # ────────────────────────────────────────
+        # 5) FLYBY CORRECTION
+        # ────────────────────────────────────────
+        flyby_bias = np.zeros(
+            self.num_actions, dtype=float
+        )
 
         if len(self._distance_history) >= 3:
             dist_trend_2 = (
-                (self._distance_history[-1] - self._distance_history[-2])
+                (
+                    self._distance_history[-1]
+                    - self._distance_history[-2]
+                )
                 if len(self._distance_history) >= 2
                 else 0.0
             )
             dist_trend_3 = (
-                self._distance_history[-1] - self._distance_history[-3]
+                self._distance_history[-1]
+                - self._distance_history[-3]
             )
 
-            if on_object < 0.5 and phase != "FLY_TO_EDGE":
+            if (
+                on_object < 0.5
+                and phase != "FLY_TO_EDGE"
+            ):
                 forward_current = rot.apply([0, 0, -1])
-                goal_dir_world_fb = self._current_goal[:3] - current_pose[:3]
-                goal_dist_world_fb = float(np.linalg.norm(goal_dir_world_fb))
+                goal_dir_world_fb = (
+                    self._current_goal[:3]
+                    - current_pose[:3]
+                )
+                goal_dist_world_fb = float(
+                    np.linalg.norm(goal_dir_world_fb)
+                )
                 if goal_dist_world_fb > 1e-8:
-                    goal_dir_norm = goal_dir_world_fb / goal_dist_world_fb
+                    goal_dir_norm = (
+                        goal_dir_world_fb
+                        / goal_dist_world_fb
+                    )
                     approach_cos = float(
-                        np.dot(forward_current, goal_dir_norm)
+                        np.dot(
+                            forward_current,
+                            goal_dir_norm,
+                        )
                     )
                 else:
                     approach_cos = 1.0
 
-                flyby_count = getattr(self, "_flyby_count", 0)
+                flyby_count = getattr(
+                    self, "_flyby_count", 0
+                )
                 flyby_triggered = False
                 FLYBY_STRENGTH = 4.0
 
                 if dist_trend_2 > 2.0:
                     flyby_triggered = True
-                    FLYBY_STRENGTH = 5.0 + flyby_count * 2.0
-                elif dist_trend_3 > 3.0 and approach_cos < 0.5:
+                    FLYBY_STRENGTH = (
+                        5.0 + flyby_count * 2.0
+                    )
+                elif (
+                    dist_trend_3 > 3.0
+                    and approach_cos < 0.5
+                ):
                     flyby_triggered = True
-                    FLYBY_STRENGTH = 4.0 + flyby_count * 2.0
+                    FLYBY_STRENGTH = (
+                        4.0 + flyby_count * 2.0
+                    )
 
                 if len(self._distance_history) >= 5:
-                    min_recent_5 = min(self._distance_history[-5:])
-                    if distance > min_recent_5 + 2.0 * self.action_space.free_step:
+                    min_recent_5 = min(
+                        self._distance_history[-5:]
+                    )
+                    if (
+                        distance
+                        > min_recent_5
+                        + 2.0
+                        * self.action_space.free_step
+                    ):
                         if not flyby_triggered:
                             flyby_triggered = True
                             FLYBY_STRENGTH = max(
-                                5.0 + flyby_count * 2.0, FLYBY_STRENGTH
+                                5.0
+                                + flyby_count * 2.0,
+                                FLYBY_STRENGTH,
                             )
 
                 if flyby_triggered:
-                    self._flyby_count = flyby_count + 1
+                    self._flyby_count = (
+                        flyby_count + 1
+                    )
 
-                    flyby_bias[self.action_space.IDX_FREE_FORWARD] -= FLYBY_STRENGTH
+                    flyby_bias[
+                        self.action_space.IDX_FREE_FORWARD
+                    ] -= FLYBY_STRENGTH
                     flyby_bias[
                         self.action_space.IDX_FREE_FORWARD_SMALL
-                    ] -= FLYBY_STRENGTH * 0.8
+                    ] -= (FLYBY_STRENGTH * 0.8)
 
                     if self._flyby_count >= 2:
                         flyby_bias[
@@ -2443,42 +3173,78 @@ class RLGoalApproachController:
                         ] -= FLYBY_STRENGTH
 
                     pose_angles_fb = current_pose[3:6]
-                    rotation_step_fb = self.action_space.rotation_step
+                    rotation_step_fb = (
+                        self.action_space.rotation_step
+                    )
 
                     fwd_up = R.from_euler(
                         "xyz",
-                        pose_angles_fb + np.array([rotation_step_fb, 0, 0]),
+                        pose_angles_fb
+                        + np.array(
+                            [rotation_step_fb, 0, 0]
+                        ),
                         degrees=True,
                     ).apply([0, 0, -1])
                     fwd_down = R.from_euler(
                         "xyz",
-                        pose_angles_fb + np.array([-rotation_step_fb, 0, 0]),
+                        pose_angles_fb
+                        + np.array(
+                            [-rotation_step_fb, 0, 0]
+                        ),
                         degrees=True,
                     ).apply([0, 0, -1])
                     fwd_left = R.from_euler(
                         "xyz",
-                        pose_angles_fb + np.array([0, rotation_step_fb, 0]),
+                        pose_angles_fb
+                        + np.array(
+                            [0, rotation_step_fb, 0]
+                        ),
                         degrees=True,
                     ).apply([0, 0, -1])
                     fwd_right = R.from_euler(
                         "xyz",
-                        pose_angles_fb + np.array([0, -rotation_step_fb, 0]),
+                        pose_angles_fb
+                        + np.array(
+                            [0, -rotation_step_fb, 0]
+                        ),
                         degrees=True,
                     ).apply([0, 0, -1])
 
-                    imp_up = float(np.dot(fwd_up, goal_dir_norm) - approach_cos)
-                    imp_down = float(np.dot(fwd_down, goal_dir_norm) - approach_cos)
-                    imp_left = float(np.dot(fwd_left, goal_dir_norm) - approach_cos)
+                    imp_up = float(
+                        np.dot(fwd_up, goal_dir_norm)
+                        - approach_cos
+                    )
+                    imp_down = float(
+                        np.dot(
+                            fwd_down, goal_dir_norm
+                        )
+                        - approach_cos
+                    )
+                    imp_left = float(
+                        np.dot(
+                            fwd_left, goal_dir_norm
+                        )
+                        - approach_cos
+                    )
                     imp_right = float(
-                        np.dot(fwd_right, goal_dir_norm) - approach_cos
+                        np.dot(
+                            fwd_right, goal_dir_norm
+                        )
+                        - approach_cos
                     )
 
-                    best_pitch = max(imp_up, imp_down)
-                    best_yaw = max(imp_left, imp_right)
+                    best_pitch = max(
+                        imp_up, imp_down
+                    )
+                    best_yaw = max(
+                        imp_left, imp_right
+                    )
 
                     if best_pitch > 0.001:
                         if imp_up > imp_down:
-                            flyby_bias[self.action_space.IDX_LOOK_UP] += FLYBY_STRENGTH
+                            flyby_bias[
+                                self.action_space.IDX_LOOK_UP
+                            ] += FLYBY_STRENGTH
                         else:
                             flyby_bias[
                                 self.action_space.IDX_LOOK_DOWN
@@ -2494,61 +3260,68 @@ class RLGoalApproachController:
                                 self.action_space.IDX_TURN_RIGHT
                             ] += FLYBY_STRENGTH
 
-            elif on_object > 0.5 and phase == "CRAWL_TO_GOAL":
-                if len(self._distance_history) >= 6 and dist_trend_3 > 3.0:
-                    trend_5 = (
-                        self._distance_history[-1] - self._distance_history[-6]
-                    )
-                    if trend_5 > 4.0:
-                        recent_detach = sum(
-                            1
-                            for tr in self._episode_transitions[-5:]
-                            if tr["action"] == self.action_space.IDX_DETACH
-                        )
-                        if recent_detach < 1:
-                            flyby_bias[self.action_space.IDX_DETACH] += 3.0
-                            for idx in range(8):
-                                flyby_bias[idx] -= 1.0
-
         bias += flyby_bias
         components["flyby_correction"] = flyby_bias
 
-        # ────────────────────────────────────────────────────
-        # 7) ORIENTATION COOLDOWN
-        # ────────────────────────────────────────────────────
-        cooldown_bias = np.zeros(self.num_actions, dtype=float)
+        # ────────────────────────────────────────
+        # 6) ORIENTATION COOLDOWN
+        # ────────────────────────────────────────
+        cooldown_bias = np.zeros(
+            self.num_actions, dtype=float
+        )
 
         if on_object > 0.5:
-            for action_idx, count in self._action_no_effect_count.items():
+            for (
+                action_idx,
+                count,
+            ) in self._action_no_effect_count.items():
                 if count >= 3:
                     penalty = min(count * 3.0, 12.0)
                     cooldown_bias[action_idx] -= penalty
 
         bias += cooldown_bias
-        components["orientation_cooldown"] = cooldown_bias
+        components["orientation_cooldown"] = (
+            cooldown_bias
+        )
 
-        # ────────────────────────────────────────────────────
-        # 8) LANDING — with emergency for all air phases
-        # ────────────────────────────────────────────────────
-        landing_bias = np.zeros(self.num_actions, dtype=float)
+        # ────────────────────────────────────────
+        # 7) LANDING
+        # ────────────────────────────────────────
+        landing_bias = np.zeros(
+            self.num_actions, dtype=float
+        )
 
-        if on_object < 0.5 and phase in ("LAND", "FLY_TO_GOAL", "FLY_TO_EDGE"):
-            LANDING_THRESHOLD = 8.0 * self.action_space.free_step
-            CLOSE_LANDING = 3.0 * self.action_space.free_step
+        if on_object < 0.5 and phase in (
+            "LAND",
+            "FLY_TO_GOAL",
+            "FLY_TO_EDGE",
+        ):
+            LANDING_THRESHOLD = (
+                8.0 * self.action_space.free_step
+            )
+            CLOSE_LANDING = (
+                3.0 * self.action_space.free_step
+            )
 
-            goal_dir_land = self._current_goal[:3] - current_pose[:3]
-            goal_dist_land = np.linalg.norm(goal_dir_land)
+            goal_dir_land = (
+                self._current_goal[:3]
+                - current_pose[:3]
+            )
+            goal_dist_land = np.linalg.norm(
+                goal_dir_land
+            )
             if goal_dist_land > 1e-8:
                 goal_dir_land /= goal_dist_land
             forward_land = rot.apply([0, 0, -1])
-            dot_land = float(np.dot(forward_land, goal_dir_land))
+            dot_land = float(
+                np.dot(forward_land, goal_dir_land)
+            )
             angle_to_goal_land = np.degrees(
                 np.arccos(np.clip(dot_land, -1, 1))
             )
 
             depth = sensor_data.get("depth", 100.0)
 
-            # Emergency: very close to surface in ANY air phase
             if depth < 5.0:
                 landing_bias[
                     self.action_space.IDX_FREE_FORWARD
@@ -2597,15 +3370,19 @@ class RLGoalApproachController:
                         ] -= 10.0
                 else:
                     landing_urgency = max(
-                        0.0, 1.0 - (distance / LANDING_THRESHOLD)
+                        0.0,
+                        1.0
+                        - (
+                            distance
+                            / LANDING_THRESHOLD
+                        ),
                     )
-
                     landing_bias[
                         self.action_space.IDX_FREE_FORWARD
-                    ] -= 4.0 * landing_urgency
+                    ] -= (4.0 * landing_urgency)
                     landing_bias[
                         self.action_space.IDX_FREE_FORWARD_SMALL
-                    ] += 3.0 * landing_urgency
+                    ] += (3.0 * landing_urgency)
 
                     if depth < 10.0:
                         landing_bias[
@@ -2615,7 +3392,11 @@ class RLGoalApproachController:
                             self.action_space.IDX_FREE_FORWARD
                         ] -= 4.0
 
-                    if distance < 4.0 * self.action_space.free_step:
+                    if (
+                        distance
+                        < 4.0
+                        * self.action_space.free_step
+                    ):
                         for idx in [
                             self.action_space.IDX_LOOK_UP_BIG,
                             self.action_space.IDX_LOOK_DOWN_BIG,
@@ -2624,14 +3405,22 @@ class RLGoalApproachController:
                         ]:
                             landing_bias[idx] -= 3.0
 
-            # ── Flyby detection ──
-            if not sensor_data.get("path_blocked", False):
+            if not sensor_data.get(
+                "path_blocked", False
+            ):
                 if len(self._distance_history) >= 10:
-                    min_recent_10 = min(self._distance_history[-10:])
-                    overshoot = distance - min_recent_10
+                    min_recent_10 = min(
+                        self._distance_history[-10:]
+                    )
+                    overshoot = (
+                        distance - min_recent_10
+                    )
                     if (
-                        overshoot > 1.0 * self.action_space.free_step
-                        and min_recent_10 < LANDING_THRESHOLD
+                        overshoot
+                        > 1.0
+                        * self.action_space.free_step
+                        and min_recent_10
+                        < LANDING_THRESHOLD
                     ):
                         landing_bias[
                             self.action_space.IDX_FREE_FORWARD
@@ -2639,21 +3428,23 @@ class RLGoalApproachController:
                         landing_bias[
                             self.action_space.IDX_FREE_FORWARD_SMALL
                         ] -= 15.0
-        # ═══ Approach speed control during LAND ═══
+
         if phase == "LAND" and on_object < 0.5:
             depth = sensor_data.get("depth", 100.0)
-            
-            # Progressive speed reduction as depth decreases
-            if depth < 3.0 * self.action_space.free_step:
-                # Very close to surface — only small steps
+            if (
+                depth
+                < 3.0 * self.action_space.free_step
+            ):
                 landing_bias[
                     self.action_space.IDX_FREE_FORWARD
                 ] -= 20.0
                 landing_bias[
                     self.action_space.IDX_FREE_FORWARD_SMALL
                 ] += 5.0
-            elif depth < 6.0 * self.action_space.free_step:
-                # Approaching — prefer small steps
+            elif (
+                depth
+                < 6.0 * self.action_space.free_step
+            ):
                 landing_bias[
                     self.action_space.IDX_FREE_FORWARD
                 ] -= 10.0
@@ -2665,7 +3456,7 @@ class RLGoalApproachController:
         components["landing"] = landing_bias
 
         return bias, components
-        
+            
     # ══════════════════════════════════════════════════════════
     # SUBGOAL HELPERS
     # ══════════════════════════════════════════════════════════
@@ -2791,6 +3582,98 @@ class RLGoalApproachController:
             )
 
         return orbit_dir
+
+    def _compute_crawl_to_edge_direction(
+        self,
+        current_pose: np.ndarray,
+        sensor_data: Dict[str, Any],
+    ) -> Optional[np.ndarray]:
+        """Compute surface-tangent direction toward nearest edge/rim.
+
+        Mirrors the logic of _compute_detach_fly_direction but returns
+        a direction projected onto the tangent plane (for crawling,
+        not flying).
+
+        Strategy:
+        - not same_side + vertical wall: crawl up toward rim
+        (same as detach_fly's up_tangent logic)
+        - not same_side + horizontal surface: crawl away from center
+        toward edge (same as detach_fly's away_from_center logic)
+        - same_side + path_blocked: crawl toward goal projection
+        on tangent plane (toward nearest corner/edge that leads
+        to goal)
+
+        Returns:
+            Unit vector in world space (tangent to surface), or None.
+        """
+        normal = sensor_data.get("point_normal")
+        if normal is None:
+            return None
+        n = np.asarray(normal, dtype=float)
+        n_len = np.linalg.norm(n)
+        if n_len < 1e-8:
+            return None
+        n /= n_len
+
+        up_dir = np.asarray(
+            sensor_data.get("up_direction", [0, 0, 1]), dtype=float
+        )
+        same_side = sensor_data.get("same_side", True)
+
+        if not same_side:
+            # ═══ Opposite sides — mirror _compute_detach_fly_direction ═══
+
+            # Project up onto tangent plane
+            up_tangent = up_dir - np.dot(up_dir, n) * n
+            up_tangent_len = np.linalg.norm(up_tangent)
+
+            if up_tangent_len > 0.3:
+                # Vertical wall: crawl up toward rim
+                crawl_dir = up_tangent / up_tangent_len
+            else:
+                # Horizontal surface (bottom/top):
+                # crawl away from center toward edge
+                center = np.asarray(
+                    sensor_data.get("object_center", [0, 0, 0]),
+                    dtype=float,
+                )
+                away = current_pose[:3] - center
+                away_t = away - np.dot(away, n) * n
+                away_len = np.linalg.norm(away_t)
+                if away_len > 1e-8:
+                    crawl_dir = away_t / away_len
+                else:
+                    # Fallback: any direction away from center
+                    crawl_dir = up_dir - np.dot(up_dir, n) * n
+                    cd_len = np.linalg.norm(crawl_dir)
+                    if cd_len < 1e-8:
+                        return None
+                    crawl_dir /= cd_len
+        else:
+            # ═══ Same side, path blocked — crawl toward goal ═══
+            # Project goal direction onto tangent plane
+            # This naturally points toward the nearest edge/corner
+            # that leads to the goal
+            goal_dir = self._current_goal[:3] - current_pose[:3]
+            crawl_dir = goal_dir - np.dot(goal_dir, n) * n
+
+            crawl_len = np.linalg.norm(crawl_dir)
+            if crawl_len < 1e-8:
+                # Goal directly behind normal — crawl away from center
+                center = np.asarray(
+                    sensor_data.get("object_center", [0, 0, 0]),
+                    dtype=float,
+                )
+                away = current_pose[:3] - center
+                crawl_dir = away - np.dot(away, n) * n
+                crawl_len = np.linalg.norm(crawl_dir)
+                if crawl_len < 1e-8:
+                    return None
+
+        crawl_len = np.linalg.norm(crawl_dir)
+        if crawl_len < 1e-8:
+            return None
+        return crawl_dir / crawl_len
 
     def _compute_detach_fly_direction(
         self,
@@ -3048,6 +3931,35 @@ class RLGoalApproachController:
         )
         return abs(float(np.dot(n / n_len, up_dir))) > 0.85
 
+    def _is_crawl_to_edge_stuck(self, window: int = 30) -> bool:
+        """Check if agent is stuck while crawling to edge.
+
+        Cannot use distance-to-goal because agent may correctly
+        move away from goal while approaching edge (e.g. crawling
+        up outer wall of mug toward rim).
+
+        Instead checks if agent position is oscillating in place:
+        if the range of distances over the window is small,
+        agent is not making meaningful movement.
+
+        Args:
+            window: Number of recent steps to check.
+
+        Returns:
+            True if agent appears stuck (oscillating in place).
+        """
+        if len(self._distance_history) < window:
+            return False
+
+        recent = self._distance_history[-window:]
+        dist_range = max(recent) - min(recent)
+
+        # Metric 1: not moving at all
+        if dist_range < self.action_space.surface_step * 2.0:
+            return True
+
+        return False
+
     def _is_making_progress(self, window: int = 10) -> bool:
         """Check if agent made meaningful distance progress in last N steps.
 
@@ -3118,92 +4030,91 @@ class RLGoalApproachController:
         if goal_reached:
             self._total_goals_reached += 1
 
-        # ═══ Update strategic Q-stores ═══
+        # ═══ Retrospective strategic detach update ═══
         cfg = self.config
         switch_alpha = (
             self._get_learning_rate()
             * cfg.get("strategic_alpha_switch_multiplier", 1.0)
         )
+        had_detach = len(self._pending_strategic_detach) > 0
 
-        # Detach outcomes
-        for pending in self._pending_strategic_detach:
-            t_state = pending["state"]
-            detach_step = pending["step"]
-
-            # Check: did detach execute?
-            if detach_step + 1 < len(self._episode_transitions):
-                next_s = self._episode_transitions[detach_step + 1]["state"]
-                if next_s[11] > 0.5:
-                    continue
-
-            # Find landing after detach
-            reached_correct_side = False
-            landed = False
-            for j in range(
-                detach_step + 1, len(self._episode_transitions)
-            ):
-                future_state = self._episode_transitions[j]["state"]
-                if future_state[11] > 0.5:
-                    landed = True
-                    future_an = future_state[6:9]
-                    future_gn = future_state[15:18]
-                    an_len = np.linalg.norm(future_an)
-                    gn_len = np.linalg.norm(future_gn)
-                    if an_len > 1e-8 and gn_len > 1e-8:
-                        agreement = float(np.dot(
-                            future_an / an_len,
-                            future_gn / gn_len,
-                        ))
-                        if agreement > 0.3:
-                            reached_correct_side = True
-                    break
-
-            if reached_correct_side or goal_reached:
-                self.strategic_detach.update_q_value(
-                    t_state, action=1,
-                    td_target=cfg.get(
-                        "strategic_reward_switch_success", 1.0
-                    ),
-                    alpha=switch_alpha,
-                )
-            elif landed:
-                self.strategic_detach.update_q_value(
-                    t_state, action=1,
-                    td_target=cfg.get(
-                        "strategic_reward_switch_wrong_side", -0.3
-                    ),
-                    alpha=switch_alpha,
-                )
-                self.strategic_detach.update_q_value(
-                    t_state, action=0,
-                    td_target=cfg.get(
-                        "strategic_reward_stay_correct", 0.3
-                    ),
-                    alpha=switch_alpha,
-                )
-            else:
-                # Timeout/collision — navigation failed
-                was_detach_needed = pending.get(
-                    "phase_was_detach_needed", False
-                )
-                if was_detach_needed:
-                    # Detach was correct decision, navigation
-                    # failed. Don't punish switch — neutral.
-                    pass
-                else:
-                    # Detach was questionable — reward stay
-                    self.strategic_detach.update_q_value(
-                        t_state, action=0,
-                        td_target=0.3,
-                        alpha=switch_alpha,
-                    )
-
-        # ═══ Evaluate cached fly direction quality ═══
-        if self._pending_strategic_detach:
+        # ── Episodes WITH detach ──
+        if had_detach:
             for pending in self._pending_strategic_detach:
                 detach_step = pending["step"]
-                
-                # Count steps spent in air after detach
+                t_state = pending["state"]
+
+                # Check: did detach actually execute?
+                if detach_step + 1 < len(self._episode_transitions):
+                    next_s = self._episode_transitions[
+                        detach_step + 1
+                    ]["state"]
+                    if next_s[11] > 0.5:
+                        continue  # didn't leave surface
+
+                # Determine switch target from episode outcome
+                if goal_reached:
+                    switch_target = cfg.get(
+                        "strategic_reward_switch_success", 1.0
+                    )
+                elif termination_reason == "collision_surface_violation":
+                    switch_target = cfg.get(
+                        "strategic_reward_switch_collision", -0.5
+                    )
+                elif termination_reason == "timeout":
+                    switch_target = -0.3
+                else:
+                    switch_target = 0.0
+
+                # Update detach point itself (full signal)
+                self.strategic_detach.update_q_value(
+                    t_state,
+                    action=1,
+                    td_target=switch_target,
+                    alpha=switch_alpha,
+                )
+
+                # Collect stuck surface states before detach
+                stuck_states = []
+                for i in range(detach_step - 1, -1, -1):
+                    tr = self._episode_transitions[i]
+                    s = tr["state"]
+                    if s[11] < 0.5:
+                        break  # hit air segment, stop
+                    stuck_states.append(s)
+
+                if switch_target > 0:
+                    # Scenario A: Goal reached with detach
+                    # Stuck-points: switch was good here too
+                    for s in stuck_states:
+                        t_retro = (
+                            self._compute_detach_state_from_full(s)
+                        )
+                        self.strategic_detach.update_q_value(
+                            t_retro,
+                            action=1,
+                            td_target=switch_target * 0.7,
+                            alpha=switch_alpha * 0.3,
+                            count_visit=False,
+                        )
+                elif switch_target < 0:
+                    # Scenario E: Collision/failure after detach
+                    # Stuck-points: stay would have been better
+                    for s in stuck_states:
+                        t_retro = (
+                            self._compute_detach_state_from_full(s)
+                        )
+                        self.strategic_detach.update_q_value(
+                            t_retro,
+                            action=0,
+                            td_target=0.3,
+                            alpha=switch_alpha * 0.2,
+                            count_visit=False,
+                        )
+                # Scenario C: Timeout with detach
+                # stuck-points neutral, skip
+
+                # Long air penalty
                 air_steps_after = 0
                 landed_successfully = False
                 for j in range(
@@ -3217,13 +4128,12 @@ class RLGoalApproachController:
                         landed_successfully = True
                         break
                     air_steps_after += 1
-                
+
                 max_reasonable_air = 50
                 if (
                     air_steps_after > max_reasonable_air
                     and not landed_successfully
                 ):
-                    t_state = pending["state"]
                     self.strategic_detach.update_q_value(
                         t_state,
                         action=1,
@@ -3234,12 +4144,56 @@ class RLGoalApproachController:
                         alpha=switch_alpha * 0.5,
                     )
 
-        # ═══ Direction outcomes (OUTSIDE detach loop) ═══
+        # ── Episodes WITHOUT detach ──
+        if not had_detach:
+            # Collect all detach-relevant surface states
+            detach_relevant = []
+            for tr in self._episode_transitions:
+                s = tr["state"]
+                if s[11] < 0.5:
+                    continue
+                t_state = self._compute_detach_state_from_full(s)
+                if t_state[0] < -0.3 or t_state[3] > 0.5:
+                    detach_relevant.append(t_state)
+
+            if detach_relevant:
+                if goal_reached:
+                    # Scenario B: Goal reached without detach
+                    # Stay was correct
+                    for t_state in detach_relevant:
+                        self.strategic_detach.update_q_value(
+                            t_state,
+                            action=0,
+                            td_target=0.5,
+                            alpha=switch_alpha * 0.3,
+                            count_visit=False,
+                        )
+                elif termination_reason == "timeout":
+                    # Scenario D: Timeout without detach
+                    # Should have detached
+                    for t_state in detach_relevant:
+                        self.strategic_detach.update_q_value(
+                            t_state,
+                            action=0,
+                            td_target=-0.3,
+                            alpha=switch_alpha * 0.3,
+                            count_visit=False,
+                        )
+                        self.strategic_detach.update_q_value(
+                            t_state,
+                            action=1,
+                            td_target=0.3,
+                            alpha=switch_alpha * 0.2,
+                            count_visit=False,
+                        )
+
+        # ═══ Direction outcomes ═══
         if self._pending_strategic_direction is not None:
             d_state = self._pending_strategic_direction["state"]
             if goal_reached:
                 self.strategic_direction.update_q_value(
-                    d_state, action=1,
+                    d_state,
+                    action=1,
                     td_target=cfg.get(
                         "strategic_reward_switch_success", 1.0
                     ),
@@ -3247,7 +4201,8 @@ class RLGoalApproachController:
                 )
             elif termination_reason == "collision_surface_violation":
                 self.strategic_direction.update_q_value(
-                    d_state, action=1,
+                    d_state,
+                    action=1,
                     td_target=cfg.get(
                         "strategic_reward_switch_collision", -0.5
                     ),
@@ -3255,62 +4210,46 @@ class RLGoalApproachController:
                 )
             else:
                 self.strategic_direction.update_q_value(
-                    d_state, action=1,
+                    d_state,
+                    action=1,
                     td_target=-0.3,
                     alpha=switch_alpha,
                 )
 
-        # Timeout penalty: agent was on surface with opposite normals
-        if termination_reason == "timeout":
-            for tr in reversed(self._episode_transitions):
-                s = tr["state"]
-                if s[11] > 0.5:
-                    an = s[6:9]
-                    gn = s[15:18]
-                    an_len = np.linalg.norm(an)
-                    gn_len = np.linalg.norm(gn)
-                    if an_len > 1e-8 and gn_len > 1e-8:
-                        agreement = float(np.dot(
-                            an / an_len, gn / gn_len
-                        ))
-                        if agreement < -0.3:
-                            t_state = self._compute_detach_state_from_full(s)
-                            self.strategic_detach.update_q_value(
-                                t_state, action=1,
-                                td_target=0.5,
-                                alpha=switch_alpha,
-                            )
-                            break
-
-        # Track detach outcomes for stats
+        # ═══ Track detach outcomes for stats ═══
         if self._pending_strategic_detach:
             self._strategic_stats["detach_total"] += len(
                 self._pending_strategic_detach
             )
             if goal_reached:
-                self._strategic_stats["detach_led_to_success"] += len(
-                    self._pending_strategic_detach
-                )
+                self._strategic_stats[
+                    "detach_led_to_success"
+                ] += len(self._pending_strategic_detach)
             elif termination_reason == "collision_surface_violation":
-                self._strategic_stats["detach_led_to_collision"] += len(
-                    self._pending_strategic_detach
-                )
+                self._strategic_stats[
+                    "detach_led_to_collision"
+                ] += len(self._pending_strategic_detach)
             else:
-                self._strategic_stats["detach_led_to_timeout"] += len(
-                    self._pending_strategic_detach
-                )
+                self._strategic_stats[
+                    "detach_led_to_timeout"
+                ] += len(self._pending_strategic_detach)
 
         # Accumulate phase counts
         for phase, count in self._episode_phase_counts.items():
             key = f"phase_{phase}"
             self._strategic_stats["phase_counts"][key] = (
-                self._strategic_stats["phase_counts"].get(key, 0)
+                self._strategic_stats["phase_counts"].get(
+                    key, 0
+                )
                 + count
             )
         self._episode_phase_counts = {}
 
         # ═══ Update Strategic SAC ═══
-        if self.strategic_sac is not None and self._strategic_sac_pending:
+        if (
+            self.strategic_sac is not None
+            and self._strategic_sac_pending
+        ):
             for pending in self._strategic_sac_pending:
                 s_state = pending["state"]
                 action = pending["action"]
@@ -3319,7 +4258,10 @@ class RLGoalApproachController:
                     if action == 1.0:
                         if goal_reached:
                             reward = 1.0
-                        elif termination_reason == "collision_surface_violation":
+                        elif (
+                            termination_reason
+                            == "collision_surface_violation"
+                        ):
                             reward = -0.5
                         else:
                             reward = -0.2
@@ -3341,7 +4283,7 @@ class RLGoalApproachController:
 
             self._strategic_sac_pending = []
 
-        # ═══ Episode done logic ═══
+        # ═══ Episode done logging ═══
         if goal_reached:
             reason = "GOAL_REACHED!!!"
             reason_key = "goal_reached"
@@ -3354,9 +4296,12 @@ class RLGoalApproachController:
                 f"epsilon={self.epsilon:.3f}, "
                 f"strategic_eps={self.strategic_epsilon:.3f}, "
                 f"success_rate="
-                f"{self._total_goals_reached}/{self._total_episodes}"
+                f"{self._total_goals_reached}/"
+                f"{self._total_episodes}"
             )
-        elif termination_reason == "collision_surface_violation":
+        elif (
+            termination_reason == "collision_surface_violation"
+        ):
             reason = "collision_surface_violation"
             reason_key = "collision_surface_violation"
         elif termination_reason == "collision_lost_object":
@@ -3383,7 +4328,8 @@ class RLGoalApproachController:
             f"final_dist={distance:.1f}mm, "
             f"epsilon={self.epsilon:.3f}, "
             f"success_rate="
-            f"{self._total_goals_reached}/{self._total_episodes}"
+            f"{self._total_goals_reached}/"
+            f"{self._total_episodes}"
         )
 
         self._current_goal = None
