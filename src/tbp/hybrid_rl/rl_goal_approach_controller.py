@@ -91,11 +91,15 @@ class RLGoalApproachController:
             **self.config,
             "state_dim": 5,
             "num_actions": 2,
-            "max_points": self.config.get("transition_max_points", 10000),
-            "k_neighbors": self.config.get("transition_k_neighbors", 5),
+            "max_points": self.config.get(
+                "transition_max_points", 10000
+            ),
+            "k_neighbors": self.config.get(
+                "transition_k_neighbors", 5
+            ),
             "insert_threshold": self.config.get(
                 "transition_insert_threshold", 0.5
-            ),
+            ) * 0.5,
         }
         self.strategic_direction = HNSWStateStore(
             config=strategic_direction_config, name="strategic_direction"
@@ -109,14 +113,6 @@ class RLGoalApproachController:
             self.config.get("strategic_epsilon_min", 0.3)
         )
         self.strategic_epsilon_decay = None
-        if self.mode == "train_adapt_epsilon":
-            total_episodes = max(1, int(self.config.get("num_episodes", 1)))
-            s_start = self.strategic_epsilon
-            s_min = self.strategic_epsilon_min
-            if s_start > s_min > 0.0:
-                self.strategic_epsilon_decay = (
-                    s_min / s_start
-                ) ** (1.0 / total_episodes)
 
         # Strategic SAC (optional, created when available)
         self.strategic_sac: Optional[StrategicSAC] = None
@@ -145,16 +141,18 @@ class RLGoalApproachController:
         )
         if self.mode == "train_adapt_epsilon":
             total_episodes = max(1, int(self.config.get("num_episodes", 1)))
+            warmup_episodes = int(self.config.get("warmup_episodes", 0))
+            effective_episodes = max(1, total_episodes - warmup_episodes)
+            
             eps_start = float(self.config.get("epsilon_start", self.epsilon))
             eps_min = float(self.config.get("epsilon_min", self.epsilon_min))
             if eps_start > eps_min > 0.0:
-                self.epsilon_decay = (eps_min / eps_start) ** (1.0 / total_episodes)
+                self.epsilon_decay = (eps_min / eps_start) ** (1.0 / effective_episodes)
 
-            # Strategic epsilon: same schedule but higher minimum
             s_start = float(self.config.get("strategic_epsilon_start", 1.0))
             s_min = float(self.config.get("strategic_epsilon_min", 0.3))
             if s_start > s_min > 0.0:
-                self.strategic_epsilon_decay = (s_min / s_start) ** (1.0 / total_episodes)
+                self.strategic_epsilon_decay = (s_min / s_start) ** (1.0 / effective_episodes)
 
         # Episode state (reset each new goal)
         self._prev_state: Optional[np.ndarray] = None
@@ -265,16 +263,23 @@ class RLGoalApproachController:
         self._pending_strategic_direction = None
         self._path_clear_streak = 0
         if self.is_training:
-            self.epsilon = max(
-                self.epsilon_min,
-                self.epsilon * self.epsilon_decay,
+            warmup_episodes = int(
+                self.config.get("warmup_episodes", 0)
             )
-            # Strategic epsilon decays together with tactical
-            if self.strategic_epsilon_decay is not None:
-                self.strategic_epsilon = max(
-                    self.strategic_epsilon_min,
-                    self.strategic_epsilon * self.strategic_epsilon_decay,
+            is_warmup = (
+                warmup_episodes > 0
+                and self._total_episodes <= warmup_episodes
+            )
+            if not is_warmup:
+                self.epsilon = max(
+                    self.epsilon_min,
+                    self.epsilon * self.epsilon_decay,
                 )
+                if self.strategic_epsilon_decay is not None:
+                    self.strategic_epsilon = max(
+                        self.strategic_epsilon_min,
+                        self.strategic_epsilon * self.strategic_epsilon_decay,
+                    )
         self._episode_phase_counts = {}
         self._strategic_sac_pending = []
         self._prev_subgoal_alignment = None
@@ -592,23 +597,41 @@ class RLGoalApproachController:
     def _compute_direction_state_from_full(
         self, full_state: np.ndarray
     ) -> np.ndarray:
-        """Compute direction state from stored 18D state."""
-        agent_normal = full_state[6:9]
-        goal_normal = full_state[15:18]
+        """Compute direction state from stored 18D state.
 
-        an_len = np.linalg.norm(agent_normal)
-        gn_len = np.linalg.norm(goal_normal)
-        if an_len > 1e-8 and gn_len > 1e-8:
-            normal_agreement = float(
-                np.dot(agent_normal / an_len, goal_normal / gn_len)
-            )
+        For air states, uses position-based features instead of
+        normal-based (which are zero when no surface visible).
+        """
+        on_object = float(full_state[11])
+
+        if on_object > 0.5:
+            agent_normal = full_state[6:9]
+            goal_normal = full_state[15:18]
+            an_len = np.linalg.norm(agent_normal)
+            gn_len = np.linalg.norm(goal_normal)
+            if an_len > 1e-8 and gn_len > 1e-8:
+                normal_agreement = float(
+                    np.dot(
+                        agent_normal / an_len,
+                        goal_normal / gn_len,
+                    )
+                )
+            else:
+                normal_agreement = 0.0
+            alignment = float(full_state[12])
         else:
-            normal_agreement = 0.0
+            alignment = float(full_state[12])
+            local_pos = full_state[0:3]
+            pos_len = np.linalg.norm(local_pos)
+            if pos_len > 1e-8:
+                normal_agreement = float(
+                    -local_pos[2] / pos_len
+                )
+            else:
+                normal_agreement = 0.0
 
-        alignment = float(full_state[12])
         norm_distance = float(full_state[13]) / 84.0
 
-        # angle_to_goal from local frame
         local_pos = full_state[0:3]
         pos_len = np.linalg.norm(local_pos)
         if pos_len > 1e-8:
@@ -616,12 +639,14 @@ class RLGoalApproachController:
         else:
             angle_to_goal = 1.0
 
-        # path_blocked approximation
         path_blocked = 1.0 if alignment < -0.3 else 0.0
 
         return np.array([
-            normal_agreement, alignment, norm_distance,
-            angle_to_goal, path_blocked,
+            normal_agreement,
+            alignment,
+            norm_distance,
+            angle_to_goal,
+            path_blocked,
         ], dtype=float)
 
     def _compute_detach_state_from_full(
@@ -1579,6 +1604,17 @@ class RLGoalApproachController:
         else:
             combined = h_norm.copy()
             temperature = 0.02
+
+        # Warmup: pure heuristic with greedy selection
+        warmup_episodes = int(
+            self.config.get("warmup_episodes", 0)
+        )
+        if (
+            warmup_episodes > 0
+            and self._total_episodes <= warmup_episodes
+        ):
+            combined = h_norm.copy()
+            temperature = 0.001
 
         if self.temperature_override is not None:
             temperature = self.temperature_override

@@ -92,5 +92,7 @@ DEFAULT_CONFIG = {
     "eval_epsilon": 0.02,
     # Eval learning rate multiplier
     "eval_alpha_multiplier": 0.1,  # alpha × 0.1 в eval mode
-    "temperature_override": None
+    "temperature_override": None,
+    "warmup_episodes": 1000,
+    "air_start_enabled": True
 }

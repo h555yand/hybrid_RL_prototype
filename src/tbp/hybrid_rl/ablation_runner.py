@@ -676,6 +676,51 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
 
         controller.set_new_goal(goal_pose, start_pos)
         env.set_goal(goal_pose)
+
+        # ═══ Air start: every 3rd training episode ═══
+        is_training = "train" in cfg.get("mode", "")
+        air_start_enabled = cfg.get(
+            "air_start_enabled", False
+        )
+
+        if (
+            is_training
+            and air_start_enabled
+            and not use_script
+            and episode % 3 == 2
+        ):
+            sensor = env.get_sensor_data()
+            normal = sensor.get("point_normal")
+            if normal is not None:
+                n = np.array(normal, dtype=float)
+                n_len = np.linalg.norm(n)
+                if n_len > 1e-8:
+                    n /= n_len
+                    detach_dist = (
+                        action_space.free_step * 3
+                    )
+                    air_pos = (
+                        env.agent_pos + n * detach_dist
+                    )
+
+                    goal_dir = goal_pose[:3] - air_pos
+                    goal_dist = np.linalg.norm(goal_dir)
+                    if goal_dist > 1e-8:
+                        air_rot = (
+                            env._look_at_direction(
+                                goal_dir / goal_dist
+                            )
+                        )
+                    else:
+                        air_rot = env.agent_rot.copy()
+
+                    env.agent_pos = air_pos
+                    env.agent_rot = air_rot
+                    start_pos = air_pos.copy()
+                    controller.set_new_goal(
+                        goal_pose, start_pos
+                    )
+                    controller._total_episodes -= 1
         controller.temperature_override = cfg.get("temperature_override")
 
         # Per-episode tracking
@@ -830,9 +875,18 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
                 )
 
         if curriculum is not None:
-            curriculum.on_episode_end(
-                episode_success, controller, episode
+            warmup_episodes = int(
+                cfg.get("warmup_episodes", 0)
             )
+            is_warmup = (
+                warmup_episodes > 0
+                and controller._total_episodes
+                <= warmup_episodes
+            )
+            if not is_warmup:
+                curriculum.on_episode_end(
+                    episode_success, controller, episode
+                )
 
         if (episode + 1) % _LOG_INTERVAL == 0:
             logger.info(

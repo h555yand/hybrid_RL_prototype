@@ -21,23 +21,23 @@ experiment:
     eval_seeds: [44]
     sac_eval_seeds: [77]
     sac_seed: 11
-    promote_threshold: 0.6
+    promote_threshold: 0.5
     promote_window: 100
 
     curriculum_levels:
-      - [10.0, 40.0]
-      - [20.0, 80.0]
-      - [30.0, 120.0]
+      - [10.0, 120.0]
+      #- [20.0, 80.0]
+      - [10.0, 120.0]
 
     training_stages:
       - mesh: mug
-        episodes: 1000
+        episodes: 5000
         epsilon_start: 1.0
         epsilon_min: 0.1
         load_mode: null
 
     eval_meshes: [mug]
-    eval_episodes_per_level: 100
+    eval_episodes_per_level: 500
 
     rl_config:
       mode: train_adapt_epsilon
