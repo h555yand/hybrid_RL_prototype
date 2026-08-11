@@ -8,7 +8,7 @@ experiment:
   config:
     seed: 42
     visualise: true
-    regenerate_scripts: false
+    regenerate_scripts: true
     do_train: true
     do_eval: true
     do_heur_eval: false
@@ -21,7 +21,7 @@ experiment:
     eval_seeds: [44]
     sac_eval_seeds: [77]
     sac_seed: 11
-    promote_threshold: 0.75
+    promote_threshold: 0.6
     promote_window: 100
 
     curriculum_levels:

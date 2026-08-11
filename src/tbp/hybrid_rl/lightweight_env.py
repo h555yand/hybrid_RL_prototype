@@ -89,6 +89,7 @@ class LightweightEnv:
             sensor_data: point_normal, on_object, depth
         """
         self._detach_had_collision = False
+        self._edge_traversed = False
 
         action_info = action_space.get_info(action_index)
 
@@ -232,6 +233,7 @@ class LightweightEnv:
             "object_center": self.mesh.centroid.tolist(),
             "same_side": same_side,
             "object_extents": (self.mesh.bounds[1] - self.mesh.bounds[0]).tolist(),
+            "edge_traversed": getattr(self, "_edge_traversed", False),
         }
     
     def get_pose(self):
@@ -559,6 +561,7 @@ class LightweightEnv:
                                 self._look_at_direction(-hit_n_full)
                             )
                             edge_traversed = True
+                            self._edge_traversed = True
 
                 if not edge_traversed:
                     self.agent_pos = old_pos
