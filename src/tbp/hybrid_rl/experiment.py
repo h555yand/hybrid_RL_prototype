@@ -637,7 +637,7 @@ class RLGoalApproachExperiment:
 
         heuristic_cache_path = self.data_dir / "bc_data_heuristic.pkl"
         with heuristic_cache_path.open("wb") as f:
-            pickle.dump(heuristic_transitions, f)
+            pickle.dump(all_heuristic_transitions, f)
             logger.info(
                 "Saved %d heuristic transitions to %s",
                 len(heuristic_transitions),
@@ -792,8 +792,8 @@ class RLGoalApproachExperiment:
 
             strategic_bc = StrategicBCTrainer(state_dim=6)
             has_data = strategic_bc.prepare_data_from_transition_memory(
-                controller.transition_detach,
-                controller.transition_direction,
+                controller.strategic_detach,
+                controller.strategic_direction,
             )
 
             if has_data:
@@ -1431,8 +1431,8 @@ class RLGoalApproachExperiment:
 
             # Warm start buffer from TransitionMemory
             controller.strategic_sac.warm_start_from_transition_memory(
-                controller.transition_detach,
-                controller.transition_direction,
+                controller.strategic_detach,
+                controller.strategic_direction,
             )
             if (
                 controller.strategic_sac.buffer_size
@@ -1446,8 +1446,8 @@ class RLGoalApproachExperiment:
         else:
             controller.strategic_sac = StrategicSAC(state_dim=6)
             controller.strategic_sac.warm_start_from_transition_memory(
-                controller.transition_detach,
-                controller.transition_direction,
+                controller.strategic_detach,
+                controller.strategic_direction,
             )
             logger.info(
                 "Strategic SAC created without BC "

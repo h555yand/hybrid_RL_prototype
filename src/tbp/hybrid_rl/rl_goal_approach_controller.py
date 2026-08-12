@@ -165,6 +165,7 @@ class RLGoalApproachController:
         self._episode_transitions: List[Dict[str, Any]] = []
         self.success_trails = []
         self.start_pos: Optional[np.ndarray] = None
+        self._current_max_extent: Optional[float] = None
         self._prev_phase: Optional[str] = None
         self._pending_strategic_detach: List[Dict[str, Any]] = []
         self._pending_strategic_direction: Optional[Dict[str, Any]] = None
@@ -250,6 +251,7 @@ class RLGoalApproachController:
         self._action_no_effect_count = {}
         self._total_episodes += 1
         self.start_pos = start_pos.copy()
+        self._current_max_extent = None
         self._last_detach_sub_steps = 1
         self._consecutive_detach_count = 0
         self._flyby_count = 0
@@ -469,6 +471,11 @@ class RLGoalApproachController:
             ]
         )
 
+        # Cache object extent for retrospective computations
+        if self._current_max_extent is None:
+            extents = sensor_data.get("object_extents", [84, 84, 84])
+            self._current_max_extent = float(max(extents))
+
         # Track distance for flyby detection
         self._distance_history.append(distance)
 
@@ -552,24 +559,12 @@ class RLGoalApproachController:
         """Compact state for direction decision in air (5D).
 
         Features:
-            normal_agreement: dot(agent_normal, goal_normal)
+            lateral_deviation: how far off-axis the goal is (0=ahead, 1=side)
             alignment: dot(goal_dir, agent_normal)
             norm_distance: distance / object_extent
             angle_to_goal: dot(forward, goal_dir)
             path_blocked: is direct path to goal blocked
         """
-        agent_normal = state[6:9]
-        goal_normal = state[15:18]
-
-        an_len = np.linalg.norm(agent_normal)
-        gn_len = np.linalg.norm(goal_normal)
-        if an_len > 1e-8 and gn_len > 1e-8:
-            normal_agreement = float(
-                np.dot(agent_normal / an_len, goal_normal / gn_len)
-            )
-        else:
-            normal_agreement = 0.0
-
         alignment = float(state[12])
 
         extents = sensor_data.get("object_extents", [84, 84, 84])
@@ -584,10 +579,14 @@ class RLGoalApproachController:
             goal_dir /= goal_dist
         angle_to_goal = float(np.dot(forward, goal_dir))
 
+        # Lateral deviation: how far goal is from forward axis
+        # 0.0 = goal directly ahead, 1.0 = goal to the side/behind
+        lateral_deviation = float(np.sqrt(max(0.0, 1.0 - angle_to_goal ** 2)))
+
         path_blocked = float(sensor_data.get("path_blocked", False))
 
         return np.array([
-            normal_agreement,
+            lateral_deviation,
             alignment,
             norm_distance,
             angle_to_goal,
@@ -595,54 +594,56 @@ class RLGoalApproachController:
         ], dtype=float)
 
     def _compute_direction_state_from_full(
-        self, full_state: np.ndarray
+        self,
+        full_state: np.ndarray,
+        path_blocked: Optional[float] = None,
     ) -> np.ndarray:
         """Compute direction state from stored 18D state.
 
-        For air states, uses position-based features instead of
-        normal-based (which are zero when no surface visible).
+        Generates the same 5 features as
+        _compute_direction_transition_state() but using
+        surrogate computations from the stored full state.
+
+        Args:
+            full_state: Stored 18D state vector.
+            path_blocked: Real path_blocked from transition dict.
+                If None, uses heuristic fallback.
+
+        Returns:
+            5D direction state vector.
         """
-        on_object = float(full_state[11])
-
-        if on_object > 0.5:
-            agent_normal = full_state[6:9]
-            goal_normal = full_state[15:18]
-            an_len = np.linalg.norm(agent_normal)
-            gn_len = np.linalg.norm(goal_normal)
-            if an_len > 1e-8 and gn_len > 1e-8:
-                normal_agreement = float(
-                    np.dot(
-                        agent_normal / an_len,
-                        goal_normal / gn_len,
-                    )
-                )
-            else:
-                normal_agreement = 0.0
-            alignment = float(full_state[12])
-        else:
-            alignment = float(full_state[12])
-            local_pos = full_state[0:3]
-            pos_len = np.linalg.norm(local_pos)
-            if pos_len > 1e-8:
-                normal_agreement = float(
-                    -local_pos[2] / pos_len
-                )
-            else:
-                normal_agreement = 0.0
-
-        norm_distance = float(full_state[13]) / 84.0
+        alignment = float(full_state[12])
+        max_extent = getattr(self, "_current_max_extent", None) or 84.0
+        norm_distance = float(full_state[13]) / max(max_extent, 1.0)
 
         local_pos = full_state[0:3]
         pos_len = np.linalg.norm(local_pos)
+
+        # angle_to_goal surrogate: forward component of goal direction
+        # in local frame. local_pos = goal - agent in agent frame,
+        # forward = -Z, so dot(forward, goal_dir) ≈ -local_pos[2]/pos_len
         if pos_len > 1e-8:
             angle_to_goal = float(-local_pos[2] / pos_len)
         else:
             angle_to_goal = 1.0
 
-        path_blocked = 1.0 if alignment < -0.3 else 0.0
+        # lateral_deviation surrogate: how far goal is from forward axis
+        # sqrt(local_pos[0]² + local_pos[1]²) / pos_len
+        if pos_len > 1e-8:
+            lateral_deviation = float(
+                np.sqrt(local_pos[0] ** 2 + local_pos[1] ** 2) / pos_len
+            )
+        else:
+            lateral_deviation = 0.0
+
+        # path_blocked: use real value from transition if available
+        if path_blocked is None:
+            path_blocked = 1.0 if alignment < -0.3 else 0.0
+        else:
+            path_blocked = float(path_blocked)
 
         return np.array([
-            normal_agreement,
+            lateral_deviation,
             alignment,
             norm_distance,
             angle_to_goal,
@@ -673,7 +674,8 @@ class RLGoalApproachController:
             normal_agreement = 0.0
 
         alignment = float(full_state[12])
-        norm_distance = float(full_state[13]) / 84.0
+        max_extent = getattr(self, "_current_max_extent", None) or 84.0
+        norm_distance = float(full_state[13]) / max(max_extent, 1.0)
 
         return np.array([
             normal_agreement,
@@ -3986,16 +3988,27 @@ class RLGoalApproachController:
                     if next_s[11] > 0.5:
                         continue
 
+                self._strategic_stats["detach_total"] += 1
+
                 if goal_reached:
                     switch_target = cfg.get(
                         "strategic_reward_switch_success", 1.0
                     )
+                    self._strategic_stats[
+                        "detach_led_to_success"
+                    ] += 1
                 elif termination_reason == "collision_surface_violation":
                     switch_target = cfg.get(
                         "strategic_reward_switch_collision", -0.5
                     )
+                    self._strategic_stats[
+                        "detach_led_to_collision"
+                    ] += 1
                 elif termination_reason == "timeout":
                     switch_target = -0.3
+                    self._strategic_stats[
+                        "detach_led_to_timeout"
+                    ] += 1
                 else:
                     switch_target = 0.0
 
@@ -4068,10 +4081,13 @@ class RLGoalApproachController:
                 t_state = self._compute_detach_state_from_full(
                     s,
                     path_blocked=pb,
-                    movement_efficiency=tr.get("movement_efficiency", 0.0),
+                    movement_efficiency=tr.get(
+                        "movement_efficiency", 0.0
+                    ),
                 )
-                
-                # Detach relevant only when actually blocked or opposite side
+
+                # Detach relevant only when actually blocked
+                # or opposite side
                 if not ss or pb > 0.5:
                     detach_relevant.append(t_state)
 
@@ -4100,71 +4116,96 @@ class RLGoalApproachController:
                         )
 
         # ═══ Retrospective direction update ═══
-        air_states_full = []
+        air_transitions = []
         for tr in self._episode_transitions:
             s = tr["state"]
-            if s[11] > 0.5:
+            if s[11] > 0.5:  # on_object — skip surface
                 continue
-            air_states_full.append(s)
+            air_transitions.append(tr)
 
-        if air_states_full:
+        if air_transitions:
             dir_alpha = switch_alpha * 0.2
 
+            # Sample representative transitions for insert
+            # (first, last, every 10th) to populate store
+            # without flooding it with redundant nearby points
+            insert_indices = set()
+            insert_indices.add(0)
+            insert_indices.add(len(air_transitions) - 1)
+            for i in range(0, len(air_transitions), 10):
+                insert_indices.add(i)
+
             if goal_reached:
-                for s in air_states_full:
-                    d_state = self._compute_direction_state_from_full(s)
+                for i, tr in enumerate(air_transitions):
+                    d_state = self._compute_direction_state_from_full(
+                        tr["state"],
+                        path_blocked=float(
+                            tr.get("path_blocked", False)
+                        ),
+                    )
                     pb = d_state[4]
+                    allow_insert = i in insert_indices
                     if pb > 0.5:
                         self.strategic_direction.update_q_value(
                             d_state, action=1, td_target=0.5,
-                            alpha=dir_alpha, count_visit=False,
+                            alpha=dir_alpha,
+                            count_visit=allow_insert,
                         )
                     else:
                         self.strategic_direction.update_q_value(
                             d_state, action=0, td_target=0.5,
-                            alpha=dir_alpha, count_visit=False,
+                            alpha=dir_alpha,
+                            count_visit=allow_insert,
                         )
+
             elif termination_reason == "timeout":
-                for s in air_states_full:
-                    d_state = self._compute_direction_state_from_full(s)
+                for i, tr in enumerate(air_transitions):
+                    d_state = self._compute_direction_state_from_full(
+                        tr["state"],
+                        path_blocked=float(
+                            tr.get("path_blocked", False)
+                        ),
+                    )
                     pb = d_state[4]
+                    allow_insert = i in insert_indices
                     if pb > 0.5:
                         self.strategic_direction.update_q_value(
                             d_state, action=1, td_target=-0.2,
-                            alpha=dir_alpha * 0.5, count_visit=False,
+                            alpha=dir_alpha * 0.5,
+                            count_visit=allow_insert,
                         )
                     else:
                         self.strategic_direction.update_q_value(
                             d_state, action=0, td_target=-0.2,
-                            alpha=dir_alpha * 0.5, count_visit=False,
+                            alpha=dir_alpha * 0.5,
+                            count_visit=allow_insert,
                         )
 
-        # ═══ Track detach outcomes for stats ═══
-        if self._pending_strategic_detach:
-            self._strategic_stats["detach_total"] += len(
-                self._pending_strategic_detach
-            )
-            if goal_reached:
-                self._strategic_stats[
-                    "detach_led_to_success"
-                ] += len(self._pending_strategic_detach)
-            elif termination_reason == "collision_surface_violation":
-                self._strategic_stats[
-                    "detach_led_to_collision"
-                ] += len(self._pending_strategic_detach)
-            else:
-                self._strategic_stats[
-                    "detach_led_to_timeout"
-                ] += len(self._pending_strategic_detach)
-
-        # Accumulate phase counts
-        for phase, count in self._episode_phase_counts.items():
-            key = f"phase_{phase}"
-            self._strategic_stats["phase_counts"][key] = (
-                self._strategic_stats["phase_counts"].get(key, 0)
-                + count
-            )
-        self._episode_phase_counts = {}
+            elif termination_reason in (
+                "collision_surface_violation",
+                "collision_other",
+            ):
+                for i, tr in enumerate(air_transitions):
+                    d_state = self._compute_direction_state_from_full(
+                        tr["state"],
+                        path_blocked=float(
+                            tr.get("path_blocked", False)
+                        ),
+                    )
+                    pb = d_state[4]
+                    allow_insert = i in insert_indices
+                    if pb > 0.5:
+                        self.strategic_direction.update_q_value(
+                            d_state, action=1, td_target=-0.3,
+                            alpha=dir_alpha * 0.3,
+                            count_visit=allow_insert,
+                        )
+                    else:
+                        self.strategic_direction.update_q_value(
+                            d_state, action=0, td_target=-0.1,
+                            alpha=dir_alpha * 0.3,
+                            count_visit=allow_insert,
+                        )
 
         # ═══ Update Strategic SAC ═══
         if (
@@ -4174,6 +4215,7 @@ class RLGoalApproachController:
             for pending in self._strategic_sac_pending:
                 s_state = pending["state"]
                 action = pending["action"]
+                reward = 0.0  # default
 
                 if pending["phase"] == "detach":
                     if action == 1.0:
@@ -4248,7 +4290,9 @@ class RLGoalApproachController:
             f"{self._total_goals_reached}/{self._total_episodes}"
         )
 
+        # ═══ Reset ═══
         self._current_goal = None
+        self._current_max_extent = None
         self._prev_state = None
         self._prev_sensor_data = None
         self._last_action = None
@@ -4269,39 +4313,6 @@ class RLGoalApproachController:
         self._strategic_sac_pending = []
         self._prev_subgoal_alignment = None
         self._prev_goal_alignment = None
-
-    def _compute_direction_state_from_full(
-        self, full_state: np.ndarray
-    ) -> np.ndarray:
-        """Compute direction state from stored 18D state."""
-        agent_normal = full_state[6:9]
-        goal_normal = full_state[15:18]
-
-        an_len = np.linalg.norm(agent_normal)
-        gn_len = np.linalg.norm(goal_normal)
-        if an_len > 1e-8 and gn_len > 1e-8:
-            normal_agreement = float(
-                np.dot(agent_normal / an_len, goal_normal / gn_len)
-            )
-        else:
-            normal_agreement = 0.0
-
-        alignment = float(full_state[12])
-        norm_distance = float(full_state[13]) / 84.0
-
-        local_pos = full_state[0:3]
-        pos_len = np.linalg.norm(local_pos)
-        if pos_len > 1e-8:
-            angle_to_goal = float(-local_pos[2] / pos_len)
-        else:
-            angle_to_goal = 1.0
-
-        path_blocked = 1.0 if alignment < -0.3 else 0.0
-
-        return np.array([
-            normal_agreement, alignment, norm_distance,
-            angle_to_goal, path_blocked,
-        ], dtype=float)
 
     # ══════════════════════════════════════════════════════════
     # DIAGNOSTICS
