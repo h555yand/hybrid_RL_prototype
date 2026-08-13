@@ -1544,7 +1544,7 @@ class RLGoalApproachController:
         eps,
         confidence,
         blend,
-        is_heuristic_override,
+        is_strategic_override,
     ) -> str:
         action_name = self.action_space.get_info(action_index).name
         q_action_name = self.action_space.get_info(q_recommends).name
@@ -1555,9 +1555,9 @@ class RLGoalApproachController:
                 f"##### Random: {action_name} - {action_index} "
                 f"epsilon {eps}."
             )
-        if is_heuristic_override:
+        if is_strategic_override:
             return (
-                f"##### Heuristics: {action_name} - {action_index} "
+                f"##### Strategic: {action_name} - {action_index} "
                 f"epsilon {eps}."
             )
 
@@ -1567,7 +1567,7 @@ class RLGoalApproachController:
             f"Q recommends: {q_action_name} - {q_recommends}; "
             f"Heuristics: {h_action_name} - {h_recommends}. "
         )
-
+    
     def _choose_action(
         self,
         state: np.ndarray,
@@ -1634,7 +1634,7 @@ class RLGoalApproachController:
             combined[self.action_space.IDX_FREE_BACKWARD] = -1e9
 
         is_random_override = False
-        is_heuristic_override = False
+        is_strategic_override = False
         action_index = None
         strategic_source = None
 
@@ -1688,7 +1688,7 @@ class RLGoalApproachController:
                 and (not same_side or path_blocked)
             ):
                 action_index = self.action_space.IDX_DETACH
-                is_heuristic_override = True
+                is_strategic_override = True
                 strategic_source = (
                     f"detach_switch("
                     f"q=[{strategic_q[0]:.2f},"
@@ -1879,7 +1879,7 @@ class RLGoalApproachController:
             },
             "sampling_method": (
                 "strategic_override"
-                if is_heuristic_override
+                if is_strategic_override
                 else "random_exploration"
                 if is_random_override
                 else "softmax_sampling"
@@ -1925,7 +1925,7 @@ class RLGoalApproachController:
                     if has_q_data
                     else "100% heuristic"
                 ),
-                is_heuristic_override=is_heuristic_override,
+                is_strategic_override=is_strategic_override,
             ),
         }
 

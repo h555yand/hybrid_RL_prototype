@@ -19,8 +19,9 @@ experiment:
 
     train_seeds: [11]
     eval_seeds: [44]
+    sac_seed: 55
     sac_eval_seeds: [77]
-    sac_seed: 11
+
     promote_threshold: 1.0
     promote_window: 100
 
@@ -30,14 +31,19 @@ experiment:
       #- [10.0, 120.0]
 
     training_stages:
-      - mesh: mug
-        episodes: 1000
+      - mesh: cup
+        episodes: 3000
         epsilon_start: 1.0
-        epsilon_min: 0.2
+        epsilon_min: 0.3
+        load_mode: null
+      - mesh: vase
+        episodes: 3000
+        epsilon_start: 1.0
+        epsilon_min: 0.3
         load_mode: null
 
-    eval_meshes: [mug]
-    eval_episodes_per_level: 300
+    eval_meshes: [cup, vase]
+    eval_episodes_per_level: 500
 
     rl_config:
       mode: train_adapt_epsilon
@@ -62,11 +68,11 @@ experiment:
       rotation_step_big: 15.0
       free_step_backward: 2.0
       # Tactical Q-store rewrite
-      eval_epsilon: 0.1 # 0.02
+      eval_epsilon: 0.02 # 0.02
       # Strategic Q-store
       strategic_epsilon_start: 1.0
-      strategic_epsilon_min: 0.2
-      strategic_eval_epsilon: 0.1 # 0.3
+      strategic_epsilon_min: 0.3
+      strategic_eval_epsilon: 0.02 # 0.02
       strategic_reward_switch_success: 1.0
       strategic_reward_switch_wrong_side: -0.3
       strategic_reward_switch_collision: -0.5

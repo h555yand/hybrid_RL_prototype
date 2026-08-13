@@ -733,4 +733,3 @@ This turns goal-directed movement into directed exploration — not random, but 
 >
 > **Multi-LM coordination.** When multiple LMs generate competing goal states, the current system picks the highest confidence. With RL navigation, the motor system could also consider reachability — a closer goal might be preferred over a more discriminative but harder-to-reach one."
 
-
