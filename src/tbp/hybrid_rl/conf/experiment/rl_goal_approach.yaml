@@ -9,12 +9,12 @@ experiment:
     seed: 42
     visualise: true
     regenerate_scripts: true
-    do_train: true
-    do_eval: true
-    do_heur_eval: false
-    do_bc_train: false
-    do_sac_train: false
-    do_sac_eval: false
+    do_train: false
+    do_eval: false
+    do_heur_eval: true
+    do_bc_train: true
+    do_sac_train: true
+    do_sac_eval: true
     do_adaptive: false
 
     train_seeds: [11]
@@ -31,18 +31,13 @@ experiment:
       #- [10.0, 120.0]
 
     training_stages:
-      - mesh: cup
-        episodes: 3000
-        epsilon_start: 1.0
-        epsilon_min: 0.3
-        load_mode: null
       - mesh: vase
         episodes: 3000
         epsilon_start: 1.0
         epsilon_min: 0.3
         load_mode: null
 
-    eval_meshes: [cup, vase]
+    eval_meshes: [vase]
     eval_episodes_per_level: 500
 
     rl_config:
@@ -101,10 +96,9 @@ experiment:
       eval_interval: 500
       eval_episodes: 50
 
-    sac_meshes: [cube, mug]
+    sac_meshes: [vase]
     sac_episodes_per_mesh:
-      cube: 1000
-      mug: 2000
+      vase: 2000
     sac_eval_episodes_per_level: 500
 
     adaptive_mesh: vase
