@@ -219,7 +219,14 @@ class AdaptiveTrainingManager:
 
         if self.mode == "online":
             self.controller.mode = "train"
-            self.controller.epsilon = 0.1
+            self.controller.epsilon = self.config.get(
+                "epsilon_start", 0.2
+            )
+            self.controller.strategic_epsilon = (
+                self.config.get(
+                    "strategic_epsilon_start", 0.2
+                )
+            )
             self._collect_transitions(success, transitions)
             self._maybe_online_sac_update()
             # Update Strategic SAC
@@ -239,7 +246,15 @@ class AdaptiveTrainingManager:
         if self.mode == "offline":
             self._trigger_offline()
             self.controller.mode = "train"
-            self.controller.epsilon = 0.1
+            self.controller.mode = "train"
+            self.controller.epsilon = self.config.get(
+                "epsilon_start", 0.2
+            )
+            self.controller.strategic_epsilon = (
+                self.config.get(
+                    "strategic_epsilon_start", 0.2
+                )
+            )
             self.mode = "online"
 
     def _collect_transitions(

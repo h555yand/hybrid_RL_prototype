@@ -1760,12 +1760,21 @@ class RLGoalApproachExperiment:
                 q_load_dir,
             )
 
+        adaptive_cfg = {
+            **self.rl_config,
+            "epsilon_start": 0.2,
+            "epsilon_min": 0.2,
+            "strategic_epsilon_start": 0.2,
+            "strategic_epsilon_min": 0.2,
+            "mode": "train_adapt_epsilon"
+        }
         controller = RLGoalApproachController.load(
             q_load_dir,
             agent_id=f"{self.adaptive_mesh}_adaptive",
-            config={**self.rl_config, "mode": "eval"},
+            config=adaptive_cfg,
         )
         controller._collision_stats = {}  # noqa: SLF001
+
 
         # Load SAC: adaptive if exists, otherwise training
         adaptive_sac_dir = str(
@@ -1808,7 +1817,7 @@ class RLGoalApproachExperiment:
         manager = AdaptiveTrainingManager(
             controller=controller,
             env=env,
-            config=self.rl_config,
+            config=adaptive_cfg,
             runs_dir=str(self.runs_dir),
             mesh_path=mesh_path,
         )
@@ -1864,15 +1873,6 @@ class RLGoalApproachExperiment:
         collision_stats_before = dict(
             controller._collision_stats  # noqa: SLF001
         )
-        # Epsilon decay for Q-store exploration
-        #adaptive_eps_start = 0.3
-        #adaptive_eps_end = 0.1
-        #adaptive_eps_decay = (
-        #    (adaptive_eps_end / adaptive_eps_start)
-        #    ** (1.0 / max(self.adaptive_episodes, 1))
-        #)
-        #current_eps = adaptive_eps_start
-
         # Curriculum for adaptive
         adaptive_curriculum = list(self.curriculum_levels)
         adaptive_level = 0
@@ -1880,17 +1880,9 @@ class RLGoalApproachExperiment:
         adaptive_promote_threshold = 0.50
         adaptive_promote_window_size = 100
 
-        # Fixed epsilon — no decay
-        adaptive_epsilon = 0.2
         ep_successes = []
 
         for episode in range(self.adaptive_episodes):
-            # Set Q-store epsilon
-            controller.epsilon = adaptive_epsilon
-            #current_eps = max(
-            #    adaptive_eps_end,
-            #    current_eps * adaptive_eps_decay,
-            #)
             env.reset()
             start_pos = env.get_pose()[:3]
             # Curriculum goal generation

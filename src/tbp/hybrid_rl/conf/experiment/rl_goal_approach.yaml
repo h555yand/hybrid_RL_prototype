@@ -7,15 +7,15 @@ experiment:
   _target_: tbp.hybrid_rl.experiment.RLGoalApproachExperiment
   config:
     seed: 42
-    visualise: false
+    visualise: true
     regenerate_scripts: true
-    do_train: true
-    do_eval: true
-    do_heur_eval: false
-    do_bc_train: false
-    do_sac_train: false
-    do_sac_eval: false
-    do_adaptive: false
+    do_train: false
+    do_eval: false
+    do_heur_eval: true
+    do_bc_train: true
+    do_sac_train: true
+    do_sac_eval: true
+    do_adaptive: true
 
     train_seeds: [11]
     eval_seeds: [44]
@@ -38,10 +38,10 @@ experiment:
         load_mode: null
 
     eval_meshes: [mug]
-    eval_episodes_per_level: 100
+    eval_episodes_per_level: 2000
     # BC data composition
     bc_q_store_fraction: 0.0    # 0.0 = only heuristic, 0.2 = 20% Q-store
-    bc_target_per_group: 30000
+    bc_target_per_group: 50000
 
     rl_config:
       state_dim: 20
@@ -103,11 +103,11 @@ experiment:
 
     sac_meshes: [mug]
     sac_episodes_per_mesh:
-      vase: 2000
+      mug: 3000
     sac_eval_episodes_per_level: 500
 
     adaptive_mesh: vase
-    adaptive_episodes: 2000
+    adaptive_episodes: 500
 
     logging:
       run_name: rl_goal_approach

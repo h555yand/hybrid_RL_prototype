@@ -143,7 +143,7 @@ class Arbitrator:
         self.q_confidence_history = deque(maxlen=1000)
         self.q_spread_history = deque(maxlen=1000)
         self.sac_confidence_history = deque(maxlen=1000)
-        
+
         # ═══ NEW: strategic SAC references ═══
         self._sac_strategic_detach: Optional[Any] = (
             None
@@ -221,7 +221,7 @@ class Arbitrator:
         # SAC score: needs actor
         sac_score = 0.0
         if self.sac_actor is not None:
-            sac_score = (0.3 * sac_confidence + 0.7) * sac_track
+            sac_score = (0.1 * sac_confidence + 0.9) * sac_track
 
         # Choose best source, heuristic as fallback only
         if q_score > 0 or sac_score > 0:
@@ -395,56 +395,10 @@ class Arbitrator:
     def _get_sac_action_discrete(
         self, state: np.ndarray
     ) -> Tuple[int, float]:
-        """Get action from SAC with strategic override."""
+        """Get action from SAC with entropy-based confidence."""
         if self.sac_actor is None:
             return 0, 0.0
 
-        # ═══ NEW: check strategic SAC override ═══
-        sensor_proxy = self._get_sensor_proxy()
-        if (
-            sensor_proxy is not None
-            and hasattr(self, "_sac_strategic_detach")
-            and self._sac_strategic_detach is not None
-        ):
-            on_object = state[11] > 0.5
-            same_side = sensor_proxy.get(
-                "same_side", True
-            )
-            path_blocked = sensor_proxy.get(
-                "path_blocked", False
-            )
-
-            if (
-                on_object
-                and (not same_side or path_blocked)
-                and self.controller._can_detach(state)
-                and self.controller
-                ._consecutive_detach_count < 3
-            ):
-                t_state = (
-                    self.controller
-                    ._compute_detach_transition_state(
-                        state,
-                        sensor_proxy,
-                        movement_efficiency=(
-                            self.controller
-                            ._compute_movement_efficiency(
-                                window=20
-                            )
-                        ),
-                    )
-                )
-                should_switch, confidence = (
-                    self._sac_strategic_detach
-                    .predict(t_state)
-                )
-                if (
-                    should_switch
-                    and confidence > 0.3
-                ):
-                    return 18, confidence  # detach
-
-        # Tactical SAC
         state_norm = state
         if self.state_mean is not None:
             state_norm = (
@@ -458,7 +412,28 @@ class Arbitrator:
                 state_norm.astype(np.float32)
             ).unsqueeze(0)
 
-            action_type_t, action_params_t, _, type_probs = (
+            # Get raw logits for confidence,
+            # sample_eval for action
+            logits, _, _ = self.sac_actor(state_t)
+
+            # Confidence from RAW logits
+            # (before temperature scaling)
+            raw_probs = torch.softmax(
+                logits, dim=-1
+            )[0]
+            entropy = -(
+                raw_probs
+                * torch.log(raw_probs + 1e-8)
+            ).sum().item()
+            max_entropy = np.log(
+                self.sac_actor.num_types
+            )
+            sac_confidence = float(
+                1.0 - entropy / max_entropy
+            )
+
+            # Action from temperature-scaled sampling
+            action_type_t, action_params_t, _, _ = (
                 self.sac_actor.sample_eval(state_t)
             )
 
@@ -487,12 +462,8 @@ class Arbitrator:
                 action_type, action_params
             )
 
-            sac_confidence = float(
-                type_probs[0].max().item()
-            )
-
         return discrete_action, sac_confidence
-    
+        
     def _get_heuristic_action(
         self,
         state: np.ndarray,
