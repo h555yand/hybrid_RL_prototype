@@ -143,6 +143,14 @@ class Arbitrator:
         self.q_confidence_history = deque(maxlen=1000)
         self.q_spread_history = deque(maxlen=1000)
         self.sac_confidence_history = deque(maxlen=1000)
+        
+        # ═══ NEW: strategic SAC references ═══
+        self._sac_strategic_detach: Optional[Any] = (
+            None
+        )
+        self._sac_strategic_direction: Optional[Any] = (
+            None
+        )
 
     def decide(self, state, current_pose, sensor_data):
         """Choose action source based on performance.
@@ -284,7 +292,15 @@ class Arbitrator:
             return 0.0
         return sum(self._heuristic_episode_results) / len(self._heuristic_episode_results)
 
-    def _get_q_action(self, state: np.ndarray) -> Tuple[int, float, float]:
+    def _get_q_action(
+        self, state: np.ndarray
+    ) -> Tuple[int, float, float]:
+        """Get action from Q-store with strategic override.
+
+        Mirrors two-level architecture of controller:
+        1. Strategic level: check detach/direction
+        2. Tactical level: Q-values for specific action
+        """
         store = self.controller._select_store(state)
 
         if store.next_id == 0:
@@ -298,49 +314,185 @@ class Arbitrator:
         )
 
         sigma = store._get_sigma(distances[0])
-        weights = store._gaussian_kernel(distances[0], sigma)
+        weights = store._gaussian_kernel(
+            distances[0], sigma
+        )
         weight_sum = float(weights.sum())
         q_confidence = min(weight_sum / k, 1.0)
 
         q_values = store.get_q_values(state)
-        # Anti-spam: block detach if consecutive
-        if self.controller._consecutive_detach_count >= 3:
-            q_values[self.controller.action_space.IDX_DETACH] = -1e9
+
+        # ═══ NEW: strategic override ═══
+        # Check if strategic level wants detach
+        on_object = state[11] > 0.5
+        if on_object:
+            sensor_proxy = self._get_sensor_proxy()
+            if sensor_proxy is not None:
+                same_side = sensor_proxy.get(
+                    "same_side", True
+                )
+                path_blocked = sensor_proxy.get(
+                    "path_blocked", False
+                )
+                if (
+                    (not same_side or path_blocked)
+                    and self.controller._can_detach(
+                        state
+                    )
+                ):
+                    t_state = self.controller._compute_detach_transition_state(
+                        state,
+                        sensor_proxy,
+                        movement_efficiency=(
+                            self.controller
+                            ._compute_movement_efficiency(
+                                window=20
+                            )
+                        ),
+                    )
+                    s_q = (
+                        self.controller
+                        .strategic_detach
+                        .get_q_values(t_state)
+                    )
+                    if (
+                        self.controller
+                        .strategic_detach.next_id > 0
+                        and s_q[1] > s_q[0]
+                    ):
+                        # Strategic says detach
+                        detach_idx = (
+                            self.controller
+                            .action_space.IDX_DETACH
+                        )
+                        q_values[detach_idx] = (
+                            np.max(q_values) + 1.0
+                        )
+
+        # Anti-spam
+        if (
+            self.controller
+            ._consecutive_detach_count >= 3
+        ):
+            q_values[
+                self.controller
+                .action_space.IDX_DETACH
+            ] = -1e9
+
         q_action = int(np.argmax(q_values))
-        q_spread = float(np.max(q_values) - np.min(q_values))
+        q_spread = float(
+            np.max(q_values) - np.min(q_values)
+        )
 
         return q_action, q_confidence, q_spread
 
-    def _get_sac_action_discrete(self, state: np.ndarray) -> Tuple[int, float]:
+    def _get_sensor_proxy(self) -> Optional[dict]:
+        """Get last known sensor data from controller."""
+        if self.controller._prev_sensor_data is not None:
+            return self.controller._prev_sensor_data
+        return None
+    
+    def _get_sac_action_discrete(
+        self, state: np.ndarray
+    ) -> Tuple[int, float]:
+        """Get action from SAC with strategic override."""
         if self.sac_actor is None:
             return 0, 0.0
 
+        # ═══ NEW: check strategic SAC override ═══
+        sensor_proxy = self._get_sensor_proxy()
+        if (
+            sensor_proxy is not None
+            and hasattr(self, "_sac_strategic_detach")
+            and self._sac_strategic_detach is not None
+        ):
+            on_object = state[11] > 0.5
+            same_side = sensor_proxy.get(
+                "same_side", True
+            )
+            path_blocked = sensor_proxy.get(
+                "path_blocked", False
+            )
+
+            if (
+                on_object
+                and (not same_side or path_blocked)
+                and self.controller._can_detach(state)
+                and self.controller
+                ._consecutive_detach_count < 3
+            ):
+                t_state = (
+                    self.controller
+                    ._compute_detach_transition_state(
+                        state,
+                        sensor_proxy,
+                        movement_efficiency=(
+                            self.controller
+                            ._compute_movement_efficiency(
+                                window=20
+                            )
+                        ),
+                    )
+                )
+                should_switch, confidence = (
+                    self._sac_strategic_detach
+                    .predict(t_state)
+                )
+                if (
+                    should_switch
+                    and confidence > 0.3
+                ):
+                    return 18, confidence  # detach
+
+        # Tactical SAC
         state_norm = state
         if self.state_mean is not None:
-            state_norm = (state - self.state_mean) / (self.state_std + 1e-8)
+            state_norm = (
+                (state - self.state_mean)
+                / (self.state_std + 1e-8)
+            )
 
         self.sac_actor.eval()
         with torch.no_grad():
-            state_t = torch.FloatTensor(state_norm.astype(np.float32)).unsqueeze(0)
+            state_t = torch.FloatTensor(
+                state_norm.astype(np.float32)
+            ).unsqueeze(0)
 
-            action_type_t, action_params_t, _, type_probs = self.sac_actor.sample_eval(state_t)
+            action_type_t, action_params_t, _, type_probs = (
+                self.sac_actor.sample_eval(state_t)
+            )
 
             action_type = action_type_t[0].item()
-            action_params_norm = action_params_t[0].numpy()
+            action_params_norm = (
+                action_params_t[0].numpy()
+            )
 
-            param_dims = ExperienceExtractor.get_param_dims()
+            param_dims = (
+                ExperienceExtractor.get_param_dims()
+            )
             dim = param_dims.get(action_type, 0)
-            if dim > 0 and self.param_mean is not None:
-                action_params = action_params_norm[:dim] * self.param_std[:dim] + self.param_mean[:dim]
+            if (
+                dim > 0
+                and self.param_mean is not None
+            ):
+                action_params = (
+                    action_params_norm[:dim]
+                    * self.param_std[:dim]
+                    + self.param_mean[:dim]
+                )
             else:
                 action_params = np.zeros(3)
 
-            discrete_action = sac_to_discrete(action_type, action_params)
+            discrete_action = sac_to_discrete(
+                action_type, action_params
+            )
 
-            sac_confidence = float(type_probs[0].max().item())
+            sac_confidence = float(
+                type_probs[0].max().item()
+            )
 
         return discrete_action, sac_confidence
-
+    
     def _get_heuristic_action(
         self,
         state: np.ndarray,

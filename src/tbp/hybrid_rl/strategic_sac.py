@@ -364,60 +364,60 @@ class StrategicSAC:
             "buffer_size": self.buffer_size,
         }
     
+    def warm_start_from_q_store(
+        self,
+        transition_store,
+    ):
+        """Populate buffer from one HNSWStateStore.
+
+        Uses raw_state (5D) directly.
+
+        Args:
+            transition_store: HNSWStateStore
+                (strategic_detach or strategic_direction).
+        """
+        for point in transition_store.points.values():
+            raw = point.raw_state.copy().astype(
+                np.float32
+            )
+            outcome = float(
+                point.q_values[1] - point.q_values[0]
+            )
+
+            if outcome > 0.3:
+                self.add_transition(
+                    raw, 1.0, 1.0, raw, True
+                )
+                self.add_transition(
+                    raw, 0.0, -0.3, raw, True
+                )
+            elif outcome < -0.1:
+                self.add_transition(
+                    raw, 1.0, -0.5, raw, True
+                )
+            else:
+                self.add_transition(
+                    raw, 1.0, 0.0, raw, True
+                )
+
+        logger.info(
+            "Strategic SAC warm start: %d buffer entries "
+            "from %d store points",
+            self.buffer_size,
+            len(transition_store.points),
+        )
+
     def warm_start_from_transition_memory(
         self,
         transition_detach,
         transition_direction,
     ):
-        """Populate buffer from TransitionMemory data."""
-        for point in transition_detach.points.values():
-            raw = point["raw_state"]
-            outcome = point["outcome"]
-
-            s_state = np.array([
-                raw[0],
-                raw[1],
-                raw[2],
-                1.0,
-                1.0,
-                0.02,
-            ], dtype=np.float32)
-
-            if outcome > 0.3:
-                self.add_transition(s_state, 1.0, 1.0, s_state, True)
-                self.add_transition(s_state, 0.0, -0.3, s_state, True)
-            elif outcome < -0.1:
-                self.add_transition(s_state, 1.0, -0.5, s_state, True)
-            else:
-                self.add_transition(s_state, 1.0, 0.0, s_state, True)
-
-        for point in transition_direction.points.values():
-            raw = point["raw_state"]
-            outcome = point["outcome"]
-
-            s_state = np.array([
-                raw[0],
-                raw[1],
-                raw[2],
-                raw[4] if len(raw) > 4 else 1.0,
-                0.0,
-                0.5,
-            ], dtype=np.float32)
-
-            if outcome > 0.3:
-                self.add_transition(s_state, 1.0, 1.0, s_state, True)
-            elif outcome < -0.1:
-                self.add_transition(s_state, 1.0, -0.5, s_state, True)
-            else:
-                self.add_transition(s_state, 1.0, 0.0, s_state, True)
-
-        logger.info(
-            "Strategic SAC warm start: %d entries "
-            "(detach=%d, direction=%d)",
-            self.buffer_size,
-            len(transition_detach.points),
-            len(transition_direction.points),
+        """Legacy wrapper — kept for backward compatibility."""
+        logger.warning(
+            "warm_start_from_transition_memory is "
+            "deprecated, use warm_start_from_q_store"
         )
+        self.warm_start_from_q_store(transition_detach)
 
     def get_stats(self) -> dict:
         return {
@@ -457,45 +457,94 @@ class StrategicSAC:
             state_std=self._state_std,
             total_updates=self.total_updates,
             log_alpha=self.log_alpha.detach().numpy(),
+            state_dim=np.array([self.state_dim]),
         )
         # Save buffer
         np.savez(
             dirpath / "strategic_buffer.npz",
-            states=self.buffer_states[:self.buffer_size],
-            actions=self.buffer_actions[:self.buffer_size],
-            rewards=self.buffer_rewards[:self.buffer_size],
-            next_states=self.buffer_next_states[:self.buffer_size],
-            dones=self.buffer_dones[:self.buffer_size],
+            states=(
+                self.buffer_states[:self.buffer_size]
+            ),
+            actions=(
+                self.buffer_actions[:self.buffer_size]
+            ),
+            rewards=(
+                self.buffer_rewards[:self.buffer_size]
+            ),
+            next_states=(
+                self.buffer_next_states[
+                    :self.buffer_size
+                ]
+            ),
+            dones=(
+                self.buffer_dones[:self.buffer_size]
+            ),
         )
         logger.info(
-            "Strategic SAC saved to %s (%d buffer entries)",
-            dirpath, self.buffer_size,
+            "Strategic SAC saved to %s "
+            "(%d buffer entries)",
+            dirpath,
+            self.buffer_size,
         )
-
+        
     @classmethod
     def load(cls, filepath: str) -> "StrategicSAC":
         dirpath = Path(filepath)
 
-        sac = cls()
+        data = np.load(
+            dirpath / "strategic_state.npz"
+        )
+
+        # Restore state_dim
+        state_dim = (
+            int(data["state_dim"][0])
+            if "state_dim" in data
+            else None
+        )
+        if state_dim is None:
+            # Infer from saved actor weights
+            actor_weights = torch.load(
+                dirpath / "strategic_actor.pt",
+                weights_only=True,
+            )
+            first_layer_key = "net.0.weight"
+            if first_layer_key in actor_weights:
+                state_dim = (
+                    actor_weights[first_layer_key]
+                    .shape[1]
+                )
+            else:
+                state_dim = 6
+
+        sac = cls(state_dim=state_dim)
 
         sac.actor.load_state_dict(
-            torch.load(dirpath / "strategic_actor.pt", weights_only=True)
+            torch.load(
+                dirpath / "strategic_actor.pt",
+                weights_only=True,
+            )
         )
         sac.critic.load_state_dict(
-            torch.load(dirpath / "strategic_critic.pt", weights_only=True)
+            torch.load(
+                dirpath / "strategic_critic.pt",
+                weights_only=True,
+            )
         )
         sac.critic_target.load_state_dict(
             torch.load(
-                dirpath / "strategic_critic_target.pt", weights_only=True
+                dirpath / "strategic_critic_target.pt",
+                weights_only=True,
             )
         )
 
-        data = np.load(dirpath / "strategic_state.npz")
         sac._state_mean = data["state_mean"]
         sac._state_std = data["state_std"]
-        sac.total_updates = int(data["total_updates"])
+        sac.total_updates = int(
+            data["total_updates"]
+        )
         sac.log_alpha = torch.tensor(
-            float(data["log_alpha"]), requires_grad=True
+            float(data["log_alpha"]),
+            requires_grad=True,
         )
         sac._norm_frozen = True
 
@@ -507,30 +556,34 @@ class StrategicSAC:
             sac.buffer_states[:n] = buf["states"]
             sac.buffer_actions[:n] = buf["actions"]
             sac.buffer_rewards[:n] = buf["rewards"]
-            sac.buffer_next_states[:n] = buf["next_states"]
+            sac.buffer_next_states[:n] = (
+                buf["next_states"]
+            )
             sac.buffer_dones[:n] = buf["dones"]
             sac.buffer_size = n
             sac.buffer_ptr = n
 
         logger.info(
-            "Strategic SAC loaded from %s (%d buffer entries)",
-            dirpath, sac.buffer_size,
+            "Strategic SAC loaded from %s "
+            "(state_dim=%d, %d buffer entries)",
+            dirpath,
+            state_dim,
+            sac.buffer_size,
         )
         return sac
 
 class StrategicBCTrainer:
     """Behavioral Cloning for Strategic SAC warm start.
 
-    Trains strategic actor to imitate successful phase transition
-    decisions from TransitionMemory data and heuristic demonstrations.
+    Trains ONE strategic actor from ONE HNSWStateStore.
 
-    Input: strategic state (6D)
+    Input: strategic state (5D)
     Output: switch probability (should detach / should switch direction)
     """
 
     def __init__(
         self,
-        state_dim: int = 6,
+        state_dim: int = 5,
         hidden_dim: int = 64,
         lr: float = 3e-4,
         batch_size: int = 64,
@@ -551,83 +604,56 @@ class StrategicBCTrainer:
         self.state_mean = None
         self.state_std = None
 
-    def prepare_data_from_transition_memory(
+    def prepare_data_from_q_store(
         self,
-        transition_detach,
-        transition_direction,
-    ):
-        """Convert TransitionMemory data to BC training format.
+        transition_store,
+    ) -> bool:
+        """Convert one HNSWStateStore to BC training data.
+
+        Uses raw_state directly (5D) from the store.
+        Outcome = q_values[1] - q_values[0] (switch - stay).
 
         Positive outcome → label=1 (switch was good)
         Negative outcome → label=0 (switch was bad, should stay)
 
-        Also generates "stay" examples: for each detach point
-        with negative outcome, create a stay example with
-        positive label.
-
         Args:
-            transition_detach: TransitionMemory for detach decisions.
-            transition_direction: TransitionMemory for direction decisions.
+            transition_store: HNSWStateStore (strategic_detach
+                or strategic_direction).
+
+        Returns:
+            True if data was prepared, False if no data.
         """
         states = []
         labels = []
 
-        # From detach memory
-        for point in transition_detach.points.values():
-            raw = point["raw_state"]
-            outcome = point["outcome"]
+        for point in transition_store.points.values():
+            raw = point.raw_state
+            outcome = float(
+                point.q_values[1] - point.q_values[0]
+            )
 
-            s_state = np.array([
-                raw[0],   # normal_agreement
-                raw[1],   # alignment
-                raw[2],   # norm_distance
-                1.0,      # path_blocked (detach implies blocked)
-                1.0,      # on_object (detach from surface)
-                0.02,     # norm_depth (on surface)
-            ], dtype=np.float32)
+            s_state = raw.copy().astype(np.float32)
 
             if outcome > 0.3:
-                # Detach was good → switch=1
+                # Switch was good
                 states.append(s_state)
                 labels.append(1.0)
                 # Also: staying would be bad
-                states.append(s_state)
-                labels.append(0.0)  # weight less
+                states.append(s_state.copy())
+                labels.append(0.0)
             elif outcome < -0.1:
-                # Detach was bad → switch=0
+                # Switch was bad
                 states.append(s_state)
                 labels.append(0.0)
             else:
-                # Neutral — add both with equal weight
-                states.append(s_state)
-                labels.append(0.5)
-
-        # From direction memory
-        for point in transition_direction.points.values():
-            raw = point["raw_state"]
-            outcome = point["outcome"]
-
-            s_state = np.array([
-                raw[0],   # normal_agreement
-                raw[1],   # alignment
-                raw[2],   # norm_distance
-                raw[4] if len(raw) > 4 else 1.0,  # path_blocked
-                0.0,      # on_object (direction is in air)
-                0.5,      # norm_depth (in air, approximate)
-            ], dtype=np.float32)
-
-            if outcome > 0.3:
-                states.append(s_state)
-                labels.append(1.0)
-            elif outcome < -0.1:
-                states.append(s_state)
-                labels.append(0.0)
-            else:
+                # Neutral
                 states.append(s_state)
                 labels.append(0.5)
 
         if not states:
-            logger.warning("No data for Strategic BC training")
+            logger.warning(
+                "No data for Strategic BC training"
+            )
             return False
 
         states = np.array(states, dtype=np.float32)
@@ -635,29 +661,59 @@ class StrategicBCTrainer:
 
         # Normalize
         self.state_mean = states.mean(axis=0)
-        self.state_std = np.maximum(states.std(axis=0), 1e-6)
-        states = (states - self.state_mean) / self.state_std
+        self.state_std = np.maximum(
+            states.std(axis=0), 1e-6
+        )
+        states = (
+            (states - self.state_mean) / self.state_std
+        )
 
         # Split
         n = len(states)
         n_val = max(1, int(n * self.val_split))
         indices = np.random.permutation(n)
 
-        self.train_states = torch.FloatTensor(states[indices[n_val:]])
-        self.train_labels = torch.FloatTensor(labels[indices[n_val:]])
-        self.val_states = torch.FloatTensor(states[indices[:n_val]])
-        self.val_labels = torch.FloatTensor(labels[indices[:n_val]])
+        self.train_states = torch.FloatTensor(
+            states[indices[n_val:]]
+        )
+        self.train_labels = torch.FloatTensor(
+            labels[indices[n_val:]]
+        )
+        self.val_states = torch.FloatTensor(
+            states[indices[:n_val]]
+        )
+        self.val_labels = torch.FloatTensor(
+            labels[indices[:n_val]]
+        )
 
         logger.info(
             "Strategic BC data: %d train, %d val "
-            "(detach=%d, direction=%d points)",
+            "(%d points from store)",
             len(self.train_states),
             len(self.val_states),
-            len(transition_detach.points),
-            len(transition_direction.points),
+            len(transition_store.points),
         )
         return True
 
+    def prepare_data_from_transition_memory(
+        self,
+        transition_detach,
+        transition_direction,
+    ):
+        """Legacy wrapper — kept for backward compatibility.
+
+        For new code use prepare_data_from_q_store() with
+        separate StrategicBCTrainer instances.
+        """
+        logger.warning(
+            "prepare_data_from_transition_memory is "
+            "deprecated, use prepare_data_from_q_store"
+        )
+        # Use detach store as primary
+        return self.prepare_data_from_q_store(
+            transition_detach
+        )
+    
     def train(self, num_epochs: int = 100):
         """Train strategic actor with BCE loss."""
         if not hasattr(self, "train_states"):

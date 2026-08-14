@@ -35,6 +35,7 @@ from .replay_buffer import ReplayBuffer
 from .rl_goal_approach_controller import RLGoalApproachController
 from .sac_actor import SACActorNetwork
 from .twin_critic import TwinCritic
+from .strategic_sac import StrategicSAC
 
 logger = logging.getLogger(__name__)
 
@@ -145,6 +146,204 @@ class PSACTrainer:
         # Mesh tracking
         self._mesh_stats: dict[str, dict[str, Any]] = {}
         self._current_mesh: str = ""
+
+        # Strategic SAC (two-level architecture)
+        self.strategic_detach_sac: StrategicSAC | None = (
+            None
+        )
+        self.strategic_direction_sac: StrategicSAC | None = (
+            None
+        )
+    def load_strategic(
+        self,
+        strategic_detach_sac: StrategicSAC | None = None,
+        strategic_direction_sac: StrategicSAC | None = None,
+    ) -> None:
+        """Load Strategic SACs for hierarchical action selection.
+
+        Args:
+            strategic_detach_sac: StrategicSAC for detach
+                decisions (5D state).
+            strategic_direction_sac: StrategicSAC for
+                direction decisions (5D state).
+        """
+        self.strategic_detach_sac = strategic_detach_sac
+        self.strategic_direction_sac = (
+            strategic_direction_sac
+        )
+        logger.info(
+            "Strategic SACs loaded: detach=%s (buf=%d), "
+            "direction=%s (buf=%d)",
+            strategic_detach_sac is not None,
+            (
+                strategic_detach_sac.buffer_size
+                if strategic_detach_sac
+                else 0
+            ),
+            strategic_direction_sac is not None,
+            (
+                strategic_direction_sac.buffer_size
+                if strategic_direction_sac
+                else 0
+            ),
+        )
+
+    def _strategic_detach_check(
+        self,
+        state_raw: np.ndarray,
+        controller: RLGoalApproachController,
+        sensor_data: dict[str, Any],
+    ) -> tuple[int | None, str | None]:
+        """On surface: should we detach?
+
+        Args:
+            state_raw: Raw 18D state vector.
+            controller: Controller for state computation.
+            sensor_data: Current sensor readings.
+
+        Returns:
+            (action_type, source) or (None, None).
+            action_type=7 means Detach.
+        """
+        if self.strategic_detach_sac is None:
+            return None, None
+
+        on_object = state_raw[11] > 0.5
+        if not on_object:
+            return None, None
+
+        same_side = sensor_data.get("same_side", True)
+        path_blocked = sensor_data.get(
+            "path_blocked", False
+        )
+
+        # Only consider detach when goal unreachable
+        if same_side and not path_blocked:
+            return None, None
+
+        # Anti-spam
+        if controller._consecutive_detach_count >= 3:
+            return None, None
+        if not controller._can_detach(state_raw):
+            return None, None
+
+        # Compute 5D detach state
+        t_state = (
+            controller._compute_detach_transition_state(
+                state_raw,
+                sensor_data,
+                movement_efficiency=(
+                    controller._compute_movement_efficiency(
+                        window=20
+                    )
+                ),
+            )
+        )
+
+        should_switch, confidence = (
+            self.strategic_detach_sac.predict(t_state)
+        )
+
+         # ═══ DIAGNOSTIC LOG ═══
+        logger.debug(
+            "DETACH_CHECK: should=%s, conf=%.3f, "
+            "same_side=%s, path_blocked=%s, "
+            "on_object=%.1f, t_state=%s",
+            should_switch, confidence,
+            same_side, path_blocked,
+            state_raw[11],
+            [round(float(x), 3) for x in t_state],
+        )
+
+        if should_switch and confidence > 0.3:
+            return 7, (
+                f"strategic_detach"
+                f"(conf={confidence:.2f})"
+            )
+        return None, None
+
+    def _strategic_direction_check(
+        self,
+        state_raw: np.ndarray,
+        controller: RLGoalApproachController,
+        sensor_data: dict[str, Any],
+        current_pose: np.ndarray,
+    ) -> str | None:
+        """In air: fly_to_goal or bypass?
+
+        Args:
+            state_raw: Raw 18D state vector.
+            controller: Controller for state computation.
+            sensor_data: Current sensor readings.
+            current_pose: Current agent pose.
+
+        Returns:
+            Phase name ("FLY_TO_GOAL" or "FLY_TO_EDGE")
+            or None if no override.
+        """
+        if self.strategic_direction_sac is None:
+            return None
+
+        on_object = state_raw[11] > 0.5
+        if on_object:
+            return None
+
+        d_state = (
+            controller._compute_direction_transition_state(
+                state_raw, sensor_data, current_pose
+            )
+        )
+
+        should_bypass, confidence = (
+            self.strategic_direction_sac.predict(d_state)
+        )
+
+        if confidence < 0.3:
+            return None
+
+        if should_bypass:
+            return "FLY_TO_EDGE"
+        return "FLY_TO_GOAL"
+
+    def _update_controller_tracking(
+        self,
+        controller: RLGoalApproachController,
+        state_raw: np.ndarray,
+        sensor_data: dict[str, Any],
+        current_pose: np.ndarray,
+        action_type: int,
+    ) -> None:
+        """Update controller internal state for strategic
+        decisions.
+
+        Controller needs phase, distance_history,
+        consecutive_detach_count etc. to make correct
+        strategic decisions on next step.
+
+        Args:
+            controller: RL controller.
+            state_raw: Current raw state (already computed).
+            sensor_data: Current sensor readings.
+            current_pose: Current agent pose.
+            action_type: Action that was executed.
+        """
+        # Update phase
+        phase, _, _ = controller._determine_phase(
+            state_raw, sensor_data, current_pose
+        )
+        controller._current_phase = phase
+
+        # Track detach count
+        if action_type == 7:  # Detach
+            controller._consecutive_detach_count += 1
+        else:
+            controller._consecutive_detach_count = 0
+
+        # Track path_blocked streak
+        if not sensor_data.get("path_blocked", False):
+            controller._path_clear_streak += 1
+        else:
+            controller._path_clear_streak = 0
 
     @property
     def alpha_type(self) -> float:
@@ -529,18 +728,7 @@ class PSACTrainer:
         | None = None,
         num_episodes: int = 100,
     ) -> float:
-        """Run evaluation during training with fixed seed.
-
-        Args:
-            env: Environment instance.
-            controller: RL controller for state computation.
-            interpreter: Action interpreter.
-            curriculum_levels: Optional curriculum levels.
-            num_episodes: Number of eval episodes.
-
-        Returns:
-            Success rate.
-        """
+        """Run evaluation with strategic override."""
         np_state = np.random.get_state()
         torch_state = torch.random.get_rng_state()
 
@@ -573,35 +761,87 @@ class PSACTrainer:
                 max_attempts=2000,
                 mesh_sample=True,
             )
-            controller.set_new_goal(goal_pose, start_pos)
+            controller.set_new_goal(
+                goal_pose, start_pos
+            )
             env.set_goal(goal_pose)
 
-            for _step in range(self.max_steps_per_goal):
+            for _step in range(
+                self.max_steps_per_goal
+            ):
                 current_pose = env.get_pose()
                 sensor_data = env.get_sensor_data()
                 state_raw = self.compute_state(
-                    env, controller, current_pose, sensor_data
+                    env, controller, current_pose,
+                    sensor_data,
                 )
-                state = self.normalize_state(state_raw)
+                state = self.normalize_state(
+                    state_raw
+                )
 
-                state_t = torch.FloatTensor(state).unsqueeze(0)
-                with torch.no_grad():
-                    at, ap, _, _ = self.actor.sample_eval(
-                        state_t
+                # ═══ NEW: strategic override ═══
+                strategic_type, _ = (
+                    self._strategic_detach_check(
+                        state_raw, controller,
+                        sensor_data,
                     )
-                action_type = at[0].item()
-                action_params = (
-                    ap[0].numpy() * self.param_std
-                    + self.param_mean
                 )
+
+                if strategic_type is not None:
+                    action_type = strategic_type
+                    action_params = np.zeros(
+                        3, dtype=np.float32
+                    )
+                else:
+                    dir_phase = (
+                        self
+                        ._strategic_direction_check(
+                            state_raw, controller,
+                            sensor_data,
+                            current_pose,
+                        )
+                    )
+                    if dir_phase is not None:
+                        controller._current_phase = (
+                            dir_phase
+                        )
+
+                    state_t = torch.FloatTensor(
+                        state
+                    ).unsqueeze(0)
+                    with torch.no_grad():
+                        at, ap, _, _ = (
+                            self.actor.sample_eval(
+                                state_t
+                            )
+                        )
+                    action_type = at[0].item()
+                    action_params = (
+                        ap[0].numpy()
+                        * self.param_std
+                        + self.param_mean
+                    )
 
                 sensor_data = interpreter.execute(
                     action_type, action_params
                 )
                 current_pose = env.get_pose()
+
+                # ═══ NEW: update tracking ═══
+                next_raw = self.compute_state(
+                    env, controller, current_pose,
+                    sensor_data,
+                )
+                self._update_controller_tracking(
+                    controller, next_raw,
+                    sensor_data, current_pose,
+                    action_type,
+                )
+
                 distance = float(
                     np.linalg.norm(
-                        goal_pose[:3] - current_pose[:3]
+                        goal_pose[:3]
+                        - current_pose[:3]
                     )
                 )
 
@@ -609,7 +849,9 @@ class PSACTrainer:
                     successes += 1
                     break
 
-                depth = sensor_data.get("depth", 100.0)
+                depth = sensor_data.get(
+                    "depth", 100.0
+                )
                 if depth < 0.5:
                     break
 
@@ -619,7 +861,7 @@ class PSACTrainer:
         torch.random.set_rng_state(torch_state)
 
         return successes / max(num_episodes, 1)
-
+    
     def _get_episode_data(
         self,
         episode_pools: dict[str, Any] | None,
@@ -782,24 +1024,7 @@ class PSACTrainer:
         visualise: bool = False,
         mesh_name: str = "",
     ) -> None:
-        """Run SAC training loop.
-
-        Args:
-            env: Environment instance.
-            controller: RL controller for state computation.
-            num_episodes: Number of training episodes.
-            update_every: Update networks every N steps.
-            updates_per_step: Gradient updates per step.
-            warmup_steps: Steps before starting updates.
-            log_interval: Log every N episodes.
-            save_dir: Directory to save best model.
-            curriculum_levels: Optional curriculum levels.
-            promote_threshold: Success rate for promotion.
-            promote_window: Window size for promotion.
-            episode_pools: Optional fixed episode pools.
-            visualise: If True, save episode visualizations.
-            mesh_name: Mesh name for visualization directory.
-        """
+        """Run SAC training loop with strategic override."""
         interpreter = ActionInterpreter(env)
 
         # Visualization setup
@@ -822,6 +1047,10 @@ class PSACTrainer:
         best_critic_target_dict = None
         best_extra = None
 
+        # ═══ NEW: strategic episode tracking ═══
+        strategic_detach_count = 0
+        strategic_direction_count = 0
+
         for episode in range(num_episodes):
             if curriculum_levels:
                 min_dist, max_dist = curriculum_levels[
@@ -838,7 +1067,8 @@ class PSACTrainer:
                 start_pos = np.array(ep_data["start_pos"])
                 start_rot = np.array(ep_data["start_rot"])
                 env.reset(
-                    position=start_pos, rotation=start_rot
+                    position=start_pos,
+                    rotation=start_rot,
                 )
                 goal_pose = np.concatenate([
                     np.array(ep_data["goal_pos"]),
@@ -860,12 +1090,62 @@ class PSACTrainer:
             )
             env.set_goal(goal_pose)
 
+            # ═══ Air start: every 3rd episode ═══
+            if episode % 3 == 2:
+                air_sensor = env.get_sensor_data()
+                air_normal = air_sensor.get(
+                    "point_normal"
+                )
+                if air_normal is not None:
+                    n = np.array(
+                        air_normal, dtype=float
+                    )
+                    n_len = np.linalg.norm(n)
+                    if n_len > 1e-8:
+                        n /= n_len
+                        detach_dist = (
+                            controller.action_space
+                            .free_step * 3
+                        )
+                        air_pos = (
+                            env.agent_pos
+                            + n * detach_dist
+                        )
+
+                        goal_dir = (
+                            goal_pose[:3] - air_pos
+                        )
+                        goal_dist = np.linalg.norm(
+                            goal_dir
+                        )
+                        if goal_dist > 1e-8:
+                            air_rot = (
+                                env
+                                ._look_at_direction(
+                                    goal_dir
+                                    / goal_dist
+                                )
+                            )
+                        else:
+                            air_rot = (
+                                env.agent_rot.copy()
+                            )
+
+                        env.agent_pos = air_pos
+                        env.agent_rot = air_rot
+
+                        controller.set_new_goal(
+                            goal_pose, air_pos
+                        )
+
             current_pose = env.get_pose()
             sensor_data = env.get_sensor_data()
             state_raw = self.compute_state(
-                env, controller, current_pose, sensor_data
+                env, controller, current_pose,
+                sensor_data,
             )
             state = self.normalize_state(state_raw)
+
             prev_distance = float(
                 np.linalg.norm(
                     goal_pose[:3] - current_pose[:3]
@@ -877,19 +1157,54 @@ class PSACTrainer:
             current_poses: list[np.ndarray] = []
             action_explanations: list[str] = []
 
+            # ═══ NEW: per-episode strategic tracking ═══
+            ep_had_strategic_detach = False
+
             for step in range(self.max_steps_per_goal):
                 self.total_steps += 1
 
-                state_t = torch.FloatTensor(state).unsqueeze(
-                    0
+                # ═══ NEW: strategic override ═══
+                strategic_type, strategic_source = (
+                    self._strategic_detach_check(
+                        state_raw, controller,
+                        sensor_data,
+                    )
                 )
-                with torch.no_grad():
-                    at, ap, _, _ = self.actor.sample(state_t)
-                action_type = at[0].item()
-                action_params = (
-                    ap[0].numpy() * self.param_std
-                    + self.param_mean
-                )
+
+                if strategic_type is not None:
+                    action_type = strategic_type
+                    action_params = np.zeros(
+                        3, dtype=np.float32
+                    )
+                    ep_had_strategic_detach = True
+                    strategic_detach_count += 1
+                else:
+                    # Direction override
+                    dir_phase = (
+                        self._strategic_direction_check(
+                            state_raw, controller,
+                            sensor_data, current_pose,
+                        )
+                    )
+                    if dir_phase is not None:
+                        controller._current_phase = (
+                            dir_phase
+                        )
+                        strategic_direction_count += 1
+
+                    # Tactical SAC
+                    state_t = torch.FloatTensor(
+                        state
+                    ).unsqueeze(0)
+                    with torch.no_grad():
+                        at, ap, _, _ = (
+                            self.actor.sample(state_t)
+                        )
+                    action_type = at[0].item()
+                    action_params = (
+                        ap[0].numpy() * self.param_std
+                        + self.param_mean
+                    )
 
                 # Track action
                 self._action_type_counts[action_type] = (
@@ -904,10 +1219,18 @@ class PSACTrainer:
                 )
                 current_pose = env.get_pose()
                 next_state_raw = self.compute_state(
-                    env, controller, current_pose, sensor_data
+                    env, controller, current_pose,
+                    sensor_data,
                 )
                 next_state = self.normalize_state(
                     next_state_raw
+                )
+
+                # ═══ NEW: update controller tracking ═══
+                self._update_controller_tracking(
+                    controller, next_state_raw,
+                    sensor_data, current_pose,
+                    action_type,
                 )
 
                 distance = float(
@@ -934,13 +1257,22 @@ class PSACTrainer:
                 )
 
                 # Collect visualization data
-                current_poses.append(current_pose.copy())
-                type_names = ExperienceExtractor.get_type_names()
+                current_poses.append(
+                    current_pose.copy()
+                )
+                type_names = (
+                    ExperienceExtractor.get_type_names()
+                )
                 act_name = type_names.get(
                     action_type, f"type_{action_type}"
                 )
+                source_tag = (
+                    f"[{strategic_source}]"
+                    if strategic_type is not None
+                    else ""
+                )
                 action_explanations.append(
-                    f"SAC: {act_name}, "
+                    f"SAC{source_tag}: {act_name}, "
                     f"dist={distance:.1f}mm"
                 )
 
@@ -949,25 +1281,29 @@ class PSACTrainer:
                     / (self.param_std + 1e-8)
                 )
                 self.buffer.add(
-                    state, action_type, action_params_norm,
+                    state, action_type,
+                    action_params_norm,
                     reward, next_state, done,
                 )
 
                 episode_reward += reward
                 state = next_state
+                state_raw = next_state_raw  # ═══ NEW
                 prev_distance = distance
 
                 if (
                     self.total_steps >= warmup_steps
-                    and self.total_steps % update_every == 0
-                    and len(self.buffer) >= self.batch_size
+                    and self.total_steps
+                    % update_every == 0
+                    and len(self.buffer)
+                    >= self.batch_size
                 ):
                     for _ in range(updates_per_step):
                         batch = self.buffer.sample(
                             self.batch_size
                         )
-                        critic_loss = self.update_critic(
-                            batch
+                        critic_loss = (
+                            self.update_critic(batch)
                         )
                         self._critic_losses.append(
                             critic_loss
@@ -983,7 +1319,10 @@ class PSACTrainer:
                         self.soft_update_target()
 
                 if done:
-                    if distance < self.goal_threshold:
+                    if (
+                        distance
+                        < self.goal_threshold
+                    ):
                         self.total_goals_reached += 1
                         self._mesh_goals += 1
                         episode_success = True
@@ -994,10 +1333,12 @@ class PSACTrainer:
             self._episode_rewards.append(episode_reward)
             self._episode_steps.append(step + 1)
 
-            # Determine episode result and save visualization
+            # Determine episode result
             if episode_success:
                 ep_result = "success"
-            elif step == (self.max_steps_per_goal - 1):
+            elif step == (
+                self.max_steps_per_goal - 1
+            ):
                 ep_result = "timeout"
             else:
                 ep_result = "collision"
@@ -1011,6 +1352,54 @@ class PSACTrainer:
                     goal_pose=goal_pose,
                     poses=current_poses,
                     actions=action_explanations,
+                )
+
+            # ═══ NEW: strategic SAC online update ═══
+            if (
+                ep_had_strategic_detach
+                and self.strategic_detach_sac is not None
+            ):
+                # Collect strategic transition
+                detach_reward = (
+                    1.0 if episode_success
+                    else -0.5 if ep_result == "collision"
+                    else -0.2
+                )
+                # Use last known detach state
+                t_state = (
+                    controller
+                    ._compute_detach_transition_state(
+                        state_raw,
+                        sensor_data,
+                        movement_efficiency=0.5,
+                    )
+                )
+                self.strategic_detach_sac.add_transition(
+                    t_state, 1.0, detach_reward,
+                    t_state, True,
+                )
+
+            # Periodic strategic SAC update
+            if (
+                (episode + 1) % 200 == 0
+                and self.strategic_detach_sac is not None
+                and self.strategic_detach_sac.buffer_size
+                >= self.strategic_detach_sac.batch_size
+            ):
+                self.strategic_detach_sac.update(
+                    num_steps=20
+                )
+            if (
+                (episode + 1) % 200 == 0
+                and self.strategic_direction_sac
+                is not None
+                and self.strategic_direction_sac
+                .buffer_size
+                >= self.strategic_direction_sac
+                .batch_size
+            ):
+                self.strategic_direction_sac.update(
+                    num_steps=20
                 )
 
             rolling_history.append(episode_success)
@@ -1029,12 +1418,16 @@ class PSACTrainer:
                 (episode + 1) % self.eval_interval == 0
                 and self.total_steps >= warmup_steps
             ):
-                eval_rate = self._run_eval_during_training(
-                    env=env,
-                    controller=controller,
-                    interpreter=interpreter,
-                    curriculum_levels=curriculum_levels,
-                    num_episodes=self.eval_episodes,
+                eval_rate = (
+                    self._run_eval_during_training(
+                        env=env,
+                        controller=controller,
+                        interpreter=interpreter,
+                        curriculum_levels=(
+                            curriculum_levels
+                        ),
+                        num_episodes=self.eval_episodes,
+                    )
                 )
                 logger.info(
                     "  EVAL at episode %d: rate=%.3f "
@@ -1048,13 +1441,17 @@ class PSACTrainer:
                     best_state_dict = {
                         k: v.clone()
                         for k, v in (
-                            self.actor.state_dict().items()
+                            self.actor
+                            .state_dict()
+                            .items()
                         )
                     }
                     best_critic_dict = {
                         k: v.clone()
                         for k, v in (
-                            self.critic.state_dict().items()
+                            self.critic
+                            .state_dict()
+                            .items()
                         )
                     }
                     best_critic_target_dict = {
@@ -1066,7 +1463,9 @@ class PSACTrainer:
                         )
                     }
                     best_extra = {
-                        "total_steps": self.total_steps,
+                        "total_steps": (
+                            self.total_steps
+                        ),
                         "total_episodes": (
                             self.total_episodes
                         ),
@@ -1087,30 +1486,38 @@ class PSACTrainer:
                         "eval_rate": eval_rate,
                     }
                     logger.info(
-                        "  New best eval model! rate=%.3f",
+                        "  New best eval model! "
+                        "rate=%.3f",
                         eval_rate,
                     )
 
             if curriculum_levels:
                 success_window.append(episode_success)
-                if len(success_window) > promote_window:
+                if (
+                    len(success_window)
+                    > promote_window
+                ):
                     success_window.pop(0)
                 if (
-                    len(success_window) == promote_window
+                    len(success_window)
+                    == promote_window
                     and curr_level
                     < len(curriculum_levels) - 1
                 ):
                     rate = (
-                        sum(success_window) / promote_window
+                        sum(success_window)
+                        / promote_window
                     )
                     if rate >= promote_threshold:
                         curr_level += 1
                         success_window = []
                         logger.info(
-                            "SAC Curriculum: promoted to "
-                            "level %d (%smm)",
+                            "SAC Curriculum: promoted "
+                            "to level %d (%smm)",
                             curr_level,
-                            curriculum_levels[curr_level],
+                            curriculum_levels[
+                                curr_level
+                            ],
                         )
 
             if (episode + 1) % log_interval == 0:
@@ -1123,12 +1530,14 @@ class PSACTrainer:
                     if curriculum_levels
                     else ""
                 )
+                # ═══ NEW: strategic stats in log ═══
                 logger.info(
                     "Episode %d/%d: reward=%.1f, "
                     "steps=%d, mesh_rate=%.3f, "
                     "rolling=%.3f, best_eval=%.3f, "
                     "bc_lambda=%.4f, alpha_t=%.3f, "
-                    "alpha_p=%.3f, buf=%d%s",
+                    "alpha_p=%.3f, buf=%d, "
+                    "s_detach=%d, s_dir=%d%s",
                     episode + 1,
                     num_episodes,
                     episode_reward,
@@ -1140,16 +1549,22 @@ class PSACTrainer:
                     self.alpha_type,
                     self.alpha_param,
                     len(self.buffer),
+                    strategic_detach_count,
+                    strategic_direction_count,
                     level_info,
                 )
 
         if best_state_dict is not None:
             self.actor.load_state_dict(best_state_dict)
-            self.critic.load_state_dict(best_critic_dict)
+            self.critic.load_state_dict(
+                best_critic_dict
+            )
             self.critic_target.load_state_dict(
                 best_critic_target_dict
             )
-            self.total_steps = best_extra["total_steps"]
+            self.total_steps = best_extra[
+                "total_steps"
+            ]
             self.total_episodes = best_extra[
                 "total_episodes"
             ]
@@ -1166,21 +1581,20 @@ class PSACTrainer:
                 requires_grad=True,
             )
             logger.info(
-                "Restored best model (eval_rate=%.3f)",
+                "Restored best model "
+                "(eval_rate=%.3f)",
                 best_extra["eval_rate"],
             )
         else:
-            logger.info("No eval checkpoint was saved")
+            logger.info(
+                "No eval checkpoint was saved"
+            )
 
         if save_dir:
             self.save(save_dir)
 
     def save(self, dirpath: str) -> None:
-        """Save SAC model to directory.
-
-        Args:
-            dirpath: Directory path.
-        """
+        """Save SAC model to directory."""
         dirpath = Path(dirpath)
         dirpath.mkdir(parents=True, exist_ok=True)
 
@@ -1221,7 +1635,9 @@ class PSACTrainer:
             ),
             total_steps=self.total_steps,
             total_episodes=self.total_episodes,
-            total_goals_reached=self.total_goals_reached,
+            total_goals_reached=(
+                self.total_goals_reached
+            ),
             bc_lambda=self.bc_lambda,
             log_alpha_type=(
                 self.log_alpha_type.detach().numpy()
@@ -1231,16 +1647,23 @@ class PSACTrainer:
             ),
         )
 
+        # ═══ NEW: save Strategic SACs ═══
+        if self.strategic_detach_sac is not None:
+            self.strategic_detach_sac.save(
+                str(dirpath / "strategic_detach_sac")
+            )
+        if self.strategic_direction_sac is not None:
+            self.strategic_direction_sac.save(
+                str(
+                    dirpath
+                    / "strategic_direction_sac"
+                )
+            )
+
         logger.info("P-SAC model saved to %s", dirpath)
 
     def load(self, dirpath: str) -> None:
-        """Load SAC model from directory.
-
-        Used for fine-tuning on new objects or resuming training.
-
-        Args:
-            dirpath: Directory path.
-        """
+        """Load SAC model from directory."""
         dirpath = Path(dirpath)
 
         self.actor.load_state_dict(
@@ -1266,7 +1689,9 @@ class PSACTrainer:
         self.state_mean = data["state_mean"]
         self.state_std = data["state_std"]
         self.total_steps = int(data["total_steps"])
-        self.total_episodes = int(data["total_episodes"])
+        self.total_episodes = int(
+            data["total_episodes"]
+        )
         self.total_goals_reached = int(
             data["total_goals_reached"]
         )
@@ -1290,4 +1715,36 @@ class PSACTrainer:
             else np.ones(3)
         )
 
-        logger.info("P-SAC model loaded from %s", dirpath)
+        # ═══ NEW: load Strategic SACs ═══
+        detach_path = (
+            dirpath / "strategic_detach_sac"
+        )
+        if (
+            detach_path / "strategic_actor.pt"
+        ).exists():
+            self.strategic_detach_sac = (
+                StrategicSAC.load(str(detach_path))
+            )
+            logger.info(
+                "Strategic detach SAC loaded from %s",
+                detach_path,
+            )
+
+        direction_path = (
+            dirpath / "strategic_direction_sac"
+        )
+        if (
+            direction_path / "strategic_actor.pt"
+        ).exists():
+            self.strategic_direction_sac = (
+                StrategicSAC.load(str(direction_path))
+            )
+            logger.info(
+                "Strategic direction SAC loaded "
+                "from %s",
+                direction_path,
+            )
+
+        logger.info(
+            "P-SAC model loaded from %s", dirpath
+        )

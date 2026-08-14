@@ -682,11 +682,13 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
         air_start_enabled = cfg.get(
             "air_start_enabled", False
         )
+        air_start_in_eval = cfg.get(
+            "air_start_in_eval", False
+        )
 
         if (
-            is_training
+            (is_training or air_start_in_eval)
             and air_start_enabled
-            and not use_script
             and episode % 3 == 2
         ):
             sensor = env.get_sensor_data()

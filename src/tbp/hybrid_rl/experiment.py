@@ -546,7 +546,8 @@ class RLGoalApproachExperiment:
         if all_bc_transitions:
             all_bc_transitions = (
                 self._filter_bc_transitions(
-                    all_bc_transitions
+                    all_bc_transitions,
+                    target_per_group=self.config.get("bc_target_per_group", 15000),
                 )
             )
             bc_output = self.data_dir / "bc_data.pkl"
@@ -583,6 +584,8 @@ class RLGoalApproachExperiment:
             "eval_epsilon": 1.0,
             "temperature_override": 0.01,
             "strategic_eval_epsilon": 1.0,
+            "air_start_enabled": True,
+            "air_start_in_eval": True,
         }
 
         all_heuristic_transitions: list[Any] = []
@@ -660,89 +663,124 @@ class RLGoalApproachExperiment:
         logger.info("=" * 60)
 
         # Collect heuristic expert data (with caching)
-        bc_data_combined_path = self.data_dir / "bc_data_combined.pkl"
+        bc_data_combined_path = (
+            self.data_dir / "bc_data_combined.pkl"
+        )
         if bc_data_combined_path.exists():
             logger.info(
-                "Loading cached bc_data_combined data from %s",
+                "Loading cached bc_data_combined "
+                "data from %s",
                 bc_data_combined_path,
             )
             with bc_data_combined_path.open("rb") as f:
-                bc_transitions = pickle.load(f)  # noqa: S301
+                bc_transitions = pickle.load(f)
             logger.info(
-                "Loaded %d cached bc_data_combined transitions",
+                "Loaded %d cached bc_data_combined "
+                "transitions",
                 len(bc_transitions),
             )
-            q_store_balanced = []
-            heuristic_limited = []
         else:
-            # Load Q-store eval BC data
-            bc_path = self.data_dir / "bc_data.pkl"
-            with bc_path.open("rb") as f:
-                q_store_transitions = pickle.load(f)  # noqa: S301
-
-            logger.info(
-                "Loaded %d Q-store eval transitions",
-                len(q_store_transitions),
+            # ═══ Load heuristic data (primary source) ═══
+            heuristic_cache_path = (
+                self.data_dir / "bc_data_heuristic.pkl"
             )
-
-            # Collect heuristic expert data (with caching)
-            heuristic_cache_path = self.data_dir / "bc_data_heuristic.pkl"
             if heuristic_cache_path.exists():
                 logger.info(
-                    "Loading cached heuristic data from %s",
+                    "Loading cached heuristic data "
+                    "from %s",
                     heuristic_cache_path,
                 )
-                with heuristic_cache_path.open("rb") as f:
-                    heuristic_transitions = pickle.load(f)  # noqa: S301
+                with heuristic_cache_path.open(
+                    "rb"
+                ) as f:
+                    heuristic_transitions = (
+                        pickle.load(f)
+                    )
                 logger.info(
-                    "Loaded %d cached heuristic transitions",
+                    "Loaded %d cached heuristic "
+                    "transitions",
                     len(heuristic_transitions),
                 )
             else:
-                heuristic_transitions = self._run_heuristic_eval()
+                heuristic_transitions = (
+                    self._run_heuristic_eval()
+                )
                 logger.info(
-                    "Calculated %d heuristic transitions",
+                    "Collected %d heuristic "
+                    "transitions",
                     len(heuristic_transitions),
                 )
 
-            # Balance Q-store data by (mesh, level)
-            q_store_balanced = self._filter_bc_transitions(
-                q_store_transitions,
-                target_per_group=3000,
+            # ═══ Optional: add small fraction of
+            #     Q-store eval data ═══
+            q_store_fraction = float(
+                self.config.get(
+                    "bc_q_store_fraction", 0.0
+                )
             )
+            q_store_transitions_used = []
 
-            # Heuristic data: keep natural distribution (no balancing)
-            # but limit total to match Q-store balanced size
-            max_heuristic = len(q_store_balanced)
-            if len(heuristic_transitions) > max_heuristic:
-                indices = np.random.permutation(
-                    len(heuristic_transitions)
-                )[:max_heuristic]
-                heuristic_limited = [
-                    heuristic_transitions[i] for i in indices
-                ]
-                logger.info(
-                    "Heuristic data limited: %d → %d",
-                    len(heuristic_transitions),
-                    max_heuristic,
+            if q_store_fraction > 0.0:
+                bc_path = (
+                    self.data_dir / "bc_data.pkl"
                 )
-            else:
-                heuristic_limited = heuristic_transitions
+                if bc_path.exists():
+                    with bc_path.open("rb") as f:
+                        q_store_transitions = (
+                            pickle.load(f)
+                        )
+                    max_q = int(
+                        len(heuristic_transitions)
+                        * q_store_fraction
+                    )
+                    if (
+                        len(q_store_transitions)
+                        > max_q
+                    ):
+                        indices = (
+                            np.random.permutation(
+                                len(
+                                    q_store_transitions
+                                )
+                            )[:max_q]
+                        )
+                        q_store_transitions_used = [
+                            q_store_transitions[i]
+                            for i in indices
+                        ]
+                    else:
+                        q_store_transitions_used = (
+                            q_store_transitions
+                        )
+                    logger.info(
+                        "Q-store data: %d → %d "
+                        "(fraction=%.1f%%)",
+                        len(q_store_transitions),
+                        len(
+                            q_store_transitions_used
+                        ),
+                        q_store_fraction * 100,
+                    )
 
-            # Combine 50/50
-            bc_transitions = q_store_balanced + heuristic_limited
+            # ═══ Combine ═══
+            bc_transitions = (
+                heuristic_transitions
+                + q_store_transitions_used
+            )
             np.random.shuffle(bc_transitions)
 
             logger.info(
-                "Combined BC data: %d Q-store + %d heuristic = %d total",
-                len(q_store_balanced),
-                len(heuristic_limited),
+                "BC data: %d heuristic + %d Q-store "
+                "= %d total",
+                len(heuristic_transitions),
+                len(q_store_transitions_used),
                 len(bc_transitions),
             )
 
-            # Save combined BC data
-            bc_combined_path = self.data_dir / "bc_data_combined.pkl"
-            with bc_combined_path.open("wb") as f:
+            # Save combined
+            with bc_data_combined_path.open(
+                "wb"
+            ) as f:
                 pickle.dump(bc_transitions, f)
 
         # Train BC
@@ -768,18 +806,18 @@ class RLGoalApproachExperiment:
             json.dump(bc_stats, f, indent=2)
 
         # ═══ Strategic BC Training ═══
-        # Train Strategic SAC actor from TransitionMemory data
-        # collected during Q-learning training
         logger.info("=" * 40)
-        logger.info("Strategic BC Training")
+        logger.info("Strategic BC Training (two separate)")
         logger.info("=" * 40)
 
-        # Load controller to access TransitionMemory
         for seed in self.train_seeds:
             q_dir = self._q_model_dir(seed)
-            if not (Path(q_dir) / "config.json").exists():
+            if not (
+                Path(q_dir) / "config.json"
+            ).exists():
                 logger.warning(
-                    "Q-store not found at %s, skipping Strategic BC",
+                    "Q-store not found at %s, "
+                    "skipping Strategic BC",
                     q_dir,
                 )
                 continue
@@ -787,63 +825,174 @@ class RLGoalApproachExperiment:
             controller = RLGoalApproachController.load(
                 q_dir,
                 agent_id=f"strategic_bc_seed_{seed}",
-                config={**self.rl_config, "mode": "eval"},
+                config={
+                    **self.rl_config,
+                    "mode": "eval",
+                },
             )
 
-            strategic_bc = StrategicBCTrainer(state_dim=6)
-            has_data = strategic_bc.prepare_data_from_transition_memory(
-                controller.strategic_detach,
-                controller.strategic_direction,
+            strategic_bc_dir = str(
+                self.runs_dir / "strategic_bc_model"
+            )
+            Path(strategic_bc_dir).mkdir(
+                parents=True, exist_ok=True
             )
 
-            if has_data:
-                strategic_bc.train(num_epochs=100)
-
-                # Save Strategic BC model
-                strategic_bc_dir = str(
-                    self.runs_dir / "strategic_bc_model"
+            # 1. Detach BC
+            detach_bc = StrategicBCTrainer(state_dim=5)
+            has_detach = (
+                detach_bc.prepare_data_from_q_store(
+                    controller.strategic_detach,
                 )
-                Path(strategic_bc_dir).mkdir(
-                    parents=True, exist_ok=True
-                )
+            )
+            if has_detach:
+                detach_bc.train(num_epochs=100)
                 torch.save(
-                    strategic_bc.get_actor_weights(),
-                    Path(strategic_bc_dir) / "strategic_actor.pt",
+                    detach_bc.get_actor_weights(),
+                    Path(strategic_bc_dir)
+                    / "strategic_detach_actor.pt",
                 )
-                state_mean, state_std = (
-                    strategic_bc.get_normalization()
+                s_mean, s_std = (
+                    detach_bc.get_normalization()
                 )
                 np.savez(
-                    Path(strategic_bc_dir) / "strategic_normalization.npz",
-                    state_mean=state_mean,
-                    state_std=state_std,
+                    Path(strategic_bc_dir)
+                    / "strategic_detach_norm.npz",
+                    state_mean=s_mean,
+                    state_std=s_std,
                 )
                 logger.info(
-                    "Strategic BC saved to %s",
+                    "Strategic Detach BC saved to %s",
                     strategic_bc_dir,
                 )
             else:
                 logger.warning(
-                    "No TransitionMemory data for Strategic BC"
+                    "No data for Strategic Detach BC"
                 )
 
+            # 2. Direction BC
+            direction_bc = StrategicBCTrainer(
+                state_dim=5
+            )
+            has_direction = (
+                direction_bc.prepare_data_from_q_store(
+                    controller.strategic_direction,
+                )
+            )
+            if has_direction:
+                direction_bc.train(num_epochs=100)
+                torch.save(
+                    direction_bc.get_actor_weights(),
+                    Path(strategic_bc_dir)
+                    / "strategic_direction_actor.pt",
+                )
+                s_mean, s_std = (
+                    direction_bc.get_normalization()
+                )
+                np.savez(
+                    Path(strategic_bc_dir)
+                    / "strategic_direction_norm.npz",
+                    state_mean=s_mean,
+                    state_std=s_std,
+                )
+                logger.info(
+                    "Strategic Direction BC saved "
+                    "to %s",
+                    strategic_bc_dir,
+                )
+            else:
+                logger.warning(
+                    "No data for Strategic "
+                    "Direction BC"
+                )
+
+            # Save strategic BC stats
+            strategic_bc_stats = {
+                "seed": seed,
+                "detach": {
+                    "has_data": has_detach,
+                    "store_points": len(
+                        controller.strategic_detach
+                        .points
+                    ),
+                    "train_size": (
+                        len(detach_bc.train_states)
+                        if has_detach
+                        and hasattr(
+                            detach_bc, "train_states"
+                        )
+                        else 0
+                    ),
+                    "val_size": (
+                        len(detach_bc.val_states)
+                        if has_detach
+                        and hasattr(
+                            detach_bc, "val_states"
+                        )
+                        else 0
+                    ),
+                },
+                "direction": {
+                    "has_data": has_direction,
+                    "store_points": len(
+                        controller.strategic_direction
+                        .points
+                    ),
+                    "train_size": (
+                        len(
+                            direction_bc.train_states
+                        )
+                        if has_direction
+                        and hasattr(
+                            direction_bc,
+                            "train_states",
+                        )
+                        else 0
+                    ),
+                    "val_size": (
+                        len(direction_bc.val_states)
+                        if has_direction
+                        and hasattr(
+                            direction_bc,
+                            "val_states",
+                        )
+                        else 0
+                    ),
+                },
+            }
+            strategic_stats_path = (
+                self.data_dir
+                / "strategic_bc_train_result.json"
+            )
+            with strategic_stats_path.open("w") as f:
+                json.dump(
+                    strategic_bc_stats, f, indent=2
+                )
+            logger.info(
+                "Strategic BC stats saved to %s",
+                strategic_stats_path,
+            )
         self._save_meta(
             "bc",
             None,
             {
                 **bc_stats,
-                "q_store_transitions": len(q_store_balanced),
-                "heuristic_transitions": len(heuristic_limited),
+                "heuristic_transitions": len(
+                    bc_transitions
+                ),
+                "q_store_fraction": float(
+                    self.config.get(
+                        "bc_q_store_fraction", 0.0
+                    )
+                ),
             },
             list(self.eval_meshes),
         )
         logger.info(
-            "BC complete: val_acc=%.4f, transitions=%d "
-            "(Q-store=%d, heuristic=%d)",
+            "BC complete: val_acc=%.4f, "
+            "transitions=%d",
             bc_stats["val_accuracy"],
             bc_stats["total_transitions"],
-            len(q_store_balanced),
-            len(heuristic_limited),
         )
 
     # ══════════════════════════════════════════════════════
@@ -906,39 +1055,129 @@ class RLGoalApproachExperiment:
         sac_model_dir = self._sac_model_dir(self.sac_seed)
 
         # Load Strategic BC into controller's Strategic SAC
+         # ═══ Load Strategic SACs from BC ═══
         strategic_bc_dir = str(
             self.runs_dir / "strategic_bc_model"
         )
-        if (
-            Path(strategic_bc_dir) / "strategic_actor.pt"
-        ).exists():
-            from tbp.hybrid_rl.strategic_sac import StrategicSAC
 
-            strategic_sac = StrategicSAC(state_dim=6)
-            strategic_sac.actor.load_state_dict(
+        strategic_detach_sac = None
+        strategic_direction_sac = None
+
+        # Detach SAC
+        detach_actor_path = (
+            Path(strategic_bc_dir)
+            / "strategic_detach_actor.pt"
+        )
+        if detach_actor_path.exists():
+            strategic_detach_sac = StrategicSAC(
+                state_dim=5
+            )
+            strategic_detach_sac.actor.load_state_dict(
                 torch.load(
-                    Path(strategic_bc_dir) / "strategic_actor.pt",
+                    detach_actor_path,
                     weights_only=True,
                 )
             )
             norm = np.load(
                 Path(strategic_bc_dir)
-                / "strategic_normalization.npz"
+                / "strategic_detach_norm.npz"
             )
-            strategic_sac._state_mean = norm["state_mean"]
-            strategic_sac._state_std = norm["state_std"]
-            strategic_sac._norm_frozen = True
+            strategic_detach_sac._state_mean = (
+                norm["state_mean"]
+            )
+            strategic_detach_sac._state_std = (
+                norm["state_std"]
+            )
+            strategic_detach_sac._norm_frozen = True
+
+            # Warm start buffer from Q-store
+            for seed in self.train_seeds:
+                q_dir = self._q_model_dir(seed)
+                if (
+                    Path(q_dir) / "config.json"
+                ).exists():
+                    q_ctrl = (
+                        RLGoalApproachController.load(
+                            q_dir,
+                            agent_id="strat_loader",
+                            config={
+                                **self.rl_config,
+                                "mode": "eval",
+                            },
+                        )
+                    )
+                    strategic_detach_sac.warm_start_from_q_store(
+                        q_ctrl.strategic_detach
+                    )
+                    break
 
             logger.info(
-                "Strategic SAC loaded with BC warm start from %s",
-                strategic_bc_dir,
+                "Strategic Detach SAC loaded "
+                "(buf=%d)",
+                strategic_detach_sac.buffer_size,
             )
-        else:
-            strategic_sac = None
+
+        # Direction SAC
+        direction_actor_path = (
+            Path(strategic_bc_dir)
+            / "strategic_direction_actor.pt"
+        )
+        if direction_actor_path.exists():
+            strategic_direction_sac = StrategicSAC(
+                state_dim=5
+            )
+            strategic_direction_sac.actor.load_state_dict(
+                torch.load(
+                    direction_actor_path,
+                    weights_only=True,
+                )
+            )
+            norm = np.load(
+                Path(strategic_bc_dir)
+                / "strategic_direction_norm.npz"
+            )
+            strategic_direction_sac._state_mean = (
+                norm["state_mean"]
+            )
+            strategic_direction_sac._state_std = (
+                norm["state_std"]
+            )
+            strategic_direction_sac._norm_frozen = True
+
+            # Warm start buffer
+            for seed in self.train_seeds:
+                q_dir = self._q_model_dir(seed)
+                if (
+                    Path(q_dir) / "config.json"
+                ).exists():
+                    q_ctrl = (
+                        RLGoalApproachController.load(
+                            q_dir,
+                            agent_id="strat_loader2",
+                            config={
+                                **self.rl_config,
+                                "mode": "eval",
+                            },
+                        )
+                    )
+                    strategic_direction_sac.warm_start_from_q_store(
+                        q_ctrl.strategic_direction
+                    )
+                    break
+
             logger.info(
-                "No Strategic BC model found, "
-                "Strategic SAC will start without warm start"
+                "Strategic Direction SAC loaded "
+                "(buf=%d)",
+                strategic_direction_sac.buffer_size,
             )
+
+        # Pass to trainer
+        trainer.load_strategic(
+            strategic_detach_sac=strategic_detach_sac,
+            strategic_direction_sac=(
+                strategic_direction_sac
+            ),
+        )
 
         for mesh_name in self.sac_meshes:
             mesh_path = str(
@@ -1037,7 +1276,7 @@ class RLGoalApproachExperiment:
             ExperienceExtractor.get_type_names()
         )
         sac_trainer = PSACTrainer(
-            state_dim=self.rl_config.get("state_dim", 15),
+            state_dim=self.rl_config.get("state_dim", 18),
             num_types=num_types,
         )
         sac_trainer.load(
@@ -1190,19 +1429,74 @@ class RLGoalApproachExperiment:
                             )
                         )
 
-                        state_t = torch.FloatTensor(
-                            state.astype(np.float32)
-                        ).unsqueeze(0)
-                        with torch.no_grad():
-                            at, ap, _, _ = (
-                                sac_trainer.actor
-                                .sample_eval(state_t)
+                        pose = env.get_pose()
+                        sensor = env.get_sensor_data()
+                        state_raw = controller._compute_state(
+                            pose, sensor
+                        )
+                        state = (
+                            sac_trainer.normalize_state(
+                                state_raw
                             )
-                        atype = at[0].item()
-                        aparams = (
-                            ap[0].numpy()
-                            * sac_trainer.param_std
-                            + sac_trainer.param_mean
+                        )
+
+                        # Strategic override
+                        strategic_type, _ = (
+                            sac_trainer._strategic_detach_check(
+                                state_raw, controller, sensor
+                            )
+                        )
+
+                        if strategic_type is not None:
+                            atype = strategic_type
+                            aparams = np.zeros(
+                                3, dtype=np.float32
+                            )
+                        else:
+                            dir_phase = (
+                                sac_trainer
+                                ._strategic_direction_check(
+                                    state_raw, controller,
+                                    sensor, pose,
+                                )
+                            )
+                            if dir_phase is not None:
+                                controller._current_phase = (
+                                    dir_phase
+                                )
+
+                            state_t = torch.FloatTensor(
+                                state.astype(np.float32)
+                            ).unsqueeze(0)
+                            with torch.no_grad():
+                                at, ap, _, _ = (
+                                    sac_trainer.actor
+                                    .sample_eval(state_t)
+                                )
+                            atype = at[0].item()
+                            aparams = (
+                                ap[0].numpy()
+                                * sac_trainer.param_std
+                                + sac_trainer.param_mean
+                            )
+
+                        action_counts[atype] = (
+                            action_counts.get(atype, 0) + 1
+                        )
+                        total_steps += 1
+
+                        sensor = interpreter.execute(
+                            atype, aparams
+                        )
+                        pose = env.get_pose()
+
+                        # Update controller tracking
+                        next_raw = controller._compute_state(
+                            pose, sensor
+                        )
+                        sac_trainer._update_controller_tracking(
+                            controller, next_raw, sensor,
+                            pose, atype,
                         )
 
                         action_counts[atype] = (
@@ -1462,6 +1756,18 @@ class RLGoalApproachExperiment:
             mesh_path=mesh_path,
         )
         manager.sac_trainer = sac_trainer
+        # ═══ NEW: pass strategic SACs to arbitrator ═══
+        if sac_trainer.strategic_detach_sac is not None:
+            manager.arbitrator._sac_strategic_detach = (
+                sac_trainer.strategic_detach_sac
+            )
+        if (
+            sac_trainer.strategic_direction_sac
+            is not None
+        ):
+            manager.arbitrator._sac_strategic_direction = (
+                sac_trainer.strategic_direction_sac
+            )
 
         # Metrics tracking
         episode_log: list[dict[str, Any]] = []
@@ -2217,7 +2523,7 @@ class RLGoalApproachExperiment:
     @staticmethod
     def _filter_bc_transitions(
         transitions: list[Any],
-        target_per_group: int = 3000,
+        target_per_group: int = 15000,
         min_samples_to_keep: int = 50,
     ) -> list[Any]:
         """Filter and balance BC transitions by mesh and level.
