@@ -456,6 +456,16 @@ class RLGoalApproachController:
         else:
             goal_normal_local = np.zeros(3)
 
+        # Path blocked
+        path_blocked_val = float(
+            sensor_data.get("path_blocked", False)
+        )
+
+        # Movement efficiency
+        movement_efficiency = (
+            self._compute_movement_efficiency(window=20)
+        )
+
         state = np.concatenate(
             [
                 local_pos_error,      # [0:3]   3D
@@ -468,6 +478,8 @@ class RLGoalApproachController:
                 [distance],           # [13]    1D
                 [norm_depth],         # [14]    1D
                 goal_normal_local,    # [15:18] 3D
+                [path_blocked_val],   # [18]    1D NEW
+                [movement_efficiency],# [19]    1D NEW
             ]
         )
 
@@ -4359,7 +4371,7 @@ class RLGoalApproachController:
             self._global_action_counts.get(a, 0) for a in air_actions
         )
         total_nav_steps = max(surface_steps + air_steps, 1)
-
+        
         stats = {
             "total_episodes": self._total_episodes,
             "total_steps": self._total_steps,
@@ -4603,6 +4615,52 @@ class RLGoalApproachController:
 
         if self.strategic_sac is not None:
             stats["strategic_sac"] = self.strategic_sac.get_stats()
+            
+        # Action source summary: strategic vs tactical
+        strategic_actions = (
+            self._strategic_stats[
+                "detach_memory_triggered"
+            ]
+            + self._strategic_stats[
+                "direction_memory_to_goal"
+            ]
+            + self._strategic_stats[
+                "direction_memory_keep_edge"
+            ]
+        )
+        tactical_actions = max(
+            self._total_steps - strategic_actions, 0
+        )
+        total_decisions = max(
+            strategic_actions + tactical_actions, 1
+        )
+        stats["action_source_summary"] = {
+            "strategic_total": strategic_actions,
+            "strategic_detach": self._strategic_stats[
+                "detach_memory_triggered"
+            ],
+            "strategic_direction": (
+                self._strategic_stats[
+                    "direction_memory_to_goal"
+                ]
+                + self._strategic_stats[
+                    "direction_memory_keep_edge"
+                ]
+            ),
+            "tactical_total": tactical_actions,
+            "strategic_rate": round(
+                strategic_actions / total_decisions,
+                4,
+            ),
+            "heuristic_fallback_total": (
+                self._strategic_stats[
+                    "detach_heuristic_fallback"
+                ]
+                + self._strategic_stats[
+                    "direction_heuristic_fallback"
+                ]
+            ),
+        }
 
         return stats
 

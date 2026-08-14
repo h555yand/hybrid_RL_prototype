@@ -9,12 +9,12 @@ experiment:
     seed: 42
     visualise: false
     regenerate_scripts: true
-    do_train: false
-    do_eval: false
+    do_train: true
+    do_eval: true
     do_heur_eval: false
     do_bc_train: false
     do_sac_train: false
-    do_sac_eval: true
+    do_sac_eval: false
     do_adaptive: false
 
     train_seeds: [11]
@@ -32,18 +32,19 @@ experiment:
 
     training_stages:
       - mesh: mug
-        episodes: 3000
+        episodes: 1000
         epsilon_start: 1.0
         epsilon_min: 0.3
         load_mode: null
 
     eval_meshes: [mug]
-    eval_episodes_per_level: 1000
+    eval_episodes_per_level: 100
     # BC data composition
     bc_q_store_fraction: 0.0    # 0.0 = only heuristic, 0.2 = 20% Q-store
     bc_target_per_group: 30000
 
     rl_config:
+      state_dim: 20
       mode: train_adapt_epsilon
       goal_threshold: 4.0
       max_points: 500000
@@ -98,6 +99,7 @@ experiment:
       max_steps_per_goal: 500
       eval_interval: 500
       eval_episodes: 50
+      use_strategic_override: false
 
     sac_meshes: [mug]
     sac_episodes_per_mesh:

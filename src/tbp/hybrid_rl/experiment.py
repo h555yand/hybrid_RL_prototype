@@ -788,7 +788,7 @@ class RLGoalApproachExperiment:
             ExperienceExtractor.get_type_names()
         )
         trainer = BCTrainer(
-            state_dim=self.rl_config.get("state_dim", 15),
+            state_dim=self.rl_config.get("state_dim", 20),
             num_types=num_types,
         )
         trainer.train(
@@ -1015,7 +1015,7 @@ class RLGoalApproachExperiment:
             if k != "load_mode"
         }
         trainer = PSACTrainer(
-            state_dim=self.rl_config.get("state_dim", 15),
+            state_dim=self.rl_config.get("state_dim", 20),
             num_types=num_types,
             **sac_cfg,
         )
@@ -1027,10 +1027,19 @@ class RLGoalApproachExperiment:
 
         if load_dir:
             trainer.load(load_dir)
-            bc_path = self.data_dir / "bc_data.pkl"
+            bc_combined_path = (
+                self.data_dir
+                / "bc_data_combined.pkl"
+            )
+            bc_path = (
+                bc_combined_path
+                if bc_combined_path.exists()
+                else self.data_dir / "bc_data.pkl"
+            )
             if bc_path.exists():
                 with bc_path.open("rb") as f:
-                    bc_data = pickle.load(f)  # noqa: S301
+                    bc_data = pickle.load(f)
+                
                 bc_norm = (
                     trainer._normalize_bc_transitions(  # noqa: SLF001
                         bc_data
@@ -1043,141 +1052,155 @@ class RLGoalApproachExperiment:
                 load_dir,
             )
         else:
+            # Use combined BC data (heuristic + optional Q-store)
+            bc_combined_path = (
+                self.data_dir / "bc_data_combined.pkl"
+            )
+            bc_data_path = (
+                str(bc_combined_path)
+                if bc_combined_path.exists()
+                else str(
+                    self.data_dir / "bc_data.pkl"
+                )
+            )
             trainer.load_bc(
                 bc_model_dir=str(
                     self.runs_dir / "bc_model"
                 ),
-                bc_data_path=str(
-                    self.data_dir / "bc_data.pkl"
-                ),
+                bc_data_path=bc_data_path,
             )
-
+            
         sac_model_dir = self._sac_model_dir(self.sac_seed)
 
-        # Load Strategic BC into controller's Strategic SAC
-         # ═══ Load Strategic SACs from BC ═══
-        strategic_bc_dir = str(
-            self.runs_dir / "strategic_bc_model"
+        # ═══ Load Strategic SACs (only if enabled) ═══
+        use_strategic = self.sac_config.get(
+            "use_strategic_override", False
         )
-
-        strategic_detach_sac = None
-        strategic_direction_sac = None
-
-        # Detach SAC
-        detach_actor_path = (
-            Path(strategic_bc_dir)
-            / "strategic_detach_actor.pt"
-        )
-        if detach_actor_path.exists():
-            strategic_detach_sac = StrategicSAC(
-                state_dim=5
+        if use_strategic:
+            # Load Strategic BC into controller's Strategic SAC
+            # ═══ Load Strategic SACs from BC ═══
+            strategic_bc_dir = str(
+                self.runs_dir / "strategic_bc_model"
             )
-            strategic_detach_sac.actor.load_state_dict(
-                torch.load(
-                    detach_actor_path,
-                    weights_only=True,
-                )
-            )
-            norm = np.load(
+
+            strategic_detach_sac = None
+            strategic_direction_sac = None
+
+            # Detach SAC
+            detach_actor_path = (
                 Path(strategic_bc_dir)
-                / "strategic_detach_norm.npz"
+                / "strategic_detach_actor.pt"
             )
-            strategic_detach_sac._state_mean = (
-                norm["state_mean"]
-            )
-            strategic_detach_sac._state_std = (
-                norm["state_std"]
-            )
-            strategic_detach_sac._norm_frozen = True
-
-            # Warm start buffer from Q-store
-            for seed in self.train_seeds:
-                q_dir = self._q_model_dir(seed)
-                if (
-                    Path(q_dir) / "config.json"
-                ).exists():
-                    q_ctrl = (
-                        RLGoalApproachController.load(
-                            q_dir,
-                            agent_id="strat_loader",
-                            config={
-                                **self.rl_config,
-                                "mode": "eval",
-                            },
-                        )
-                    )
-                    strategic_detach_sac.warm_start_from_q_store(
-                        q_ctrl.strategic_detach
-                    )
-                    break
-
-            logger.info(
-                "Strategic Detach SAC loaded "
-                "(buf=%d)",
-                strategic_detach_sac.buffer_size,
-            )
-
-        # Direction SAC
-        direction_actor_path = (
-            Path(strategic_bc_dir)
-            / "strategic_direction_actor.pt"
-        )
-        if direction_actor_path.exists():
-            strategic_direction_sac = StrategicSAC(
-                state_dim=5
-            )
-            strategic_direction_sac.actor.load_state_dict(
-                torch.load(
-                    direction_actor_path,
-                    weights_only=True,
+            if detach_actor_path.exists():
+                strategic_detach_sac = StrategicSAC(
+                    state_dim=5
                 )
-            )
-            norm = np.load(
-                Path(strategic_bc_dir)
-                / "strategic_direction_norm.npz"
-            )
-            strategic_direction_sac._state_mean = (
-                norm["state_mean"]
-            )
-            strategic_direction_sac._state_std = (
-                norm["state_std"]
-            )
-            strategic_direction_sac._norm_frozen = True
+                strategic_detach_sac.actor.load_state_dict(
+                    torch.load(
+                        detach_actor_path,
+                        weights_only=True,
+                    )
+                )
+                norm = np.load(
+                    Path(strategic_bc_dir)
+                    / "strategic_detach_norm.npz"
+                )
+                strategic_detach_sac._state_mean = (
+                    norm["state_mean"]
+                )
+                strategic_detach_sac._state_std = (
+                    norm["state_std"]
+                )
+                strategic_detach_sac._norm_frozen = True
 
-            # Warm start buffer
-            for seed in self.train_seeds:
-                q_dir = self._q_model_dir(seed)
-                if (
-                    Path(q_dir) / "config.json"
-                ).exists():
-                    q_ctrl = (
-                        RLGoalApproachController.load(
-                            q_dir,
-                            agent_id="strat_loader2",
-                            config={
-                                **self.rl_config,
-                                "mode": "eval",
-                            },
+                # Warm start buffer from Q-store
+                for seed in self.train_seeds:
+                    q_dir = self._q_model_dir(seed)
+                    if (
+                        Path(q_dir) / "config.json"
+                    ).exists():
+                        q_ctrl = (
+                            RLGoalApproachController.load(
+                                q_dir,
+                                agent_id="strat_loader",
+                                config={
+                                    **self.rl_config,
+                                    "mode": "eval",
+                                },
+                            )
                         )
-                    )
-                    strategic_direction_sac.warm_start_from_q_store(
-                        q_ctrl.strategic_direction
-                    )
-                    break
+                        strategic_detach_sac.warm_start_from_q_store(
+                            q_ctrl.strategic_detach
+                        )
+                        break
 
-            logger.info(
-                "Strategic Direction SAC loaded "
-                "(buf=%d)",
-                strategic_direction_sac.buffer_size,
+                logger.info(
+                    "Strategic Detach SAC loaded "
+                    "(buf=%d)",
+                    strategic_detach_sac.buffer_size,
+                )
+
+            # Direction SAC
+            direction_actor_path = (
+                Path(strategic_bc_dir)
+                / "strategic_direction_actor.pt"
             )
+            if direction_actor_path.exists():
+                strategic_direction_sac = StrategicSAC(
+                    state_dim=5
+                )
+                strategic_direction_sac.actor.load_state_dict(
+                    torch.load(
+                        direction_actor_path,
+                        weights_only=True,
+                    )
+                )
+                norm = np.load(
+                    Path(strategic_bc_dir)
+                    / "strategic_direction_norm.npz"
+                )
+                strategic_direction_sac._state_mean = (
+                    norm["state_mean"]
+                )
+                strategic_direction_sac._state_std = (
+                    norm["state_std"]
+                )
+                strategic_direction_sac._norm_frozen = True
 
-        # Pass to trainer
-        trainer.load_strategic(
-            strategic_detach_sac=strategic_detach_sac,
-            strategic_direction_sac=(
-                strategic_direction_sac
-            ),
-        )
+                # Warm start buffer
+                for seed in self.train_seeds:
+                    q_dir = self._q_model_dir(seed)
+                    if (
+                        Path(q_dir) / "config.json"
+                    ).exists():
+                        q_ctrl = (
+                            RLGoalApproachController.load(
+                                q_dir,
+                                agent_id="strat_loader2",
+                                config={
+                                    **self.rl_config,
+                                    "mode": "eval",
+                                },
+                            )
+                        )
+                        strategic_direction_sac.warm_start_from_q_store(
+                            q_ctrl.strategic_direction
+                        )
+                        break
+
+                logger.info(
+                    "Strategic Direction SAC loaded "
+                    "(buf=%d)",
+                    strategic_direction_sac.buffer_size,
+                )
+
+            # Pass to trainer
+            trainer.load_strategic(
+                strategic_detach_sac=strategic_detach_sac,
+                strategic_direction_sac=(
+                    strategic_direction_sac
+                ),
+            )
 
         for mesh_name in self.sac_meshes:
             mesh_path = str(
@@ -1276,7 +1299,7 @@ class RLGoalApproachExperiment:
             ExperienceExtractor.get_type_names()
         )
         sac_trainer = PSACTrainer(
-            state_dim=self.rl_config.get("state_dim", 18),
+            state_dim=self.rl_config.get("state_dim", 20),
             num_types=num_types,
         )
         sac_trainer.load(
@@ -1420,8 +1443,10 @@ class RLGoalApproachExperiment:
                     ):
                         pose = env.get_pose()
                         sensor = env.get_sensor_data()
-                        state_raw = controller._compute_state(  # noqa: SLF001
-                            pose, sensor
+                        state_raw = (
+                            controller._compute_state(
+                                pose, sensor
+                            )
                         )
                         state = (
                             sac_trainer.normalize_state(
@@ -1429,86 +1454,168 @@ class RLGoalApproachExperiment:
                             )
                         )
 
-                        pose = env.get_pose()
-                        sensor = env.get_sensor_data()
-                        state_raw = controller._compute_state(
-                            pose, sensor
-                        )
-                        state = (
-                            sac_trainer.normalize_state(
-                                state_raw
+                        # Strategic override (if enabled)
+                        strategic_type = None
+                        if (
+                            sac_trainer
+                            .use_strategic_override
+                        ):
+                            strategic_type, _ = (
+                                sac_trainer
+                                ._strategic_detach_check(
+                                    state_raw,
+                                    controller,
+                                    sensor,
+                                )
                             )
-                        )
 
-                        # Strategic override
-                        strategic_type, _ = (
-                            sac_trainer._strategic_detach_check(
-                                state_raw, controller, sensor
-                            )
-                        )
-
-                        if strategic_type is not None:
+                        if (
+                            strategic_type
+                            is not None
+                        ):
                             atype = strategic_type
                             aparams = np.zeros(
-                                3, dtype=np.float32
+                                3,
+                                dtype=np.float32,
                             )
                         else:
-                            dir_phase = (
+                            if (
                                 sac_trainer
-                                ._strategic_direction_check(
-                                    state_raw, controller,
-                                    sensor, pose,
+                                .use_strategic_override
+                            ):
+                                dir_phase = (
+                                    sac_trainer
+                                    ._strategic_direction_check(
+                                        state_raw,
+                                        controller,
+                                        sensor,
+                                        pose,
+                                    )
                                 )
-                            )
-                            if dir_phase is not None:
-                                controller._current_phase = (
+                                if (
                                     dir_phase
-                                )
+                                    is not None
+                                ):
+                                    controller._current_phase = (
+                                        dir_phase
+                                    )
 
-                            state_t = torch.FloatTensor(
-                                state.astype(np.float32)
-                            ).unsqueeze(0)
+                            state_t = (
+                                torch.FloatTensor(
+                                    state.astype(
+                                        np.float32
+                                    )
+                                ).unsqueeze(0)
+                            )
                             with torch.no_grad():
                                 at, ap, _, _ = (
-                                    sac_trainer.actor
-                                    .sample_eval(state_t)
+                                    sac_trainer
+                                    .actor
+                                    .sample_eval(
+                                        state_t
+                                    )
                                 )
                             atype = at[0].item()
                             aparams = (
                                 ap[0].numpy()
-                                * sac_trainer.param_std
-                                + sac_trainer.param_mean
+                                * sac_trainer
+                                .param_std
+                                + sac_trainer
+                                .param_mean
                             )
 
+                            # Action masks
+                            on_obj = (
+                                state_raw[11] > 0.5
+                            )
+                            if (
+                                atype == 7
+                                and not on_obj
+                            ):
+                                atype = 1
+                                aparams = np.array(
+                                    [
+                                        sac_trainer
+                                        .param_mean[
+                                            0
+                                        ],
+                                        0.0,
+                                        0.0,
+                                    ],
+                                    dtype=(
+                                        np.float32
+                                    ),
+                                )
+                            if (
+                                atype == 7
+                                and state_raw[13]
+                                < 9.0
+                            ):
+                                atype = 0
+                                aparams = np.array(
+                                    [
+                                        0.0,
+                                        sac_trainer
+                                        .param_mean[
+                                            1
+                                        ],
+                                        0.0,
+                                    ],
+                                    dtype=(
+                                        np.float32
+                                    ),
+                                )
+                            if (
+                                atype == 7
+                                and controller
+                                ._consecutive_detach_count
+                                >= 3
+                            ):
+                                atype = 0
+                                aparams = np.array(
+                                    [
+                                        0.0,
+                                        sac_trainer
+                                        .param_mean[
+                                            1
+                                        ],
+                                        0.0,
+                                    ],
+                                    dtype=(
+                                        np.float32
+                                    ),
+                                )
+
                         action_counts[atype] = (
-                            action_counts.get(atype, 0) + 1
-                        )
-                        total_steps += 1
-
-                        sensor = interpreter.execute(
-                            atype, aparams
-                        )
-                        pose = env.get_pose()
-
-                        # Update controller tracking
-                        next_raw = controller._compute_state(
-                            pose, sensor
-                        )
-                        sac_trainer._update_controller_tracking(
-                            controller, next_raw, sensor,
-                            pose, atype,
-                        )
-
-                        action_counts[atype] = (
-                            action_counts.get(atype, 0)
+                            action_counts.get(
+                                atype, 0
+                            )
                             + 1
                         )
                         total_steps += 1
 
-                        sensor = interpreter.execute(
-                            atype, aparams
+                        sensor = (
+                            interpreter.execute(
+                                atype, aparams
+                            )
                         )
                         pose = env.get_pose()
+
+                        # Update tracking
+                        next_raw = (
+                            controller
+                            ._compute_state(
+                                pose, sensor
+                            )
+                        )
+                        sac_trainer._update_controller_tracking(
+                            controller,
+                            next_raw,
+                            sensor,
+                            pose,
+                            atype,
+                        )
+
                         dist = float(
                             np.linalg.norm(
                                 goal_pose[:3]
@@ -1518,7 +1625,8 @@ class RLGoalApproachExperiment:
 
                         if (
                             dist
-                            < sac_trainer.goal_threshold
+                            < sac_trainer
+                            .goal_threshold
                         ):
                             success = True
                             break
@@ -1531,7 +1639,9 @@ class RLGoalApproachExperiment:
                             < _COLLISION_DEPTH_THRESHOLD
                         ):
                             collision = True
-                            collision_counts[atype] = (
+                            collision_counts[
+                                atype
+                            ] = (
                                 collision_counts.get(
                                     atype, 0
                                 )
@@ -1663,7 +1773,7 @@ class RLGoalApproachExperiment:
             / f"adaptive_sac_seed_{self.sac_seed}"
         )
         sac_trainer = PSACTrainer(
-            state_dim=self.rl_config.get("state_dim", 15),
+            state_dim=self.rl_config.get("state_dim", 20),
             num_types=num_types,
         )
         if (
@@ -1684,69 +1794,16 @@ class RLGoalApproachExperiment:
             )
 
         # Load or create Strategic SAC
-        strategic_bc_dir = str(
-            self.runs_dir / "strategic_bc_model"
-        )
-        adaptive_strategic_dir = str(
-            self.runs_dir
-            / f"adaptive_strategic_sac_seed_{adapt_seed}"
-        )
-
-        if (
-            Path(adaptive_strategic_dir)
-            / "strategic_actor.pt"
-        ).exists():
-            controller.strategic_sac = StrategicSAC.load(
-                adaptive_strategic_dir
-            )
-            logger.info(
-                "Strategic SAC loaded from adaptive: %s",
-                adaptive_strategic_dir,
-            )
-        elif (
-            Path(strategic_bc_dir) / "strategic_actor.pt"
-        ).exists():
-            from tbp.hybrid_rl.strategic_sac import StrategicSAC
-
-            controller.strategic_sac = StrategicSAC(state_dim=6)
-            controller.strategic_sac.actor.load_state_dict(
-                torch.load(
-                    Path(strategic_bc_dir) / "strategic_actor.pt",
-                    weights_only=True,
-                )
-            )
-            norm = np.load(
-                Path(strategic_bc_dir)
-                / "strategic_normalization.npz"
-            )
-            controller.strategic_sac._state_mean = norm["state_mean"]
-            controller.strategic_sac._state_std = norm["state_std"]
-            controller.strategic_sac._norm_frozen = True
-
-            # Warm start buffer from TransitionMemory
-            controller.strategic_sac.warm_start_from_transition_memory(
-                controller.strategic_detach,
-                controller.strategic_direction,
-            )
-            if (
-                controller.strategic_sac.buffer_size
-                >= controller.strategic_sac.batch_size
-            ):
-                controller.strategic_sac.update(num_steps=50)
-
-            logger.info(
-                "Strategic SAC created with BC warm start"
-            )
-        else:
-            controller.strategic_sac = StrategicSAC(state_dim=6)
-            controller.strategic_sac.warm_start_from_transition_memory(
-                controller.strategic_detach,
-                controller.strategic_direction,
-            )
-            logger.info(
-                "Strategic SAC created without BC "
-                "(warm start from TransitionMemory only)"
-            )
+        # ═══ Strategic SAC for adaptive ═══
+        # Controller already has strategic_detach and
+        # strategic_direction Q-stores loaded from
+        # Q-store checkpoint. These are used by
+        # controller._choose_action() for strategic
+        # decisions.
+        #
+        # Old controller.strategic_sac (6D) is NOT used.
+        # It was replaced by two separate 5D Q-stores.
+        controller.strategic_sac = None
 
         manager = AdaptiveTrainingManager(
             controller=controller,
@@ -1756,6 +1813,7 @@ class RLGoalApproachExperiment:
             mesh_path=mesh_path,
         )
         manager.sac_trainer = sac_trainer
+
         # ═══ NEW: pass strategic SACs to arbitrator ═══
         if sac_trainer.strategic_detach_sac is not None:
             manager.arbitrator._sac_strategic_detach = (
@@ -2482,16 +2540,6 @@ class RLGoalApproachExperiment:
             "Adaptive results saved to %s", results_path
         )
 
-        # Save Strategic SAC
-        if controller.strategic_sac is not None:
-            controller.strategic_sac.save(
-                adaptive_strategic_dir
-            )
-            logger.info(
-                "Adaptive Strategic SAC saved to %s",
-                adaptive_strategic_dir,
-            )
-        
         # Save meta
         self._save_meta(
             f"adaptive_{self.adaptive_mesh}",

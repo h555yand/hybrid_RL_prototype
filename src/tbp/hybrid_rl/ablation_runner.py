@@ -158,6 +158,9 @@ def run_eval_per_seed(  # noqa: PLR0913
                         "strategic", {}
                     ),
                 },
+                 "action_source": stats.get(
+                    "action_source_summary", {}
+                ),
             }
         seed_key = f"train_{train_seed}_eval_{eval_seed}"
         results_per_seed[seed_key] = seed_results

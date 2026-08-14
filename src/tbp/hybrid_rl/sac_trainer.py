@@ -147,6 +147,13 @@ class PSACTrainer:
         self._mesh_stats: dict[str, dict[str, Any]] = {}
         self._current_mesh: str = ""
 
+        # Strategic override option
+        self.use_strategic_override = bool(
+            kwargs.get(
+                "use_strategic_override", False
+            )
+        )
+
         # Strategic SAC (two-level architecture)
         self.strategic_detach_sac: StrategicSAC | None = (
             None
@@ -779,13 +786,16 @@ class PSACTrainer:
                     state_raw
                 )
 
-                # ═══ NEW: strategic override ═══
-                strategic_type, _ = (
-                    self._strategic_detach_check(
-                        state_raw, controller,
-                        sensor_data,
+                # Strategic override (optional)
+                strategic_type = None
+
+                if self.use_strategic_override:
+                    strategic_type, _ = (
+                        self._strategic_detach_check(
+                            state_raw, controller,
+                            sensor_data,
+                        )
                     )
-                )
 
                 if strategic_type is not None:
                     action_type = strategic_type
@@ -793,18 +803,21 @@ class PSACTrainer:
                         3, dtype=np.float32
                     )
                 else:
-                    dir_phase = (
-                        self
-                        ._strategic_direction_check(
-                            state_raw, controller,
-                            sensor_data,
-                            current_pose,
+                    if self.use_strategic_override:
+                        dir_phase = (
+                            self
+                            ._strategic_direction_check(
+                                state_raw,
+                                controller,
+                                sensor_data,
+                                current_pose,
+                            )
                         )
-                    )
-                    if dir_phase is not None:
-                        controller._current_phase = (
-                            dir_phase
-                        )
+                        if dir_phase is not None:
+                            controller \
+                                ._current_phase = (
+                                    dir_phase
+                                )
 
                     state_t = torch.FloatTensor(
                         state
@@ -822,6 +835,46 @@ class PSACTrainer:
                         + self.param_mean
                     )
 
+                    # ═══ Action masks ═══
+                    on_object = state_raw[11] > 0.5
+
+                    if (
+                        action_type == 7
+                        and not on_object
+                    ):
+                        action_type = 1
+                        action_params = np.array(
+                            [self.param_mean[0],
+                             0.0, 0.0],
+                            dtype=np.float32,
+                        )
+
+                    if (
+                        action_type == 7
+                        and state_raw[13] < 9.0
+                    ):
+                        action_type = 0
+                        action_params = np.array(
+                            [0.0,
+                             self.param_mean[1],
+                             0.0],
+                            dtype=np.float32,
+                        )
+
+                    if (
+                        action_type == 7
+                        and controller
+                        ._consecutive_detach_count
+                        >= 3
+                    ):
+                        action_type = 0
+                        action_params = np.array(
+                            [0.0,
+                             self.param_mean[1],
+                             0.0],
+                            dtype=np.float32,
+                        )
+                        
                 sensor_data = interpreter.execute(
                     action_type, action_params
                 )
@@ -1158,18 +1211,24 @@ class PSACTrainer:
             action_explanations: list[str] = []
 
             # ═══ NEW: per-episode strategic tracking ═══
+            # Per-episode tracking
             ep_had_strategic_detach = False
+            ep_detach_states: list[np.ndarray] = []
 
             for step in range(self.max_steps_per_goal):
                 self.total_steps += 1
 
-                # ═══ NEW: strategic override ═══
-                strategic_type, strategic_source = (
-                    self._strategic_detach_check(
-                        state_raw, controller,
-                        sensor_data,
+                # ═══ Strategic override (optional) ═══
+                strategic_type = None
+                strategic_source = None
+
+                if self.use_strategic_override:
+                    strategic_type, strategic_source = (
+                        self._strategic_detach_check(
+                            state_raw, controller,
+                            sensor_data,
+                        )
                     )
-                )
 
                 if strategic_type is not None:
                     action_type = strategic_type
@@ -1178,19 +1237,46 @@ class PSACTrainer:
                     )
                     ep_had_strategic_detach = True
                     strategic_detach_count += 1
+
+                    # Save detach state for
+                    # retrospective update
+                    if (
+                        self.strategic_detach_sac
+                        is not None
+                    ):
+                        detach_t_state = (
+                            controller
+                            ._compute_detach_transition_state(
+                                state_raw,
+                                sensor_data,
+                                movement_efficiency=(
+                                    controller
+                                    ._compute_movement_efficiency(
+                                        window=20
+                                    )
+                                ),
+                            )
+                        )
+                        ep_detach_states.append(
+                            detach_t_state.copy()
+                        )
                 else:
-                    # Direction override
-                    dir_phase = (
-                        self._strategic_direction_check(
-                            state_raw, controller,
-                            sensor_data, current_pose,
+                    # Direction override (optional)
+                    if self.use_strategic_override:
+                        dir_phase = (
+                            self
+                            ._strategic_direction_check(
+                                state_raw,
+                                controller,
+                                sensor_data,
+                                current_pose,
+                            )
                         )
-                    )
-                    if dir_phase is not None:
-                        controller._current_phase = (
-                            dir_phase
-                        )
-                        strategic_direction_count += 1
+                        if dir_phase is not None:
+                            controller._current_phase = (
+                                dir_phase
+                            )
+                            strategic_direction_count += 1
 
                     # Tactical SAC
                     state_t = torch.FloatTensor(
@@ -1206,8 +1292,53 @@ class PSACTrainer:
                         + self.param_mean
                     )
 
+                    # ═══ Action masks ═══
+                    on_object = state_raw[11] > 0.5
+
+                    # No detach in air
+                    if (
+                        action_type == 7
+                        and not on_object
+                    ):
+                        action_type = 1
+                        action_params = np.array(
+                            [self.param_mean[0],
+                             0.0, 0.0],
+                            dtype=np.float32,
+                        )
+
+                    # No detach near goal
+                    if (
+                        action_type == 7
+                        and state_raw[13] < 9.0
+                    ):
+                        action_type = 0
+                        action_params = np.array(
+                            [0.0,
+                             self.param_mean[1],
+                             0.0],
+                            dtype=np.float32,
+                        )
+
+                    # No detach 3x in a row
+                    if (
+                        action_type == 7
+                        and controller
+                        ._consecutive_detach_count
+                        >= 3
+                    ):
+                        action_type = 0
+                        action_params = np.array(
+                            [0.0,
+                             self.param_mean[1],
+                             0.0],
+                            dtype=np.float32,
+                        )
+
                 # Track action
-                self._action_type_counts[action_type] = (
+                self._action_type_counts[
+                    action_type
+                ] = (
                     self._action_type_counts.get(
                         action_type, 0
                     )
@@ -1226,7 +1357,7 @@ class PSACTrainer:
                     next_state_raw
                 )
 
-                # ═══ NEW: update controller tracking ═══
+                # Update controller tracking
                 self._update_controller_tracking(
                     controller, next_state_raw,
                     sensor_data, current_pose,
@@ -1235,15 +1366,20 @@ class PSACTrainer:
 
                 distance = float(
                     np.linalg.norm(
-                        goal_pose[:3] - current_pose[:3]
+                        goal_pose[:3]
+                        - current_pose[:3]
                     )
                 )
 
                 collision = None
-                depth = sensor_data.get("depth", 100.0)
+                depth = sensor_data.get(
+                    "depth", 100.0
+                )
                 if depth < 0.5:
                     collision = "surface_violation"
-                    self._collision_counts[action_type] = (
+                    self._collision_counts[
+                        action_type
+                    ] = (
                         self._collision_counts.get(
                             action_type, 0
                         )
@@ -1252,19 +1388,22 @@ class PSACTrainer:
 
                 reward, done = self.compute_reward(
                     next_state, state, distance,
-                    prev_distance, collision, step + 1,
+                    prev_distance, collision,
+                    step + 1,
                     sensor_data=sensor_data,
                 )
 
-                # Collect visualization data
+                # Visualization data
                 current_poses.append(
                     current_pose.copy()
                 )
                 type_names = (
-                    ExperienceExtractor.get_type_names()
+                    ExperienceExtractor
+                    .get_type_names()
                 )
                 act_name = type_names.get(
-                    action_type, f"type_{action_type}"
+                    action_type,
+                    f"type_{action_type}",
                 )
                 source_tag = (
                     f"[{strategic_source}]"
@@ -1288,7 +1427,7 @@ class PSACTrainer:
 
                 episode_reward += reward
                 state = next_state
-                state_raw = next_state_raw  # ═══ NEW
+                state_raw = next_state_raw
                 prev_distance = distance
 
                 if (
@@ -1308,9 +1447,14 @@ class PSACTrainer:
                         self._critic_losses.append(
                             critic_loss
                         )
-                        if self.total_steps % 10 == 0:
+                        if (
+                            self.total_steps % 10
+                            == 0
+                        ):
                             sac_loss, _bc_loss = (
-                                self.update_actor(batch)
+                                self.update_actor(
+                                    batch
+                                )
                             )
                             self._actor_losses.append(
                                 sac_loss
@@ -1355,53 +1499,59 @@ class PSACTrainer:
                 )
 
             # ═══ NEW: strategic SAC online update ═══
-            if (
-                ep_had_strategic_detach
-                and self.strategic_detach_sac is not None
-            ):
-                # Collect strategic transition
-                detach_reward = (
-                    1.0 if episode_success
-                    else -0.5 if ep_result == "collision"
-                    else -0.2
-                )
-                # Use last known detach state
-                t_state = (
-                    controller
-                    ._compute_detach_transition_state(
-                        state_raw,
-                        sensor_data,
-                        movement_efficiency=0.5,
+            # ═══ Strategic SAC update (only when enabled) ═══
+            if self.use_strategic_override:
+                # Retrospective detach update
+                if (
+                    ep_detach_states
+                    and self.strategic_detach_sac
+                    is not None
+                ):
+                    detach_reward = (
+                        1.0 if episode_success
+                        else -0.5
+                        if ep_result == "collision"
+                        else -0.2
                     )
-                )
-                self.strategic_detach_sac.add_transition(
-                    t_state, 1.0, detach_reward,
-                    t_state, True,
-                )
+                    for t_state in ep_detach_states:
+                        self.strategic_detach_sac \
+                            .add_transition(
+                                t_state,
+                                1.0,
+                                detach_reward,
+                                t_state,
+                                True,
+                            )
 
-            # Periodic strategic SAC update
-            if (
-                (episode + 1) % 200 == 0
-                and self.strategic_detach_sac is not None
-                and self.strategic_detach_sac.buffer_size
-                >= self.strategic_detach_sac.batch_size
-            ):
-                self.strategic_detach_sac.update(
-                    num_steps=20
-                )
-            if (
-                (episode + 1) % 200 == 0
-                and self.strategic_direction_sac
-                is not None
-                and self.strategic_direction_sac
-                .buffer_size
-                >= self.strategic_direction_sac
-                .batch_size
-            ):
-                self.strategic_direction_sac.update(
-                    num_steps=20
-                )
-
+                # Periodic update
+                if (episode + 1) % 200 == 0:
+                    if (
+                        self.strategic_detach_sac
+                        is not None
+                        and self
+                        .strategic_detach_sac
+                        .buffer_size
+                        >= self
+                        .strategic_detach_sac
+                        .batch_size
+                    ):
+                        self.strategic_detach_sac \
+                            .update(num_steps=20)
+                    if (
+                        self
+                        .strategic_direction_sac
+                        is not None
+                        and self
+                        .strategic_direction_sac
+                        .buffer_size
+                        >= self
+                        .strategic_direction_sac
+                        .batch_size
+                    ):
+                        self \
+                            .strategic_direction_sac \
+                            .update(num_steps=20)
+                        
             rolling_history.append(episode_success)
             if len(rolling_history) >= 50:
                 rolling_rate = (
