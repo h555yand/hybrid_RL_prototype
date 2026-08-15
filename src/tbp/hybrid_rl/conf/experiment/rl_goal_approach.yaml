@@ -11,11 +11,11 @@ experiment:
     regenerate_scripts: true
     do_train: false
     do_eval: false
-    do_heur_eval: true
-    do_bc_train: true
+    do_heur_eval: false
+    do_bc_train: false
     do_sac_train: true
-    do_sac_eval: true
-    do_adaptive: true
+    do_sac_eval: false
+    do_adaptive: false
 
     train_seeds: [11]
     eval_seeds: [44]

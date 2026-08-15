@@ -868,7 +868,7 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
             level = (
                 curriculum.level_idx if curriculum else level_idx
             )
-            if (episode + 1) % _LOG_INTERVAL == 0:
+            if ((episode + 1) % _LOG_INTERVAL == 0) and ((episode + 1) >= 100):
                 visualizer.save_episode(
                     env=env,
                     episode=episode,

@@ -38,6 +38,7 @@ from .twin_critic import TwinCritic
 from .strategic_sac import StrategicSAC
 
 logger = logging.getLogger(__name__)
+_LOG_INTERVAL = 100
 
 
 class PSACTrainer:
@@ -1488,15 +1489,16 @@ class PSACTrainer:
                 ep_result = "collision"
 
             if visualizer:
-                visualizer.save_episode(
-                    env=env,
-                    episode=episode,
-                    level=curr_level,
-                    result=ep_result,
-                    goal_pose=goal_pose,
-                    poses=current_poses,
-                    actions=action_explanations,
-                )
+                if ((episode + 1) % _LOG_INTERVAL == 0) and ((episode + 1) >= 500):
+                    visualizer.save_episode(
+                        env=env,
+                        episode=episode,
+                        level=curr_level,
+                        result=ep_result,
+                        goal_pose=goal_pose,
+                        poses=current_poses,
+                        actions=action_explanations,
+                    )
 
             # ═══ NEW: strategic SAC online update ═══
             # ═══ Strategic SAC update (only when enabled) ═══
