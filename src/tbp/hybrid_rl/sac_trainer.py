@@ -965,45 +965,16 @@ class PSACTrainer:
                     )
 
                     # ═══ Action masks ═══
-                    on_object = state_raw[11] > 0.5
-
-                    if (
-                        action_type == 7
-                        and not on_object
-                    ):
-                        action_type = 1
-                        action_params = np.array(
-                            [self.param_mean[0],
-                             0.0, 0.0],
-                            dtype=np.float32,
+                    action_type, action_params = (
+                        self._apply_action_masks(
+                            action_type,
+                            action_params,
+                            state_raw,
+                            state,
+                            controller,
                         )
+                    )
 
-                    if (
-                        action_type == 7
-                        and state_raw[13] < 9.0
-                    ):
-                        action_type = 0
-                        action_params = np.array(
-                            [0.0,
-                             self.param_mean[1],
-                             0.0],
-                            dtype=np.float32,
-                        )
-
-                    if (
-                        action_type == 7
-                        and controller
-                        ._consecutive_detach_count
-                        >= 3
-                    ):
-                        action_type = 0
-                        action_params = np.array(
-                            [0.0,
-                             self.param_mean[1],
-                             0.0],
-                            dtype=np.float32,
-                        )
-                        
                 sensor_data = interpreter.execute(
                     action_type, action_params
                 )
@@ -1187,7 +1158,107 @@ class PSACTrainer:
             "buffer_size": len(self.buffer),
             "mesh_stats": dict(self._mesh_stats),
         }
+    
+    def _apply_action_masks(
+        self,
+        action_type: int,
+        action_params: np.ndarray,
+        state_raw: np.ndarray,
+        state_normalized: np.ndarray,
+        controller: RLGoalApproachController,
+    ) -> tuple[int, np.ndarray]:
+        """Apply physical action masks and resample
+        if needed.
 
+        Masks:
+        - No detach in air
+        - No detach 3x in a row
+        - No MoveTangentially in air
+        - No MoveLinear on surface
+
+        Args:
+            action_type: SAC action type (0-7).
+            action_params: Action parameters.
+            state_raw: Raw state vector.
+            state_normalized: Normalized state vector.
+            controller: Controller for tracking.
+
+        Returns:
+            (action_type, action_params) — possibly
+            resampled.
+        """
+        on_object = state_raw[11] > 0.5
+
+        need_resample = False
+
+        if action_type == 7 and not on_object:
+            need_resample = True
+
+        if (
+            action_type == 7
+            and controller._consecutive_detach_count
+            >= 3
+        ):
+            need_resample = True
+
+        if action_type == 0 and not on_object:
+            need_resample = True
+
+        if action_type == 1 and on_object:
+            need_resample = True
+
+        if need_resample:
+            state_t = torch.FloatTensor(
+                state_normalized
+            ).unsqueeze(0)
+            with torch.no_grad():
+                logits, param_mus, _ = self.actor(
+                    state_t
+                )
+                if not on_object:
+                    logits[0, 0] = -1e9
+                    logits[0, 7] = -1e9
+                if on_object:
+                    logits[0, 1] = -1e9
+                if (
+                    controller
+                    ._consecutive_detach_count
+                    >= 3
+                ):
+                    logits[0, 7] = -1e9
+
+                masked_probs = torch.softmax(
+                    logits, dim=-1
+                )
+                action_type = int(
+                    torch.multinomial(
+                        masked_probs, 1
+                    ).item()
+                )
+                if action_type in param_mus:
+                    raw_params = (
+                        param_mus[action_type][0]
+                        .numpy()
+                    )
+                    dim = len(raw_params)
+                    action_params = (
+                        raw_params
+                        * self.param_std[:dim]
+                        + self.param_mean[:dim]
+                    )
+                    # Pad to max_params
+                    padded = np.zeros(
+                        3, dtype=np.float32
+                    )
+                    padded[:dim] = action_params
+                    action_params = padded
+                else:
+                    action_params = np.zeros(
+                        3, dtype=np.float32
+                    )
+
+        return action_type, action_params
+    
     def train(  # noqa: PLR0913, C901, PLR0912, PLR0915
         self,
         env: LightweightEnv,
@@ -1240,7 +1311,6 @@ class PSACTrainer:
         effective_episodes = max(
             1, num_episodes - actor_warmup_episodes
         )
-        # Estimate total steps for decay
         estimated_steps_per_episode = (
             self.max_steps_per_goal // 2
         )
@@ -1268,18 +1338,6 @@ class PSACTrainer:
                         estimated_actor_updates, 1
                     )
                 )
-            )
-
-        if (
-            self.bc_lambda_init > self.bc_lambda_min
-            and self.bc_lambda_min > 0
-        ):
-            self.bc_lambda_decay = (
-                (
-                    self.bc_lambda_min
-                    / self.bc_lambda_init
-                )
-                ** (1.0 / max(total_effective_steps, 1))
             )
         else:
             self.bc_lambda_decay = 1.0
@@ -1491,47 +1549,15 @@ class PSACTrainer:
                     )
 
                     # ═══ Action masks ═══
-                    on_object = state_raw[11] > 0.5
-
-                    # No detach in air
-                    if (
-                        action_type == 7
-                        and not on_object
-                    ):
-                        action_type = 1
-                        action_params = np.array(
-                            [self.param_mean[0],
-                             0.0, 0.0],
-                            dtype=np.float32,
+                    action_type, action_params = (
+                        self._apply_action_masks(
+                            action_type,
+                            action_params,
+                            state_raw,
+                            state,
+                            controller,
                         )
-
-                    # No detach near goal
-                    if (
-                        action_type == 7
-                        and state_raw[13] < 9.0
-                    ):
-                        action_type = 0
-                        action_params = np.array(
-                            [0.0,
-                             self.param_mean[1],
-                             0.0],
-                            dtype=np.float32,
-                        )
-
-                    # No detach 3x in a row
-                    if (
-                        action_type == 7
-                        and controller
-                        ._consecutive_detach_count
-                        >= 3
-                    ):
-                        action_type = 0
-                        action_params = np.array(
-                            [0.0,
-                             self.param_mean[1],
-                             0.0],
-                            dtype=np.float32,
-                        )
+                    )
 
                 # Track action
                 self._action_type_counts[

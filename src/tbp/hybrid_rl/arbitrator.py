@@ -221,7 +221,7 @@ class Arbitrator:
         # SAC score: needs actor
         sac_score = 0.0
         if self.sac_actor is not None:
-            sac_score = (0.1 * sac_confidence + 0.9) * sac_track
+            sac_score = (0.15 * sac_confidence + 0.7) * sac_track
 
         # Choose best source, heuristic as fallback only
         if q_score > 0 or sac_score > 0:

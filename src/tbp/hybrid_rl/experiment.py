@@ -295,6 +295,104 @@ class RLGoalApproachExperiment:
             json.dump(meta, f, indent=2)
         logger.info("Meta saved to %s", meta_path)
 
+    @staticmethod
+    def _balance_by_action_type(
+        transitions: list,
+        min_pct: float = 0.01,
+        min_absolute: int = 100,
+    ) -> list:
+        """Ensure minimum representation of each
+        action type.
+
+        Each type gets at least max(min_absolute,
+        total * min_pct) examples.
+        Only oversamples types that already have
+        >= min_absolute examples.
+
+        Args:
+            transitions: BC transitions.
+            min_pct: Minimum fraction of total (0.01=1%).
+            min_absolute: Minimum raw examples to
+                qualify for oversampling.
+
+        Returns:
+            Balanced transitions.
+        """
+        type_names = (
+            ExperienceExtractor.get_type_names()
+        )
+
+        by_type: dict[int, list] = {}
+        for tr in transitions:
+            tid = tr.action_type
+            if tid not in by_type:
+                by_type[tid] = []
+            by_type[tid].append(tr)
+
+        total = len(transitions)
+        min_target = max(
+            min_absolute,
+            int(total * min_pct),
+        )
+
+        logger.info(
+            "Action type balance: total=%d, "
+            "min_target=%d (%.1f%% or %d)",
+            total,
+            min_target,
+            min_pct * 100,
+            min_absolute,
+        )
+        logger.info("  BEFORE:")
+        for tid in sorted(by_type.keys()):
+            name = type_names.get(
+                tid, f"type_{tid}"
+            )
+            logger.info(
+                "    %s: %d (%.2f%%)",
+                name,
+                len(by_type[tid]),
+                100.0 * len(by_type[tid])
+                / max(total, 1),
+            )
+
+        balanced = list(transitions)
+        for tid, trs in by_type.items():
+            name = type_names.get(
+                tid, f"type_{tid}"
+            )
+            if (
+                len(trs) < min_target
+                and len(trs) >= min_absolute
+            ):
+                need = min_target - len(trs)
+                indices = np.random.choice(
+                    len(trs), need, replace=True
+                )
+                extra = [trs[i] for i in indices]
+                balanced.extend(extra)
+                logger.info(
+                    "    %s: oversampled %d → %d",
+                    name,
+                    len(trs),
+                    min_target,
+                )
+            elif len(trs) < min_absolute:
+                logger.info(
+                    "    %s: skipped (%d < %d "
+                    "min_absolute)",
+                    name,
+                    len(trs),
+                    min_absolute,
+                )
+
+        logger.info(
+            "  Action type balance: %d → %d",
+            total,
+            len(balanced),
+        )
+
+        return balanced
     # ══════════════════════════════════════════════════════
     # Context manager
     # ══════════════════════════════════════════════════════
@@ -552,12 +650,6 @@ class RLGoalApproachExperiment:
             json.dump(all_eval_results, f, indent=2)
 
         if all_bc_transitions:
-            all_bc_transitions = (
-                self._filter_bc_transitions(
-                    all_bc_transitions,
-                    target_per_group=self.config.get("bc_target_per_group", 15000),
-                )
-            )
             bc_output = self.data_dir / "bc_data.pkl"
             with bc_output.open("wb") as f:
                 pickle.dump(  # noqa: S301
@@ -776,13 +868,50 @@ class RLGoalApproachExperiment:
                 heuristic_transitions
                 + q_store_transitions_used
             )
-            np.random.shuffle(bc_transitions)
-
             logger.info(
                 "BC data: %d heuristic + %d Q-store "
                 "= %d total",
                 len(heuristic_transitions),
                 len(q_store_transitions_used),
+                len(bc_transitions),
+            )
+
+            # ═══ Balance by (mesh, level) ═══
+            bc_total_target = self.config.get(
+                "bc_total_target", None
+            )
+            if bc_total_target is not None:
+                bc_transitions = (
+                    self._filter_bc_transitions(
+                        bc_transitions,
+                        total_target=int(
+                            bc_total_target
+                        ),
+                    )
+                )
+
+            # ═══ Balance rare action types ═══
+            bc_transitions = (
+                self._balance_by_action_type(
+                    bc_transitions,
+                    min_pct=float(
+                        self.config.get(
+                            "bc_action_min_pct", 0.01
+                        )
+                    ),
+                    min_absolute=int(
+                        self.config.get(
+                            "bc_action_min_absolute",
+                            100,
+                        )
+                    ),
+                )
+            )
+            
+            np.random.shuffle(bc_transitions)
+
+            logger.info(
+                "BC data: %d total after balancing",
                 len(bc_transitions),
             )
 
@@ -1256,6 +1385,8 @@ class RLGoalApproachExperiment:
                 ),
                 save_dir=sac_model_dir,
                 curriculum_levels=self.curriculum_levels,
+                promote_threshold=self.promote_threshold,
+                promote_window=self.promote_window,
                 episode_pools=sac_pools[self.sac_seed],
                 visualise=self.visualise,
                 mesh_name=mesh_name,
@@ -1536,66 +1667,16 @@ class RLGoalApproachExperiment:
                             )
 
                             # Action masks
-                            on_obj = (
-                                state_raw[11] > 0.5
+                            atype, aparams = (
+                                sac_trainer
+                                ._apply_action_masks(
+                                    atype,
+                                    aparams,
+                                    state_raw,
+                                    state,
+                                    controller,
+                                )
                             )
-                            if (
-                                atype == 7
-                                and not on_obj
-                            ):
-                                atype = 1
-                                aparams = np.array(
-                                    [
-                                        sac_trainer
-                                        .param_mean[
-                                            0
-                                        ],
-                                        0.0,
-                                        0.0,
-                                    ],
-                                    dtype=(
-                                        np.float32
-                                    ),
-                                )
-                            if (
-                                atype == 7
-                                and state_raw[13]
-                                < 9.0
-                            ):
-                                atype = 0
-                                aparams = np.array(
-                                    [
-                                        0.0,
-                                        sac_trainer
-                                        .param_mean[
-                                            1
-                                        ],
-                                        0.0,
-                                    ],
-                                    dtype=(
-                                        np.float32
-                                    ),
-                                )
-                            if (
-                                atype == 7
-                                and controller
-                                ._consecutive_detach_count
-                                >= 3
-                            ):
-                                atype = 0
-                                aparams = np.array(
-                                    [
-                                        0.0,
-                                        sac_trainer
-                                        .param_mean[
-                                            1
-                                        ],
-                                        0.0,
-                                    ],
-                                    dtype=(
-                                        np.float32
-                                    ),
-                                )
 
                         action_counts[atype] = (
                             action_counts.get(
@@ -2573,101 +2654,157 @@ class RLGoalApproachExperiment:
 
     @staticmethod
     def _filter_bc_transitions(
-        transitions: list[Any],
-        target_per_group: int = 15000,
+        transitions: list,
+        total_target: int = 100000,
         min_samples_to_keep: int = 50,
-    ) -> list[Any]:
-        """Filter and balance BC transitions by mesh and level.
+    ) -> list:
+        """Balance BC transitions by (mesh, level).
 
-        Ensures equal representation of each (mesh, level) combination.
-        Within each group, keeps natural action type distribution.
+        Distributes total_target equally across groups.
+        Groups with fewer samples are oversampled,
+        groups with more are undersampled.
 
         Args:
-            transitions: All collected BC transitions.
-            target_per_group: Target transitions per (mesh, level) group.
-            min_samples_to_keep: Minimum samples for a group to be
-                included in oversampling.
+            transitions: All BC transitions.
+            total_target: Total desired transitions.
+            min_samples_to_keep: Minimum for inclusion.
 
         Returns:
-            Balanced list of transitions.
+            Balanced transitions.
         """
-        type_names = ExperienceExtractor.get_type_names()
+        type_names = (
+            ExperienceExtractor.get_type_names()
+        )
         mesh_id_to_name = {
             v: k
-            for k, v in ExperienceExtractor.MESH_NAME_TO_ID.items()
+            for k, v in (
+                ExperienceExtractor
+                .MESH_NAME_TO_ID.items()
+            )
         }
 
         # Group by (mesh_id, level)
-        groups: dict[tuple[int, int], list[Any]] = {}
+        groups: dict[tuple[int, int], list] = {}
         for tr in transitions:
-            key = (getattr(tr, "mesh_id", -1), getattr(tr, "level", 0))
+            key = (
+                getattr(tr, "mesh_id", -1),
+                getattr(tr, "level", 0),
+            )
             if key not in groups:
                 groups[key] = []
             groups[key].append(tr)
 
-        # Log before balancing
+        # Calculate target per group
+        num_groups = max(len(groups), 1)
+        target_per_group = total_target // num_groups
+
+        # Log before
         logger.info("BC balance BEFORE:")
-        for (mid, level), trs in sorted(groups.items()):
-            mname = mesh_id_to_name.get(mid, f"mesh_{mid}")
-            # Count action types
+        for (mid, level), trs in sorted(
+            groups.items()
+        ):
+            mname = mesh_id_to_name.get(
+                mid, f"mesh_{mid}"
+            )
             type_counts: dict[str, int] = {}
             for tr in trs:
-                tname = type_names.get(tr.action_type, f"type_{tr.action_type}")
-                type_counts[tname] = type_counts.get(tname, 0) + 1
+                tname = type_names.get(
+                    tr.action_type,
+                    f"type_{tr.action_type}",
+                )
+                type_counts[tname] = (
+                    type_counts.get(tname, 0) + 1
+                )
             logger.info(
-                "  %s L%d: %d transitions, actions: %s",
-                mname, level, len(trs), type_counts,
+                "  %s L%d: %d transitions, "
+                "actions: %s",
+                mname,
+                level,
+                len(trs),
+                type_counts,
             )
 
-        # Balance: equal per (mesh, level) group
-        balanced: list[Any] = []
+        # Balance
+        balanced: list = []
         for (mid, level), trs in groups.items():
-            mname = mesh_id_to_name.get(mid, f"mesh_{mid}")
+            mname = mesh_id_to_name.get(
+                mid, f"mesh_{mid}"
+            )
 
             if len(trs) < min_samples_to_keep:
                 balanced.extend(trs)
                 logger.info(
-                    "  %s L%d: kept all %d (too few)",
-                    mname, level, len(trs),
+                    "  %s L%d: kept all %d "
+                    "(too few)",
+                    mname,
+                    level,
+                    len(trs),
                 )
             elif len(trs) >= target_per_group:
-                indices = np.random.permutation(len(trs))[:target_per_group]
-                balanced.extend([trs[i] for i in indices])
+                indices = (
+                    np.random.permutation(
+                        len(trs)
+                    )[:target_per_group]
+                )
+                balanced.extend(
+                    [trs[i] for i in indices]
+                )
                 logger.info(
-                    "  %s L%d: undersampled %d → %d",
-                    mname, level, len(trs), target_per_group,
+                    "  %s L%d: undersampled "
+                    "%d → %d",
+                    mname,
+                    level,
+                    len(trs),
+                    target_per_group,
                 )
             else:
                 indices = np.random.choice(
-                    len(trs), target_per_group, replace=True
+                    len(trs),
+                    target_per_group,
+                    replace=True,
                 )
-                balanced.extend([trs[i] for i in indices])
+                balanced.extend(
+                    [trs[i] for i in indices]
+                )
                 logger.info(
-                    "  %s L%d: oversampled %d → %d",
-                    mname, level, len(trs), target_per_group,
+                    "  %s L%d: oversampled "
+                    "%d → %d",
+                    mname,
+                    level,
+                    len(trs),
+                    target_per_group,
                 )
 
         np.random.shuffle(balanced)
 
-        # Log after balancing
+        # Log after
         after_groups: dict[str, int] = {}
         for tr in balanced:
             mname = mesh_id_to_name.get(
-                getattr(tr, "mesh_id", -1), "unknown"
+                getattr(tr, "mesh_id", -1),
+                "unknown",
             )
-            key = f"{mname}_L{getattr(tr, 'level', 0)}"
-            after_groups[key] = after_groups.get(key, 0) + 1
+            key = (
+                f"{mname}_L"
+                f"{getattr(tr, 'level', 0)}"
+            )
+            after_groups[key] = (
+                after_groups.get(key, 0) + 1
+            )
 
         logger.info("BC balance AFTER:")
         for key in sorted(after_groups.keys()):
             logger.info(
                 "  %s: %d transitions (%.1f%%)",
-                key, after_groups[key],
-                100.0 * after_groups[key] / max(len(balanced), 1),
+                key,
+                after_groups[key],
+                100.0 * after_groups[key]
+                / max(len(balanced), 1),
             )
 
         logger.info(
             "BC filter: %d → %d transitions",
-            len(transitions), len(balanced),
+            len(transitions),
+            len(balanced),
         )
         return balanced
