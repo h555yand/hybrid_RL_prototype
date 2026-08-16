@@ -70,8 +70,10 @@ class PSACTrainer:
         alpha_param_init: float = 0.1,
         batch_size: int = 256,
         buffer_capacity: int = 100_000,
-        bc_lambda_init: float = 1.0,
-        bc_lambda_decay: float = 0.9999,
+        bc_lambda_init: float = 5.0,
+        bc_lambda_decay: float = 0.9999,  # legacy, не используется если есть min
+        bc_lambda_min: float = 2.0,
+        actor_warmup_fraction: float = 0.2,
         max_steps_per_goal: int = 150,
         goal_threshold: float = 5.0,
         eval_interval: int = 200,
@@ -121,7 +123,17 @@ class PSACTrainer:
         )
 
         self.bc_lambda = bc_lambda_init
-        self.bc_lambda_decay = bc_lambda_decay
+        self.bc_lambda_init = bc_lambda_init
+        self.bc_lambda_min = float(
+            kwargs.get("bc_lambda_min", bc_lambda_min)
+        )
+        self.bc_lambda_decay = bc_lambda_decay  # will be recalculated in train()
+        self.actor_warmup_fraction = float(
+            kwargs.get(
+                "actor_warmup_fraction",
+                actor_warmup_fraction,
+            )
+        )
         self.bc_data = None
 
         self.state_mean = None
@@ -162,6 +174,14 @@ class PSACTrainer:
         self.strategic_direction_sac: StrategicSAC | None = (
             None
         )
+        # CQL (Conservative Q-Learning)
+        self.use_cql = bool(
+            kwargs.get("use_cql", False)
+        )
+        self.cql_alpha = float(
+            kwargs.get("cql_alpha", 1.0)
+        )
+
     def load_strategic(
         self,
         strategic_detach_sac: StrategicSAC | None = None,
@@ -589,6 +609,111 @@ class PSACTrainer:
 
         return critic_loss.item()
 
+    def update_critic_cql(
+        self, batch: dict[str, np.ndarray]
+    ) -> float:
+        """Update critic with CQL conservative penalty.
+
+        Standard critic loss + penalty for overestimating
+        Q-values of actions not in the dataset.
+
+        Args:
+            batch: Batch from replay buffer.
+
+        Returns:
+            Critic loss value.
+        """
+        states = torch.FloatTensor(batch["states"])
+        action_types = torch.LongTensor(
+            batch["action_types"]
+        )
+        action_params = torch.FloatTensor(
+            batch["action_params"]
+        )
+        rewards = torch.FloatTensor(batch["rewards"])
+        next_states = torch.FloatTensor(
+            batch["next_states"]
+        )
+        dones = torch.FloatTensor(batch["dones"])
+
+        # ═══ Standard TD target ═══
+        with torch.no_grad():
+            next_type, next_params, next_log_prob, _ = (
+                self.actor.sample(next_states)
+            )
+            next_q = self.critic_target.min_q(
+                next_states, next_type, next_params
+            )
+            alpha = self.alpha_type + self.alpha_param
+            target_q = (
+                rewards
+                + self.gamma * (1 - dones)
+                * (next_q - alpha * next_log_prob)
+            )
+
+        q1, q2 = self.critic(
+            states, action_types, action_params
+        )
+        td_loss = (
+            F.mse_loss(q1, target_q)
+            + F.mse_loss(q2, target_q)
+        )
+
+        # ═══ CQL penalty ═══
+        # Q-values for actions sampled from current
+        # policy (potentially out-of-distribution)
+        with torch.no_grad():
+            policy_types, policy_params, _, _ = (
+                self.actor.sample(states)
+            )
+        q1_policy, q2_policy = self.critic(
+            states, policy_types, policy_params
+        )
+
+        # Q-values for random actions
+        batch_size = states.shape[0]
+        random_types = torch.randint(
+            0, self.num_types, (batch_size,)
+        )
+        random_params = torch.randn(
+            batch_size, self.max_params
+        )
+        q1_random, q2_random = self.critic(
+            states, random_types, random_params
+        )
+
+        # CQL: push down Q for policy/random actions,
+        # push up Q for data actions
+        cql_penalty = (
+            torch.logsumexp(
+                torch.stack(
+                    [q1_policy, q1_random], dim=0
+                ),
+                dim=0,
+            ).mean()
+            - q1.mean()
+            + torch.logsumexp(
+                torch.stack(
+                    [q2_policy, q2_random], dim=0
+                ),
+                dim=0,
+            ).mean()
+            - q2.mean()
+        )
+
+        critic_loss = (
+            td_loss + self.cql_alpha * cql_penalty
+        )
+
+        self.critic_optimizer.zero_grad()
+        critic_loss.backward()
+        torch.nn.utils.clip_grad_norm_(
+            self.critic.parameters(), 1.0
+        )
+        self.critic_optimizer.step()
+
+        return critic_loss.item()
+
     def update_actor(
         self, batch: dict[str, np.ndarray]
     ) -> tuple[float, float]:
@@ -666,7 +791,10 @@ class PSACTrainer:
         )
         self.actor_optimizer.step()
 
-        self.bc_lambda *= self.bc_lambda_decay
+        self.bc_lambda = max(
+            self.bc_lambda * self.bc_lambda_decay,
+            self.bc_lambda_min,
+        )
 
         return sac_loss.item(), bc_loss.item()
 
@@ -1105,6 +1233,72 @@ class PSACTrainer:
         strategic_detach_count = 0
         strategic_direction_count = 0
 
+        # ═══ BC lambda decay (like Q-store epsilon) ═══
+        actor_warmup_episodes = int(
+            num_episodes * self.actor_warmup_fraction
+        )
+        effective_episodes = max(
+            1, num_episodes - actor_warmup_episodes
+        )
+        # Estimate total steps for decay
+        estimated_steps_per_episode = (
+            self.max_steps_per_goal // 2
+        )
+        total_effective_steps = (
+            effective_episodes
+            * estimated_steps_per_episode
+        )
+        # Decay per actor update (every 10 steps)
+        estimated_actor_updates = max(
+            total_effective_steps // 10, 1
+        )
+
+        if (
+            self.bc_lambda_init > self.bc_lambda_min
+            and self.bc_lambda_min > 0
+        ):
+            self.bc_lambda_decay = (
+                (
+                    self.bc_lambda_min
+                    / self.bc_lambda_init
+                )
+                ** (
+                    1.0
+                    / max(
+                        estimated_actor_updates, 1
+                    )
+                )
+            )
+
+        if (
+            self.bc_lambda_init > self.bc_lambda_min
+            and self.bc_lambda_min > 0
+        ):
+            self.bc_lambda_decay = (
+                (
+                    self.bc_lambda_min
+                    / self.bc_lambda_init
+                )
+                ** (1.0 / max(total_effective_steps, 1))
+            )
+        else:
+            self.bc_lambda_decay = 1.0
+
+        # Reset bc_lambda for this training run
+        self.bc_lambda = self.bc_lambda_init
+
+        logger.info(
+            "BC lambda: init=%.3f, min=%.3f, "
+            "decay=%.8f, actor_warmup=%d episodes, "
+            "CQL=%s (alpha=%.2f)",
+            self.bc_lambda_init,
+            self.bc_lambda_min,
+            self.bc_lambda_decay,
+            actor_warmup_episodes,
+            self.use_cql,
+            self.cql_alpha if self.use_cql else 0.0,
+        )
+
         for episode in range(num_episodes):
             if curriculum_levels:
                 min_dist, max_dist = curriculum_levels[
@@ -1215,6 +1409,9 @@ class PSACTrainer:
             # Per-episode tracking
             ep_had_strategic_detach = False
             ep_detach_states: list[np.ndarray] = []
+
+            # В начале эпизода:
+            prev_sensor_data = None
 
             for step in range(self.max_steps_per_goal):
                 self.total_steps += 1
@@ -1386,13 +1583,20 @@ class PSACTrainer:
                         )
                         + 1
                     )
-
-                reward, done = self.compute_reward(
-                    next_state, state, distance,
-                    prev_distance, collision,
-                    step + 1,
-                    sensor_data=sensor_data,
+                reward, done, _ = (
+                    controller.compute_common_reward(
+                        state=next_state_raw,
+                        prev_state=state_raw,
+                        action_type=action_type,
+                        collision=collision,
+                        sensor_data=sensor_data,
+                        prev_sensor_data=(
+                            prev_sensor_data
+                        ),
+                        current_pose=current_pose,
+                    )
                 )
+                prev_sensor_data = sensor_data
 
                 # Visualization data
                 current_poses.append(
@@ -1442,15 +1646,29 @@ class PSACTrainer:
                         batch = self.buffer.sample(
                             self.batch_size
                         )
-                        critic_loss = (
-                            self.update_critic(batch)
-                        )
+                        # Critic: CQL or standard
+                        if self.use_cql:
+                            critic_loss = (
+                                self
+                                .update_critic_cql(
+                                    batch
+                                )
+                            )
+                        else:
+                            critic_loss = (
+                                self.update_critic(
+                                    batch
+                                )
+                            )
                         self._critic_losses.append(
                             critic_loss
                         )
+
                         if (
-                            self.total_steps % 10
-                            == 0
+                            episode
+                            >= actor_warmup_episodes
+                            and self.total_steps
+                            % 10 == 0
                         ):
                             sac_loss, _bc_loss = (
                                 self.update_actor(
@@ -1461,6 +1679,7 @@ class PSACTrainer:
                                 sac_loss
                             )
                             self.update_alpha(batch)
+
                         self.soft_update_target()
 
                 if done:
@@ -1489,7 +1708,7 @@ class PSACTrainer:
                 ep_result = "collision"
 
             if visualizer:
-                if ((episode + 1) % _LOG_INTERVAL == 0) and ((episode + 1) >= 500):
+                if ((episode + 1) % _LOG_INTERVAL == 0) and ((episode + 1) >= 100):
                     visualizer.save_episode(
                         env=env,
                         episode=episode,
@@ -1682,14 +1901,19 @@ class PSACTrainer:
                     if curriculum_levels
                     else ""
                 )
-                # ═══ NEW: strategic stats in log ═══
+                warmup_tag = (
+                    " [WARMUP]"
+                    if episode
+                    < actor_warmup_episodes
+                    else ""
+                )
                 logger.info(
                     "Episode %d/%d: reward=%.1f, "
                     "steps=%d, mesh_rate=%.3f, "
                     "rolling=%.3f, best_eval=%.3f, "
                     "bc_lambda=%.4f, alpha_t=%.3f, "
                     "alpha_p=%.3f, buf=%d, "
-                    "s_detach=%d, s_dir=%d%s",
+                    "s_detach=%d, s_dir=%d%s%s",
                     episode + 1,
                     num_episodes,
                     episode_reward,
@@ -1703,6 +1927,7 @@ class PSACTrainer:
                     len(self.buffer),
                     strategic_detach_count,
                     strategic_direction_count,
+                    warmup_tag,
                     level_info,
                 )
 

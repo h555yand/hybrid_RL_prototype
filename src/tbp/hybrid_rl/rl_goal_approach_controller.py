@@ -26,6 +26,7 @@ from .action_space import ActionSpace
 from .config import DEFAULT_CONFIG
 from .hnsw_state_store import HNSWStateStore
 from .strategic_sac import StrategicSAC
+from .experience_extractor import ExperienceExtractor
 
 logger = logging.getLogger(__name__)
 
@@ -1109,16 +1110,34 @@ class RLGoalApproachController:
     # ══════════════════════════════════════════════════════════
     # REWARD
     # ══════════════════════════════════════════════════════════
-    def _compute_reward(
+    def compute_common_reward(
         self,
-        state,
-        prev_state,
-        action,
-        collision,
-        sensor_data=None,
-        prev_sensor_data=None,
-        current_pose=None,
-    ):
+        state: np.ndarray,
+        prev_state: np.ndarray,
+        action_type: int,
+        collision: Optional[str] = None,
+        sensor_data: Optional[Dict] = None,
+        prev_sensor_data: Optional[Dict] = None,
+        current_pose: Optional[np.ndarray] = None,
+    ) -> Tuple[float, bool, Optional[str]]:
+        """Common reward function for Q-store and SAC.
+
+        Same logic as _compute_reward but accepts
+        action_type (0-7) instead of discrete action
+        index (0-23).
+
+        Args:
+            state: Current raw state vector.
+            prev_state: Previous raw state vector.
+            action_type: PSAC action type (0-7).
+            collision: Collision string or None.
+            sensor_data: Current sensor readings.
+            prev_sensor_data: Previous sensor readings.
+            current_pose: Current agent pose.
+
+        Returns:
+            (reward, done, termination_reason)
+        """
         cfg = self.config
         reward = 0.0
         done = False
@@ -1132,28 +1151,21 @@ class RLGoalApproachController:
 
         surface_step = self.action_space.surface_step
 
-        # Extract side/phase info
         curr_same_side = (
             sensor_data.get("same_side", True)
             if sensor_data is not None
             else True
         )
-        prev_same_side = (
-            prev_sensor_data.get("same_side", True)
-            if prev_sensor_data is not None
-            else True
-        )
 
-        # Determine current phase
         phase = getattr(
-            self, "_current_phase", "CRAWL_TO_GOAL"
+            self, "_current_phase",
+            "CRAWL_TO_GOAL",
         )
 
-        # ═══ 1. Progress toward goal ═══
+        # ═══ 1. Progress ═══
         progress_raw = prev_distance - distance
         progress = progress_raw
 
-        # Reduce negative progress during bypass flight
         if (
             on_object < 0.5
             and phase == "FLY_TO_EDGE"
@@ -1161,11 +1173,9 @@ class RLGoalApproachController:
         ):
             progress = progress_raw * 0.2
 
-        # In CRAWL_TO_EDGE / DETACH_NEEDED, progress toward goal
-        # is misleading — agent should crawl to edge, not to goal.
-        # Suppress progress reward so subgoal_potential (alignment
-        # shaping) can guide the agent toward the edge.
-        if phase in ("CRAWL_TO_EDGE", "DETACH_NEEDED"):
+        if phase in (
+            "CRAWL_TO_EDGE", "DETACH_NEEDED"
+        ):
             progress = progress_raw * 0.1
 
         detour_mode = (
@@ -1183,25 +1193,31 @@ class RLGoalApproachController:
                     "detour_negative_progress_clip_steps"
                 ]
             )
-            progress = max(progress_raw, min_progress)
+            progress = max(
+                progress_raw, min_progress
+            )
 
         reward += (
             progress
             / surface_step
             * cfg["reward_progress"]
         )
+
         if on_object > 0.5:
-            efficiency = self._compute_movement_efficiency(window=20)
+            efficiency = (
+                self._compute_movement_efficiency(
+                    window=20
+                )
+            )
             if efficiency < 0.1:
-                reward += -0.3  # stagnation penalty for oscillation
+                reward += -0.3
 
         # ═══ 1.5 Subgoal shaping ═══
         phi_current = self._subgoal_potential(state)
         phi_prev = self._subgoal_potential(prev_state)
-        subgoal_shaping = (
+        reward += (
             self.gamma * phi_current - phi_prev
         )
-        reward += subgoal_shaping
 
         # ═══ 2. Goal reached ═══
         if distance < cfg["goal_threshold"]:
@@ -1212,28 +1228,19 @@ class RLGoalApproachController:
         # ═══ 3. Step penalty ═══
         reward += cfg["reward_step_penalty"]
 
-        # ═══ 3.5 Risky free actions on surface ═══
+        # ═══ 3.5 Risky free on surface ═══
+        # action_type=1 is MoveLinear
         if (
-            action
-            == self.action_space.IDX_FREE_FORWARD
-            and prev_on_object > 0.5
-        ):
-            reward += -2.0
-        if (
-            action
-            == self.action_space.IDX_FREE_BACKWARD
-            and prev_on_object > 0.5
-        ):
-            reward += -2.0
-        if (
-            action
-            == self.action_space.IDX_FREE_FORWARD_SMALL
+            action_type == 1
             and prev_on_object > 0.5
         ):
             reward += -2.0
 
-        # ═══ 3.6 Penalty for flying too far ═══
-        if on_object < 0.5 and sensor_data is not None:
+        # ═══ 3.6 Flying too far ═══
+        if (
+            on_object < 0.5
+            and sensor_data is not None
+        ):
             extents = sensor_data.get(
                 "object_extents", [84, 84, 84]
             )
@@ -1241,52 +1248,35 @@ class RLGoalApproachController:
             if distance > max_extent * 1.5:
                 reward += -2.0
 
-        # ═══ 4. Collisions ═══
+        # ═══ 4. Collision ═══
         if collision == "surface_violation":
-            reward += cfg["reward_surface_violation"]
+            reward += cfg[
+                "reward_surface_violation"
+            ]
             done = True
             termination_reason = (
                 "collision_surface_violation"
-            )
-            action_name = (
-                self.action_space.get_info(action).name
-                if action is not None
-                else "unknown"
-            )
-            self._collision_stats[action_name] = (
-                self._collision_stats.get(
-                    action_name, 0
-                )
-                + 1
             )
         elif collision == "detach_collision":
-            reward += cfg["reward_surface_violation"]
+            reward += cfg[
+                "reward_surface_violation"
+            ]
             done = True
             termination_reason = (
                 "collision_surface_violation"
             )
-            action_name = (
-                self.action_space.get_info(action).name
-                if action is not None
-                else "unknown"
-            )
-            self._collision_stats[action_name] = (
-                self._collision_stats.get(
-                    action_name, 0
-                )
-                + 1
-            )
         elif collision == "lost_object":
-            if (
-                action
-                != self.action_space.IDX_DETACH
-            ):
-                reward += cfg["reward_drifted_away"]
+            if action_type != 7:  # not Detach
+                reward += cfg[
+                    "reward_drifted_away"
+                ]
 
-        # ═══ 4.6 Detach while not on surface ═══
-        if action == self.action_space.IDX_DETACH:
-            if prev_on_object < 0.5:
-                reward += -5.0
+        # ═══ 4.6 Detach in air ═══
+        if (
+            action_type == 7
+            and prev_on_object < 0.5
+        ):
+            reward += -5.0
 
         # ═══ 5. Near goal on surface ═══
         near_radius = surface_step * 3
@@ -1298,11 +1288,7 @@ class RLGoalApproachController:
                 "reward_near_goal_on_surface"
             ]
 
-        # ═══════════════════════════════════════
-        # 6. PHASE BONUSES — tactical only
-        # ═══════════════════════════════════════
-
-        # ── 6.2 Successful landing near goal ──
+        # ═══ 6.2 Successful landing ═══
         successful_landing = (
             prev_on_object < 0.5
             and on_object > 0.5
@@ -1312,18 +1298,12 @@ class RLGoalApproachController:
         if successful_landing:
             landing_radius = 8.0 * surface_step
             landing_quality = max(
-                0.0, 1.0 - distance / landing_radius
+                0.0,
+                1.0 - distance / landing_radius,
             )
-            landing_bonus = 8.0 * landing_quality
-            reward += landing_bonus
-            logger.debug(
-                f"PHASE_BONUS: successful landing "
-                f"+{landing_bonus:.1f}, "
-                f"quality={landing_quality:.2f}, "
-                f"dist={distance:.1f}"
-            )
+            reward += 8.0 * landing_quality
 
-        # ── 6.5 Correct crawl bonus ──
+        # ═══ 6.5 Correct crawl bonus ═══
         if (
             on_object > 0.5
             and phase == "CRAWL_TO_GOAL"
@@ -1331,96 +1311,108 @@ class RLGoalApproachController:
         ):
             reward += 0.2
 
-        # ── 6.6 FLY_TO_EDGE: alignment with
-        #        subgoal direction ──
+        # ═══ 6.6/6.7 Fly alignment ═══
         if (
             on_object < 0.5
-            and phase == "FLY_TO_EDGE"
             and current_pose is not None
         ):
-            subgoal_dir = getattr(
-                self, "_current_subgoal_dir", None
+            from scipy.spatial.transform import (
+                Rotation as R,
             )
-            if subgoal_dir is not None:
-                rot = R.from_euler(
-                    "xyz",
-                    current_pose[3:6],
-                    degrees=True,
-                )
-                forward = rot.apply([0, 0, -1])
-                curr_alignment = float(
-                    np.dot(forward, subgoal_dir)
-                )
 
-                prev_subgoal_alignment = getattr(
+            if (
+                phase == "FLY_TO_EDGE"
+            ):
+                subgoal_dir = getattr(
                     self,
-                    "_prev_subgoal_alignment",
+                    "_current_subgoal_dir",
                     None,
                 )
-                if (
-                    prev_subgoal_alignment is not None
-                ):
-                    align_improvement = (
-                        curr_alignment
-                        - prev_subgoal_alignment
+                if subgoal_dir is not None:
+                    rot = R.from_euler(
+                        "xyz",
+                        current_pose[3:6],
+                        degrees=True,
                     )
-                    reward += (
-                        align_improvement * 2.0
+                    forward = rot.apply(
+                        [0, 0, -1]
+                    )
+                    curr_a = float(
+                        np.dot(
+                            forward, subgoal_dir
+                        )
+                    )
+                    prev_a = getattr(
+                        self,
+                        "_prev_subgoal_alignment",
+                        None,
+                    )
+                    if prev_a is not None:
+                        reward += (
+                            (curr_a - prev_a)
+                            * 2.0
+                        )
+                    self._prev_subgoal_alignment = (
+                        curr_a
+                    )
+                else:
+                    self._prev_subgoal_alignment = (
+                        None
                     )
 
+            elif phase in (
+                "FLY_TO_GOAL", "LAND"
+            ):
+                goal = self._current_goal
+                if goal is not None:
+                    goal_dir = (
+                        goal[:3]
+                        - current_pose[:3]
+                    )
+                    goal_dist = np.linalg.norm(
+                        goal_dir
+                    )
+                    if goal_dist > 1e-8:
+                        goal_dir /= goal_dist
+                        rot = R.from_euler(
+                            "xyz",
+                            current_pose[3:6],
+                            degrees=True,
+                        )
+                        forward = rot.apply(
+                            [0, 0, -1]
+                        )
+                        curr_a = float(
+                            np.dot(
+                                forward,
+                                goal_dir,
+                            )
+                        )
+                        prev_a = getattr(
+                            self,
+                            "_prev_goal_alignment",
+                            None,
+                        )
+                        if prev_a is not None:
+                            reward += (
+                                (curr_a - prev_a)
+                                * 2.0
+                            )
+                        self._prev_goal_alignment = (
+                            curr_a
+                        )
+                    else:
+                        self._prev_goal_alignment = (
+                            None
+                        )
                 self._prev_subgoal_alignment = (
-                    curr_alignment
+                    None
                 )
             else:
-                self._prev_subgoal_alignment = None
-
-        # ── 6.7 FLY_TO_GOAL/LAND: alignment with
-        #        goal direction ──
-        elif (
-            on_object < 0.5
-            and phase in ("FLY_TO_GOAL", "LAND")
-            and current_pose is not None
-        ):
-            goal_dir = (
-                self._current_goal[:3]
-                - current_pose[:3]
-            )
-            goal_dist = np.linalg.norm(goal_dir)
-            if goal_dist > 1e-8:
-                goal_dir = goal_dir / goal_dist
-                rot = R.from_euler(
-                    "xyz",
-                    current_pose[3:6],
-                    degrees=True,
+                self._prev_subgoal_alignment = (
+                    None
                 )
-                forward = rot.apply([0, 0, -1])
-                curr_alignment = float(
-                    np.dot(forward, goal_dir)
-                )
-
-                prev_goal_alignment = getattr(
-                    self,
-                    "_prev_goal_alignment",
-                    None,
-                )
-                if prev_goal_alignment is not None:
-                    align_improvement = (
-                        curr_alignment
-                        - prev_goal_alignment
-                    )
-                    reward += (
-                        align_improvement * 2.0
-                    )
-
-                self._prev_goal_alignment = (
-                    curr_alignment
-                )
-            else:
                 self._prev_goal_alignment = None
-            self._prev_subgoal_alignment = None
-        else:
-            self._prev_subgoal_alignment = None
-            self._prev_goal_alignment = None
 
         # ═══ 7. Timeout ═══
         if self._steps >= cfg["max_steps_per_goal"]:
@@ -1430,7 +1422,57 @@ class RLGoalApproachController:
                 termination_reason = "timeout"
 
         return reward, done, termination_reason
+    
+    def _compute_reward(
+        self, state, prev_state, action,
+        collision, sensor_data=None,
+        prev_sensor_data=None,
+        current_pose=None,
+    ):
+        """Q-store reward = common + Q-specific."""
+        # Map discrete action to action_type
+        action_type, _ = (
+            ExperienceExtractor.DISCRETE_TO_PSAC
+            .get(action, (0, lambda c: []))
+        )
+        # Вызвать только тип, не params
+        action_type = (
+            ExperienceExtractor
+            .DISCRETE_TO_PSAC[action][0]
+        )
 
+        reward, done, termination_reason = (
+            self.compute_common_reward(
+                state=state,
+                prev_state=prev_state,
+                action_type=action_type,
+                collision=collision,
+                sensor_data=sensor_data,
+                prev_sensor_data=prev_sensor_data,
+                current_pose=current_pose,
+            )
+        )
+
+        # ═══ Q-specific: collision stats ═══
+        if collision in (
+            "surface_violation",
+            "detach_collision",
+        ):
+            action_name = (
+                self.action_space.get_info(action)
+                .name
+                if action is not None
+                else "unknown"
+            )
+            self._collision_stats[action_name] = (
+                self._collision_stats.get(
+                    action_name, 0
+                )
+                + 1
+            )
+
+        return reward, done, termination_reason
+    
     def _subgoal_potential(self, state: np.ndarray) -> float:
         """Potential function for subgoal reward shaping.
 
