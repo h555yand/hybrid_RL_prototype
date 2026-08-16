@@ -131,6 +131,11 @@ class RLGoalApproachExperiment:
                 [[10.0, 40.0], [20.0, 80.0], [40.0, 120.0]],
             )
         ]
+        self.curriculum_filters: list[dict[str, Any]] = (
+            self.config.get(
+                "curriculum_filters", []
+            )
+        )
         self.train_seeds: list[int] = self.config.get(
             "train_seeds", [11]
         )
@@ -395,6 +400,7 @@ class RLGoalApproachExperiment:
                 curriculum_levels=self.curriculum_levels,
                 regenerate=self.regenerate_scripts,
                 prefix=f"train_{mesh_name}",
+                curriculum_filters=self.curriculum_filters,
             )
 
             for seed in self.train_seeds:
@@ -412,6 +418,7 @@ class RLGoalApproachExperiment:
 
                 curriculum_config = {
                     "levels": self.curriculum_levels,
+                    "filters": self.curriculum_filters,
                     "promote_threshold": (
                         self.promote_threshold
                     ),
@@ -508,6 +515,7 @@ class RLGoalApproachExperiment:
                 curriculum_levels=self.curriculum_levels,
                 regenerate=self.regenerate_scripts,
                 prefix=f"eval_{mesh_name}",
+                curriculum_filters=self.curriculum_filters,
             )
 
             eval_results, bc_transitions = (
@@ -608,6 +616,7 @@ class RLGoalApproachExperiment:
                 curriculum_levels=self.curriculum_levels,
                 regenerate=self.regenerate_scripts,
                 prefix=f"heuristic_{mesh_name}",
+                curriculum_filters=self.curriculum_filters,
             )
 
             _, heuristic_transitions = (
@@ -1230,6 +1239,7 @@ class RLGoalApproachExperiment:
                 curriculum_levels=self.curriculum_levels,
                 regenerate=self.regenerate_scripts,
                 prefix=f"sac_train_{mesh_name}",
+                curriculum_filters=self.curriculum_filters,
             )
 
             trainer.start_mesh_tracking(mesh_name)
@@ -1324,6 +1334,7 @@ class RLGoalApproachExperiment:
                 curriculum_levels=self.curriculum_levels,
                 regenerate=self.regenerate_scripts,
                 prefix=f"sac_eval_{mesh_name}",
+                curriculum_filters=self.curriculum_filters,
             )
 
             results = self._eval_sac_on_pools(

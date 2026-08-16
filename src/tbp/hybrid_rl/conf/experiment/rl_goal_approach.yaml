@@ -7,14 +7,14 @@ experiment:
   _target_: tbp.hybrid_rl.experiment.RLGoalApproachExperiment
   config:
     seed: 42
-    visualise: true
+    visualise: false
     regenerate_scripts: true
     do_train: false
     do_eval: false
-    do_heur_eval: false
+    do_heur_eval: true
     do_bc_train: false
     do_sac_train: false
-    do_sac_eval: true
+    do_sac_eval: false
     do_adaptive: false
 
     train_seeds: [11]
@@ -22,13 +22,18 @@ experiment:
     sac_seed: 55
     sac_eval_seeds: [77]
 
-    promote_threshold: 1.0
+    promote_threshold: 0.7
     promote_window: 100
 
     curriculum_levels:
+      - [10.0, 60.0]
+      - [10.0, 80.0]
       - [10.0, 120.0]
-      #- [20.0, 80.0]
-      #- [10.0, 120.0]
+
+    curriculum_filters:
+      - {same_side: true, path_blocked: false}
+      - {same_side: true}
+      - {}
 
     training_stages:
       - mesh: mug
@@ -38,10 +43,10 @@ experiment:
         load_mode: null
 
     eval_meshes: [mug]
-    eval_episodes_per_level: 2000
+    eval_episodes_per_level: 50
     # BC data composition
     bc_q_store_fraction: 0.0    # 0.0 = only heuristic, 0.2 = 20% Q-store
-    bc_target_per_group: 50000
+    bc_target_per_group: 30000
 
     rl_config:
       state_dim: 20
