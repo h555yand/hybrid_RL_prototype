@@ -35,34 +35,156 @@ class ExperienceExtractor:
 
     # 24-action space (no detach_edge)
     DISCRETE_TO_PSAC = {
-        0:  (0, lambda cfg: [0.0, cfg["surface_step"]]),
-        1:  (0, lambda cfg: [45.0, cfg["surface_step"]]),
-        2:  (0, lambda cfg: [90.0, cfg["surface_step"]]),
-        3:  (0, lambda cfg: [135.0, cfg["surface_step"]]),
-        4:  (0, lambda cfg: [180.0, cfg["surface_step"]]),
-        5:  (0, lambda cfg: [225.0, cfg["surface_step"]]),
-        6:  (0, lambda cfg: [270.0, cfg["surface_step"]]),
-        7:  (0, lambda cfg: [315.0, cfg["surface_step"]]),
+        0:  (0, lambda cfg: [
+            np.sin(np.radians(0.0)),
+            np.cos(np.radians(0.0)),
+            cfg["surface_step"],
+        ]),
+        1:  (0, lambda cfg: [
+            np.sin(np.radians(45.0)),
+            np.cos(np.radians(45.0)),
+            cfg["surface_step"],
+        ]),
+        2:  (0, lambda cfg: [
+            np.sin(np.radians(90.0)),
+            np.cos(np.radians(90.0)),
+            cfg["surface_step"],
+        ]),
+        3:  (0, lambda cfg: [
+            np.sin(np.radians(135.0)),
+            np.cos(np.radians(135.0)),
+            cfg["surface_step"],
+        ]),
+        4:  (0, lambda cfg: [
+            np.sin(np.radians(180.0)),
+            np.cos(np.radians(180.0)),
+            cfg["surface_step"],
+        ]),
+        5:  (0, lambda cfg: [
+            np.sin(np.radians(225.0)),
+            np.cos(np.radians(225.0)),
+            cfg["surface_step"],
+        ]),
+        6:  (0, lambda cfg: [
+            np.sin(np.radians(270.0)),
+            np.cos(np.radians(270.0)),
+            cfg["surface_step"],
+        ]),
+        7:  (0, lambda cfg: [
+            np.sin(np.radians(315.0)),
+            np.cos(np.radians(315.0)),
+            cfg["surface_step"],
+        ]),
         8:  (1, lambda cfg: [cfg["free_step"]]),
         9:  (1, lambda cfg: [-cfg["free_step"]]),
-        10: (2, lambda cfg: [cfg["rotation_step"]]),
-        11: (2, lambda cfg: [-cfg["rotation_step"]]),
-        12: (3, lambda cfg: [cfg["rotation_step"]]),
-        13: (3, lambda cfg: [-cfg["rotation_step"]]),
-        14: (4, lambda cfg: [cfg["rotation_step"]]),
-        15: (4, lambda cfg: [-cfg["rotation_step"]]),
-        16: (5, lambda cfg: [cfg["rotation_step"],
-                             cfg.get("orient_left_distance", 0.02),
-                             cfg.get("orient_forward_distance", 0.05)]),
-        17: (6, lambda cfg: [cfg["rotation_step"],
-                             cfg.get("orient_down_distance", 0.02),
-                             cfg.get("orient_forward_distance", 0.05)]),
-        18: (7, lambda cfg: []),                                     # detach
-        19: (1, lambda cfg: [cfg.get("free_step_small", 2.0)]),      # free_forward_small
-        20: (3, lambda cfg: [cfg.get("rotation_step_big", 15.0)]),   # look_up_big
-        21: (3, lambda cfg: [-cfg.get("rotation_step_big", 15.0)]),  # look_down_big
-        22: (2, lambda cfg: [cfg.get("rotation_step_big", 15.0)]),   # turn_left_big
-        23: (2, lambda cfg: [-cfg.get("rotation_step_big", 15.0)]),  # turn_right_big
+        10: (2, lambda cfg: [
+            np.sin(np.radians(
+                cfg["rotation_step"]
+            )),
+            np.cos(np.radians(
+                cfg["rotation_step"]
+            )),
+        ]),
+        11: (2, lambda cfg: [
+            np.sin(np.radians(
+                -cfg["rotation_step"]
+            )),
+            np.cos(np.radians(
+                -cfg["rotation_step"]
+            )),
+        ]),
+        12: (3, lambda cfg: [
+            np.sin(np.radians(
+                cfg["rotation_step"]
+            )),
+            np.cos(np.radians(
+                cfg["rotation_step"]
+            )),
+        ]),
+        13: (3, lambda cfg: [
+            np.sin(np.radians(
+                -cfg["rotation_step"]
+            )),
+            np.cos(np.radians(
+                -cfg["rotation_step"]
+            )),
+        ]),
+        14: (4, lambda cfg: [
+            np.sin(np.radians(
+                cfg["rotation_step"]
+            )),
+            np.cos(np.radians(
+                cfg["rotation_step"]
+            )),
+        ]),
+        15: (4, lambda cfg: [
+            np.sin(np.radians(
+                -cfg["rotation_step"]
+            )),
+            np.cos(np.radians(
+                -cfg["rotation_step"]
+            )),
+        ]),
+        16: (5, lambda cfg: [
+            cfg["rotation_step"],
+            cfg.get("orient_left_distance", 0.02),
+            cfg.get(
+                "orient_forward_distance", 0.05
+            ),
+        ]),
+        17: (6, lambda cfg: [
+            cfg["rotation_step"],
+            cfg.get(
+                "orient_down_distance", 0.02
+            ),
+            cfg.get(
+                "orient_forward_distance", 0.05
+            ),
+        ]),
+        18: (7, lambda cfg: []),
+        19: (1, lambda cfg: [
+            cfg.get("free_step_small", 2.0),
+        ]),
+        20: (3, lambda cfg: [
+            np.sin(np.radians(
+                cfg.get("rotation_step_big", 15.0)
+            )),
+            np.cos(np.radians(
+                cfg.get("rotation_step_big", 15.0)
+            )),
+        ]),
+        21: (3, lambda cfg: [
+            np.sin(np.radians(
+                -cfg.get(
+                    "rotation_step_big", 15.0
+                )
+            )),
+            np.cos(np.radians(
+                -cfg.get(
+                    "rotation_step_big", 15.0
+                )
+            )),
+        ]),
+        22: (2, lambda cfg: [
+            np.sin(np.radians(
+                cfg.get("rotation_step_big", 15.0)
+            )),
+            np.cos(np.radians(
+                cfg.get("rotation_step_big", 15.0)
+            )),
+        ]),
+        23: (2, lambda cfg: [
+            np.sin(np.radians(
+                -cfg.get(
+                    "rotation_step_big", 15.0
+                )
+            )),
+            np.cos(np.radians(
+                -cfg.get(
+                    "rotation_step_big", 15.0
+                )
+            )),
+        ]),
     }
 
     MESH_NAME_TO_ID = {
@@ -129,16 +251,16 @@ class ExperienceExtractor:
     @staticmethod
     def get_param_dims() -> Dict[int, int]:
         return {
-            0: 2,  # MoveTangentially: angle, distance
+            0: 3,  # MoveTangentially: sin, cos, distance
             1: 1,  # MoveLinear: distance
-            2: 1,  # Turn: angle
-            3: 1,  # Look: angle
-            4: 1,  # SensorRotate: angle
+            2: 2,  # Turn: sin, cos
+            3: 2,  # Look: sin, cos
+            4: 2,  # SensorRotate: sin, cos
             5: 3,  # OrientHorizontal: rotation, left, forward
             6: 3,  # OrientVertical: rotation, down, forward
             7: 0,  # Detach: no params
         }
-
+    
     @staticmethod
     def get_type_names() -> Dict[int, str]:
         return {

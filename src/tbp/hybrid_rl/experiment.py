@@ -48,6 +48,7 @@ from tbp.hybrid_rl.rl_goal_approach_controller import (
 from tbp.hybrid_rl.sac_trainer import PSACTrainer
 from tbp.hybrid_rl.ablation_runner import _maybe_save_visualization, visualize_agent_goal
 from tbp.hybrid_rl.strategic_sac import StrategicSAC, StrategicBCTrainer
+from tbp.hybrid_rl.episode_pools import _is_reachable_by_surface
 
 logger = logging.getLogger(__name__)
 
@@ -1969,52 +1970,95 @@ class RLGoalApproachExperiment:
         adaptive_curriculum = list(self.curriculum_levels)
         adaptive_level = 0
         adaptive_promote_window: list[bool] = []
-        adaptive_promote_threshold = 0.50
-        adaptive_promote_window_size = 100
+        adaptive_promote_threshold = self.promote_threshold
+        adaptive_promote_window_size = self.promote_window
 
         ep_successes = []
 
         for episode in range(self.adaptive_episodes):
             env.reset()
             start_pos = env.get_pose()[:3]
-            # Curriculum goal generation
+            # Curriculum goal generation with filters
             min_dist, max_dist = adaptive_curriculum[
                 adaptive_level
             ]
 
-            # Level 0: filter for same side
-            require_same_side = (adaptive_level == 0)
-            goal_pose = None
+            # Get filter for current level
+            level_filter = (
+                self.curriculum_filters[
+                    adaptive_level
+                ]
+                if adaptive_level
+                < len(self.curriculum_filters)
+                else {}
+            )
+            require_same_side = level_filter.get(
+                "same_side", None
+            )
+            require_path_blocked = level_filter.get(
+                "path_blocked", None
+            )
 
-            if require_same_side:
-                from tbp.hybrid_rl.episode_pools import (
-                    _is_reachable_by_surface,
+            max_goal_attempts = (
+                50
+                if (
+                    require_same_side is not None
+                    or require_path_blocked
+                    is not None
                 )
-                for _attempt in range(50):
-                    candidate = env.get_random_surface_point(
+                else 1
+            )
+
+            goal_pose = None
+            for _attempt in range(
+                max_goal_attempts
+            ):
+                candidate = (
+                    env.get_random_surface_point(
                         reference_pos=start_pos,
                         min_dist=min_dist,
                         max_dist=max_dist,
                         max_attempts=2000,
                         mesh_sample=True,
                     )
-                    if _is_reachable_by_surface(
-                        env, start_pos, candidate[:3]
-                    ):
-                        goal_pose = candidate
-                        break
-                if goal_pose is None:
-                    goal_pose = candidate
-            else:
-                goal_pose = env.get_random_surface_point(
-                    reference_pos=start_pos,
-                    min_dist=min_dist,
-                    max_dist=max_dist,
-                    max_attempts=2000,
-                    mesh_sample=True,
                 )
 
-            controller.set_new_goal(goal_pose, start_pos)
+                if require_same_side is not None:
+                    same_side = (
+                        _is_reachable_by_surface(
+                            env,
+                            start_pos,
+                            candidate[:3],
+                        )
+                    )
+                    if same_side != require_same_side:
+                        continue
+
+                if (
+                    require_path_blocked is not None
+                ):
+                    env._current_goal = (
+                        np.concatenate([
+                            candidate[:3],
+                            candidate[3:],
+                        ])
+                    )
+                    sensor = env.get_sensor_data()
+                    pb = sensor.get(
+                        "path_blocked", False
+                    )
+                    if pb != require_path_blocked:
+                        continue
+
+                goal_pose = candidate
+                break
+
+            if goal_pose is None:
+                goal_pose = candidate
+
+            controller.set_new_goal(
+                goal_pose, start_pos
+            )
             env.set_goal(goal_pose)
 
             goals_before = (

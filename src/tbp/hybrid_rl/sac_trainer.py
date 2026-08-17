@@ -1895,14 +1895,10 @@ class PSACTrainer:
                 success_window.append(episode_success)
                 if (
                     len(success_window)
-                    > promote_window
-                ):
-                    success_window.pop(0)
-                if (
-                    len(success_window)
                     == promote_window
                     and curr_level
                     < len(curriculum_levels) - 1
+                    and episode >= actor_warmup_until
                 ):
                     rate = (
                         sum(success_window)
@@ -1912,9 +1908,7 @@ class PSACTrainer:
                         curr_level += 1
                         success_window = []
                         actor_warmup_until = (
-                            episode
-                            + self
-                            .actor_warmup_per_level
+                            episode + self.actor_warmup_per_level
                         )
                         # Reset best model for
                         # new level
@@ -1935,7 +1929,7 @@ class PSACTrainer:
                             ],
                             actor_warmup_until,
                         )
-                        
+
             if (episode + 1) % log_interval == 0:
                 mesh_rate = (
                     self._mesh_goals

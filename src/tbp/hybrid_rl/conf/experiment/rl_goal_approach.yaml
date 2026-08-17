@@ -13,9 +13,9 @@ experiment:
     do_eval: false
     do_heur_eval: false
     do_bc_train: false
-    do_sac_train: true
+    do_sac_train: false
     do_sac_eval: false
-    do_adaptive: false
+    do_adaptive: true
 
     train_seeds: [11]
     eval_seeds: [44]
@@ -119,7 +119,7 @@ experiment:
     sac_eval_episodes_per_level: 500
 
     adaptive_mesh: vase
-    adaptive_episodes: 500
+    adaptive_episodes: 2000
 
     logging:
       run_name: rl_goal_approach
