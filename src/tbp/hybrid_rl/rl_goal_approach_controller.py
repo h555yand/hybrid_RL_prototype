@@ -1215,9 +1215,13 @@ class RLGoalApproachController:
         # ═══ 1.5 Subgoal shaping ═══
         phi_current = self._subgoal_potential(state)
         phi_prev = self._subgoal_potential(prev_state)
-        reward += (
+        subgoal_shaping = (
             self.gamma * phi_current - phi_prev
         )
+        subgoal_shaping = float(
+            np.clip(subgoal_shaping, -3.0, 3.0)
+        )
+        reward += subgoal_shaping
 
         # ═══ 2. Goal reached ═══
         if distance < cfg["goal_threshold"]:

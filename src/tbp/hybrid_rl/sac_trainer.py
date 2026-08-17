@@ -73,7 +73,6 @@ class PSACTrainer:
         bc_lambda_init: float = 5.0,
         bc_lambda_decay: float = 0.9999,  # legacy, не используется если есть min
         bc_lambda_min: float = 2.0,
-        actor_warmup_fraction: float = 0.2,
         max_steps_per_goal: int = 150,
         goal_threshold: float = 5.0,
         eval_interval: int = 200,
@@ -128,10 +127,10 @@ class PSACTrainer:
             kwargs.get("bc_lambda_min", bc_lambda_min)
         )
         self.bc_lambda_decay = bc_lambda_decay  # will be recalculated in train()
-        self.actor_warmup_fraction = float(
+        # Actor warmup per level (episodes)
+        self.actor_warmup_per_level = int(
             kwargs.get(
-                "actor_warmup_fraction",
-                actor_warmup_fraction,
+                "actor_warmup_per_level", 100
             )
         )
         self.bc_data = None
@@ -1304,12 +1303,18 @@ class PSACTrainer:
         strategic_detach_count = 0
         strategic_direction_count = 0
 
-        # ═══ BC lambda decay (like Q-store epsilon) ═══
-        actor_warmup_episodes = int(
-            num_episodes * self.actor_warmup_fraction
+        # ═══ Actor warmup per curriculum level ═══
+        actor_warmup_until = (
+            self.actor_warmup_per_level
         )
+
+        # ═══ BC lambda decay ═══
+        # Estimate effective training steps
+        # (after first warmup, all levels)
         effective_episodes = max(
-            1, num_episodes - actor_warmup_episodes
+            1,
+            num_episodes
+            - self.actor_warmup_per_level,
         )
         estimated_steps_per_episode = (
             self.max_steps_per_goal // 2
@@ -1318,7 +1323,6 @@ class PSACTrainer:
             effective_episodes
             * estimated_steps_per_episode
         )
-        # Decay per actor update (every 10 steps)
         estimated_actor_updates = max(
             total_effective_steps // 10, 1
         )
@@ -1342,17 +1346,16 @@ class PSACTrainer:
         else:
             self.bc_lambda_decay = 1.0
 
-        # Reset bc_lambda for this training run
         self.bc_lambda = self.bc_lambda_init
 
         logger.info(
             "BC lambda: init=%.3f, min=%.3f, "
-            "decay=%.8f, actor_warmup=%d episodes, "
-            "CQL=%s (alpha=%.2f)",
+            "decay=%.8f, actor_warmup=%d "
+            "episodes/level, CQL=%s (alpha=%.2f)",
             self.bc_lambda_init,
             self.bc_lambda_min,
             self.bc_lambda_decay,
-            actor_warmup_episodes,
+            self.actor_warmup_per_level,
             self.use_cql,
             self.cql_alpha if self.use_cql else 0.0,
         )
@@ -1672,7 +1675,7 @@ class PSACTrainer:
                         batch = self.buffer.sample(
                             self.batch_size
                         )
-                        # Critic: CQL or standard
+
                         if self.use_cql:
                             critic_loss = (
                                 self
@@ -1692,7 +1695,7 @@ class PSACTrainer:
 
                         if (
                             episode
-                            >= actor_warmup_episodes
+                            >= actor_warmup_until
                             and self.total_steps
                             % 10 == 0
                         ):
@@ -1908,15 +1911,31 @@ class PSACTrainer:
                     if rate >= promote_threshold:
                         curr_level += 1
                         success_window = []
+                        actor_warmup_until = (
+                            episode
+                            + self
+                            .actor_warmup_per_level
+                        )
+                        # Reset best model for
+                        # new level
+                        best_eval_rate = 0.0
+                        best_state_dict = None
+                        best_critic_dict = None
+                        best_critic_target_dict = None
+                        best_extra = None
                         logger.info(
-                            "SAC Curriculum: promoted "
-                            "to level %d (%smm)",
+                            "SAC Curriculum: "
+                            "promoted to level %d "
+                            "(%smm), actor warmup "
+                            "until ep %d, "
+                            "best_eval reset",
                             curr_level,
                             curriculum_levels[
                                 curr_level
                             ],
+                            actor_warmup_until,
                         )
-
+                        
             if (episode + 1) % log_interval == 0:
                 mesh_rate = (
                     self._mesh_goals
@@ -1929,8 +1948,7 @@ class PSACTrainer:
                 )
                 warmup_tag = (
                     " [WARMUP]"
-                    if episode
-                    < actor_warmup_episodes
+                    if episode < actor_warmup_until
                     else ""
                 )
                 logger.info(
