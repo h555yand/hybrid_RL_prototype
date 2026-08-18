@@ -11,7 +11,7 @@
 
 DEFAULT_CONFIG = {
     # State
-    "state_dim": 20,
+    "state_dim": 22,
     # HNSW store
     "max_points": 100000,
     "k_neighbors": 7,
@@ -94,5 +94,6 @@ DEFAULT_CONFIG = {
     "eval_alpha_multiplier": 0.1,  # alpha × 0.1 в eval mode
     "temperature_override": None,
     "warmup_episodes": 40,
-    "air_start_enabled": True
+    "air_start_enabled": True,
+    "stuck_threshold": 0.15,
 }

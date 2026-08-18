@@ -7,7 +7,7 @@ experiment:
   _target_: tbp.hybrid_rl.experiment.RLGoalApproachExperiment
   config:
     seed: 42
-    visualise: true
+    visualise: false
     regenerate_scripts: true
     do_train: true
     do_eval: true
@@ -15,7 +15,7 @@ experiment:
     do_bc_train: true
     do_sac_train: true
     do_sac_eval: true
-    do_adaptive: false
+    do_adaptive: true
 
     train_seeds: [11]
     eval_seeds: [44]
@@ -37,21 +37,50 @@ experiment:
 
     training_stages:
       - mesh: mug
-        episodes: 100
+        episodes: 1300
         epsilon_start: 1.0
         epsilon_min: 0.3
         load_mode: null
 
     eval_meshes: [mug]
-    eval_episodes_per_level: 2000
+    eval_episodes_per_level: 500
     # BC data composition
     bc_q_store_fraction: 0.0    # 0.0 = only heuristic, 0.2 = 20% Q-store
     bc_total_target: null
     bc_action_min_pct: 0.01       # 1% от total
-    bc_action_min_absolute: 100   # минимум 100 примеров чтобы 
+    bc_action_min_absolute: 100   # минимум 100 примеров
 
     rl_config:
-      state_dim: 20
+      state_dim: 22
+      stuck_threshold: 0.15
+      # Feature weights for HNSW stores
+      feature_weights_free:
+        3: 0.3
+        4: 0.3
+        5: 0.3
+        6: 0.0
+        7: 0.0
+        8: 0.0
+        9: 0.0
+        10: 0.0
+        11: 0.0
+        12: 0.0
+        19: 0.5
+        20: 0.0
+        21: 0.0
+      feature_weights_surface:
+        3: 0.0
+        4: 0.0
+        5: 0.0
+        6: 0.1
+        7: 0.1
+        8: 0.1
+        10: 0.1
+        11: 0.0
+        14: 0.0
+        18: 0.3
+        20: 1.5
+        21: 1.5
       mode: train_adapt_epsilon
       goal_threshold: 4.0
       max_points: 500000
@@ -91,6 +120,8 @@ experiment:
       strategic_reward_stay_orbit_progress: 0.02
       strategic_reward_stay_orbit_stuck: -0.05
       strategic_reward_stay_should_have: 0.2
+      warmup_episodes: 100
+      air_start_enabled: true
 
     sac_config:
       load_mode: null
@@ -116,10 +147,10 @@ experiment:
     sac_meshes: [mug]
     sac_episodes_per_mesh:
       mug: 1000
-    sac_eval_episodes_per_level: 500
+    sac_eval_episodes_per_level: 100
 
     adaptive_mesh: vase
-    adaptive_episodes: 2000
+    adaptive_episodes: 1000
 
     logging:
       run_name: rl_goal_approach

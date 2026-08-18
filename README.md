@@ -1083,3 +1083,70 @@ Q(s, detach) ← Q(s, detach) + α·0.2 · (reward_goal_reached × 0.3 - Q(s, de
 ```
 - Solves credit assignment: detach at step 5 gets direct credit from goal at step 100
 - Without this, lambda-return gives near-zero credit to early detach decisions
+
+## Резюме улучшений SAC пайплайна
+
+### State representation
+
+| Было | Стало | Зачем |
+|---|---|---|
+| 18D state | **22D state** | Больше информации для принятия решений |
+| Нет path_blocked | **path_blocked [18]** | SAC знает когда путь заблокирован |
+| Нет movement_efficiency | **movement_efficiency [19]** | SAC знает когда застрял |
+| Нет projected direction | **projected_goal_2d [20:22]** | SAC знает куда ползти на любом объекте |
+
+### Action representation
+
+| Было | Стало | Зачем |
+|---|---|---|
+| Angle в градусах (0-360) | **Sin/cos representation** | Нет разрыва при 0°/360°, лучше аппроксимация нейросетью |
+| MoveTangentially params: [angle, dist] | **[sin, cos, dist]** | Непрерывное представление направления |
+| Turn/Look params: [angle] | **[sin, cos]** | Консистентное представление углов |
+
+### Подготовка данных (BC)
+
+| Было | Стало | Зачем |
+|---|---|---|
+| Q-store eval + heuristic 50/50 | **Только heuristic** | Чистые данные без Q-store bias |
+| Без air start | **Air start каждый 3-й эпизод** | SAC видит примеры полёта и приземления |
+| Без фильтров по уровням | **Curriculum filters** (same_side, path_blocked) | Разделение по сложности |
+| Баланс только по (mesh, level) | **+ баланс по action type** (min 1%) | Редкие действия (detach) представлены |
+| Фиксированный target_per_group | **bc_total_target (опционально)** | Гибкое управление объёмом данных |
+
+### Тренировка SAC
+
+| Было | Стало | Зачем |
+|---|---|---|
+| Стандартный SAC critic | **CQL (Conservative Q-Learning)** | Предотвращает переоценку незнакомых действий |
+| Нет actor warmup | **Warmup per level (100 эпизодов)** | Critic учится до обновления actor |
+| bc_lambda decay без floor | **bc_lambda min=2.0** | BC regularization не исчезает |
+| bc_lambda decay по total steps | **Decay по actor updates** | Правильный темп decay |
+| Нет action masks | **Masks: no detach in air, no crawl in air, no fly on surface, no detach 3x** | Физические ограничения |
+| Mask заменяет на фиксированное действие | **Resample из actor с маской** | SAC сам выбирает альтернативу |
+| Curriculum по расстоянию | **Curriculum с фильтрами** (same_side, path_blocked) | От простого к сложному |
+| Promote во время warmup | **Promote только после warmup** | Actor обучен перед усложнением |
+| Best model глобальный | **Best model per level** | Лучшая модель для текущей сложности |
+| Reward только progress + goal | **Общая reward function** (subgoal shaping, landing bonus, fly alignment, stagnation penalty) | Те же сигналы что у Q-store |
+| Subgoal shaping без clamp | **Clamp [-3, 3]** | Предотвращает аномальные rewards |
+
+### Adaptive mode
+
+| Было | Стало | Зачем |
+|---|---|---|
+| Стандартный critic update | **CQL critic update** | Безопасное обучение на новом объекте |
+| Нет actor warmup | **Warmup 200 эпизодов** | Critic адаптируется до actor |
+| Все transitions в один поток | **Все → buffer, успешные → BC data** | Critic видит негативный опыт, actor якорится к позитивному |
+| Offline SAC = полная тренировка с env | **CQL retrain на buffer без env** | Безопасное offline обучение |
+| Нет curriculum filters | **Те же filters из конфига** | Консистентность с offline тренировкой |
+
+### Результаты
+
+| Метрика | Первый SAC | Финальный SAC |
+|---|---|---|
+| Eval rate (mug) | 12% | **94%** |
+| Rolling rate | 20% (деградация) | **72%** (стабильный) |
+| Steps/success L0 | ~960 | **16.7** |ы
+| Steps/success L1 | - | **46.6** |
+| Steps/success L2 | - | **102.9** |
+| Catastrophic forgetting | Да | **Нет** |
+| Detach accuracy (BC) | 0% | **55.6%** |

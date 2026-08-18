@@ -727,7 +727,8 @@ class RLGoalApproachExperiment:
                         self.eval_episodes_per_level
                     ),
                     mesh_name=mesh_name,
-                    visualise=self.visualise
+                    visualise=self.visualise,
+                    log_prefix="heuristic",
                 )
             )
 

@@ -69,9 +69,28 @@ class RLGoalApproachController:
         )
         self.num_actions = self.action_space.NUM_ACTIONS
 
-        # HNSW Q-store
-        self.q_store_free = HNSWStateStore(config=self.config, name="free")
-        self.q_store_surface = HNSWStateStore(config=self.config, name="surface")
+        # HNSW Q-store with per-store feature weights
+        free_weights = self.config.get(
+            "feature_weights_free", None
+        )
+        surface_weights = self.config.get(
+            "feature_weights_surface", None
+        )
+
+        self.q_store_free = HNSWStateStore(
+            config={
+                **self.config,
+                "feature_weights": free_weights,
+            },
+            name="free",
+        )
+        self.q_store_surface = HNSWStateStore(
+            config={
+                **self.config,
+                "feature_weights": surface_weights,
+            },
+            name="surface",
+        )
 
         # Strategic Q-stores (2 actions: stay=0, switch=1)
         strategic_detach_config = {
@@ -265,24 +284,27 @@ class RLGoalApproachController:
         self._pending_strategic_detach = []
         self._pending_strategic_direction = None
         self._path_clear_streak = 0
+
         if self.is_training:
-            warmup_episodes = int(
-                self.config.get("warmup_episodes", 0)
+            is_level_warmup = getattr(
+                self, "_force_warmup", False
             )
-            is_warmup = (
-                warmup_episodes > 0
-                and self._total_episodes <= warmup_episodes
-            )
-            if not is_warmup:
+            if not is_level_warmup:
                 self.epsilon = max(
                     self.epsilon_min,
-                    self.epsilon * self.epsilon_decay,
+                    self.epsilon
+                    * self.epsilon_decay,
                 )
-                if self.strategic_epsilon_decay is not None:
+                if (
+                    self.strategic_epsilon_decay
+                    is not None
+                ):
                     self.strategic_epsilon = max(
                         self.strategic_epsilon_min,
-                        self.strategic_epsilon * self.strategic_epsilon_decay,
+                        self.strategic_epsilon
+                        * self.strategic_epsilon_decay,
                     )
+
         self._episode_phase_counts = {}
         self._strategic_sac_pending = []
         self._prev_subgoal_alignment = None
@@ -347,19 +369,19 @@ class RLGoalApproachController:
                     "same_side": sensor_data.get("same_side", True),
                 }
             )
+            if self.is_training:
+                if done:
+                    td_target = reward
+                else:
+                    next_q = next_store.get_q_values(state)
+                    td_target = reward + self.gamma * np.max(next_q)
 
-            if done:
-                td_target = reward
-            else:
-                next_q = next_store.get_q_values(state)
-                td_target = reward + self.gamma * np.max(next_q)
-
-            prev_store.update_q_value(
-                self._prev_state,
-                self._last_action,
-                td_target,
-                self._get_learning_rate(),
-            )
+                prev_store.update_q_value(
+                    self._prev_state,
+                    self._last_action,
+                    td_target,
+                    self._get_learning_rate(),
+                )
 
             if done:
                 if termination_reason == "goal_reached":
@@ -466,6 +488,53 @@ class RLGoalApproachController:
         movement_efficiency = (
             self._compute_movement_efficiency(window=20)
         )
+        # Projected goal direction on tangent plane
+        if (
+            on_object > 0.5
+            and np.linalg.norm(local_normal) > 1e-8
+            and distance > 1e-8
+        ):
+            # Goal direction in world frame
+            rot_mat = R.from_euler(
+                "xyz", current_pose[3:6],
+                degrees=True,
+            )
+            goal_dir_world = rot_mat.apply(
+                local_pos_error
+            )
+            normal_world = rot_mat.apply(
+                local_normal
+            )
+            n_len = np.linalg.norm(normal_world)
+            if n_len > 1e-8:
+                n_hat = normal_world / n_len
+                # Project onto tangent plane
+                projected = (
+                    goal_dir_world
+                    - np.dot(goal_dir_world, n_hat)
+                    * n_hat
+                )
+                proj_len = np.linalg.norm(projected)
+                if proj_len > 1e-8:
+                    projected /= proj_len
+                # Back to local frame
+                projected_local = (
+                    rot_mat.inv().apply(projected)
+                )
+                # Take 2D (x, y components)
+                projected_2d = projected_local[:2]
+            else:
+                projected_2d = np.zeros(2)
+        else:
+            # In air or no normal: use
+            # local_pos_error direction
+            if distance > 1e-8:
+                projected_2d = (
+                    local_pos_error[:2]
+                    / distance
+                )
+            else:
+                projected_2d = np.zeros(2)
 
         state = np.concatenate(
             [
@@ -479,8 +548,9 @@ class RLGoalApproachController:
                 [distance],           # [13]    1D
                 [norm_depth],         # [14]    1D
                 goal_normal_local,    # [15:18] 3D
-                [path_blocked_val],   # [18]    1D NEW
-                [movement_efficiency],# [19]    1D NEW
+                [path_blocked_val],   # [18]    1D
+                [movement_efficiency],# [19]    1D
+                projected_2d,         # [20:22] 2D NEW
             ]
         )
 
@@ -814,41 +884,49 @@ class RLGoalApproachController:
             self._orbit_direction_age = 0
 
             if not same_side or path_blocked:
-                # Goal unreachable directly — crawl to nearest edge/rim
-                # But first check if stuck (fallback to DETACH_NEEDED)
-                if self._is_crawl_to_edge_stuck(window=50):
-                    fly_dir = self._compute_detach_fly_direction(
-                        current_pose, sensor_data
+                stuck_threshold = self.config.get(
+                    "stuck_threshold", 0.15
+                )
+                eff = (
+                    self
+                    ._compute_movement_efficiency(
+                        window=20
+                    )
+                )
+                if eff < stuck_threshold:
+                    fly_dir = (
+                        self
+                        ._compute_detach_fly_direction(
+                            current_pose,
+                            sensor_data,
+                        )
                     )
                     return (
                         "DETACH_NEEDED",
                         fly_dir,
-                        f"stuck crawling to edge, "
-                        f"consider detach "
+                        f"stuck, consider detach "
                         f"(dist={distance:.0f}, "
+                        f"eff={eff:.2f}, "
                         f"ss={same_side}, "
                         f"pb={path_blocked})",
                     )
 
-                edge_dir = self._compute_crawl_to_edge_direction(
-                    current_pose, sensor_data
+                edge_dir = (
+                    self
+                    ._compute_crawl_to_edge_direction(
+                        current_pose,
+                        sensor_data,
+                    )
                 )
                 return (
                     "CRAWL_TO_EDGE",
                     edge_dir,
                     f"crawling to edge "
-                    f"(dist={distance:.0f}, ss={same_side}, "
+                    f"(dist={distance:.0f}, "
+                    f"ss={same_side}, "
                     f"pb={path_blocked})",
                 )
-
-            return (
-                "CRAWL_TO_GOAL",
-                None,
-                f"crawl to goal "
-                f"(dist={distance:.0f}, ss={same_side}, "
-                f"pb={path_blocked})",
-            )
-        
+                    
         # ═══ IN AIR ═══
         else:
             landing_threshold = (
@@ -1740,13 +1818,24 @@ class RLGoalApproachController:
             )
 
             # Strategic detach: Q-store decides per-step
+            stuck_threshold = self.config.get(
+                "stuck_threshold", 0.15
+            )
+            movement_eff = (
+                self._compute_movement_efficiency(
+                    window=20
+                )
+            )
+            stuck = movement_eff < stuck_threshold
             if (
                 should_switch
                 and self._can_detach(state)
                 and (not same_side or path_blocked)
+                and stuck
             ):
-                action_index = self.action_space.IDX_DETACH
-                is_strategic_override = True
+                action_index = (
+                    self.action_space.IDX_DETACH
+                )
                 strategic_source = (
                     f"detach_switch("
                     f"q=[{strategic_q[0]:.2f},"
@@ -2202,7 +2291,7 @@ class RLGoalApproachController:
             ] -= 2.0
 
         # supress as detach is strategic decision
-        suppress[self.action_space.IDX_DETACH] -= 5.0
+        suppress[self.action_space.IDX_DETACH] -= 10.0
 
         if (
             self._last_action
@@ -4129,49 +4218,93 @@ class RLGoalApproachController:
 
         # ── Episodes WITHOUT detach ──
         if not had_detach:
-            detach_relevant = []
-            for tr in self._episode_transitions:
-                s = tr["state"]
-                if s[11] < 0.5:
-                    continue
-                pb = float(tr.get("path_blocked", True))
-                ss = tr.get("same_side", True)
-                t_state = self._compute_detach_state_from_full(
-                    s,
-                    path_blocked=pb,
-                    movement_efficiency=tr.get(
-                        "movement_efficiency", 0.0
-                    ),
-                )
+            stuck_threshold = self.config.get(
+                "stuck_threshold", 0.15
+            )
 
-                # Detach relevant only when actually blocked
-                # or opposite side
-                if not ss or pb > 0.5:
-                    detach_relevant.append(t_state)
-
-            if detach_relevant:
-                if goal_reached:
-                    for t_state in detach_relevant:
-                        self.strategic_detach.update_q_value(
-                            t_state, action=0,
+            if goal_reached:
+                # Success without detach — stay was
+                # correct for ALL surface states
+                for tr in self._episode_transitions:
+                    s = tr["state"]
+                    if s[11] < 0.5:
+                        continue
+                    eff = tr.get(
+                        "movement_efficiency", 1.0
+                    )
+                    pb = float(
+                        tr.get(
+                            "path_blocked", False
+                        )
+                    )
+                    t_state = (
+                        self
+                        ._compute_detach_state_from_full(
+                            s,
+                            path_blocked=pb,
+                            movement_efficiency=eff,
+                        )
+                    )
+                    self.strategic_detach \
+                        .update_q_value(
+                            t_state,
+                            action=0,
                             td_target=0.5,
-                            alpha=switch_alpha * 0.3,
+                            alpha=(
+                                switch_alpha * 0.3
+                            ),
                             count_visit=False,
                         )
-                elif termination_reason == "timeout":
-                    for t_state in detach_relevant:
-                        self.strategic_detach.update_q_value(
-                            t_state, action=0,
-                            td_target=-0.3,
-                            alpha=switch_alpha,
-                            count_visit=False,
+
+            elif termination_reason == "timeout":
+                # Timeout without detach — detach
+                # would have helped ONLY if agent
+                # was truly stuck
+                for tr in self._episode_transitions:
+                    s = tr["state"]
+                    if s[11] < 0.5:
+                        continue
+                    pb = float(
+                        tr.get(
+                            "path_blocked", False
                         )
-                        self.strategic_detach.update_q_value(
-                            t_state, action=1,
-                            td_target=0.3,
-                            alpha=switch_alpha * 0.5,
-                            count_visit=False,
+                    )
+                    ss = tr.get("same_side", True)
+                    eff = tr.get(
+                        "movement_efficiency", 1.0
+                    )
+
+                    if (
+                        (not ss or pb > 0.5)
+                        and eff < stuck_threshold
+                    ):
+                        t_state = (
+                            self
+                            ._compute_detach_state_from_full(
+                                s,
+                                path_blocked=pb,
+                                movement_efficiency=eff,
+                            )
                         )
+                        self.strategic_detach \
+                            .update_q_value(
+                                t_state,
+                                action=0,
+                                td_target=-0.3,
+                                alpha=switch_alpha,
+                                count_visit=False,
+                            )
+                        self.strategic_detach \
+                            .update_q_value(
+                                t_state,
+                                action=1,
+                                td_target=0.3,
+                                alpha=(
+                                    switch_alpha
+                                    * 0.5
+                                ),
+                                count_visit=False,
+                            )
 
         # ═══ Retrospective direction update ═══
         air_transitions = []
@@ -4746,18 +4879,19 @@ class RLGoalApproachController:
                 }
             )
 
-            if done:
-                td_target = reward
-            else:
-                next_q = next_store.get_q_values(state)
-                td_target = reward + self.gamma * np.max(next_q)
+            if self.is_training:
+                if done:
+                    td_target = reward
+                else:
+                    next_q = next_store.get_q_values(state)
+                    td_target = reward + self.gamma * np.max(next_q)
 
-            prev_store.update_q_value(
-                self._prev_state,
-                self._last_action,
-                td_target,
-                self._get_learning_rate(),
-            )
+                prev_store.update_q_value(
+                    self._prev_state,
+                    self._last_action,
+                    td_target,
+                    self._get_learning_rate(),
+                )
 
             if done:
                 if termination_reason == "goal_reached":
@@ -4844,11 +4978,34 @@ class RLGoalApproachController:
 
         controller = cls(agent_id=agent_id, config=cfg)
 
-        controller.q_store_free = HNSWStateStore.load_with_index(
-            os.path.join(dirpath, "q_store_free"), extra_cfg=config
+        free_cfg = {
+            **(config or {}),
+            "feature_weights": (config or {}).get(
+                "feature_weights_free", None
+            ),
+        }
+        controller.q_store_free = (
+            HNSWStateStore.load_with_index(
+                os.path.join(
+                    dirpath, "q_store_free"
+                ),
+                extra_cfg=free_cfg,
+            )
         )
-        controller.q_store_surface = HNSWStateStore.load_with_index(
-            os.path.join(dirpath, "q_store_surface"), extra_cfg=config
+
+        surface_cfg = {
+            **(config or {}),
+            "feature_weights": (config or {}).get(
+                "feature_weights_surface", None
+            ),
+        }
+        controller.q_store_surface = (
+            HNSWStateStore.load_with_index(
+                os.path.join(
+                    dirpath, "q_store_surface"
+                ),
+                extra_cfg=surface_cfg,
+            )
         )
 
         # Load transition memories

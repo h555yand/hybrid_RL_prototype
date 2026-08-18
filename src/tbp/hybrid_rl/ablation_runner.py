@@ -54,7 +54,8 @@ def run_eval_per_seed(  # noqa: PLR0913
     collect_bc: bool = False,
     episodes_per_level: int | None = None,
     mesh_name: str = "",
-    visualise=False
+    visualise=False,
+    log_prefix="eval",
 ) -> tuple[dict[str, Any], list[Any]]:
     """Run evaluation across seeds and curriculum levels.
 
@@ -105,7 +106,8 @@ def run_eval_per_seed(  # noqa: PLR0913
                 episode_script=level_pool,
                 episodes_per_level=episodes_per_level,
                 visualise=visualise,
-                level_idx=level_idx
+                level_idx=level_idx,
+                save_on_exit=False,
             )
 
             if collect_bc:
@@ -167,7 +169,8 @@ def run_eval_per_seed(  # noqa: PLR0913
 
         seed_output = (
             data_dir
-            / f"eval_result_{mesh_name}_seed_{train_seed}_{eval_seed}.json"
+            / f"{log_prefix}_result_{mesh_name}"
+            f"_seed_{train_seed}_{eval_seed}.json"
         )
         with seed_output.open("w", encoding="utf-8") as f:
             json.dump(seed_results, f, indent=2)
@@ -240,29 +243,28 @@ def _aggregate_level_results(
 
 
 class _CurriculumTracker:
-    """Tracks curriculum level progression during training.
-
-    Monitors rolling success rate and promotes to the next level
-    when the rate exceeds the threshold.
-    """
-
     def __init__(
         self,
-        levels: list[tuple[float, float]],
-        promote_threshold: float = 0.20,
-        promote_window: int = 50,
-    ) -> None:
+        levels,
+        promote_threshold=0.20,
+        promote_window=50,
+        warmup_per_level=40,
+    ):
         self.levels = list(levels)
         self.promote_threshold = promote_threshold
         self.promote_window = promote_window
+        self.warmup_per_level = warmup_per_level
 
         self.level_idx = 0
-        self.window: collections.deque[bool] = collections.deque(
+        self.window = collections.deque(
             maxlen=promote_window
         )
         self.level_episodes = 0
         self.level_successes = 0
-        self.stats: dict[str, Any] = {
+        self._level_warmup_remaining = (
+            warmup_per_level
+        )
+        self.stats = {
             "levels_reached": 1,
             "episodes_per_level": [],
             "successes_per_level": [],
@@ -271,87 +273,114 @@ class _CurriculumTracker:
         }
 
     @property
-    def current_bounds(self) -> tuple[float, float]:
-        """Return (min_dist, max_dist) for current level.
+    def is_warmup(self):
+        return self._level_warmup_remaining > 0
 
-        Returns:
-            Tuple of minimum and maximum distance bounds.
-        """
-        return tuple(self.levels[self.level_idx])
+    @property
+    def current_bounds(self):
+        return tuple(
+            self.levels[self.level_idx]
+        )
 
     def on_episode_end(
-        self,
-        success: bool,
-        controller: RLGoalApproachController,
-        episode: int,
-    ) -> None:
-        """Update curriculum state after an episode.
-
-        Args:
-            success: Whether the episode was successful.
-            controller: Controller to update goal_threshold on promotion.
-            episode: Current episode number (for logging).
-        """
-        self.window.append(success)
+        self, success, controller, episode
+    ):
         self.level_episodes += 1
         if success:
             self.level_successes += 1
 
-        window_full = len(self.window) == self.promote_window
-        not_last_level = self.level_idx < len(self.levels) - 1
+        if self._level_warmup_remaining > 0:
+            self._level_warmup_remaining -= 1
+            return
+
+        self.window.append(success)
+
+        window_full = (
+            len(self.window)
+            == self.promote_window
+        )
+        not_last_level = (
+            self.level_idx
+            < len(self.levels) - 1
+        )
 
         if window_full and not_last_level:
-            rolling_rate = sum(self.window) / self.promote_window
-            if rolling_rate >= self.promote_threshold:
-                self._promote(controller, episode, rolling_rate)
+            rolling_rate = (
+                sum(self.window)
+                / self.promote_window
+            )
+            if (
+                rolling_rate
+                >= self.promote_threshold
+            ):
+                self._promote(
+                    controller, episode,
+                    rolling_rate,
+                )
 
     def _promote(
-        self,
-        controller: RLGoalApproachController,
-        episode: int,
-        rolling_rate: float,
-    ) -> None:
-        self.stats["episodes_per_level"].append(self.level_episodes)
-        self.stats["successes_per_level"].append(self.level_successes)
-        self.stats["success_rate_per_level"].append(
-            self.level_successes / max(self.level_episodes, 1)
+        self, controller, episode, rolling_rate
+    ):
+        self.stats[
+            "episodes_per_level"
+        ].append(self.level_episodes)
+        self.stats[
+            "successes_per_level"
+        ].append(self.level_successes)
+        self.stats[
+            "success_rate_per_level"
+        ].append(
+            self.level_successes
+            / max(self.level_episodes, 1)
         )
 
         self.level_idx += 1
-        # goal_threshold stays fixed from config — no per-level override
-
-        self.window = collections.deque(maxlen=self.promote_window)
+        self.window = collections.deque(
+            maxlen=self.promote_window
+        )
         self.level_episodes = 0
         self.level_successes = 0
-        self.stats["levels_reached"] = self.level_idx + 1
+        self._level_warmup_remaining = (
+            self.warmup_per_level
+        )
+        self.stats["levels_reached"] = (
+            self.level_idx + 1
+        )
 
-        new_min, new_max = self.levels[self.level_idx]
+        new_min, new_max = (
+            self.levels[self.level_idx]
+        )
         logger.info(
-            "  [Curriculum] ep=%d: promoted to level %d: "
-            "dist [%s, %s] mm (rolling_rate=%.3f)(epsilon=%.3f)",
+            "  [Curriculum] ep=%d: promoted to "
+            "level %d: dist [%s, %s] mm "
+            "(rolling_rate=%.3f)"
+            "(epsilon=%.3f)"
+            "(warmup=%d episodes)",
             episode + 1,
             self.level_idx,
             new_min,
             new_max,
             rolling_rate,
             controller.epsilon,
+            self.warmup_per_level,
         )
-        
-    def finalize(self) -> dict[str, Any]:
-        """Finalize and return curriculum statistics.
 
-        Returns:
-            Dictionary with curriculum training statistics.
-        """
-        self.stats["episodes_per_level"].append(self.level_episodes)
-        self.stats["successes_per_level"].append(self.level_successes)
-        self.stats["success_rate_per_level"].append(
-            self.level_successes / max(self.level_episodes, 1)
+    def finalize(self):
+        self.stats[
+            "episodes_per_level"
+        ].append(self.level_episodes)
+        self.stats[
+            "successes_per_level"
+        ].append(self.level_successes)
+        self.stats[
+            "success_rate_per_level"
+        ].append(
+            self.level_successes
+            / max(self.level_episodes, 1)
         )
         self.stats["final_level"] = self.level_idx
         return self.stats
-
-
+    
 def _init_controller(
     cfg: dict[str, Any],
     load_dir: str | None,
@@ -503,6 +532,7 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
     visualise: bool = False,
     episodes_per_level: int | None = None,
     level_idx=0,
+    save_on_exit: bool = True,
 ) -> int | dict[str, Any]:
     """Run Q-learning episodes in train or eval mode.
 
@@ -604,10 +634,17 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
         curriculum = _CurriculumTracker(
             levels=curriculum_config["levels"],
             promote_threshold=float(
-                curriculum_config.get("promote_threshold", 0.20)
+                curriculum_config.get(
+                    "promote_threshold", 0.20
+                )
             ),
             promote_window=int(
-                curriculum_config.get("promote_window", 50)
+                curriculum_config.get(
+                    "promote_window", 50
+                )
+            ),
+            warmup_per_level=int(
+                cfg.get("warmup_episodes", 40)
             ),
         )
 
@@ -676,6 +713,17 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
                     curriculum.stats["fallback_episodes"] += 1
             else:
                 goal_pose = env.get_random_surface_point()
+
+        # Set warmup flag for controller
+        if curriculum is not None:
+            controller._force_warmup = (
+                curriculum.is_warmup
+            )
+            if curriculum.is_warmup:
+                controller.epsilon = 1.0
+                controller.strategic_epsilon = 1.0
+        else:
+            controller._force_warmup = False
 
         controller.set_new_goal(goal_pose, start_pos)
         env.set_goal(goal_pose)
@@ -880,18 +928,10 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
                 )
 
         if curriculum is not None:
-            warmup_episodes = int(
-                cfg.get("warmup_episodes", 0)
+            curriculum.on_episode_end(
+                episode_success, controller,
+                episode,
             )
-            is_warmup = (
-                warmup_episodes > 0
-                and controller._total_episodes
-                <= warmup_episodes
-            )
-            if not is_warmup:
-                curriculum.on_episode_end(
-                    episode_success, controller, episode
-                )
 
         if (episode + 1) % _LOG_INTERVAL == 0:
             logger.info(
@@ -901,8 +941,9 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
                 controller.get_stats(),
             )
 
-    controller.save(save_dir)
-    logger.info("Saved to %s", save_dir)
+    if save_on_exit:
+        controller.save(save_dir)
+        logger.info("Saved to %s", save_dir)
     logger.info(
         "Final: %d/%d goals reached", goals_reached, num_episodes
     )
