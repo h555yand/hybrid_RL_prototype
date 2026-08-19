@@ -926,7 +926,15 @@ class RLGoalApproachController:
                     f"ss={same_side}, "
                     f"pb={path_blocked})",
                 )
-                    
+            return (
+                "CRAWL_TO_GOAL",
+                None,
+                f"crawl to goal "
+                f"(dist={distance:.0f}, "
+                f"ss={same_side}, "
+                f"pb={path_blocked})",
+            )
+                
         # ═══ IN AIR ═══
         else:
             landing_threshold = (
