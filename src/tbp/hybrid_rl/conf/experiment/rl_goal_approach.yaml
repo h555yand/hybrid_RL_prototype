@@ -8,14 +8,14 @@ experiment:
   config:
     seed: 42
     visualise: false
-    regenerate_scripts: true
+    regenerate_scripts: false
     do_train: true
     do_eval: true
-    do_heur_eval: true
-    do_bc_train: true
-    do_sac_train: true
-    do_sac_eval: true
-    do_adaptive: true
+    do_heur_eval: false
+    do_bc_train: false
+    do_sac_train: false
+    do_sac_eval: false
+    do_adaptive: false
 
     train_seeds: [11]
     eval_seeds: [44]
@@ -37,7 +37,7 @@ experiment:
 
     training_stages:
       - mesh: mug
-        episodes: 1300
+        episodes: 3000
         epsilon_start: 1.0
         epsilon_min: 0.3
         load_mode: null
@@ -52,7 +52,9 @@ experiment:
 
     rl_config:
       state_dim: 22
-      stuck_threshold: 0.15
+      stuck_threshold: 0.05
+      warmup_episodes: 500
+      air_start_enabled: true
       # Feature weights for HNSW stores
       feature_weights_free:
         3: 0.3
@@ -120,8 +122,6 @@ experiment:
       strategic_reward_stay_orbit_progress: 0.02
       strategic_reward_stay_orbit_stuck: -0.05
       strategic_reward_stay_should_have: 0.2
-      warmup_episodes: 100
-      air_start_enabled: true
 
     sac_config:
       load_mode: null

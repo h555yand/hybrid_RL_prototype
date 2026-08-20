@@ -162,7 +162,13 @@ class RLGoalApproachController:
         if self.mode == "train_adapt_epsilon":
             total_episodes = max(1, int(self.config.get("num_episodes", 1)))
             warmup_episodes = int(self.config.get("warmup_episodes", 0))
-            effective_episodes = max(1, total_episodes - warmup_episodes)
+            
+            # Считаем уровни из конфига
+            curriculum_levels = self.config.get("curriculum_levels", [])
+            num_levels = max(1, len(curriculum_levels))
+            total_warmup = warmup_episodes * num_levels
+            
+            effective_episodes = max(1, total_episodes - total_warmup)
             
             eps_start = float(self.config.get("epsilon_start", self.epsilon))
             eps_min = float(self.config.get("epsilon_min", self.epsilon_min))
@@ -173,7 +179,7 @@ class RLGoalApproachController:
             s_min = float(self.config.get("strategic_epsilon_min", 0.3))
             if s_start > s_min > 0.0:
                 self.strategic_epsilon_decay = (s_min / s_start) ** (1.0 / effective_episodes)
-
+                
         # Episode state (reset each new goal)
         self._prev_state: Optional[np.ndarray] = None
         self._prev_sensor_data: Optional[Dict] = None
@@ -367,6 +373,7 @@ class RLGoalApproachController:
                     "reward": float(reward),
                     "path_blocked": sensor_data.get("path_blocked", False),
                     "same_side": sensor_data.get("same_side", True),
+                     "movement_efficiency": self._compute_movement_efficiency(window=20),  # NEW
                 }
             )
             if self.is_training:
@@ -1600,13 +1607,11 @@ class RLGoalApproachController:
     def _apply_success_backup_updates(self) -> None:
         """Apply backward updates along successful trajectory.
 
-        Two mechanisms:
-        1. Standard lambda-return: propagates discounted return backward
+        Lambda-return: propagates discounted return backward
         through the trajectory with exponential decay.
-        2. Critical Action Bonus: directly boosts Q-values for strategic
-        actions (detach) that enabled the success, regardless of
-        their position in the trajectory. Solves credit assignment
-        for early-episode decisions.
+        
+        Critical Action Bonus REMOVED — credit assignment for detach
+        is handled by strategic level in _on_episode_done.
         """
         if not self.success_backup_enabled:
             return
@@ -1641,38 +1646,19 @@ class RLGoalApproachController:
                 count_visit=False,
             )
 
-        # ═══ Critical Action Bonus ═══
-        # Directly boost Q-values for detach actions in successful
-        # episodes. Detach is typically at the start of the episode,
-        # far from goal_reached reward. Lambda-return gives it almost
-        # zero credit. This bonus ensures detach learns its true value.
-        critical_bonus = self.config.get("reward_goal_reached", 30.0) * 0.3
-        critical_lr = self._get_learning_rate() * 0.2
-
-        detach_count = 0
-        for tr in self._episode_transitions:
-            action = tr["action"]
-            if action == self.action_space.IDX_DETACH:
-                store = self._select_store(tr["state"])
-                store.update_q_value(
-                    tr["state"],
-                    action,
-                    critical_bonus,
-                    critical_lr,
-                    count_visit=False,
-                )
-                detach_count += 1
+        # ═══ Critical Action Bonus — REMOVED ═══
+        # Was: directly boosting Q-values for detach actions.
+        # Now handled by strategic_detach store in _on_episode_done
+        # with proper same_side/path_blocked based rewards.
 
         logger.debug(
             "Applied success backup: k=%d, base_alpha=%.4f, "
-            "lambda=%.3f, critical_bonus=%.1f, detach_count=%d",
+            "lambda=%.3f",
             k,
             base_alpha,
             self.success_backup_lambda,
-            critical_bonus,
-            detach_count,
         )
-        
+
     def _get_current_epsilon(self):
         if self.is_training:
             return self.epsilon
@@ -1776,6 +1762,7 @@ class RLGoalApproachController:
             combined[self.action_space.IDX_FREE_FORWARD] = -1e9
             combined[self.action_space.IDX_FREE_FORWARD_SMALL] = -1e9
             combined[self.action_space.IDX_FREE_BACKWARD] = -1e9
+            combined[self.action_space.IDX_DETACH] = -1e9  # NEW: detach = strategic only
 
         is_random_override = False
         is_strategic_override = False
@@ -1825,21 +1812,10 @@ class RLGoalApproachController:
                 strategic_combined[1] > strategic_combined[0]
             )
 
-            # Strategic detach: Q-store decides per-step
-            stuck_threshold = self.config.get(
-                "stuck_threshold", 0.15
-            )
-            movement_eff = (
-                self._compute_movement_efficiency(
-                    window=20
-                )
-            )
-            stuck = movement_eff < stuck_threshold
             if (
                 should_switch
                 and self._can_detach(state)
                 and (not same_side or path_blocked)
-                and stuck
             ):
                 action_index = (
                     self.action_space.IDX_DETACH
@@ -1854,12 +1830,16 @@ class RLGoalApproachController:
                 )
                 self._strategic_stats["detach_memory_triggered"] += 1
 
+                # ═══ CHANGED: сохраняем контекст для ретроспективного обучения ═══
                 self._pending_strategic_detach.append({
                     "state": t_state.copy(),
                     "step": len(self._episode_transitions),
                     "phase_was_detach_needed": (
                         current_phase == "DETACH_NEEDED"
                     ),
+                    "same_side_before": same_side,
+                    "path_blocked_before": path_blocked,
+                    "dist_before": float(state[13]),
                 })
             else:
                 if not same_side or path_blocked:
@@ -1967,6 +1947,7 @@ class RLGoalApproachController:
                     valid_mask[self.action_space.IDX_FREE_FORWARD] = False
                     valid_mask[self.action_space.IDX_FREE_FORWARD_SMALL] = False
                     valid_mask[self.action_space.IDX_FREE_BACKWARD] = False
+                    valid_mask[self.action_space.IDX_DETACH] = False  # NEW
                 if (
                     state[11] > 0.5
                     and state[13] < 5.0 * self.action_space.surface_step
@@ -1990,13 +1971,14 @@ class RLGoalApproachController:
             action_index == self.action_space.IDX_DETACH
             and on_object
         ):
-            # Check if not already recorded by strategic override
             already_recorded = (
                 self._pending_strategic_detach
                 and self._pending_strategic_detach[-1]["step"]
                 == len(self._episode_transitions)
             )
             if not already_recorded:
+                same_side = sensor_data.get("same_side", True)
+                path_blocked = sensor_data.get("path_blocked", False)
                 t_state = self._compute_detach_transition_state(
                     state, sensor_data,
                     movement_efficiency=self._compute_movement_efficiency(window=20),
@@ -2007,6 +1989,9 @@ class RLGoalApproachController:
                     "phase_was_detach_needed": (
                         current_phase == "DETACH_NEEDED"
                     ),
+                    "same_side_before": same_side,           # NEW
+                    "path_blocked_before": path_blocked,     # NEW
+                    "dist_before": float(state[13]),         # NEW
                 })
 
         self._prev_phase = current_phase
@@ -4128,6 +4113,7 @@ class RLGoalApproachController:
             * cfg.get("strategic_alpha_switch_multiplier", 1.0)
         )
         had_detach = len(self._pending_strategic_detach) > 0
+        stuck_threshold = self.config.get("stuck_threshold", 0.05)
 
         # ── Episodes WITH detach ──
         if had_detach:
@@ -4145,25 +4131,61 @@ class RLGoalApproachController:
 
                 self._strategic_stats["detach_total"] += 1
 
+                # ═══ CHANGED: reward based on geometric outcome ═══
+                same_side_before = pending.get("same_side_before", False)
+                path_blocked_before = pending.get("path_blocked_before", True)
+
+                # Find state after landing
+                same_side_after = None
+                path_blocked_after = None
+                landed = False
+                air_steps_after = 0
+                for j in range(
+                    detach_step + 1, len(self._episode_transitions)
+                ):
+                    future_state = self._episode_transitions[j]["state"]
+                    if future_state[11] > 0.5:  # landed
+                        landed = True
+                        same_side_after = self._episode_transitions[j].get(
+                            "same_side", True
+                        )
+                        path_blocked_after = self._episode_transitions[j].get(
+                            "path_blocked", False
+                        )
+                        break
+                    air_steps_after += 1
+
                 if goal_reached:
-                    switch_target = cfg.get(
-                        "strategic_reward_switch_success", 1.0
-                    )
-                    self._strategic_stats[
-                        "detach_led_to_success"
-                    ] += 1
+                    if not landed:
+                        # Never landed but somehow reached goal — unlikely, neutral
+                        switch_target = 0.0
+                    elif not same_side_before and same_side_after:
+                        # Detach solved the same_side problem — full reward
+                        switch_target = 1.0
+                        self._strategic_stats["detach_led_to_success"] += 1
+                    elif path_blocked_before and not path_blocked_after:
+                        # Detach unblocked the path — good reward
+                        switch_target = 0.8
+                        self._strategic_stats["detach_led_to_success"] += 1
+                    elif same_side_before and same_side_after:
+                        # Was on correct side, stayed on correct side
+                        # Detach was unnecessary but episode succeeded
+                        switch_target = 0.0  # neutral
+                        self._strategic_stats["detach_led_to_success"] += 1
+                    else:
+                        # Landed on wrong side but still reached goal
+                        switch_target = 0.1
+                        self._strategic_stats["detach_led_to_success"] += 1
+
                 elif termination_reason == "collision_surface_violation":
-                    switch_target = cfg.get(
-                        "strategic_reward_switch_collision", -0.5
-                    )
-                    self._strategic_stats[
-                        "detach_led_to_collision"
-                    ] += 1
+                    switch_target = -0.5
+                    self._strategic_stats["detach_led_to_collision"] += 1
+
                 elif termination_reason == "timeout":
-                    switch_target = -0.3
-                    self._strategic_stats[
-                        "detach_led_to_timeout"
-                    ] += 1
+                    # ═══ CHANGED: strong penalty for timeout ═══
+                    switch_target = -1.0  # was -0.3
+                    self._strategic_stats["detach_led_to_timeout"] += 1
+
                 else:
                     switch_target = 0.0
 
@@ -4173,26 +4195,38 @@ class RLGoalApproachController:
                     alpha=switch_alpha,
                 )
 
+                # ═══ CHANGED: retrospective stuck states ═══
+                # Only update if detach was clearly good or bad
                 stuck_states = []
                 for i in range(detach_step - 1, -1, -1):
                     tr = self._episode_transitions[i]
                     s = tr["state"]
                     if s[11] < 0.5:
                         break
-                    stuck_states.append(s)
+                    stuck_states.append(tr)
 
-                if switch_target > 0:
-                    for s in stuck_states:
-                        t_retro = self._compute_detach_state_from_full(s)
+                if switch_target > 0.5:
+                    # Detach was clearly good — teach stuck states that switch helps
+                    for tr in stuck_states:
+                        pb = float(tr.get("path_blocked", False))
+                        eff = tr.get("movement_efficiency", 0.5)
+                        t_retro = self._compute_detach_state_from_full(
+                            tr["state"], path_blocked=pb, movement_efficiency=eff,
+                        )
                         self.strategic_detach.update_q_value(
                             t_retro, action=1,
-                            td_target=switch_target * 0.7,
+                            td_target=switch_target * 0.5,
                             alpha=switch_alpha * 0.3,
                             count_visit=False,
                         )
-                elif switch_target < 0:
-                    for s in stuck_states:
-                        t_retro = self._compute_detach_state_from_full(s)
+                elif switch_target < -0.5:
+                    # Detach was clearly bad — teach stuck states that stay is better
+                    for tr in stuck_states:
+                        pb = float(tr.get("path_blocked", False))
+                        eff = tr.get("movement_efficiency", 0.5)
+                        t_retro = self._compute_detach_state_from_full(
+                            tr["state"], path_blocked=pb, movement_efficiency=eff,
+                        )
                         self.strategic_detach.update_q_value(
                             t_retro, action=0,
                             td_target=0.3,
@@ -4200,119 +4234,80 @@ class RLGoalApproachController:
                             count_visit=False,
                         )
 
-                air_steps_after = 0
-                landed_successfully = False
-                for j in range(
-                    detach_step + 1, len(self._episode_transitions)
-                ):
-                    future_state = self._episode_transitions[j]["state"]
-                    if future_state[11] > 0.5:
-                        landed_successfully = True
-                        break
-                    air_steps_after += 1
-
+                # ═══ KEPT: long air penalty ═══
                 max_reasonable_air = 50
                 if (
                     air_steps_after > max_reasonable_air
-                    and not landed_successfully
+                    and not landed
                 ):
                     self.strategic_detach.update_q_value(
                         t_state, action=1,
                         td_target=cfg.get(
-                            "strategic_reward_switch_long_air", -0.2
+                            "strategic_reward_switch_long_air", -0.5
                         ),
                         alpha=switch_alpha * 0.5,
                     )
 
         # ── Episodes WITHOUT detach ──
         if not had_detach:
-            stuck_threshold = self.config.get(
-                "stuck_threshold", 0.15
-            )
-
             if goal_reached:
-                # Success without detach — stay was
-                # correct for ALL surface states
+                # ═══ CHANGED: stay reward only for "decision zone" states ═══
                 for tr in self._episode_transitions:
                     s = tr["state"]
-                    if s[11] < 0.5:
+                    if s[11] < 0.5:  # in air — skip
                         continue
-                    eff = tr.get(
-                        "movement_efficiency", 1.0
+
+                    ss = tr.get("same_side", True)
+                    pb = float(tr.get("path_blocked", False))
+                    eff = tr.get("movement_efficiency", 1.0)
+
+                    # Only update states where detach could have been considered
+                    could_have_detached = (
+                        (not ss or pb > 0.5)
+                        and eff < stuck_threshold
                     )
-                    pb = float(
-                        tr.get(
-                            "path_blocked", False
+
+                    if could_have_detached:
+                        t_state = self._compute_detach_state_from_full(
+                            s, path_blocked=pb, movement_efficiency=eff,
                         )
-                    )
-                    t_state = (
-                        self
-                        ._compute_detach_state_from_full(
-                            s,
-                            path_blocked=pb,
-                            movement_efficiency=eff,
-                        )
-                    )
-                    self.strategic_detach \
-                        .update_q_value(
-                            t_state,
-                            action=0,
-                            td_target=0.5,
-                            alpha=(
-                                switch_alpha * 0.3
-                            ),
-                            count_visit=False,
+                        self.strategic_detach.update_q_value(
+                            t_state, action=0,  # stay
+                            td_target=1.0,      # was 0.5
+                            alpha=switch_alpha,  # was switch_alpha * 0.3
                         )
 
             elif termination_reason == "timeout":
-                # Timeout without detach — detach
-                # would have helped ONLY if agent
-                # was truly stuck
+                # ═══ CHANGED: only penalize stay, do NOT reward switch ═══
                 for tr in self._episode_transitions:
                     s = tr["state"]
                     if s[11] < 0.5:
                         continue
-                    pb = float(
-                        tr.get(
-                            "path_blocked", False
-                        )
-                    )
-                    ss = tr.get("same_side", True)
-                    eff = tr.get(
-                        "movement_efficiency", 1.0
-                    )
 
-                    if (
+                    ss = tr.get("same_side", True)
+                    pb = float(tr.get("path_blocked", False))
+                    eff = tr.get("movement_efficiency", 1.0)
+
+                    could_have_detached = (
                         (not ss or pb > 0.5)
                         and eff < stuck_threshold
-                    ):
-                        t_state = (
-                            self
-                            ._compute_detach_state_from_full(
-                                s,
-                                path_blocked=pb,
-                                movement_efficiency=eff,
-                            )
+                    )
+
+                    if could_have_detached:
+                        t_state = self._compute_detach_state_from_full(
+                            s, path_blocked=pb, movement_efficiency=eff,
                         )
-                        self.strategic_detach \
-                            .update_q_value(
-                                t_state,
-                                action=0,
-                                td_target=-0.3,
-                                alpha=switch_alpha,
-                                count_visit=False,
-                            )
-                        self.strategic_detach \
-                            .update_q_value(
-                                t_state,
-                                action=1,
-                                td_target=0.3,
-                                alpha=(
-                                    switch_alpha
-                                    * 0.5
-                                ),
-                                count_visit=False,
-                            )
+                        self.strategic_detach.update_q_value(
+                            t_state, action=0,  # stay was bad
+                            td_target=-0.3,
+                            alpha=switch_alpha * 0.5,
+                            count_visit=False,
+                        )
+                        # ═══ REMOVED: no counterfactual switch reward ═══
+                        # Was:
+                        # self.strategic_detach.update_q_value(
+                        #     t_state, action=1, td_target=0.3, ...
+                        # )
 
         # ═══ Retrospective direction update ═══
         air_transitions = []
