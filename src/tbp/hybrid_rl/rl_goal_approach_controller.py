@@ -258,7 +258,7 @@ class RLGoalApproachController:
     # ══════════════════════════════════════════════════════════
     @property
     def is_training(self):
-        if self.mode in ("train", "train_adapt_epsilon"):
+        if self.mode in ("train", "train_adapt_epsilon", "adaptive"):
             return True
         if self.mode == "eval":
             return False
@@ -291,7 +291,7 @@ class RLGoalApproachController:
         self._pending_strategic_direction = None
         self._path_clear_streak = 0
 
-        if self.is_training:
+        if self.is_training and self.mode != "adaptive":
             is_level_warmup = getattr(
                 self, "_force_warmup", False
             )

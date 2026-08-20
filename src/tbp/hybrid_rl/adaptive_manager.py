@@ -11,11 +11,11 @@
 when/how to train for new objects.
 
 Modes:
-  - inference_only: success_rate > 80%, no training needed
-  - online: 60-80%, update Q-store + accumulate for SAC
-  - offline: < 60%, selective retraining:
-      - Q-store: always retrain with decreasing epsilon (0.6 → 0.3 → 0.1 → 0.05)
-      - SAC: retrain only if SAC success rate is below threshold
+  - mastered: success_rate > 80%, light tuning (Q alpha*0.1, eps=0.02)
+  - online: 40-80%, full Q learning + periodic SAC updates,
+    adaptive epsilon based on success rate
+  - offline: < 40% for extended period, Q retrain (500 ep, eps 1→0.3)
+    + SAC CQL retrain, then switch to online
 """
 
 import logging
@@ -27,7 +27,6 @@ import numpy as np
 
 from .ablation_runner import run_episodes
 from .arbitrator import Arbitrator
-from .behavioral_cloning import BCTrainer
 from .experience_extractor import ExperienceExtractor
 from .lightweight_env import LightweightEnv
 from .rl_goal_approach_controller import RLGoalApproachController
@@ -38,8 +37,6 @@ logger = logging.getLogger(__name__)
 
 class AdaptiveTrainingManager:
 
-    OFFLINE_Q_EPSILON_SCHEDULE = [0.6, 0.3, 0.1, 0.05]
-
     def __init__(
         self,
         controller: RLGoalApproachController,
@@ -47,16 +44,17 @@ class AdaptiveTrainingManager:
         config: Dict[str, Any],
         runs_dir: str,
         mesh_path: str,
-        online_threshold: float = 0.80,
-        offline_threshold: float = 0.40,
-        sac_offline_threshold: float = 0.50,
+        mastered_threshold: float = 0.80,
+        offline_threshold: float = 0.50,
         monitor_window: int = 100,
-        online_sac_update_every: int = 500,
+        online_sac_update_every: int = 200,
         online_sac_update_steps: int = 20,
-        online_bc_update_every: int = 2000,
-        offline_q_episodes: int = 5000,
-        offline_sac_episodes: int = 2000,
+        offline_q_episodes: int = 500,
+        offline_sac_steps: int = 2000,
         post_offline_cooldown: int = 200,
+        max_bc_transitions: int = 5000,
+        epsilon_warmup_episodes: int = 20,
+        epsilon_default: float = 0.15,
     ):
         self.controller = controller
         self.env = env
@@ -64,128 +62,104 @@ class AdaptiveTrainingManager:
         self.runs_dir = Path(runs_dir)
         self.mesh_path = mesh_path
 
-        self.online_threshold = online_threshold
+        # Mode thresholds
+        self.mastered_threshold = mastered_threshold
         self.offline_threshold = offline_threshold
-        self.sac_offline_threshold = sac_offline_threshold
         self.monitor_window = monitor_window
+
+        # Online SAC updates
         self.online_sac_update_every = online_sac_update_every
         self.online_sac_update_steps = online_sac_update_steps
-        self.online_bc_update_every = online_bc_update_every
+
+        # Offline retrain params
         self.offline_q_episodes = offline_q_episodes
-        self.offline_sac_episodes = offline_sac_episodes
+        self.offline_q_epsilon_start = 1.0
+        self.offline_q_epsilon_min = 0.3
+        self.offline_sac_steps = offline_sac_steps
         self.post_offline_cooldown = post_offline_cooldown
 
-        self.success_history = deque(maxlen=monitor_window)
-        self.online_transitions_raw = []
+        # BC data management
+        self.max_bc_transitions = max_bc_transitions
+        self.bc_transitions: List = []
+
+        # Adaptive epsilon
+        self.epsilon_warmup_episodes = epsilon_warmup_episodes
+        self.epsilon_default = epsilon_default
+
+        # Performance tracking
+        self.success_history: deque = deque(maxlen=monitor_window)
+        self.online_transitions_raw: List = []
         self.online_episodes_since_sac_update = 0
-        self.online_episodes_since_bc_update = 0
         self.total_episodes = 0
         self.total_sac_updates = 0
-        self.total_bc_updates = 0
         self.total_offline_iterations = 0
         self._episodes_since_offline = 0
-        self.mode = "inference_only"
+        self.mode = "online"
 
-        self.sac_trainer = None
+        # Components
+        self.sac_trainer: PSACTrainer | None = None
         self.action_space = controller.action_space
-        self.extractor = ExperienceExtractor(config=config)
-        self.arbitrator = Arbitrator(controller=controller)
-        self.bc_transitions = []  # накопитель BC данных от всех offline итераций
         mesh_name = Path(mesh_path).stem
-        self.extractor = ExperienceExtractor(config=config, mesh_name=mesh_name)
+        self.extractor = ExperienceExtractor(
+            config=config, mesh_name=mesh_name
+        )
+        self.arbitrator = Arbitrator(controller=controller)
 
     @property
-    def success_rate(self):
+    def success_rate(self) -> float:
         if len(self.success_history) == 0:
             return 0.0
-        return sum(self.success_history) / len(self.success_history)
+        return sum(self.success_history) / len(
+            self.success_history
+        )
+
+    def _get_adaptive_epsilon(self) -> float:
+        """Compute epsilon based on rolling success rate.
+
+        Returns moderate default during warmup, then adapts:
+        high success → low epsilon (exploit),
+        low success → high epsilon (explore).
+        """
+        if len(self.success_history) < self.epsilon_warmup_episodes:
+            return self.epsilon_default
+        rate = self.success_rate
+        return 0.05 + 0.3 * (1.0 - rate)
 
     def get_action(self, state, current_pose, sensor_data):
         """Get action from arbitrator.
 
-        Args:
-            state: Current state vector.
-            current_pose: Current agent pose.
-            sensor_data: Current sensor readings.
-
         Returns:
-            Tuple of (action_index, source_name).
+            Tuple of (action_type, action_params, source_name).
         """
         if self.sac_trainer is not None:
-            self.arbitrator.sac_actor = (
-                self.sac_trainer.actor
-            )
-            self.arbitrator.state_mean = (
-                self.sac_trainer.state_mean
-            )
-            self.arbitrator.state_std = (
-                self.sac_trainer.state_std
-            )
-            self.arbitrator.param_mean = (
-                self.sac_trainer.param_mean
-            )
-            self.arbitrator.param_std = (
-                self.sac_trainer.param_std
-            )
+            self.arbitrator.sac_actor = self.sac_trainer.actor
+            self.arbitrator.state_mean = self.sac_trainer.state_mean
+            self.arbitrator.state_std = self.sac_trainer.state_std
+            self.arbitrator.param_mean = self.sac_trainer.param_mean
+            self.arbitrator.param_std = self.sac_trainer.param_std
 
         return self.arbitrator.decide(
             state, current_pose, sensor_data
         )
 
-    def decide_mode(self):
-        """Decide operating mode based on performance.
-
-        Modes:
-        - online: Q-store updates every step, SAC updates
-          periodically. Default mode — always learning.
-        - inference_only: no updates. Only when consistently
-          high success rate — system has mastered the object.
-        - offline: full retraining. Only when both sources
-          fail for extended period — emergency mode.
-
-        Returns:
-            Mode string: "online", "inference_only", or "offline".
-        """
+    def decide_mode(self) -> str:
+        """Decide operating mode based on performance."""
         if len(self.success_history) < self.monitor_window:
             return "online"
 
-        if (
-            self._episodes_since_offline
-            < self.post_offline_cooldown
-        ):
+        if self._episodes_since_offline < self.post_offline_cooldown:
             return "online"
 
         rate = self.success_rate
 
-        # Mastered the object — stop learning
-        if rate >= self.online_threshold:
-            return "inference_only"
+        if rate >= self.mastered_threshold:
+            return "mastered"
 
-        # Both sources failing for extended period
         if rate < self.offline_threshold:
-            q_rate = self.arbitrator.q_success_rate
-            sac_rate = self.arbitrator.sac_success_rate
-            episodes_stuck = (
-                self._count_episodes_below_threshold()
-            )
-
-            min_stuck = self.monitor_window * 3
-            if (
-                q_rate < self.offline_threshold
-                and sac_rate < self.offline_threshold
-                and episodes_stuck > min_stuck
-            ):
-                return "offline"
-
-        # Default: keep learning online
-        return "online"
+            return "offline"
     
     def _count_episodes_below_threshold(self) -> int:
-        """Count recent consecutive failures in success history.
-
-        Returns:
-            Number of consecutive failures from the end.
-        """
+        """Count recent consecutive failures from end of history."""
         count = 0
         for success in reversed(self.success_history):
             if not success:
@@ -193,115 +167,97 @@ class AdaptiveTrainingManager:
             else:
                 break
         return count
-    
-    def on_episode_complete(self, success: bool, transitions: List[Dict[str, Any]]):
+
+    def on_episode_complete(
+        self,
+        success: bool,
+        transitions: List[Dict[str, Any]],
+    ) -> None:
+        """Process episode completion: update mode, collect data, trigger updates.
+
+        Args:
+            success: Whether episode reached goal.
+            transitions: Episode transitions for SAC training.
+        """
         self.success_history.append(success)
         self.total_episodes += 1
         self._episodes_since_offline += 1
         self.online_episodes_since_sac_update += 1
-        self.online_episodes_since_bc_update += 1
 
         old_mode = self.mode
         self.mode = self.decide_mode()
 
         if self.mode != old_mode:
             logger.info(
-                f"AdaptiveTraining: mode changed {old_mode} → {self.mode} "
-                f"(success_rate={self.success_rate:.3f}, "
-                f"episodes={self.total_episodes}, "
-                f"cooldown={self._episodes_since_offline}/{self.post_offline_cooldown})"
+                "AdaptiveTraining: mode %s → %s "
+                "(rate=%.3f, episodes=%d)",
+                old_mode,
+                self.mode,
+                self.success_rate,
+                self.total_episodes,
             )
 
-        if self.mode == "inference_only":
-            self.controller.mode = "eval"
-            self.controller.epsilon = self.controller.eval_epsilon
+        if self.mode == "mastered":
+            # Light tuning: Q updates with reduced alpha (eval mode)
+            self.controller.mode = "adaptive"
+            self.controller.epsilon = 0.02
+            self.controller.strategic_epsilon = 0.02
             return
 
         if self.mode == "online":
-            self.controller.mode = "train"
-            self.controller.epsilon = self.config.get(
-                "epsilon_start", 0.2
-            )
-            self.controller.strategic_epsilon = (
-                self.config.get(
-                    "strategic_epsilon_start", 0.2
-                )
-            )
+            self.controller.mode = "adaptive"
+            eps = self._get_adaptive_epsilon()
+            self.controller.epsilon = eps
+            self.controller.strategic_epsilon = eps
             self._collect_transitions(success, transitions)
             self._maybe_online_sac_update()
-            # Update Strategic SAC
-            if (
-                self.controller.strategic_sac is not None
-                and self.controller.strategic_sac.buffer_size
-                >= self.controller.strategic_sac.batch_size
-                and self.total_episodes % 100 == 0
-            ):
-                stats = self.controller.strategic_sac.update(
-                    num_steps=20
-                )
-                logger.debug(
-                    "Strategic SAC update: %s", stats
-                )
+            return
 
         if self.mode == "offline":
             self._trigger_offline()
             self.controller.mode = "train"
-            self.controller.mode = "train"
-            self.controller.epsilon = self.config.get(
-                "epsilon_start", 0.2
-            )
-            self.controller.strategic_epsilon = (
-                self.config.get(
-                    "strategic_epsilon_start", 0.2
-                )
-            )
+            eps = self._get_adaptive_epsilon()
+            self.controller.epsilon = eps
+            self.controller.strategic_epsilon = eps
             self.mode = "online"
 
     def _collect_transitions(
         self,
         success: bool,
         transitions: List[Dict[str, Any]],
-    ):
-        """Collect transitions for SAC update.
+    ) -> None:
+        """Collect transitions for SAC training.
 
-        All transitions → online_transitions_raw
-            (for buffer, critic needs negative examples)
-        Successful only → bc_transitions
-            (for BC regularization)
-
-        Args:
-            success: Whether the episode succeeded.
-            transitions: Episode transitions.
+        Success transitions always collected (for buffer + BC).
+        Failure transitions collected with 30% probability
+        (critic needs some negatives, but not too many).
         """
         if not transitions:
             return
 
-        psac_transitions = (
-            self.extractor.convert_trajectory(
-                transitions
-            )
+        psac_transitions = self.extractor.convert_trajectory(
+            transitions
         )
 
-        # All transitions for buffer
-        self.online_transitions_raw.extend(
-            psac_transitions
-        )
-
-        # Only successful for BC regularization
         if success:
-            self.bc_transitions.extend(
-                psac_transitions
-            )
+            # Always collect successful transitions
+            self.online_transitions_raw.extend(psac_transitions)
+            self.bc_transitions.extend(psac_transitions)
+            if len(self.bc_transitions) > self.max_bc_transitions:
+                self.bc_transitions = self.bc_transitions[
+                    -self.max_bc_transitions :
+                ]
+        else:
+            # Collect 30% of failure transitions (critic needs some negatives)
+            if np.random.random() < 0.3:
+                self.online_transitions_raw.extend(psac_transitions)
 
-    def _maybe_online_sac_update(self):
-        """Online SAC update with CQL support.
+    def _maybe_online_sac_update(self) -> None:
+        """Periodic online SAC update: critic only.
 
-        Every online_sac_update_every episodes:
-        - Add ALL transitions to buffer (critic
-          needs negative examples)
-        - Update BC data with successful only
-        - Update critic (CQL if enabled)
-        - Update actor (only after warmup)
+        Actor is NOT updated online to prevent catastrophic forgetting.
+        Actor updates happen only in offline mode with curated BC data
+        and full training protections (warmup, CQL, strong BC lambda).
         """
         if self.sac_trainer is None:
             return
@@ -313,18 +269,12 @@ class AdaptiveTrainingManager:
             return
 
         if len(self.online_transitions_raw) < 100:
-            logger.info(
-                "SAC update skipped: only %d "
-                "transitions",
-                len(self.online_transitions_raw),
-            )
             self.online_episodes_since_sac_update = 0
             return
 
-        # Add ALL transitions to buffer
+        # Add transitions to buffer
         all_normalized = (
-            self.sac_trainer
-            ._normalize_bc_transitions(
+            self.sac_trainer._normalize_bc_transitions(
                 self.online_transitions_raw
             )
         )
@@ -341,133 +291,57 @@ class AdaptiveTrainingManager:
                 )
                 added += 1
 
-        # Update BC data with successful only
+        # Update BC data
         if self.bc_transitions:
-            self.sac_trainer.bc_data = (
-                self.bc_transitions.copy()
-            )
+            self.sac_trainer.bc_data = self.bc_transitions.copy()
 
-        # Clear raw transitions
         self.online_transitions_raw = []
 
-        if (
-            len(self.sac_trainer.buffer)
-            < self.sac_trainer.batch_size
-        ):
-            logger.info(
-                "SAC update skipped: buffer too "
-                "small (%d)",
-                len(self.sac_trainer.buffer),
-            )
+        if len(self.sac_trainer.buffer) < self.sac_trainer.batch_size:
             self.online_episodes_since_sac_update = 0
             return
 
-        # Conservative update
-        old_bc_lambda = self.sac_trainer.bc_lambda
-        self.sac_trainer.bc_lambda = max(
-            old_bc_lambda,
-            self.sac_trainer.bc_lambda_min,
-        )
-
-        # Actor warmup: first 200 episodes
-        # only critic
-        actor_ready = self.total_episodes > 200
-
-        for _ in range(
-            self.online_sac_update_steps
-        ):
+        # Online: critic only (safe, no catastrophic forgetting)
+        for _ in range(self.online_sac_update_steps):
             batch = self.sac_trainer.buffer.sample(
                 self.sac_trainer.batch_size
             )
-
-            # CQL or standard critic
-            if self.sac_trainer.use_cql:
-                self.sac_trainer.update_critic_cql(
-                    batch
-                )
-            else:
-                self.sac_trainer.update_critic(
-                    batch
-                )
-
-            # Actor: only after warmup
-            if actor_ready:
-                self.sac_trainer.update_actor(
-                    batch
-                )
-
+            self.sac_trainer.update_critic_cql(batch)
             self.sac_trainer.soft_update_target()
 
-        self.sac_trainer.bc_lambda = old_bc_lambda
         self.total_sac_updates += 1
         self.online_episodes_since_sac_update = 0
 
         logger.info(
-            "Online SAC update: added=%d, "
-            "bc_data=%d, steps=%d, cql=%s, "
-            "actor=%s, bc_lambda=%.2f, "
-            "total_updates=%d",
+            "Online SAC update (critic only): added=%d, "
+            "bc=%d, steps=%d, total=%d",
             added,
             len(self.bc_transitions),
             self.online_sac_update_steps,
-            self.sac_trainer.use_cql,
-            actor_ready,
-            self.sac_trainer.bc_lambda,
             self.total_sac_updates,
         )
 
-    def _maybe_online_bc_update(self):
-        if self.sac_trainer is None:
-            return
-
-        if self.online_episodes_since_bc_update < self.online_bc_update_every:
-            return
-
-        if self.sac_trainer.bc_data is not None and len(self.sac_trainer.bc_data) > 100:
-            for _ in range(20):
-                batch = self.sac_trainer.buffer.sample(self.sac_trainer.batch_size)
-                self.sac_trainer.update_actor(batch)
-
-            self.total_bc_updates += 1
-            self.online_episodes_since_bc_update = 0
-
-            logger.info(
-                f"AdaptiveTraining: online BC update #{self.total_bc_updates} "
-                f"(bc_data={len(self.sac_trainer.bc_data)})"
-            )
-
-    def _trigger_offline(self):
-        """Trigger offline retraining when success rate is too low."""
+    def _trigger_offline(self) -> None:
+        """Offline retraining: Q 500 ep + SAC with training protections."""
         self.total_offline_iterations += 1
-
-        eps_idx = min(
-            self.total_offline_iterations - 1,
-            len(self.OFFLINE_Q_EPSILON_SCHEDULE) - 1,
-        )
-        q_epsilon = self.OFFLINE_Q_EPSILON_SCHEDULE[eps_idx]
+        self._episodes_since_offline = 0
 
         logger.info(
-            "AdaptiveTraining: triggering OFFLINE "
-            "iteration #%d (success_rate=%.3f, "
-            "q_epsilon=%.3f)",
+            "AdaptiveTraining: OFFLINE #%d (rate=%.3f)",
             self.total_offline_iterations,
             self.success_rate,
-            q_epsilon,
         )
 
-        # === Q-learning: save current, then retrain ===
+        # === Phase 1: Q-learning retrain ===
         q_save_dir = str(self.runs_dir / "adaptive_q")
         self.controller.save(q_save_dir)
 
         logger.info(
-            "AdaptiveTraining: OFFLINE Q-learning "
-            "(episodes=%d, epsilon=%.3f, load=%s)",
+            "OFFLINE Q: %d episodes, eps %.1f→%.1f",
             self.offline_q_episodes,
-            q_epsilon,
-            q_save_dir,
+            self.offline_q_epsilon_start,
+            self.offline_q_epsilon_min,
         )
-
-        from .ablation_runner import run_episodes
 
         train_result = run_episodes(
             mesh_dir=str(self.runs_dir.parent),
@@ -477,24 +351,36 @@ class AdaptiveTrainingManager:
             config={
                 **self.config,
                 "mode": "train_adapt_epsilon",
-                "epsilon_start": q_epsilon,
+                "epsilon_start": self.offline_q_epsilon_start,
+                "epsilon_min": self.offline_q_epsilon_min,
+                "num_episodes": self.offline_q_episodes,
             },
             mesh_path=self.mesh_path,
             seed=42,
             return_metrics=True,
         )
 
-        # Reload updated Q-store into controller
+        # Reload controller and fix all references
         self.controller = RLGoalApproachController.load(
             q_save_dir,
             agent_id=self.controller.agent_id,
-            config={**self.config, "mode": "eval"},
+            config={**self.config, "mode": "adaptive"},
         )
+        self.arbitrator.controller = self.controller
 
-        # Collect BC transitions from successful episodes
-        success_trails = train_result.get(
-            "success_trails", []
-        )
+        # Unfreeze normalization for new object
+        for store in [
+            self.controller.q_store_free,
+            self.controller.q_store_surface,
+            self.controller.strategic_detach,
+            self.controller.strategic_direction,
+        ]:
+            store._norm_frozen = False
+            store._freeze_done = False
+            store._state_buffer.clear()
+
+        # Collect BC transitions
+        success_trails = train_result.get("success_trails", [])
         if success_trails:
             new_transitions = (
                 self.extractor.convert_all_trajectories(
@@ -502,172 +388,110 @@ class AdaptiveTrainingManager:
                 )
             )
             self.bc_transitions.extend(new_transitions)
+            if len(self.bc_transitions) > self.max_bc_transitions:
+                self.bc_transitions = self.bc_transitions[
+                    -self.max_bc_transitions :
+                ]
+
+        q_rate = train_result.get("success_rate", 0.0)
+        logger.info("OFFLINE Q complete: rate=%.3f", q_rate)
+
+        # === Phase 2: SAC retrain with training protections ===
+        if self.sac_trainer is not None and self.bc_transitions:
             logger.info(
-                "AdaptiveTraining: collected %d BC "
-                "transitions (total=%d)",
-                len(new_transitions),
+                "OFFLINE SAC: %d steps, bc=%d",
+                self.offline_sac_steps,
                 len(self.bc_transitions),
             )
 
-        q_success_rate = train_result.get(
-            "success_rate", 0.0
-        )
-        logger.info(
-            "AdaptiveTraining: OFFLINE Q-learning "
-            "complete (success_rate=%.3f)",
-            q_success_rate,
-        )
-
-        # === SAC: fine-tune existing, not from scratch ===
-        sac_sr = self.arbitrator.sac_success_rate
-        need_sac_retrain = (
-            self.sac_trainer is not None
-            and sac_sr < self.sac_offline_threshold
-            and self.total_offline_iterations > 2
-        )
-
-        if need_sac_retrain:
-            logger.info(
-                "AdaptiveTraining: OFFLINE SAC "
-                "CQL retrain "
-                "(sac_rate=%.3f, "
-                "all_transitions=%d, "
-                "bc_transitions=%d)",
-                sac_sr,
-                len(self.online_transitions_raw),
-                len(self.bc_transitions),
+            # Add transitions to buffer
+            all_normalized = (
+                self.sac_trainer._normalize_bc_transitions(
+                    self.bc_transitions
+                )
             )
-
-            # Add ALL accumulated transitions
-            # to buffer
-            if self.online_transitions_raw:
-                all_normalized = (
-                    self.sac_trainer
-                    ._normalize_bc_transitions(
-                        self.online_transitions_raw
+            for tr in all_normalized:
+                if tr.next_state is not None:
+                    self.sac_trainer.buffer.add(
+                        state=tr.state,
+                        action_type=tr.action_type,
+                        action_params=tr.action_params,
+                        reward=tr.reward,
+                        next_state=tr.next_state,
+                        done=tr.done,
                     )
-                )
-                for tr in all_normalized:
-                    if tr.next_state is not None:
-                        self.sac_trainer.buffer.add(
-                            state=tr.state,
-                            action_type=(
-                                tr.action_type
-                            ),
-                            action_params=(
-                                tr.action_params
-                            ),
-                            reward=tr.reward,
-                            next_state=(
-                                tr.next_state
-                            ),
-                            done=tr.done,
-                        )
 
-            # Update BC data with successful
-            if self.bc_transitions:
-                self.sac_trainer.bc_data = (
-                    self.bc_transitions.copy()
-                )
+            self.sac_trainer.bc_data = self.bc_transitions.copy()
 
-            # CQL offline retrain on buffer
-            old_bc_lambda = (
-                self.sac_trainer.bc_lambda
-            )
-            self.sac_trainer.bc_lambda = max(
-                old_bc_lambda,
-                self.sac_trainer.bc_lambda_min,
-            )
+            # Reset BC lambda to init (strong regularization, like training)
+            old_bc_lambda = self.sac_trainer.bc_lambda
+            self.sac_trainer.bc_lambda = self.sac_trainer.bc_lambda_init
 
-            offline_steps = min(
-                self.offline_sac_episodes * 10,
-                5000,
-            )
-            warmup_steps = offline_steps // 2
+            warmup = self.offline_sac_steps // 2
 
-            for step in range(offline_steps):
+            for step_i in range(self.offline_sac_steps):
                 if (
                     len(self.sac_trainer.buffer)
                     < self.sac_trainer.batch_size
                 ):
                     break
 
-                batch = (
-                    self.sac_trainer.buffer.sample(
-                        self.sac_trainer.batch_size
-                    )
+                batch = self.sac_trainer.buffer.sample(
+                    self.sac_trainer.batch_size
                 )
 
-                if self.sac_trainer.use_cql:
-                    self.sac_trainer \
-                        .update_critic_cql(batch)
-                else:
-                    self.sac_trainer \
-                        .update_critic(batch)
+                # Always CQL (conservative)
+                self.sac_trainer.update_critic_cql(batch)
 
-                if step >= warmup_steps:
-                    self.sac_trainer \
-                        .update_actor(batch)
+                # Actor: after warmup, every 5th step (like training)
+                if step_i >= warmup and step_i % 5 == 0:
+                    self.sac_trainer.update_actor(batch)
 
-                self.sac_trainer \
-                    .soft_update_target()
+                # Alpha update (like training)
+                if step_i >= warmup:
+                    self.sac_trainer.update_alpha(batch)
 
-            self.sac_trainer.bc_lambda = (
-                old_bc_lambda
+                self.sac_trainer.soft_update_target()
+
+            # Restore BC lambda to min (for future online)
+            self.sac_trainer.bc_lambda = max(
+                old_bc_lambda, self.sac_trainer.bc_lambda_min
             )
 
-            # Save
-            sac_save_dir = str(
-                self.runs_dir / "adaptive_sac"
-            )
+            sac_save_dir = str(self.runs_dir / "adaptive_sac")
             self.sac_trainer.save(sac_save_dir)
-
-            # Clear raw transitions
             self.online_transitions_raw = []
 
             logger.info(
-                "AdaptiveTraining: OFFLINE SAC "
-                "CQL retrain complete "
-                "(steps=%d, warmup=%d)",
-                offline_steps,
-                warmup_steps,
+                "OFFLINE SAC complete: %d steps, "
+                "warmup=%d, bc_lambda=%.1f→%.1f",
+                self.offline_sac_steps,
+                warmup,
+                self.sac_trainer.bc_lambda_init,
+                self.sac_trainer.bc_lambda,
             )
-        else:
-            reason = (
-                "sac_trainer is None"
-                if self.sac_trainer is None
-                else (
-                    f"sac_rate {sac_sr:.3f} >= "
-                    f"threshold "
-                    f"{self.sac_offline_threshold}"
-                    if sac_sr
-                    >= self.sac_offline_threshold
-                    else (
-                        f"only "
-                        f"{self.total_offline_iterations}"
-                        " offline iterations "
-                        "(need > 2)"
-                    )
-                )
-            )
-            logger.info(
-                "AdaptiveTraining: OFFLINE SAC "
-                "skipped — %s",
-                reason,
-            )
-        
+
+        # Reset for fresh evaluation
+        self.success_history.clear()
+
     def get_stats(self) -> Dict[str, Any]:
         return {
             "mode": self.mode,
-            "success_rate": self.success_rate,
+            "success_rate": round(self.success_rate, 3),
             "total_episodes": self.total_episodes,
             "history_size": len(self.success_history),
-            "online_transitions_pending": len(self.online_transitions_raw),
+            "online_transitions_pending": len(
+                self.online_transitions_raw
+            ),
+            "bc_transitions": len(self.bc_transitions),
             "sac_loaded": self.sac_trainer is not None,
             "total_sac_updates": self.total_sac_updates,
-            "total_bc_updates": self.total_bc_updates,
             "total_offline_iterations": self.total_offline_iterations,
-            "episodes_since_sac_update": self.online_episodes_since_sac_update,
-            "episodes_since_bc_update": self.online_episodes_since_bc_update,
+            "episodes_since_sac_update": (
+                self.online_episodes_since_sac_update
+            ),
             "episodes_since_offline": self._episodes_since_offline,
+            "current_epsilon": round(
+                self._get_adaptive_epsilon(), 3
+            ),
         }

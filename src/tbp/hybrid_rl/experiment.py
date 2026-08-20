@@ -49,6 +49,8 @@ from tbp.hybrid_rl.sac_trainer import PSACTrainer
 from tbp.hybrid_rl.ablation_runner import _maybe_save_visualization, visualize_agent_goal
 from tbp.hybrid_rl.strategic_sac import StrategicSAC, StrategicBCTrainer
 from tbp.hybrid_rl.episode_pools import _is_reachable_by_surface
+from .arbitrator import sac_to_discrete
+from .action_interpreter import ActionInterpreter
 
 logger = logging.getLogger(__name__)
 
@@ -1818,9 +1820,13 @@ class RLGoalApproachExperiment:
     # ══════════════════════════════════════════════════════
     # Adaptive
     # ══════════════════════════════════════════════════════
-
     def _run_adaptive(self) -> None:
-        """Run adaptive mode with Q-store + SAC arbitration."""
+        """Run adaptive mode with Q-store + SAC arbitration.
+        
+        Synergy: Q-store chooses action type (familiar states),
+        SAC provides continuous params. When Q is not confident,
+        SAC decides both type and params.
+        """
         logger.info("=" * 60)
         logger.info("Adaptive: %s", self.adaptive_mesh)
         logger.info("=" * 60)
@@ -1856,19 +1862,29 @@ class RLGoalApproachExperiment:
 
         adaptive_cfg = {
             **self.rl_config,
-            "epsilon_start": 0.2,
-            "epsilon_min": 0.2,
-            "strategic_epsilon_start": 0.2,
-            "strategic_epsilon_min": 0.2,
-            "mode": "train_adapt_epsilon"
+            "mode": "adaptive",
         }
         controller = RLGoalApproachController.load(
             q_load_dir,
             agent_id=f"{self.adaptive_mesh}_adaptive",
             config=adaptive_cfg,
         )
-        controller._collision_stats = {}  # noqa: SLF001
+        # Unfreeze Q-store normalization for new object
+        controller.q_store_free._norm_frozen = False
+        controller.q_store_free._freeze_done = False
+        controller.q_store_free._state_buffer.clear()
+        controller.q_store_surface._norm_frozen = False
+        controller.q_store_surface._freeze_done = False
+        controller.q_store_surface._state_buffer.clear()
+        controller.strategic_detach._norm_frozen = False
+        controller.strategic_detach._freeze_done = False
+        controller.strategic_detach._state_buffer.clear()
+        controller.strategic_direction._norm_frozen = False
+        controller.strategic_direction._freeze_done = False
+        controller.strategic_direction._state_buffer.clear()
+        logger.info("Q-store normalization unfrozen for adaptive mode")
 
+        controller._collision_stats = {}
 
         # Load SAC: adaptive if exists, otherwise training
         adaptive_sac_dir = str(
@@ -1896,16 +1912,7 @@ class RLGoalApproachExperiment:
                 self._sac_model_dir(self.sac_seed),
             )
 
-        # Load or create Strategic SAC
-        # ═══ Strategic SAC for adaptive ═══
-        # Controller already has strategic_detach and
-        # strategic_direction Q-stores loaded from
-        # Q-store checkpoint. These are used by
-        # controller._choose_action() for strategic
-        # decisions.
-        #
-        # Old controller.strategic_sac (6D) is NOT used.
-        # It was replaced by two separate 5D Q-stores.
+        # Strategic SAC
         controller.strategic_sac = None
 
         manager = AdaptiveTrainingManager(
@@ -1917,7 +1924,6 @@ class RLGoalApproachExperiment:
         )
         manager.sac_trainer = sac_trainer
 
-        # ═══ NEW: pass strategic SACs to arbitrator ═══
         if sac_trainer.strategic_detach_sac is not None:
             manager.arbitrator._sac_strategic_detach = (
                 sac_trainer.strategic_detach_sac
@@ -1938,23 +1944,24 @@ class RLGoalApproachExperiment:
         source_counts: dict[str, int] = {
             "q_store": 0,
             "sac": 0,
+            "blend": 0,
             "heuristic": 0,
         }
         total_steps_adaptive = 0
         rolling_successes: list[bool] = []
-        # Create adaptive logs directory
+
         adaptive_log_dir = (
             self.data_dir
             / f"adaptive_logs_{self.adaptive_mesh}"
         )
         adaptive_log_dir.mkdir(parents=True, exist_ok=True)
         self._prev_adaptive_mode = "online"
-        # Per-source detailed tracking
+
         q_terminations: dict[str, int] = {
-            "success": 0, "collision": 0, "timeout": 0
+            "success": 0, "collision": 0, "timeout": 0,
         }
         sac_terminations: dict[str, int] = {
-            "success": 0, "collision": 0, "timeout": 0
+            "success": 0, "collision": 0, "timeout": 0,
         }
         q_final_distances: list[float] = []
         sac_final_distances: list[float] = []
@@ -1963,10 +1970,11 @@ class RLGoalApproachExperiment:
         adaptive_max_steps = self.rl_config.get(
             "max_steps_per_goal", 400
         )
-        # Перед эпизодом:
+
         collision_stats_before = dict(
-            controller._collision_stats  # noqa: SLF001
+            controller._collision_stats
         )
+
         # Curriculum for adaptive
         adaptive_curriculum = list(self.curriculum_levels)
         adaptive_level = 0
@@ -1976,19 +1984,21 @@ class RLGoalApproachExperiment:
 
         ep_successes = []
 
+        # Create interpreter for continuous action execution
+        interpreter = ActionInterpreter(env)
+        type_names = ExperienceExtractor.get_type_names()
+
         for episode in range(self.adaptive_episodes):
             env.reset()
             start_pos = env.get_pose()[:3]
+
             # Curriculum goal generation with filters
             min_dist, max_dist = adaptive_curriculum[
                 adaptive_level
             ]
 
-            # Get filter for current level
             level_filter = (
-                self.curriculum_filters[
-                    adaptive_level
-                ]
+                self.curriculum_filters[adaptive_level]
                 if adaptive_level
                 < len(self.curriculum_filters)
                 else {}
@@ -2004,16 +2014,13 @@ class RLGoalApproachExperiment:
                 50
                 if (
                     require_same_side is not None
-                    or require_path_blocked
-                    is not None
+                    or require_path_blocked is not None
                 )
                 else 1
             )
 
             goal_pose = None
-            for _attempt in range(
-                max_goal_attempts
-            ):
+            for _attempt in range(max_goal_attempts):
                 candidate = (
                     env.get_random_surface_point(
                         reference_pos=start_pos,
@@ -2025,29 +2032,18 @@ class RLGoalApproachExperiment:
                 )
 
                 if require_same_side is not None:
-                    same_side = (
-                        _is_reachable_by_surface(
-                            env,
-                            start_pos,
-                            candidate[:3],
-                        )
+                    same_side = _is_reachable_by_surface(
+                        env, start_pos, candidate[:3],
                     )
                     if same_side != require_same_side:
                         continue
 
-                if (
-                    require_path_blocked is not None
-                ):
-                    env._current_goal = (
-                        np.concatenate([
-                            candidate[:3],
-                            candidate[3:],
-                        ])
-                    )
+                if require_path_blocked is not None:
+                    env._current_goal = np.concatenate([
+                        candidate[:3], candidate[3:],
+                    ])
                     sensor = env.get_sensor_data()
-                    pb = sensor.get(
-                        "path_blocked", False
-                    )
+                    pb = sensor.get("path_blocked", False)
                     if pb != require_path_blocked:
                         continue
 
@@ -2057,79 +2053,96 @@ class RLGoalApproachExperiment:
             if goal_pose is None:
                 goal_pose = candidate
 
-            controller.set_new_goal(
-                goal_pose, start_pos
-            )
+            controller.set_new_goal(goal_pose, start_pos)
             env.set_goal(goal_pose)
 
-            goals_before = (
-                controller._total_goals_reached  # noqa: SLF001
-            )
+            goals_before = controller._total_goals_reached
             ep_steps = 0
             ep_sources: list[str] = []
             ep_actions: list[int] = []
             current_poses = []
             action_explanations = []
 
+            # Save transitions before episode
+            collision_stats_before = dict(
+                controller._collision_stats
+            )
+
             for step in range(adaptive_max_steps):
                 pose = env.get_pose()
-                current_poses.append(pose)
+                current_poses.append(pose.copy())
                 sensor = env.get_sensor_data()
-                state = (
-                    controller._compute_state(  # noqa: SLF001
-                        pose, sensor
-                    )
+                state = controller._compute_state(pose, sensor)
+
+                # Arbitrator returns (type, params, source)
+                action_type, action_params, source = (
+                    manager.get_action(state, pose, sensor)
                 )
-                action_idx, source = manager.get_action(
-                    state, pose, sensor
+
+                # Convert to discrete for Q-store learning
+                discrete_idx = sac_to_discrete(
+                    action_type, action_params
                 )
-                 # Save transitions before update_only clears them
+
+                # Save transitions before update_only clears them
                 last_transitions = (
                     controller._episode_transitions.copy()
                 )
+
+                # Execute continuous action in environment
+                sensor_after = interpreter.execute(
+                    action_type, action_params
+                )
+
+                # Q-store learns from discrete action
+                pose_after = env.get_pose()
                 _st, done = controller.update_only(
-                    pose, sensor, action_idx
+                    pose_after, sensor_after, discrete_idx
                 )
 
                 ep_steps += 1
                 total_steps_adaptive += 1
                 ep_sources.append(source)
-                ep_actions.append(action_idx)
+                ep_actions.append(discrete_idx)
 
-                # Track action
-                act_name = controller.action_space.get_info(
-                    action_idx
-                ).name
+                # Track action type
+                act_name = type_names.get(
+                    action_type, f"type_{action_type}"
+                )
                 action_counts[act_name] = (
                     action_counts.get(act_name, 0) + 1
                 )
-                action_explanations.append(f"source: {source}, act_name: {act_name}")
+                action_explanations.append(
+                    f"source: {source}, type: {act_name}, "
+                    f"params: [{action_params[0]:.2f}, "
+                    f"{action_params[1]:.2f}, "
+                    f"{action_params[2]:.2f}]"
+                )
 
                 # Track source
-                source_key = (
-                    source
-                    if source in source_counts
-                    else "heuristic"
-                )
+                if source in ("blend", "q_type_sac_params"):
+                    source_key = "blend"
+                elif source.startswith("q_"):
+                    source_key = "q_store"
+                elif source == "sac":
+                    source_key = "sac"
+                else:
+                    source_key = "heuristic"
                 source_counts[source_key] = (
                     source_counts.get(source_key, 0) + 1
                 )
 
                 if done:
                     break
-                env.step(
-                    action_idx, controller.action_space
-                )
 
             success = (
-                controller._total_goals_reached  # noqa: SLF001
+                controller._total_goals_reached
                 > goals_before
             )
 
             ep_successes.append(success)
             total_episodes_rate = (
-                sum(ep_successes)
-                / len(ep_successes)
+                sum(ep_successes) / len(ep_successes)
             )
 
             # Determine termination
@@ -2142,29 +2155,28 @@ class RLGoalApproachExperiment:
 
             if termination == "collision":
                 for act_name, count in (
-                    controller._collision_stats.items()  # noqa: SLF001
+                    controller._collision_stats.items()
                 ):
                     prev = collision_stats_before.get(
                         act_name, 0
                     )
                     if count > prev:
                         collision_counts[act_name] = (
-                            collision_counts.get(
-                                act_name, 0
-                            )
+                            collision_counts.get(act_name, 0)
                             + (count - prev)
                         )
-            # Update baseline after every episode
+
             collision_stats_before = dict(
-                controller._collision_stats  # noqa: SLF001
+                controller._collision_stats
             )
 
             transitions = last_transitions
-            
+
             manager.on_episode_complete(
                 success=success,
                 transitions=transitions,
             )
+
             # Save on mode change
             current_mode = manager.mode
             if (
@@ -2180,9 +2192,7 @@ class RLGoalApproachExperiment:
                     "rolling_success_rate": round(
                         rolling_rate, 3
                     ),
-                    "trigger": (
-                        "success_rate_change"
-                    ),
+                    "trigger": "success_rate_change",
                     "recent_episodes": episode_log[-10:],
                 }
                 change_path = (
@@ -2205,11 +2215,16 @@ class RLGoalApproachExperiment:
 
             # Curriculum promote
             adaptive_promote_window.append(success)
-            if len(adaptive_promote_window) > adaptive_promote_window_size:
+            if (
+                len(adaptive_promote_window)
+                > adaptive_promote_window_size
+            ):
                 adaptive_promote_window.pop(0)
             if (
-                len(adaptive_promote_window) == adaptive_promote_window_size
-                and adaptive_level < len(adaptive_curriculum) - 1
+                len(adaptive_promote_window)
+                == adaptive_promote_window_size
+                and adaptive_level
+                < len(adaptive_curriculum) - 1
             ):
                 promote_rate = (
                     sum(adaptive_promote_window)
@@ -2245,6 +2260,17 @@ class RLGoalApproachExperiment:
                 if ep_sources
                 else "none"
             )
+            # Normalize dominant source for tracking
+            if dominant_source in (
+                "blend", "q_type_sac_params",
+            ):
+                dominant_source_key = "q_store"
+            elif dominant_source.startswith("q_"):
+                dominant_source_key = "q_store"
+            elif dominant_source == "sac":
+                dominant_source_key = "sac"
+            else:
+                dominant_source_key = "heuristic"
 
             # Per-episode log
             start_dist = float(
@@ -2271,8 +2297,9 @@ class RLGoalApproachExperiment:
                 "mode": manager.mode,
                 "curriculum_level": adaptive_level,
             })
+
             # Per-source termination and distance tracking
-            if dominant_source == "q_store":
+            if dominant_source_key == "q_store":
                 q_terminations[termination] = (
                     q_terminations.get(termination, 0) + 1
                 )
@@ -2280,7 +2307,7 @@ class RLGoalApproachExperiment:
                     round(final_dist, 1)
                 )
                 q_episode_steps.append(ep_steps)
-            elif dominant_source == "sac":
+            elif dominant_source_key == "sac":
                 sac_terminations[termination] = (
                     sac_terminations.get(termination, 0) + 1
                 )
@@ -2289,13 +2316,13 @@ class RLGoalApproachExperiment:
                 )
                 sac_episode_steps.append(ep_steps)
 
-            # Snapshot every 100 episodes — save to file
-            # _ADAPTIVE_LOG_INTERVAL = 1
+            # Snapshot every N episodes
             if (episode + 1) % _ADAPTIVE_LOG_INTERVAL == 0:
                 if self.visualise:
-                    # start_rot = np.array([0.0, 0.0, 0.0])
-                    # visualize_agent_goal(env, np.concatenate([start_pos, start_rot]), goal_pose)
-                    vis_dir = Path(adaptive_log_dir) / "visualizations"
+                    vis_dir = (
+                        Path(adaptive_log_dir)
+                        / "visualizations"
+                    )
                     _maybe_save_visualization(
                         controller=controller,
                         env=env,
@@ -2384,6 +2411,9 @@ class RLGoalApproachExperiment:
                         "sac_rate": arb_stats.get(
                             "sac_rate", 0
                         ),
+                        "blend_rate": arb_stats.get(
+                            "blend_rate", 0
+                        ),
                         "heuristic_rate": arb_stats.get(
                             "heuristic_rate", 0
                         ),
@@ -2393,8 +2423,8 @@ class RLGoalApproachExperiment:
                         "q_spread_mean": arb_stats.get(
                             "q_spread_mean", 0
                         ),
-                        "sac_confidence_mean": arb_stats.get(
-                            "sac_confidence_mean", 0
+                        "q_confidence_mean": arb_stats.get(
+                            "q_confidence_mean", 0
                         ),
                         "q_success_rate": arb_stats.get(
                             "q_success_rate", 0
@@ -2497,7 +2527,6 @@ class RLGoalApproachExperiment:
                 }
                 snapshot_log.append(snapshot)
 
-                # Save snapshot to file
                 snap_path = (
                     adaptive_log_dir
                     / f"snapshot_ep_{episode + 1:05d}.json"
@@ -2514,7 +2543,7 @@ class RLGoalApproachExperiment:
                     snap_path,
                 )
 
-        # Save adaptive models (separate from training)
+        # Save adaptive models
         adapt_q_dir = str(
             self.runs_dir
             / f"adaptive_q_seed_{adapt_seed}"
@@ -2669,7 +2698,6 @@ class RLGoalApproachExperiment:
             "Adaptive results saved to %s", results_path
         )
 
-        # Save meta
         self._save_meta(
             f"adaptive_{self.adaptive_mesh}",
             adapt_seed,
@@ -2692,7 +2720,7 @@ class RLGoalApproachExperiment:
             final_results["collision_rate"],
             final_results["timeout_rate"],
         )
-
+    
     # ═════════════════════════════════════════════════════
     # Utilities
     # ═════════════════════════════════════════════════════
