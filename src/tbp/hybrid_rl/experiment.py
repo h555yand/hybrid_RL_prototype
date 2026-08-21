@@ -2178,7 +2178,7 @@ class RLGoalApproachExperiment:
             )
 
             # Save on mode change
-            current_mode = manager.mode
+            current_mode = manager.mode or "online"
             if (
                 episode > 0
                 and episode_log

@@ -8,14 +8,14 @@ experiment:
   config:
     seed: 42
     visualise: false
-    regenerate_scripts: false
+    regenerate_scripts: true
     do_train: false
     do_eval: false
-    do_heur_eval: false
+    do_heur_eval: true
     do_bc_train: false
     do_sac_train: false
     do_sac_eval: false
-    do_adaptive: true
+    do_adaptive: false
 
     train_seeds: [11]
     eval_seeds: [44]
@@ -42,8 +42,8 @@ experiment:
         epsilon_min: 0.3
         load_mode: null
 
-    eval_meshes: [mug]
-    eval_episodes_per_level: 500
+    eval_meshes: [vase]
+    eval_episodes_per_level: 100
     # BC data composition
     bc_q_store_fraction: 0.0    # 0.0 = only heuristic, 0.2 = 20% Q-store
     bc_total_target: null
