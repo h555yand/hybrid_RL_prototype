@@ -1599,6 +1599,110 @@ class RLGoalApproachController:
     # ══════════════════════════════════════════════════════════
     # ACTION SELECTION
     # ══════════════════════════════════════════════════════════
+    def _choose_action_heuristic(self, state, current_pose, sensor_data):
+        heuristic, _ = self._compute_heuristic_bias(
+            state=state,
+            current_pose=current_pose,
+            sensor_data=sensor_data,
+            prev_action=self._last_action,
+        )
+        combined = self.apply_action_mask(heuristic, state)
+        action_index = None
+        current_phase = getattr(self, "_current_phase", "CRAWL_TO_GOAL")
+        on_object = state[11] > 0.5
+        self._episode_phase_counts[current_phase] = self._episode_phase_counts.get(current_phase, 0) + 1
+        s_eps = self.strategic_epsilon
+        if on_object:
+            same_side = sensor_data.get("same_side", True)
+            path_blocked = sensor_data.get("path_blocked", False)
+            t_state = self._compute_detach_transition_state(state, sensor_data, movement_efficiency=self._compute_movement_efficiency(window=20))
+            strategic_q = self.strategic_detach.get_q_values(t_state)
+            strategic_h = self._compute_strategic_heuristic(current_phase, on_object=True)
+            has_data = self.strategic_detach.next_id > 0 and np.max(np.abs(strategic_q)) > 1e-6
+            if has_data:
+                sq_norm = self._normalize_values(strategic_q)
+                sh_norm = self._normalize_values(strategic_h)
+                strategic_combined = (1 - s_eps) * sq_norm + s_eps * sh_norm
+            else:
+                strategic_combined = strategic_h.copy()
+            should_switch = strategic_combined[1] > strategic_combined[0]
+            if should_switch and self._can_detach(state) and (not same_side or path_blocked):
+                action_index = self.action_space.IDX_DETACH
+                self._strategic_stats["detach_memory_triggered"] += 1
+                self._pending_strategic_detach.append({"state": t_state.copy(), "step": len(self._episode_transitions), "phase_was_detach_needed": current_phase == "DETACH_NEEDED", "same_side_before": same_side, "path_blocked_before": path_blocked, "dist_before": float(state[13])})
+            else:
+                if not same_side or path_blocked:
+                    self._strategic_stats["detach_heuristic_fallback"] += 1
+        elif not on_object:
+            d_state = self._compute_direction_transition_state(state, sensor_data, current_pose)
+            strategic_q = self.strategic_direction.get_q_values(d_state)
+            path_blocked = sensor_data.get("path_blocked", False)
+            strategic_h = np.zeros(2)
+            if path_blocked:
+                strategic_h[1] += 3.0
+                strategic_h[0] -= 1.0
+            else:
+                strategic_h[0] += 3.0
+                strategic_h[1] -= 3.0
+            has_data = self.strategic_direction.next_id > 0 and np.max(np.abs(strategic_q)) > 1e-6
+            if has_data:
+                sq_norm = self._normalize_values(strategic_q)
+                sh_norm = self._normalize_values(strategic_h)
+                dir_combined = (1 - s_eps) * sq_norm + s_eps * sh_norm
+            else:
+                dir_combined = strategic_h.copy()
+            if dir_combined[1] > dir_combined[0]:
+                if self._current_phase != "FLY_TO_EDGE":
+                    self._current_phase = "FLY_TO_EDGE"
+                self._strategic_stats["direction_memory_keep_edge"] += 1
+            else:
+                if self._current_phase == "FLY_TO_EDGE":
+                    self._current_phase = "FLY_TO_GOAL"
+                    self._cached_fly_direction = None
+                self._strategic_stats["direction_memory_to_goal"] += 1
+            if not path_blocked:
+                self._path_clear_streak += 1
+            else:
+                self._path_clear_streak = 0
+        self._prev_phase = current_phase
+        if action_index is None:
+            action_index = int(np.argmax(combined))
+        if action_index == self.action_space.IDX_DETACH and on_object:
+            already_recorded = self._pending_strategic_detach and self._pending_strategic_detach[-1]["step"] == len(self._episode_transitions)
+            if not already_recorded:
+                same_side = sensor_data.get("same_side", True)
+                path_blocked = sensor_data.get("path_blocked", False)
+                t_state = self._compute_detach_transition_state(state, sensor_data, movement_efficiency=self._compute_movement_efficiency(window=20))
+                self._pending_strategic_detach.append({"state": t_state.copy(), "step": len(self._episode_transitions), "phase_was_detach_needed": current_phase == "DETACH_NEEDED", "same_side_before": same_side, "path_blocked_before": path_blocked, "dist_before": float(state[13])})
+        chosen_name = self.action_space.get_info(action_index).name
+        if chosen_name == "detach":
+            self._consecutive_detach_count += 1
+        else:
+            self._consecutive_detach_count = 0
+        return action_index
+
+    def apply_action_mask(
+        self, values: np.ndarray, state: np.ndarray
+    ) -> np.ndarray:
+        """Apply physical action masks."""
+        masked = values.copy()
+        on_object = state[11] > 0.5
+
+        if on_object:
+            masked[self.action_space.IDX_FREE_FORWARD] = -1e9
+            masked[self.action_space.IDX_FREE_FORWARD_SMALL] = -1e9
+            masked[self.action_space.IDX_FREE_BACKWARD] = -1e9
+            masked[self.action_space.IDX_DETACH] = -1e9
+        else:
+            for idx in range(8):
+                masked[idx] = -1e9
+            masked[self.action_space.IDX_DETACH] = -1e9
+
+        if self._consecutive_detach_count >= 3:
+            masked[self.action_space.IDX_DETACH] = -1e9
+
+        return masked
+    
     def _get_learning_rate(self) -> float:
         if self.is_training:
             return self.alpha
@@ -1752,17 +1856,7 @@ class RLGoalApproachController:
             temperature = self.temperature_override
 
         # ═══ ACTION MASK ═══
-        if state[11] < 0.5:  # in air
-            combined[self.action_space.IDX_DETACH] = -1e9
-            for idx in range(8):
-                combined[idx] = -1e9
-        if self._consecutive_detach_count >= 3:
-            combined[self.action_space.IDX_DETACH] = -1e9
-        if state[11] > 0.5:  # on surface
-            combined[self.action_space.IDX_FREE_FORWARD] = -1e9
-            combined[self.action_space.IDX_FREE_FORWARD_SMALL] = -1e9
-            combined[self.action_space.IDX_FREE_BACKWARD] = -1e9
-            combined[self.action_space.IDX_DETACH] = -1e9  # NEW: detach = strategic only
+        combined = self.apply_action_mask(combined, state)
 
         is_random_override = False
         is_strategic_override = False
@@ -1937,17 +2031,11 @@ class RLGoalApproachController:
                 valid_mask = np.ones(
                     self.num_actions, dtype=bool
                 )
-                if state[11] < 0.5:
-                    valid_mask[self.action_space.IDX_DETACH] = False
-                    for idx in range(8):
-                        valid_mask[idx] = False
-                if self._consecutive_detach_count >= 3:
-                    valid_mask[self.action_space.IDX_DETACH] = False
-                if state[11] > 0.5:
-                    valid_mask[self.action_space.IDX_FREE_FORWARD] = False
-                    valid_mask[self.action_space.IDX_FREE_FORWARD_SMALL] = False
-                    valid_mask[self.action_space.IDX_FREE_BACKWARD] = False
-                    valid_mask[self.action_space.IDX_DETACH] = False  # NEW
+                # Apply same mask logic
+                masked_check = self.apply_action_mask(
+                    np.zeros(self.num_actions), state
+                )
+                valid_mask[masked_check < -1e8] = False
                 if (
                     state[11] > 0.5
                     and state[13] < 5.0 * self.action_space.surface_step

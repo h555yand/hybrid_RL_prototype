@@ -1915,12 +1915,22 @@ class RLGoalApproachExperiment:
         # Strategic SAC
         controller.strategic_sac = None
 
+        adapt_q_dir = str(
+            self.runs_dir
+            / f"adaptive_q_seed_{adapt_seed}"
+        )
+        adapt_sac_dir = str(
+            self.runs_dir
+            / f"adaptive_sac_seed_{self.sac_seed}"
+        )
         manager = AdaptiveTrainingManager(
             controller=controller,
             env=env,
             config=adaptive_cfg,
             runs_dir=str(self.runs_dir),
             mesh_path=mesh_path,
+            q_save_dir=adapt_q_dir,
+            sac_save_dir=adapt_sac_dir,
         )
         manager.sac_trainer = sac_trainer
 
@@ -1955,7 +1965,6 @@ class RLGoalApproachExperiment:
             / f"adaptive_logs_{self.adaptive_mesh}"
         )
         adaptive_log_dir.mkdir(parents=True, exist_ok=True)
-        self._prev_adaptive_mode = "online"
 
         q_terminations: dict[str, int] = {
             "success": 0, "collision": 0, "timeout": 0,
@@ -2056,6 +2065,9 @@ class RLGoalApproachExperiment:
             controller.set_new_goal(goal_pose, start_pos)
             env.set_goal(goal_pose)
 
+            # Tell arbitrator about new episode and level
+            manager.arbitrator.start_episode(level=adaptive_level)
+
             goals_before = controller._total_goals_reached
             ep_steps = 0
             ep_sources: list[str] = []
@@ -2120,14 +2132,17 @@ class RLGoalApproachExperiment:
                 )
 
                 # Track source
-                if source in ("blend", "q_type_sac_params"):
+                if source.startswith("blend"):
                     source_key = "blend"
                 elif source.startswith("q_"):
                     source_key = "q_store"
-                elif source == "sac":
+                elif source.startswith("sac"):
                     source_key = "sac"
-                else:
+                elif source.startswith("heuristic"):
                     source_key = "heuristic"
+                else:
+                    source_key = "other"
+
                 source_counts[source_key] = (
                     source_counts.get(source_key, 0) + 1
                 )
@@ -2177,40 +2192,28 @@ class RLGoalApproachExperiment:
                 transitions=transitions,
             )
 
-            # Save on mode change
-            current_mode = manager.mode or "online"
-            if (
-                episode > 0
-                and episode_log
-                and hasattr(self, "_prev_adaptive_mode")
-                and self._prev_adaptive_mode != current_mode
-            ):
-                mode_change = {
-                    "episode": episode,
-                    "from_mode": self._prev_adaptive_mode,
-                    "to_mode": current_mode,
-                    "rolling_success_rate": round(
-                        rolling_rate, 3
-                    ),
-                    "trigger": "success_rate_change",
-                    "recent_episodes": episode_log[-10:],
-                }
+            # Write mode changes to JSON
+            while manager.mode_changes:
+                change = manager.mode_changes.pop(0)
+                change["recent_episodes"] = episode_log[-10:]
+                change_idx = len([
+                    f for f in adaptive_log_dir.iterdir()
+                    if f.name.startswith("mode_change_")
+                ])
                 change_path = (
                     adaptive_log_dir
-                    / f"mode_change_ep_{episode:05d}.json"
+                    / f"mode_change_{change_idx:04d}_ep_{change['episode']:05d}.json"
                 )
                 with change_path.open("w") as f:
-                    json.dump(mode_change, f, indent=2)
+                    json.dump(change, f, indent=2)
                 logger.info(
-                    "Mode change at ep %d: %s → %s "
-                    "(rate=%.3f), saved to %s",
-                    episode,
-                    self._prev_adaptive_mode,
-                    current_mode,
-                    rolling_rate,
+                    "Mode change saved: %s → %s at ep %d to %s",
+                    change["from_mode"],
+                    change["to_mode"],
+                    change["episode"],
                     change_path,
                 )
-            self._prev_adaptive_mode = current_mode
+
             manager.arbitrator.on_episode_end(success)
 
             # Curriculum promote
@@ -2544,20 +2547,12 @@ class RLGoalApproachExperiment:
                 )
 
         # Save adaptive models
-        adapt_q_dir = str(
-            self.runs_dir
-            / f"adaptive_q_seed_{adapt_seed}"
-        )
         controller.save(adapt_q_dir)
         logger.info(
             "Adaptive Q-store saved to %s", adapt_q_dir
         )
 
         if manager.sac_trainer:
-            adapt_sac_dir = str(
-                self.runs_dir
-                / f"adaptive_sac_seed_{self.sac_seed}"
-            )
             manager.sac_trainer.save(adapt_sac_dir)
             logger.info(
                 "Adaptive SAC saved to %s", adapt_sac_dir

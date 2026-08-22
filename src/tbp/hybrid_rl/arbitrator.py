@@ -1,30 +1,21 @@
-# Copyright 2025-2026 Thousand Brains Project
-#
-# Copyright may exist in Contributors' modifications
-# and/or contributions to the work.
-#
-# Use of this source code is governed by the MIT
-# license that can be found in the LICENSE file or at
-# https://opensource.org/licenses/MIT.
-
 """Arbitrator: decides which action source to use per step.
-Switches between Q-store (episodic memory), SAC (skill),
-and heuristic (fallback).
 
 Logic:
-  1. Q-store confident AND distinguishes actions → Q-store (familiar territory)
-  2. SAC confident → SAC (generalizes to unfamiliar states)
-  3. Q-store has some data → Q-store (weak fallback)
-  4. Heuristic (last resort)
+  1. Calibration phase (20 ep per level): forced Q/SAC alternating
+  2. Normal phase: scoring = confidence × track_record[level]
+     - Q >> SAC: Q type + SAC params
+     - Q > SAC, types differ: Q type + Q params
+     - Q > SAC, types agree: blend params (50/50)
+     - SAC > Q: SAC type + SAC params
+     - Both low: heuristic fallback
 """
 
 import logging
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import torch
-from collections import Counter
 
 from .experience_extractor import ExperienceExtractor
 from .rl_goal_approach_controller import RLGoalApproachController
@@ -46,41 +37,34 @@ def sac_to_discrete(action_type: int, action_params: np.ndarray) -> int:
                 best_diff = diff
                 best_idx = i
         return best_idx
-
     elif action_type == 1:
         step = float(action_params[0])
         if step < 0:
-            return 9   # free_backward
+            return 9
         elif abs(step) <= 3.0:
-            return 19  # free_forward_small (was 20)
+            return 19
         else:
-            return 8   # free_forward
-
-    elif action_type == 2:  # Turn
+            return 8
+    elif action_type == 2:
         angle = float(action_params[0])
         if abs(angle) > 10.0:
-            return 22 if angle >= 0 else 23  # turn_left/right_big (was 23/24)
-        return 10 if angle >= 0 else 11      # turn_left/right
-
-    elif action_type == 3:  # Look
+            return 22 if angle >= 0 else 23
+        return 10 if angle >= 0 else 11
+    elif action_type == 3:
         angle = float(action_params[0])
         if abs(angle) > 10.0:
-            return 20 if angle >= 0 else 21  # look_up/down_big (was 21/22)
-        return 12 if angle >= 0 else 13      # look_up/down
-
+            return 20 if angle >= 0 else 21
+        return 12 if angle >= 0 else 13
     elif action_type == 4:
         return 14 if float(action_params[0]) >= 0 else 15
-
     elif action_type == 5:
         return 16
-
     elif action_type == 6:
         return 17
-
     elif action_type == 7:
-        return 18  # detach
-
+        return 18
     return 0
+
 
 class Arbitrator:
 
@@ -92,11 +76,7 @@ class Arbitrator:
         state_std: Optional[np.ndarray] = None,
         param_mean: Optional[np.ndarray] = None,
         param_std: Optional[np.ndarray] = None,
-        q_confidence_threshold: float = 0.5,
-        q_spread_threshold: float = 1.0,
-        sac_confidence_threshold: float = 0.3,
-        q_weak_threshold: float = 0.2,
-        source_success_window: int = 100,
+        min_eval_per_source: int = 10,
     ):
         self.controller = controller
         self.sac_actor = sac_actor
@@ -104,10 +84,6 @@ class Arbitrator:
         self.state_std = state_std
         self.param_mean = param_mean
         self.param_std = param_std
-        self.q_confidence_threshold = q_confidence_threshold
-        self.q_spread_threshold = q_spread_threshold
-        self.sac_confidence_threshold = sac_confidence_threshold
-        self.q_weak_threshold = q_weak_threshold
 
         self.stats = {
             "q_store_chosen": 0,
@@ -129,18 +105,76 @@ class Arbitrator:
 
         self.q_confidence_history = deque(maxlen=1000)
         self.q_spread_history = deque(maxlen=1000)
-        self.sac_confidence_history = deque(maxlen=1000)
 
         self._current_episode_sources = []
-        self._q_episode_results = deque(maxlen=source_success_window)
-        self._sac_episode_results = deque(maxlen=source_success_window)
-        self._heuristic_episode_results = deque(maxlen=source_success_window)
 
-        self._sac_strategic_detach: Optional[Any] = None
-        self._sac_strategic_direction: Optional[Any] = None
+        # Per-level track record
+        self._min_eval_per_source = min_eval_per_source
+        self._level_q_results: Dict[int, deque] = defaultdict(
+            lambda: deque(maxlen=50)
+        )
+        self._level_sac_results: Dict[int, deque] = defaultdict(
+            lambda: deque(maxlen=50)
+        )
+
+        # Calibration state
+        self._current_level = 0
+        self._is_calibrating = True
+        self._calibration_counter = 0
+        self._calibration_source = None
+        self._episodes_on_level = 0
 
         self._param_dims = ExperienceExtractor.get_param_dims()
         self._type_names = ExperienceExtractor.get_type_names()
+
+        # Strategic SAC references
+        self._sac_strategic_detach: Optional[Any] = None
+        self._sac_strategic_direction: Optional[Any] = None
+
+    def start_episode(self, level: int):
+        if level != self._current_level:
+            self._current_level = level
+            self._calibration_counter = 0
+            self._is_calibrating = True
+            self._episodes_on_level = 0
+
+        self._episodes_on_level += 1
+
+        # Recalibrate every 50 episodes on same level
+        if (
+            not self._is_calibrating
+            and self._episodes_on_level % 50 == 0
+        ):
+            self._calibration_counter = 0
+            self._is_calibrating = True
+            logger.info(
+                "Arbitrator: recalibrating level %d "
+                "(ep_on_level=%d)",
+                level, self._episodes_on_level,
+            )
+
+        if self._is_calibrating:
+            self._calibration_counter += 1
+            calibration_episodes = self._min_eval_per_source * 2
+
+            if self._calibration_counter <= calibration_episodes:
+                self._calibration_source = (
+                    "q_store"
+                    if self._calibration_counter % 2 == 1
+                    else "sac"
+                )
+            else:
+                self._is_calibrating = False
+                self._calibration_source = None
+                q_track = self._get_track(self._level_q_results[level])
+                sac_track = self._get_track(self._level_sac_results[level])
+                logger.info(
+                    "Arbitrator: calibration done for level %d "
+                    "(q_track=%.3f, sac_track=%.3f)",
+                    level, q_track, sac_track,
+                )
+
+        self._current_episode_sources = []
 
     def decide(
         self,
@@ -148,139 +182,150 @@ class Arbitrator:
         current_pose: np.ndarray,
         sensor_data: Dict[str, Any],
     ) -> Tuple[int, np.ndarray, str]:
-        """Choose action using Q-type + SAC-params synergy.
-
-        Strategy:
-        1. Q confident → Q chooses type, SAC provides params
-        2. Q not confident → SAC chooses both type and params
-        3. No SAC → Q discrete action converted to (type, params)
-        4. No Q data → heuristic
+        """Choose action using scoring = confidence × track_record[level].
 
         Returns:
             Tuple of (action_type, action_params, source_name).
-            action_params are denormalized, ready for ActionInterpreter.
         """
         self.stats["total_decisions"] += 1
+        level = self._current_level
+        has_sac = self.sac_actor is not None
 
-        # Get Q-store action + confidence
-        q_action_discrete, q_confidence, q_spread = (
-            self._get_q_action(state)
-        )
-        q_action_type, q_params_fn = (
-            ExperienceExtractor.DISCRETE_TO_PSAC[q_action_discrete]
-        )
+        # === Get proposals ===
+        q_action, q_confidence, q_spread = self._get_q_action(state)
+        q_type = ExperienceExtractor.DISCRETE_TO_PSAC[q_action][0]
+        q_params = self._discrete_to_params(q_action)
 
-        # Track Q proposal
-        q_name = self._type_names.get(q_action_type, f"type_{q_action_type}")
+        if has_sac:
+            sac_type, sac_params = self._get_sac_action_continuous(state)
+        else:
+            sac_type, sac_params = q_type, q_params.copy()
+
+        # Track proposals
+        q_name = self._type_names.get(q_type, f"type_{q_type}")
         self.q_proposed_actions[q_name] += 1
         self.q_confidence_history.append(q_confidence)
         self.q_spread_history.append(q_spread)
-
-        has_sac = self.sac_actor is not None
-        has_q_data = q_confidence > 0.01
-
-        # Get SAC action if available
-        sac_type = None
-        sac_params = None
         if has_sac:
-            sac_type, sac_params = self._get_sac_action_continuous(state)
             sac_name = self._type_names.get(sac_type, f"type_{sac_type}")
             self.sac_proposed_actions[sac_name] += 1
             self.both_proposed_count += 1
-            if q_action_type == sac_type:
+            if q_type == sac_type:
                 self.agreement_count += 1
 
-        # === Decision logic ===
-
-        # Case 1: Q confident — Q chooses type, SAC provides params
-        if (
-            has_q_data
-            and q_confidence > self.q_confidence_threshold
-            and q_spread > self.q_spread_threshold
-        ):
-            if has_sac:
-                if q_action_type == sac_type:
-                    # Agreement: use SAC params (more precise)
-                    source = "blend"
-                    self.stats["blend_chosen"] += 1
-                    self.blend_chosen_actions[q_name] += 1
-                    self._current_episode_sources.append("q_store")
-                    return q_action_type, sac_params, source
-                else:
-                    # Disagreement: Q type, SAC params for that type
-                    forced_params = self._get_sac_params_for_type(
-                        state, q_action_type
-                    )
-                    source = "q_type_sac_params"
-                    self.stats["q_store_chosen"] += 1
-                    self.q_chosen_actions[q_name] += 1
-                    self._current_episode_sources.append("q_store")
-                    return q_action_type, forced_params, source
-            else:
-                # No SAC: Q discrete → convert to (type, params)
-                q_params = self._discrete_to_params(q_action_discrete)
-                source = "q_store"
+        # === Calibration: forced source ===
+        if self._is_calibrating:
+            if self._calibration_source == "q_store":
                 self.stats["q_store_chosen"] += 1
-                self.q_chosen_actions[q_name] += 1
                 self._current_episode_sources.append("q_store")
-                return q_action_type, q_params, source
+                return q_type, q_params, "q_calibration"
+            else:
+                self.stats["sac_chosen"] += 1
+                self._current_episode_sources.append("sac")
+                return sac_type, sac_params, "sac_calibration"
 
-        # Case 2: Q not confident, SAC available → SAC decides
+        # === Scoring ===
+        q_track = self._get_track(self._level_q_results[level])
+        sac_track = self._get_track(self._level_sac_results[level])
+
+        q_score = 0.0
+        if q_confidence > 0.1 and q_spread > 0.5:
+            q_score = (0.3 * q_confidence + 0.7) * q_track
+
+        sac_score = 0.0
         if has_sac:
-            source = "sac"
-            sac_name = self._type_names.get(sac_type, f"type_{sac_type}")
-            self.stats["sac_chosen"] += 1
-            self.sac_chosen_actions[sac_name] += 1
-            self._current_episode_sources.append("sac")
-            return sac_type, sac_params, source
+            sac_score = 0.7 * sac_track
 
-        # Case 3: Q has some data but low confidence → Q fallback
-        if has_q_data:
-            q_params = self._discrete_to_params(q_action_discrete)
-            source = "q_store_weak"
+        # === Decision ===
+
+        # Both below threshold → heuristic
+        if q_score < 0.1 and sac_score < 0.1:
+            h_action = self._get_heuristic_action(
+                state, current_pose, sensor_data
+            )
+            h_type = ExperienceExtractor.DISCRETE_TO_PSAC[h_action][0]
+            h_params = self._discrete_to_params(h_action)
+            self.stats["heuristic_chosen"] += 1
+            self.heuristic_chosen_actions[
+                self._type_names.get(h_type, f"type_{h_type}")
+            ] += 1
+            self._current_episode_sources.append("heuristic")
+            return h_type, h_params, (
+                f"heuristic(qs={q_score:.2f},ss={sac_score:.2f})"
+            )
+
+        # Q much more confident → Q type + SAC params
+        if q_score > sac_score * 1.5 and q_score > 0.2:
+            if has_sac:
+                forced_params = self._get_sac_params_for_type(state, q_type)
+            else:
+                forced_params = q_params
             self.stats["q_store_chosen"] += 1
             self.q_chosen_actions[q_name] += 1
             self._current_episode_sources.append("q_store")
-            return q_action_type, q_params, source
+            return q_type, forced_params, (
+                f"q_dominant(qs={q_score:.2f},ss={sac_score:.2f})"
+            )
 
-        # Case 4: Nothing available → heuristic
-        heuristic_action = self._get_heuristic_action(
-            state, current_pose, sensor_data
-        )
-        h_type, _ = ExperienceExtractor.DISCRETE_TO_PSAC[heuristic_action]
-        h_params = self._discrete_to_params(heuristic_action)
-        h_name = self._type_names.get(h_type, f"type_{h_type}")
-        self.stats["heuristic_chosen"] += 1
-        self.heuristic_chosen_actions[h_name] += 1
-        self._current_episode_sources.append("heuristic")
-        return h_type, h_params, "heuristic"
+        # Q more confident, types disagree → Q type + Q params
+        if q_score > sac_score and q_type != sac_type:
+            self.stats["q_store_chosen"] += 1
+            self.q_chosen_actions[q_name] += 1
+            self._current_episode_sources.append("q_store")
+            return q_type, q_params, (
+                f"q_veto(qs={q_score:.2f},ss={sac_score:.2f})"
+            )
+
+        # Q more confident, types agree → blend params
+        if q_score > sac_score and q_type == sac_type and has_sac:
+            dim = self._param_dims.get(q_type, 0)
+            if dim > 0:
+                blended = 0.5 * q_params[:dim] + 0.5 * sac_params[:dim]
+                blend_padded = np.zeros(3, dtype=np.float32)
+                blend_padded[:dim] = blended
+            else:
+                blend_padded = sac_params.copy()
+            self.stats["blend_chosen"] += 1
+            self.blend_chosen_actions[q_name] += 1
+            self._current_episode_sources.append("blend")
+            return q_type, blend_padded, (
+                f"blend(qs={q_score:.2f},ss={sac_score:.2f})"
+            )
+
+        # SAC wins
+        if has_sac:
+            sac_n = self._type_names.get(sac_type, f"type_{sac_type}")
+            self.stats["sac_chosen"] += 1
+            self.sac_chosen_actions[sac_n] += 1
+            self._current_episode_sources.append("sac")
+            return sac_type, sac_params, (
+                f"sac(qs={q_score:.2f},ss={sac_score:.2f})"
+            )
+
+        # Fallback Q (no SAC)
+        self.stats["q_store_chosen"] += 1
+        self.q_chosen_actions[q_name] += 1
+        self._current_episode_sources.append("q_store")
+        return q_type, q_params, "q_fallback"
+
+    def _get_track(self, results: deque) -> float:
+        """Track record: neutral prior if insufficient data."""
+        if len(results) < self._min_eval_per_source:
+            return 0.5
+        return sum(results) / len(results)
 
     def _discrete_to_params(self, discrete_action: int) -> np.ndarray:
-        """Convert discrete Q-store action to denormalized params.
-
-        Args:
-            discrete_action: Discrete action index (0-23).
-
-        Returns:
-            Denormalized action params ready for ActionInterpreter.
-        """
+        """Convert discrete Q action to denormalized params."""
         _, params_fn = ExperienceExtractor.DISCRETE_TO_PSAC[discrete_action]
         raw_params = params_fn(self.controller.config)
         padded = np.zeros(3, dtype=np.float32)
-        padded[:len(raw_params)] = raw_params
+        padded[: len(raw_params)] = raw_params
         return padded
 
     def _get_sac_action_continuous(
         self, state: np.ndarray
     ) -> Tuple[int, np.ndarray]:
-        """Get SAC action as (type, denormalized_params).
-
-        Physical action masks applied (same as Q-store):
-        - No MoveTangentially in air
-        - No MoveLinear on surface
-        - No Detach in air
-        - No Detach spam (3x in a row)
-        """
+        """Get SAC action with physical masks."""
         state_norm = state
         if self.state_mean is not None:
             state_norm = (state - self.state_mean) / (self.state_std + 1e-8)
@@ -293,33 +338,35 @@ class Arbitrator:
                 state_norm.astype(np.float32)
             ).unsqueeze(0)
 
-            logits, param_mus, param_log_stds = self.sac_actor(state_t)
+            logits, param_mus, _ = self.sac_actor(state_t)
 
-            # Physical action masks (same as Q-store)
-            if not on_object:  # in air
-                logits[0, 0] = -1e9  # no MoveTangentially
-                logits[0, 7] = -1e9  # no Detach (already in air)
-            if on_object:  # on surface
-                logits[0, 1] = -1e9  # no MoveLinear
-            # Anti-spam
+            # Physical masks
+            if not on_object:
+                logits[0, 0] = -1e9  # no MoveTangentially in air
+                logits[0, 7] = -1e9  # no Detach in air
+            if on_object:
+                logits[0, 1] = -1e9  # no MoveLinear on surface
             if self.controller._consecutive_detach_count >= 3:
                 logits[0, 7] = -1e9
 
-            # Sample from masked distribution
             temperature = 0.3
             type_probs = torch.softmax(logits / temperature, dim=-1)
             type_probs = type_probs.clamp(min=1e-8)
             type_probs = type_probs / type_probs.sum(dim=-1, keepdim=True)
             type_dist = torch.distributions.Categorical(type_probs)
             action_type_t = type_dist.sample()
-
             action_type = action_type_t[0].item()
 
-            # Get params for chosen type
             dim = self._param_dims.get(action_type, 0)
-            if dim > 0 and action_type in param_mus and self.param_mean is not None:
+            if (
+                dim > 0
+                and action_type in param_mus
+                and self.param_mean is not None
+            ):
                 mu = param_mus[action_type][0].numpy()
-                params = mu[:dim] * self.param_std[:dim] + self.param_mean[:dim]
+                params = (
+                    mu[:dim] * self.param_std[:dim] + self.param_mean[:dim]
+                )
                 padded = np.zeros(3, dtype=np.float32)
                 padded[:dim] = params
             else:
@@ -330,19 +377,10 @@ class Arbitrator:
     def _get_sac_params_for_type(
         self, state: np.ndarray, forced_type: int
     ) -> np.ndarray:
-        """Get SAC params for a specific action type.
+        """Get SAC params for a specific action type."""
+        if forced_type == 7:
+            return np.zeros(3, dtype=np.float32)
 
-        When Q chooses the type but SAC chose a different type,
-        we can still get SAC's param prediction for Q's type
-        because SAC has per-type param heads.
-
-        Args:
-            state: Raw state vector.
-            forced_type: Action type to get params for.
-
-        Returns:
-            Denormalized action params ready for ActionInterpreter.
-        """
         state_norm = state
         if self.state_mean is not None:
             state_norm = (state - self.state_mean) / (self.state_std + 1e-8)
@@ -352,28 +390,28 @@ class Arbitrator:
             state_t = torch.FloatTensor(
                 state_norm.astype(np.float32)
             ).unsqueeze(0)
-
             _, param_mus, _ = self.sac_actor(state_t)
 
             dim = self._param_dims.get(forced_type, 0)
-            if dim > 0 and forced_type in param_mus and self.param_mean is not None:
+            if (
+                dim > 0
+                and forced_type in param_mus
+                and self.param_mean is not None
+            ):
                 raw = param_mus[forced_type][0].numpy()
-                params = raw[:dim] * self.param_std[:dim] + self.param_mean[:dim]
+                params = (
+                    raw[:dim] * self.param_std[:dim] + self.param_mean[:dim]
+                )
                 padded = np.zeros(3, dtype=np.float32)
                 padded[:dim] = params
                 return padded
-            else:
-                # No params for this type (e.g. Detach)
-                # Fall back to discrete params
-                return np.zeros(3, dtype=np.float32)
+
+        return np.zeros(3, dtype=np.float32)
 
     def _get_q_action(
         self, state: np.ndarray
     ) -> Tuple[int, float, float]:
-        """Get action from Q-store with strategic override.
-
-        Same as before — no changes needed.
-        """
+        """Get action from Q-store with physical masks and strategic override."""
         store = self.controller._select_store(state)
 
         if store.next_id == 0:
@@ -393,7 +431,10 @@ class Arbitrator:
 
         q_values = store.get_q_values(state)
 
-        # Strategic override for detach
+        # ═══ PHYSICAL MASKS ═══
+        q_values = self.controller.apply_action_mask(q_values, state)
+
+        # ═══ STRATEGIC OVERRIDE (after mask, can re-enable detach) ═══
         on_object = state[11] > 0.5
         if on_object:
             sensor_proxy = self._get_sensor_proxy()
@@ -404,11 +445,15 @@ class Arbitrator:
                     (not same_side or path_blocked)
                     and self.controller._can_detach(state)
                 ):
-                    t_state = self.controller._compute_detach_transition_state(
-                        state, sensor_proxy,
-                        movement_efficiency=(
-                            self.controller._compute_movement_efficiency(window=20)
-                        ),
+                    t_state = (
+                        self.controller._compute_detach_transition_state(
+                            state, sensor_proxy,
+                            movement_efficiency=(
+                                self.controller._compute_movement_efficiency(
+                                    window=20
+                                )
+                            ),
+                        )
                     )
                     s_q = self.controller.strategic_detach.get_q_values(t_state)
                     if (
@@ -422,7 +467,13 @@ class Arbitrator:
             q_values[self.controller.action_space.IDX_DETACH] = -1e9
 
         q_action = int(np.argmax(q_values))
-        q_spread = float(np.max(q_values) - np.min(q_values))
+
+        # ═══ SPREAD from valid actions only ═══
+        valid = q_values > -1e8
+        if valid.sum() > 1:
+            q_spread = float(np.max(q_values[valid]) - np.min(q_values[valid]))
+        else:
+            q_spread = 0.0
 
         return q_action, q_confidence, q_spread
 
@@ -431,58 +482,51 @@ class Arbitrator:
             return self.controller._prev_sensor_data
         return None
 
-    def _get_heuristic_action(
-        self,
-        state: np.ndarray,
-        current_pose: np.ndarray,
-        sensor_data: Dict[str, Any],
-    ) -> int:
-        heuristic, _ = self.controller._compute_heuristic_bias(
+    def _get_heuristic_action(self, state, current_pose, sensor_data) -> int:
+        return self.controller._choose_action_heuristic(
             state=state,
             current_pose=current_pose,
             sensor_data=sensor_data,
-            prev_action=self.controller._last_action,
         )
-        return int(np.argmax(heuristic))
 
-    def on_episode_end(self, success):
-        if not self._current_episode_sources:
-            self._current_episode_sources = []
-            return
+    def on_episode_end(self, success: bool):
+        level = self._current_level
 
-        counts = Counter(self._current_episode_sources)
-        total = len(self._current_episode_sources)
-
-        min_participation = 0.1
-        for source, count in counts.items():
-            participation = count / total
-            if participation >= min_participation:
-                if source == "q_store":
-                    self._q_episode_results.append(success)
-                elif source == "sac":
-                    self._sac_episode_results.append(success)
-                elif source == "heuristic":
-                    self._heuristic_episode_results.append(success)
+        if self._is_calibrating:
+            if self._calibration_source == "q_store":
+                self._level_q_results[level].append(success)
+            elif self._calibration_source == "sac":
+                self._level_sac_results[level].append(success)
+        else:
+            counts = Counter(self._current_episode_sources)
+            if counts:
+                dominant = counts.most_common(1)[0][0]
+                if dominant in ("q_store", "blend"):
+                    self._level_q_results[level].append(success)
+                elif dominant == "sac":
+                    self._level_sac_results[level].append(success)
 
         self._current_episode_sources = []
 
     @property
     def q_success_rate(self) -> float:
-        if len(self._q_episode_results) == 0:
+        """Overall Q success rate across all levels."""
+        all_results = []
+        for results in self._level_q_results.values():
+            all_results.extend(results)
+        if not all_results:
             return 0.0
-        return sum(self._q_episode_results) / len(self._q_episode_results)
+        return sum(all_results) / len(all_results)
 
     @property
     def sac_success_rate(self) -> float:
-        if len(self._sac_episode_results) == 0:
+        """Overall SAC success rate across all levels."""
+        all_results = []
+        for results in self._level_sac_results.values():
+            all_results.extend(results)
+        if not all_results:
             return 0.0
-        return sum(self._sac_episode_results) / len(self._sac_episode_results)
-
-    @property
-    def heuristic_success_rate(self) -> float:
-        if len(self._heuristic_episode_results) == 0:
-            return 0.0
-        return sum(self._heuristic_episode_results) / len(self._heuristic_episode_results)
+        return sum(all_results) / len(all_results)
 
     def get_stats(self) -> Dict[str, Any]:
         total = max(self.stats["total_decisions"], 1)
@@ -490,35 +534,74 @@ class Arbitrator:
         agreement_rate = (
             self.agreement_count / max(self.both_proposed_count, 1)
         )
-
-        q_conf_mean = float(np.mean(self.q_confidence_history)) if self.q_confidence_history else 0.0
-        q_spread_mean = float(np.mean(self.q_spread_history)) if self.q_spread_history else 0.0
+        q_conf_mean = (
+            float(np.mean(self.q_confidence_history))
+            if self.q_confidence_history
+            else 0.0
+        )
+        q_spread_mean = (
+            float(np.mean(self.q_spread_history))
+            if self.q_spread_history
+            else 0.0
+        )
 
         def _top_actions(action_dict, n=15):
-            sorted_actions = sorted(action_dict.items(), key=lambda x: -x[1])
+            sorted_actions = sorted(
+                action_dict.items(), key=lambda x: -x[1]
+            )
             total_actions = max(sum(action_dict.values()), 1)
             return {
-                name: {"count": count, "rate": round(count / total_actions, 3)}
+                name: {
+                    "count": count,
+                    "rate": round(count / total_actions, 3),
+                }
                 for name, count in sorted_actions[:n]
+            }
+
+        # Per-level track record
+        level_stats = {}
+        for level in sorted(
+            set(
+                list(self._level_q_results.keys())
+                + list(self._level_sac_results.keys())
+            )
+        ):
+            q_r = self._get_track(self._level_q_results[level])
+            s_r = self._get_track(self._level_sac_results[level])
+            level_stats[f"level_{level}"] = {
+                "q_rate": round(q_r, 3),
+                "sac_rate": round(s_r, 3),
+                "q_evals": len(self._level_q_results[level]),
+                "sac_evals": len(self._level_sac_results[level]),
             }
 
         return {
             "total_decisions": self.stats["total_decisions"],
-            "q_store_rate": round(self.stats["q_store_chosen"] / total, 3),
-            "sac_rate": round(self.stats["sac_chosen"] / total, 3),
-            "blend_rate": round(self.stats.get("blend_chosen", 0) / total, 3),
-            "heuristic_rate": round(self.stats["heuristic_chosen"] / total, 3),
+            "q_store_rate": round(
+                self.stats["q_store_chosen"] / total, 3
+            ),
+            "sac_rate": round(
+                self.stats["sac_chosen"] / total, 3
+            ),
+            "blend_rate": round(
+                self.stats.get("blend_chosen", 0) / total, 3
+            ),
+            "heuristic_rate": round(
+                self.stats["heuristic_chosen"] / total, 3
+            ),
             "q_success_rate": round(self.q_success_rate, 3),
             "sac_success_rate": round(self.sac_success_rate, 3),
-            "heuristic_success_rate": round(self.heuristic_success_rate, 3),
-            "q_episodes": len(self._q_episode_results),
-            "sac_episodes": len(self._sac_episode_results),
             "agreement_rate": round(agreement_rate, 3),
             "q_confidence_mean": round(q_conf_mean, 3),
             "q_spread_mean": round(q_spread_mean, 3),
+            "is_calibrating": self._is_calibrating,
+            "current_level": self._current_level,
+            "per_level_track_record": level_stats,
             "q_proposed_top": _top_actions(self.q_proposed_actions),
             "sac_proposed_top": _top_actions(self.sac_proposed_actions),
             "q_chosen_top": _top_actions(self.q_chosen_actions),
             "sac_chosen_top": _top_actions(self.sac_chosen_actions),
-            "blend_chosen_top": _top_actions(self.blend_chosen_actions),
+            "blend_chosen_top": _top_actions(
+                self.blend_chosen_actions
+            ),
         }
