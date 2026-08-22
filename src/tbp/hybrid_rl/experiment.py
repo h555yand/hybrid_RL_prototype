@@ -1932,6 +1932,8 @@ class RLGoalApproachExperiment:
             q_save_dir=adapt_q_dir,
             sac_save_dir=adapt_sac_dir,
             offline_check_window=self.config.get("offline_check_window", 50),
+            promote_threshold=self.promote_threshold,
+            promote_window=self.promote_window,
         )
         manager.sac_trainer = sac_trainer
 
@@ -2322,25 +2324,25 @@ class RLGoalApproachExperiment:
                 sac_episode_steps.append(ep_steps)
 
             # Snapshot every N episodes
-            if (episode + 1) % _ADAPTIVE_LOG_INTERVAL == 0:
-                if self.visualise:
-                    vis_dir = (
-                        Path(adaptive_log_dir)
-                        / "visualizations"
-                    )
-                    _maybe_save_visualization(
-                        controller=controller,
-                        env=env,
-                        episode=episode,
-                        ep_result=termination,
-                        goal_pose=goal_pose,
-                        current_poses=current_poses,
-                        action_explanations=action_explanations,
-                        vis_dir=vis_dir,
-                        vis_filter=None,
-                        vis_counts=None,
-                    )
+            if self.visualise and (episode + 1) % _ADAPTIVE_LOG_INTERVAL <= 2 and (episode + 1) >=  _ADAPTIVE_LOG_INTERVAL:
+                vis_dir = (
+                    Path(adaptive_log_dir)
+                    / "visualizations"
+                )
+                _maybe_save_visualization(
+                    controller=controller,
+                    env=env,
+                    episode=episode,
+                    ep_result=termination,
+                    goal_pose=goal_pose,
+                    current_poses=current_poses,
+                    action_explanations=action_explanations,
+                    vis_dir=vis_dir,
+                    vis_filter=None,
+                    vis_counts=None,
+                )
 
+            if (episode + 1) % _ADAPTIVE_LOG_INTERVAL == 0:
                 stats = manager.get_stats()
                 arb_stats = manager.arbitrator.get_stats()
 

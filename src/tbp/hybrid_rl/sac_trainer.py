@@ -1736,7 +1736,7 @@ class PSACTrainer:
                 ep_result = "collision"
 
             if visualizer:
-                if ((episode + 1) % log_interval) <= 2 and (episode + 1) >= log_interval:
+                if ((episode + 1) % log_interval) <= 0 and (episode + 1) >= log_interval:
                     visualizer.save_episode(
                         env=env,
                         episode=episode,

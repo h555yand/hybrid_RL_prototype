@@ -61,6 +61,8 @@ class AdaptiveTrainingManager:
         q_save_dir: str = None,
         sac_save_dir: str = None,
         offline_check_window: int = 50,
+        promote_threshold: float = 0.70,
+        promote_window: int = 100,
     ):
         self.controller = controller
         self.env = env
@@ -75,6 +77,8 @@ class AdaptiveTrainingManager:
         self.offline_threshold = offline_threshold
         self.monitor_window = monitor_window
         self.offline_check_window = offline_check_window
+        self.promote_threshold = promote_threshold
+        self.promote_window = promote_window
 
         # Online SAC updates
         self.online_sac_update_every = online_sac_update_every
@@ -389,7 +393,6 @@ class AdaptiveTrainingManager:
             self.success_rate,
         )
 
-        # Current level info
         current_level = self.arbitrator._current_level
         all_levels = list(
             self.config.get("curriculum_levels", [[10, 120]])
@@ -397,14 +400,22 @@ class AdaptiveTrainingManager:
         all_filters = list(
             self.config.get("curriculum_filters", [{}])
         )
-        remaining_levels = all_levels[current_level:]
-        remaining_filters = all_filters[current_level:]
+        if current_level >= len(all_levels):
+            remaining_levels = [all_levels[-1]] if all_levels else [[10, 120]]
+            remaining_filters = [all_filters[-1]] if all_filters else [{}]
+        else:
+            remaining_levels = all_levels[current_level:]
+            remaining_filters = all_filters[current_level:]
 
-        # === Phase 1: Q-learning retrain from current level ===
+        if not remaining_levels:
+            remaining_levels = [[10, 120]]
+        if not remaining_filters:
+            remaining_filters = [{}]
+
         q_save_dir = self.q_save_dir
         self.controller.save(q_save_dir)
 
-        q_warmup = int(self.offline_q_episodes * 0.5)  # 50% heuristic warmup
+        q_warmup = self.offline_q_episodes // 2
 
         logger.info(
             "OFFLINE Q: %d episodes (warmup=%d), eps %.1f→%.1f, "
@@ -435,9 +446,13 @@ class AdaptiveTrainingManager:
             mesh_path=self.mesh_path,
             seed=42,
             return_metrics=True,
+            curriculum_config={
+                "levels": remaining_levels,
+                "promote_threshold": self.promote_threshold,
+                "promote_window": self.promote_window,
+            },
         )
 
-        # Reload controller
         self.controller = RLGoalApproachController.load(
             q_save_dir,
             agent_id=self.controller.agent_id,
@@ -452,7 +467,6 @@ class AdaptiveTrainingManager:
         self.arbitrator._is_calibrating = True
         self.arbitrator._episodes_on_level = 0
 
-        # Unfreeze normalization
         for store in [
             self.controller.q_store_free,
             self.controller.q_store_surface,
@@ -466,7 +480,6 @@ class AdaptiveTrainingManager:
         q_rate = train_result.get("success_rate", 0.0)
         logger.info("OFFLINE Q complete: rate=%.3f", q_rate)
 
-        # === Phase 2: SAC retrain from current level ===
         success_trails = train_result.get("success_trails", [])
 
         if (
@@ -487,17 +500,14 @@ class AdaptiveTrainingManager:
                 current_level,
             )
 
-            # Update BC data
             self.sac_trainer.bc_data = all_bc
             self.sac_trainer.bc_lambda = self.sac_trainer.bc_lambda_init
 
-            # Enable CQL for offline (conservative learning)
             old_use_cql = self.sac_trainer.use_cql
             old_cql_alpha = self.sac_trainer.cql_alpha
             self.sac_trainer.use_cql = True
             self.sac_trainer.cql_alpha = 1.0
 
-            # SAC train from current level
             self.sac_trainer.train(
                 env=self.env,
                 controller=self.controller,
@@ -511,7 +521,6 @@ class AdaptiveTrainingManager:
                 mesh_name=Path(self.mesh_path).stem,
             )
 
-            # Restore CQL settings
             self.sac_trainer.use_cql = old_use_cql
             self.sac_trainer.cql_alpha = old_cql_alpha
 
@@ -527,10 +536,9 @@ class AdaptiveTrainingManager:
                 len(success_trails) if success_trails else 0,
             )
 
-        # Reset for fresh evaluation
         self.success_history.clear()
         self._level_success_history.clear()
-
+        
     def get_stats(self) -> Dict[str, Any]:
         return {
             "mode": self.mode,
