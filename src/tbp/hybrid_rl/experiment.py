@@ -1931,6 +1931,7 @@ class RLGoalApproachExperiment:
             mesh_path=mesh_path,
             q_save_dir=adapt_q_dir,
             sac_save_dir=adapt_sac_dir,
+            offline_check_window=self.config.get("offline_check_window", 50),
         )
         manager.sac_trainer = sac_trainer
 
@@ -2090,6 +2091,7 @@ class RLGoalApproachExperiment:
                 action_type, action_params, source = (
                     manager.get_action(state, pose, sensor)
                 )
+                controller._current_source = source
 
                 # Convert to discrete for Q-store learning
                 discrete_idx = sac_to_discrete(

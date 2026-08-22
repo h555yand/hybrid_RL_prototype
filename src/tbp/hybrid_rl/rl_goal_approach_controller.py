@@ -224,6 +224,7 @@ class RLGoalApproachController:
         self._cached_orbit_direction = None
         self._orbit_direction_age = 0
         self._current_phase = "CRAWL_TO_GOAL"
+        self._current_source = None
         self._strategic_stats = {
             # Detach decisions
             "detach_memory_triggered": 0,
@@ -286,6 +287,7 @@ class RLGoalApproachController:
         self._cached_orbit_direction = None
         self._orbit_direction_age = 0
         self._current_phase = "CRAWL_TO_GOAL"
+        self._current_source = None
         self._prev_phase = None
         self._pending_strategic_detach = []
         self._pending_strategic_direction = None
@@ -4531,6 +4533,7 @@ class RLGoalApproachController:
         if goal_reached:
             reason = "GOAL_REACHED!!!"
             reason_key = "goal_reached"
+            source_str = f", source={self._current_source}" if self._current_source else ""
             logger.info(
                 f"Episode {self._total_episodes} DONE: {reason}, "
                 f"start_dist={start_distance:.1f}mm, "
@@ -4541,6 +4544,7 @@ class RLGoalApproachController:
                 f"strategic_eps={self.strategic_epsilon:.3f}, "
                 f"success_rate="
                 f"{self._total_goals_reached}/{self._total_episodes}"
+                f"{source_str}"
             )
         elif termination_reason == "collision_surface_violation":
             reason = "collision_surface_violation"

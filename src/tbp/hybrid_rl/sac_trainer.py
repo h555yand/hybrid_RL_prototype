@@ -38,7 +38,6 @@ from .twin_critic import TwinCritic
 from .strategic_sac import StrategicSAC
 
 logger = logging.getLogger(__name__)
-_LOG_INTERVAL = 100
 
 
 class PSACTrainer:
@@ -1737,7 +1736,7 @@ class PSACTrainer:
                 ep_result = "collision"
 
             if visualizer:
-                if ((episode + 1) % _LOG_INTERVAL == 0) and ((episode + 1) >= 100):
+                if ((episode + 1) % log_interval) <= 2 and (episode + 1) >= log_interval:
                     visualizer.save_episode(
                         env=env,
                         episode=episode,

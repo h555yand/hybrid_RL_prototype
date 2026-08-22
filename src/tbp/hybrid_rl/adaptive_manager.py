@@ -60,6 +60,7 @@ class AdaptiveTrainingManager:
         epsilon_default: float = 0.15,
         q_save_dir: str = None,
         sac_save_dir: str = None,
+        offline_check_window: int = 50,
     ):
         self.controller = controller
         self.env = env
@@ -73,6 +74,7 @@ class AdaptiveTrainingManager:
         self.mastered_threshold = mastered_threshold
         self.offline_threshold = offline_threshold
         self.monitor_window = monitor_window
+        self.offline_check_window = offline_check_window
 
         # Online SAC updates
         self.online_sac_update_every = online_sac_update_every
@@ -114,6 +116,7 @@ class AdaptiveTrainingManager:
         )
         self.arbitrator = Arbitrator(controller=controller)
         self.mode_changes: List[Dict[str, Any]] = []
+        self._level_success_history: Dict[int, deque] = {}
 
     @property
     def success_rate(self) -> float:
@@ -122,6 +125,12 @@ class AdaptiveTrainingManager:
         return sum(self.success_history) / len(
             self.success_history
         )
+
+    def _get_level_success_rate(self, level: int) -> float:
+        history = self._level_success_history.get(level)
+        if history is None or len(history) == 0:
+            return 0.0
+        return sum(history) / len(history)
 
     def _get_adaptive_epsilon(self) -> float:
         """Compute epsilon based on rolling success rate.
@@ -153,44 +162,56 @@ class AdaptiveTrainingManager:
         )
 
     def decide_mode(self) -> str:
-        """Decide operating mode based on performance.
-
-        Modes:
-        - mastered: high success, light tuning only
-        - online: default, full learning with adaptive epsilon
-        - offline: emergency retrain when sustained low performance
-        """
-        if len(self.success_history) < self.monitor_window:
+        current_level = self.arbitrator._current_level
+        level_history = self._level_success_history.get(current_level)
+        if level_history is None or len(level_history) < self.monitor_window:
             return "online"
-
         if self._episodes_since_offline < self.post_offline_cooldown:
             return "online"
 
-        rate = self.success_rate
+        rate = sum(level_history) / len(level_history)
 
         if rate >= self.mastered_threshold:
             return "mastered"
 
-        if rate < self.offline_threshold:
-            # Min online before first offline
+        if self._episodes_since_offline < self.offline_check_window:
+            return "online"
+
+        h_track = self.arbitrator._get_track(
+            self.arbitrator._level_heuristic_results[current_level]
+        )
+        h_track = max(h_track, 0.1)
+
+        q_track = self.arbitrator._get_track(
+            self.arbitrator._level_q_results[current_level]
+        )
+        sac_track = self.arbitrator._get_track(
+            self.arbitrator._level_sac_results[current_level]
+        )
+        best_ml_track = max(q_track, sac_track)
+
+        if best_ml_track < h_track * 0.5:
             if (
                 self.total_offline_iterations == 0
                 and self.total_episodes < self.min_online_before_offline
             ):
                 return "online"
-            # Max offline iterations
             if self.total_offline_iterations >= self.max_offline_iterations:
                 return "online"
             return "offline"
 
         return "online"
-
+    
     def on_episode_complete(
         self,
         success: bool,
         transitions: List[Dict[str, Any]],
     ) -> None:
         self.success_history.append(success)
+        current_level = self.arbitrator._current_level
+        if current_level not in self._level_success_history:
+            self._level_success_history[current_level] = deque(maxlen=self.monitor_window)
+        self._level_success_history[current_level].append(success)
         self.total_episodes += 1
         self._episodes_since_offline += 1
         self.online_episodes_since_sac_update += 1
@@ -424,6 +445,13 @@ class AdaptiveTrainingManager:
         )
         self.arbitrator.controller = self.controller
 
+        self.arbitrator._level_q_results.clear()
+        self.arbitrator._level_sac_results.clear()
+        self.arbitrator._level_heuristic_results.clear()
+        self.arbitrator._calibration_counter = 0
+        self.arbitrator._is_calibrating = True
+        self.arbitrator._episodes_on_level = 0
+
         # Unfreeze normalization
         for store in [
             self.controller.q_store_free,
@@ -501,7 +529,7 @@ class AdaptiveTrainingManager:
 
         # Reset for fresh evaluation
         self.success_history.clear()
-
+        self._level_success_history.clear()
 
     def get_stats(self) -> Dict[str, Any]:
         return {
