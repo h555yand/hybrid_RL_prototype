@@ -26,13 +26,13 @@ experiment:
     promote_window: 100
 
     curriculum_levels:
-      - [10.0, 60.0]
-      - [10.0, 80.0]
+      #- [10.0, 60.0]
+      #- [10.0, 80.0]
       - [10.0, 120.0]
 
     curriculum_filters:
-      - {same_side: true, path_blocked: false}
-      - {same_side: true, path_blocked: true}
+      #- {same_side: true, path_blocked: false}
+      #- {same_side: true, path_blocked: true}
       - {same_side: false}
 
     training_stages:

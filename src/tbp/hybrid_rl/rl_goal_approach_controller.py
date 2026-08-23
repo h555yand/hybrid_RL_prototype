@@ -2485,16 +2485,32 @@ class RLGoalApproachController:
 
                             if best is not None:
                                 surface_move[best] = SURFACE_STRENGTH
+                                e_world_direct = self._current_goal[:3] - current_pose[:3]
+                                e_t_direct = e_world_direct - np.dot(e_world_direct, n_hat) * n_hat
                                 self._last_surface_debug = {
                                     "phase": "CRAWL_TO_EDGE",
                                     "e_t": e_t.tolist(),
+                                    "e_t_direct": e_t_direct.tolist(),
+                                    "goal_dir_world": e_world_direct.tolist(),
                                     "n_hat": n_hat.tolist(),
                                     "best_dir": best,
                                     "best_score": round(best_score, 2),
                                     "scores": [round(s, 2) for s in scores],
                                     "tangential_dist": round(tangential_dist, 2),
+                                    "subgoal_dir": subgoal_dir.tolist() if subgoal_dir is not None else None,
+                                    "agent_rot": current_pose[3:6].tolist(),
                                 }
-
+                        else:
+                            self._last_surface_debug = {
+                                "phase": "CRAWL_TO_EDGE",
+                                "note": "tangential_dist_too_small",
+                                "tangential_dist": round(tangential_dist, 4),
+                                "e_t": e_t.tolist() if e_t is not None else None,
+                                "n_hat": n_hat.tolist(),
+                                "goal_dir_world": (self._current_goal[:3] - current_pose[:3]).tolist(),
+                                "subgoal_dir": subgoal_dir.tolist() if subgoal_dir is not None else None,
+                            }
+                            
         if on_object > 0.5 and phase == "CRAWL_TO_GOAL":
             SURFACE_STRENGTH = 4.0
 
@@ -2625,6 +2641,21 @@ class RLGoalApproachController:
                                             )
                                         )
                                         use_geodesic = True
+                                        # Fallback: if geodesic lost vertical component
+                                        e_t_flat_check = (
+                                            e_world
+                                            - np.dot(e_world, n_hat) * n_hat
+                                        )
+                                        e_t_flat_len = float(np.linalg.norm(e_t_flat_check))
+                                        e_t_geo_len = float(np.linalg.norm(e_t))
+                                        if e_t_flat_len > 1e-8 and e_t_geo_len > 1e-8:
+                                            cos_check = float(np.dot(
+                                                e_t / e_t_geo_len,
+                                                e_t_flat_check / e_t_flat_len,
+                                            ))
+                                            if cos_check < 0.3:
+                                                e_t = e_t_flat_check
+                                                use_geodesic = False
 
                         if not use_geodesic:
                             e_t = (
@@ -2801,10 +2832,15 @@ class RLGoalApproachController:
                                         )
 
                             if best is not None:
-                                surface_move[best] = (SURFACE_STRENGTH)
+                                surface_move[best] = SURFACE_STRENGTH
+                                e_world_direct = self._current_goal[:3] - current_pose[:3]
+                                e_t_direct = e_world_direct - np.dot(e_world_direct, n_hat) * n_hat
                                 self._last_surface_debug = {
                                     "phase": "CRAWL_TO_GOAL",
                                     "e_t": e_t.tolist(),
+                                    "e_t_direct": e_t_direct.tolist(),
+                                    "e_world": (rot.apply(local_pos_error)).tolist(),
+                                    "goal_dir_world": e_world_direct.tolist(),
                                     "n_hat": n_hat.tolist(),
                                     "best_dir": best,
                                     "best_score": round(best_score, 2),
@@ -2812,8 +2848,17 @@ class RLGoalApproachController:
                                     "tangential_dist": round(tangential_dist, 2),
                                     "use_geodesic": use_geodesic if not path_blocked_now else False,
                                     "path_blocked": path_blocked_now,
+                                    "agent_rot": current_pose[3:6].tolist(),
                                 }
-
+                        else:
+                            self._last_surface_debug = {
+                                "phase": "CRAWL_TO_GOAL",
+                                "note": "tangential_dist_too_small",
+                                "tangential_dist": round(tangential_dist, 4),
+                                "e_t": e_t.tolist() if e_t is not None else None,
+                                "n_hat": n_hat.tolist(),
+                                "goal_dir_world": (self._current_goal[:3] - current_pose[:3]).tolist(),
+                            }
         bias += surface_move
         components["surface_move"] = surface_move
 
@@ -3766,8 +3811,75 @@ class RLGoalApproachController:
             )
 
         return orbit_dir
-
+    
     def _compute_crawl_to_edge_direction(
+        self,
+        current_pose: np.ndarray,
+        sensor_data: Dict[str, Any],
+    ) -> Optional[np.ndarray]:
+        normal = sensor_data.get("point_normal")
+        if normal is None:
+            return None
+        n = np.asarray(normal, dtype=float)
+        n_len = np.linalg.norm(n)
+        if n_len < 1e-8:
+            return None
+        n /= n_len
+
+        up_dir = np.asarray(
+            sensor_data.get("up_direction", [0, 0, 1]), dtype=float
+        )
+        same_side = sensor_data.get("same_side", True)
+
+        if not same_side:
+            up_tangent = up_dir - np.dot(up_dir, n) * n
+            up_tangent_len = np.linalg.norm(up_tangent)
+
+            if up_tangent_len > 0.3:
+                crawl_dir = up_tangent / up_tangent_len
+            else:
+                center = np.asarray(
+                    sensor_data.get("object_center", [0, 0, 0]),
+                    dtype=float,
+                )
+                to_center = center - current_pose[:3]
+                to_center_t = to_center - np.dot(to_center, n) * n
+                tc_len = np.linalg.norm(to_center_t)
+
+                if tc_len > 1e-8:
+                    dot_normal_center = np.dot(n, to_center)
+                    if dot_normal_center > 0:
+                        crawl_dir = -to_center_t / tc_len
+                    else:
+                        crawl_dir = to_center_t / tc_len
+                else:
+                    crawl_dir = up_dir - np.dot(up_dir, n) * n
+                    cd_len = np.linalg.norm(crawl_dir)
+                    if cd_len < 1e-8:
+                        return None
+                    crawl_dir /= cd_len
+        else:
+            goal_dir = self._current_goal[:3] - current_pose[:3]
+            crawl_dir = goal_dir - np.dot(goal_dir, n) * n
+
+            crawl_len = np.linalg.norm(crawl_dir)
+            if crawl_len < 1e-8:
+                center = np.asarray(
+                    sensor_data.get("object_center", [0, 0, 0]),
+                    dtype=float,
+                )
+                away = current_pose[:3] - center
+                crawl_dir = away - np.dot(away, n) * n
+                crawl_len = np.linalg.norm(crawl_dir)
+                if crawl_len < 1e-8:
+                    return None
+
+        crawl_len = np.linalg.norm(crawl_dir)
+        if crawl_len < 1e-8:
+            return None
+        return crawl_dir / crawl_len
+        
+    def _compute_crawl_to_edge_direction_old(
         self,
         current_pose: np.ndarray,
         sensor_data: Dict[str, Any],

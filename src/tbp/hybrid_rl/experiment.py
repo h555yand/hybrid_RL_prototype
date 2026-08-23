@@ -2142,8 +2142,19 @@ class RLGoalApproachExperiment:
                         f", best_dir={surface_debug['best_dir']}"
                         f", scores={surface_debug['scores']}"
                     )
+                    if "e_t_direct" in surface_debug:
+                        d = surface_debug["e_t_direct"]
+                        surface_str += (
+                            f", e_t_direct=[{d[0]:.1f},{d[1]:.1f},{d[2]:.1f}]"
+                        )
+                    if "use_geodesic" in surface_debug:
+                        surface_str += f", geo={surface_debug['use_geodesic']}"
+                    if "goal_dir_world" in surface_debug:
+                        g = surface_debug["goal_dir_world"]
+                        surface_str += (
+                            f", goal_w=[{g[0]:.1f},{g[1]:.1f},{g[2]:.1f}]"
+                        )
                     controller._last_surface_debug = None
-
                 action_explanations.append(
                     f"source: {source}, type: {act_name}, "
                     f"params: [{action_params[0]:.2f}, "
@@ -2348,7 +2359,7 @@ class RLGoalApproachExperiment:
                 sac_episode_steps.append(ep_steps)
 
             # Snapshot every N episodes
-            if self.visualise and (episode + 1) % _ADAPTIVE_LOG_INTERVAL <= 3 and (episode + 1) >=  _ADAPTIVE_LOG_INTERVAL:
+            if self.visualise and (episode + 1) % 50 <= 3 and (episode + 1) >= 0:
                 vis_dir = (
                     Path(adaptive_log_dir)
                     / "visualizations"
