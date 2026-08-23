@@ -2195,6 +2195,9 @@ class RLGoalApproachExperiment:
                 success=success,
                 transitions=transitions,
             )
+            if manager._offline_just_completed:
+                rolling_successes.clear()
+                manager._offline_just_completed = False
 
             # Write mode changes to JSON
             while manager.mode_changes:

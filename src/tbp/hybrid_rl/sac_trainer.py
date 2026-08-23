@@ -860,6 +860,7 @@ class PSACTrainer:
         interpreter: ActionInterpreter,
         curriculum_levels: list[tuple[float, float]]
         | None = None,
+        curriculum_filters=None,
         num_episodes: int = 100,
     ) -> float:
         """Run evaluation with strategic override."""
@@ -878,23 +879,53 @@ class PSACTrainer:
 
         self.actor.eval()
 
+        level_filter = {}
+        if curriculum_filters and max_level < len(curriculum_filters):
+            level_filter = curriculum_filters[max_level]
+
         for _ep in range(num_episodes):
             if curriculum_levels:
-                min_dist, max_dist = curriculum_levels[
-                    max_level
-                ]
+                min_dist, max_dist = curriculum_levels[max_level]
             else:
                 min_dist, max_dist = 10.0, 120.0
 
             env.reset()
             start_pos = env.get_pose()[:3]
-            goal_pose = env.get_random_surface_point(
-                reference_pos=start_pos,
-                min_dist=min_dist,
-                max_dist=max_dist,
-                max_attempts=2000,
-                mesh_sample=True,
+
+            require_same_side = level_filter.get("same_side", None)
+            require_path_blocked = level_filter.get("path_blocked", None)
+            max_goal_attempts = (
+                50
+                if (require_same_side is not None or require_path_blocked is not None)
+                else 1
             )
+
+            goal_pose = None
+            for _attempt in range(max_goal_attempts):
+                candidate = env.get_random_surface_point(
+                    reference_pos=start_pos,
+                    min_dist=min_dist,
+                    max_dist=max_dist,
+                    max_attempts=2000,
+                    mesh_sample=True,
+                )
+                if require_same_side is not None:
+                    from .episode_pools import _is_reachable_by_surface
+                    same_side = _is_reachable_by_surface(env, start_pos, candidate[:3])
+                    if same_side != require_same_side:
+                        continue
+                if require_path_blocked is not None:
+                    env._current_goal = np.concatenate([candidate[:3], candidate[3:]])
+                    sensor = env.get_sensor_data()
+                    pb = sensor.get("path_blocked", False)
+                    if pb != require_path_blocked:
+                        continue
+                goal_pose = candidate
+                break
+
+            if goal_pose is None:
+                goal_pose = candidate
+
             controller.set_new_goal(
                 goal_pose, start_pos
             )
@@ -1269,6 +1300,7 @@ class PSACTrainer:
         save_dir: str | None = None,
         curriculum_levels: list[tuple[float, float]]
         | None = None,
+        curriculum_filters=None,
         promote_threshold: float = 0.5,
         promote_window: int = 100,
         episode_pools: dict[str, Any] | None = None,
@@ -1359,6 +1391,7 @@ class PSACTrainer:
             self.cql_alpha if self.use_cql else 0.0,
         )
 
+        local_steps = 0
         for episode in range(num_episodes):
             if curriculum_levels:
                 min_dist, max_dist = curriculum_levels[
@@ -1366,6 +1399,10 @@ class PSACTrainer:
                 ]
             else:
                 min_dist, max_dist = 10.0, 120.0
+
+            level_filter = {}
+            if curriculum_filters and curr_level < len(curriculum_filters):
+                level_filter = curriculum_filters[curr_level]
 
             ep_data = self._get_episode_data(
                 episode_pools, curr_level, episode
@@ -1383,15 +1420,42 @@ class PSACTrainer:
                     np.array(ep_data["goal_rot"]),
                 ])
             else:
-                env.reset()
-                start_pos = env.get_pose()[:3]
-                goal_pose = env.get_random_surface_point(
-                    reference_pos=start_pos,
-                    min_dist=min_dist,
-                    max_dist=max_dist,
-                    max_attempts=2000,
-                    mesh_sample=True,
-                )
+                    env.reset()
+                    start_pos = env.get_pose()[:3]
+
+                    require_same_side = level_filter.get("same_side", None)
+                    require_path_blocked = level_filter.get("path_blocked", None)
+                    max_goal_attempts = (
+                        50
+                        if (require_same_side is not None or require_path_blocked is not None)
+                        else 1
+                    )
+
+                    goal_pose = None
+                    for _attempt in range(max_goal_attempts):
+                        candidate = env.get_random_surface_point(
+                            reference_pos=start_pos,
+                            min_dist=min_dist,
+                            max_dist=max_dist,
+                            max_attempts=2000,
+                            mesh_sample=True,
+                        )
+                        if require_same_side is not None:
+                            from .episode_pools import _is_reachable_by_surface
+                            same_side = _is_reachable_by_surface(env, start_pos, candidate[:3])
+                            if same_side != require_same_side:
+                                continue
+                        if require_path_blocked is not None:
+                            env._current_goal = np.concatenate([candidate[:3], candidate[3:]])
+                            sensor = env.get_sensor_data()
+                            pb = sensor.get("path_blocked", False)
+                            if pb != require_path_blocked:
+                                continue
+                        goal_pose = candidate
+                        break
+
+                    if goal_pose is None:
+                        goal_pose = candidate
 
             controller.set_new_goal(
                 goal_pose, env.get_pose()[:3]
@@ -1475,6 +1539,7 @@ class PSACTrainer:
 
             for step in range(self.max_steps_per_goal):
                 self.total_steps += 1
+                local_steps += 1
 
                 # ═══ Strategic override (optional) ═══
                 strategic_type = None
@@ -1664,7 +1729,7 @@ class PSACTrainer:
                 prev_distance = distance
 
                 if (
-                    self.total_steps >= warmup_steps
+                    local_steps >= warmup_steps
                     and self.total_steps
                     % update_every == 0
                     and len(self.buffer)
@@ -1815,7 +1880,7 @@ class PSACTrainer:
 
             if (
                 (episode + 1) % self.eval_interval == 0
-                and self.total_steps >= warmup_steps
+                and local_steps >= warmup_steps
             ):
                 eval_rate = (
                     self._run_eval_during_training(
@@ -1825,6 +1890,7 @@ class PSACTrainer:
                         curriculum_levels=(
                             curriculum_levels
                         ),
+                        curriculum_filters=curriculum_filters,
                         num_episodes=self.eval_episodes,
                     )
                 )
@@ -1916,6 +1982,9 @@ class PSACTrainer:
                         best_critic_dict = None
                         best_critic_target_dict = None
                         best_extra = None
+                        level_filter = {}
+                        if curriculum_filters and curr_level < len(curriculum_filters):
+                            level_filter = curriculum_filters[curr_level]
                         logger.info(
                             "SAC Curriculum: "
                             "promoted to level %d "

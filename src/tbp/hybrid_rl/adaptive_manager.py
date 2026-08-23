@@ -121,6 +121,7 @@ class AdaptiveTrainingManager:
         self.arbitrator = Arbitrator(controller=controller)
         self.mode_changes: List[Dict[str, Any]] = []
         self._level_success_history: Dict[int, deque] = {}
+        self._offline_just_completed = False
 
     @property
     def success_rate(self) -> float:
@@ -258,6 +259,7 @@ class AdaptiveTrainingManager:
 
         if self.mode == "offline":
             self._trigger_offline()
+            self._offline_just_completed = True
             self.controller.mode = "adaptive"
             eps = self._get_adaptive_epsilon()
             self.controller.epsilon = eps
@@ -442,6 +444,7 @@ class AdaptiveTrainingManager:
                 "warmup_episodes": q_warmup,
                 "curriculum_levels": remaining_levels,
                 "curriculum_filters": remaining_filters,
+                "unfreeze_normalization": True,
             },
             mesh_path=self.mesh_path,
             seed=42,
@@ -466,16 +469,6 @@ class AdaptiveTrainingManager:
         self.arbitrator._calibration_counter = 0
         self.arbitrator._is_calibrating = True
         self.arbitrator._episodes_on_level = 0
-
-        for store in [
-            self.controller.q_store_free,
-            self.controller.q_store_surface,
-            self.controller.strategic_detach,
-            self.controller.strategic_direction,
-        ]:
-            store._norm_frozen = False
-            store._freeze_done = False
-            store._state_buffer.clear()
 
         q_rate = train_result.get("success_rate", 0.0)
         logger.info("OFFLINE Q complete: rate=%.3f", q_rate)
@@ -507,6 +500,8 @@ class AdaptiveTrainingManager:
             old_cql_alpha = self.sac_trainer.cql_alpha
             self.sac_trainer.use_cql = True
             self.sac_trainer.cql_alpha = 1.0
+            old_eval_interval = self.sac_trainer.eval_interval
+            self.sac_trainer.eval_interval = 100
 
             self.sac_trainer.train(
                 env=self.env,
@@ -518,9 +513,11 @@ class AdaptiveTrainingManager:
                 log_interval=50,
                 save_dir=self.sac_save_dir,
                 curriculum_levels=remaining_levels,
+                curriculum_filters=remaining_filters,
                 mesh_name=Path(self.mesh_path).stem,
             )
 
+            self.sac_trainer.eval_interval = old_eval_interval
             self.sac_trainer.use_cql = old_use_cql
             self.sac_trainer.cql_alpha = old_cql_alpha
 

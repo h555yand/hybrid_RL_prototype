@@ -30,6 +30,7 @@ from tbp.hybrid_rl.experience_extractor import ExperienceExtractor
 from tbp.hybrid_rl.lightweight_env import LightweightEnv
 from tbp.hybrid_rl.rl_goal_approach_controller import RLGoalApproachController
 from tbp.hybrid_rl.visualize_env import save_episode_frames, visualize_agent_goal
+from tbp.hybrid_rl.episode_pools import _is_reachable_by_surface
 
 _LOG_INTERVAL = 100
 
@@ -404,12 +405,19 @@ def _init_controller(
     controller = RLGoalApproachController.load(
         load_dir, agent_id=agent_id, config=config_overrides
     )
+
     if cfg.get("unfreeze_normalization", False):
-        controller.q_store_free._norm_frozen = False
-        controller.q_store_free._freeze_done = False
-        controller.q_store_surface._norm_frozen = False
-        controller.q_store_surface._freeze_done = False
+        for store in [
+            controller.q_store_free,
+            controller.q_store_surface,
+            controller.strategic_detach,
+            controller.strategic_direction,
+        ]:
+            store._norm_frozen = False
+            store._freeze_done = False
+            store._state_buffer.clear()
         logger.info("Normalization unfrozen for transfer learning")
+
     return controller
 
 
@@ -660,6 +668,7 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
     _orbit_ages: list[int] = []
     _detach_outcomes: list[dict[str, Any]] = []
     _collision_per_phase: dict[str, int] = {}
+    curriculum_filters_list = cfg.get("curriculum_filters", [])
 
     for episode in range(num_episodes):
         if episodes_per_level is not None and episode >= episodes_per_level:
@@ -700,12 +709,46 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
             start_pos = env.get_pose()[:3]
             if curriculum is not None:
                 min_d, max_d = curriculum.current_bounds
-                goal_pose = env.get_random_surface_point(
-                    reference_pos=start_pos,
-                    min_dist=min_d,
-                    max_dist=max_d,
-                    max_attempts=2000,
+                level_filter = {}
+                if curriculum.level_idx < len(curriculum_filters_list):
+                    level_filter = curriculum_filters_list[curriculum.level_idx]
+
+                require_same_side = level_filter.get("same_side", None)
+                require_path_blocked = level_filter.get("path_blocked", None)
+                max_goal_attempts = (
+                    50
+                    if (require_same_side is not None or require_path_blocked is not None)
+                    else 1
                 )
+
+                goal_pose = None
+                for _attempt in range(max_goal_attempts):
+                    candidate = env.get_random_surface_point(
+                        reference_pos=start_pos,
+                        min_dist=min_d,
+                        max_dist=max_d,
+                        max_attempts=2000,
+                    )
+                    if require_same_side is not None:
+                        same_side = _is_reachable_by_surface(
+                            env, start_pos, candidate[:3]
+                        )
+                        if same_side != require_same_side:
+                            continue
+                    if require_path_blocked is not None:
+                        env._current_goal = np.concatenate([
+                            candidate[:3], candidate[3:]
+                        ])
+                        sensor = env.get_sensor_data()
+                        pb = sensor.get("path_blocked", False)
+                        if pb != require_path_blocked:
+                            continue
+                    goal_pose = candidate
+                    break
+
+                if goal_pose is None:
+                    goal_pose = candidate
+
                 goal_dist = float(
                     np.linalg.norm(goal_pose[:3] - start_pos)
                 )
