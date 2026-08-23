@@ -1869,21 +1869,13 @@ class RLGoalApproachExperiment:
             agent_id=f"{self.adaptive_mesh}_adaptive",
             config=adaptive_cfg,
         )
-        # Unfreeze Q-store normalization for new object
-        controller.q_store_free._norm_frozen = False
-        controller.q_store_free._freeze_done = False
-        controller.q_store_free._state_buffer.clear()
-        controller.q_store_surface._norm_frozen = False
-        controller.q_store_surface._freeze_done = False
-        controller.q_store_surface._state_buffer.clear()
-        controller.strategic_detach._norm_frozen = False
-        controller.strategic_detach._freeze_done = False
-        controller.strategic_detach._state_buffer.clear()
-        controller.strategic_direction._norm_frozen = False
-        controller.strategic_direction._freeze_done = False
-        controller.strategic_direction._state_buffer.clear()
-        logger.info("Q-store normalization unfrozen for adaptive mode")
-
+        # Normalization stays frozen from training.
+        # Unfreezing happens only during offline retrain
+        # (via unfreeze_normalization in run_episodes config).
+        logger.info(
+            "Adaptive mode: normalization frozen from training, "
+            "will unfreeze only during offline retrain"
+        )
         controller._collision_stats = {}
 
         # Load SAC: adaptive if exists, otherwise training
@@ -2128,11 +2120,40 @@ class RLGoalApproachExperiment:
                 action_counts[act_name] = (
                     action_counts.get(act_name, 0) + 1
                 )
+                dist_to_goal = float(np.linalg.norm(goal_pose[:3] - pose[:3]))
+                sensor_normal = sensor.get("point_normal", None)
+                normal_str = ""
+                if sensor_normal is not None:
+                    normal_str = (
+                        f", n=[{sensor_normal[0]:.2f},"
+                        f"{sensor_normal[1]:.2f},"
+                        f"{sensor_normal[2]:.2f}]"
+                    )
+                phase_str = getattr(controller, "_current_phase", "")
+                same_side = sensor.get("same_side", True)
+                path_blocked = sensor.get("path_blocked", False)
+                surface_debug = getattr(controller, "_last_surface_debug", None)
+                surface_str = ""
+                if surface_debug is not None:
+                    surface_str = (
+                        f", e_t=[{surface_debug['e_t'][0]:.1f},"
+                        f"{surface_debug['e_t'][1]:.1f},"
+                        f"{surface_debug['e_t'][2]:.1f}]"
+                        f", best_dir={surface_debug['best_dir']}"
+                        f", scores={surface_debug['scores']}"
+                    )
+                    controller._last_surface_debug = None
+
                 action_explanations.append(
                     f"source: {source}, type: {act_name}, "
                     f"params: [{action_params[0]:.2f}, "
                     f"{action_params[1]:.2f}, "
-                    f"{action_params[2]:.2f}]"
+                    f"{action_params[2]:.2f}], "
+                    f"dist={dist_to_goal:.1f}, "
+                    f"phase={phase_str}, "
+                    f"ss={int(same_side)}, pb={int(path_blocked)}"
+                    f"{normal_str}"
+                    f"{surface_str}"
                 )
 
                 # Track source
@@ -2327,7 +2348,7 @@ class RLGoalApproachExperiment:
                 sac_episode_steps.append(ep_steps)
 
             # Snapshot every N episodes
-            if self.visualise and (episode + 1) % _ADAPTIVE_LOG_INTERVAL <= 2 and (episode + 1) >=  _ADAPTIVE_LOG_INTERVAL:
+            if self.visualise and (episode + 1) % _ADAPTIVE_LOG_INTERVAL <= 3 and (episode + 1) >=  _ADAPTIVE_LOG_INTERVAL:
                 vis_dir = (
                     Path(adaptive_log_dir)
                     / "visualizations"

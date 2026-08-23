@@ -102,6 +102,7 @@ class RLGoalApproachController:
             "insert_threshold": self.config.get(
                 "transition_insert_threshold", 0.5
             ),
+            "norm_warmup_steps": 500,
         }
         self.strategic_detach = HNSWStateStore(
             config=strategic_detach_config, name="strategic_detach"
@@ -120,6 +121,7 @@ class RLGoalApproachController:
             "insert_threshold": self.config.get(
                 "transition_insert_threshold", 0.5
             ) * 0.5,
+            "norm_warmup_steps": 500,
         }
         self.strategic_direction = HNSWStateStore(
             config=strategic_direction_config, name="strategic_direction"
@@ -2279,6 +2281,7 @@ class RLGoalApproachController:
 
         bias = np.zeros(self.num_actions, dtype=float)
         components: Dict[str, np.ndarray] = {}
+        self._last_surface_debug = None
 
         local_pos_error = state[0:3]
         on_object = float(state[11])
@@ -2482,6 +2485,15 @@ class RLGoalApproachController:
 
                             if best is not None:
                                 surface_move[best] = SURFACE_STRENGTH
+                                self._last_surface_debug = {
+                                    "phase": "CRAWL_TO_EDGE",
+                                    "e_t": e_t.tolist(),
+                                    "n_hat": n_hat.tolist(),
+                                    "best_dir": best,
+                                    "best_score": round(best_score, 2),
+                                    "scores": [round(s, 2) for s in scores],
+                                    "tangential_dist": round(tangential_dist, 2),
+                                }
 
         if on_object > 0.5 and phase == "CRAWL_TO_GOAL":
             SURFACE_STRENGTH = 4.0
@@ -2789,11 +2801,18 @@ class RLGoalApproachController:
                                         )
 
                             if best is not None:
-                                surface_move[
-                                    best
-                                ] = (
-                                    SURFACE_STRENGTH
-                                )
+                                surface_move[best] = (SURFACE_STRENGTH)
+                                self._last_surface_debug = {
+                                    "phase": "CRAWL_TO_GOAL",
+                                    "e_t": e_t.tolist(),
+                                    "n_hat": n_hat.tolist(),
+                                    "best_dir": best,
+                                    "best_score": round(best_score, 2),
+                                    "scores": [round(s, 2) for s in scores],
+                                    "tangential_dist": round(tangential_dist, 2),
+                                    "use_geodesic": use_geodesic if not path_blocked_now else False,
+                                    "path_blocked": path_blocked_now,
+                                }
 
         bias += surface_move
         components["surface_move"] = surface_move
