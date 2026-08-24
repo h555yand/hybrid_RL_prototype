@@ -520,6 +520,15 @@ class RLGoalApproachExperiment:
                 "unfreeze_normalization": (
                     load_mode is not None
                 ),
+                # Strategic epsilon follows tactical
+                "strategic_epsilon_start": stage.get(
+                    "strategic_epsilon_start",
+                    epsilon_start,
+                ),
+                "strategic_epsilon_min": stage.get(
+                    "strategic_epsilon_min",
+                    stage.get("epsilon_min", 0.05),
+                ),
             }
 
             # Determine seeds and prefix for pool generation

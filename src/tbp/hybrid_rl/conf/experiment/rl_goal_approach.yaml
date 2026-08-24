@@ -132,7 +132,7 @@ experiment:
         warmup_episodes: 30
         promote_threshold: 0.65
         promote_window: 200
-        
+
     # ═══════════════════════════════════════════
     # EVAL: train objects + held-out
     # ═══════════════════════════════════════════
@@ -251,8 +251,6 @@ experiment:
       eval_epsilon: 0.02
 
       # Strategic Q-store
-      strategic_epsilon_start: 1.0
-      strategic_epsilon_min: 0.3
       strategic_eval_epsilon: 0.02
       strategic_reward_switch_success: 1.0
       strategic_reward_switch_wrong_side: -0.3
