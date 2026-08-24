@@ -21,6 +21,7 @@ experiment:
     eval_seeds: [44]
     sac_seed: 55
     sac_eval_seeds: [77]
+    adapt_seed: 99
 
     promote_threshold: 0.7
     promote_window: 100

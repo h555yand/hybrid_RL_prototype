@@ -24,6 +24,7 @@ import time
 import types
 from pathlib import Path
 from typing import Any
+import random
 
 import numpy as np
 import torch
@@ -150,6 +151,9 @@ class RLGoalApproachExperiment:
         )
         self.sac_seed: int = self.config.get(
             "sac_seed", self.train_seeds[0]
+        )
+        self.adapt_seed: int = self.config.get(
+            "adapt_seed", 42
         )
         self.eval_episodes_per_level: int = self.config.get(
             "eval_episodes_per_level", 500
@@ -1834,11 +1838,15 @@ class RLGoalApproachExperiment:
         mesh_path = str(
             self.data_dir / f"{self.adaptive_mesh}.stl"
         )
-        env = LightweightEnv(mesh_path)
+
+        adapt_seed = self.train_seeds[0]
+        np.random.seed(self.adapt_seed)
+        random.seed(self.adapt_seed)
+        env = LightweightEnv(mesh_path, seed=adapt_seed)
+
         num_types = len(
             ExperienceExtractor.get_type_names()
         )
-        adapt_seed = self.train_seeds[0]
 
         # Load Q-store: adaptive if exists, otherwise training
         adaptive_q_dir = str(
@@ -2154,7 +2162,30 @@ class RLGoalApproachExperiment:
                         surface_str += (
                             f", goal_w=[{g[0]:.1f},{g[1]:.1f},{g[2]:.1f}]"
                         )
+                    # ═══ ADD THIS BLOCK ═══
+                    rim_debug = getattr(controller, "_rim_debug", None)
+                    if rim_debug is not None:
+                        surface_str += (
+                            f", is_horiz={rim_debug.get('is_horizontal')}"
+                        )
+                        if rim_debug.get("is_horizontal"):
+                            eh = rim_debug.get("e_t_horiz", [0, 0, 0])
+                            surface_str += (
+                                f", up={rim_debug.get('up_dir')}"
+                                f", h_len={rim_debug.get('horiz_len')}"
+                                f", v_comp={rim_debug.get('vert_comp')}"
+                                f", h_ratio={rim_debug.get('horiz_ratio')}"
+                                f", aw={rim_debug.get('away_weight')}"
+                                f", e_t_h=[{eh[0]:.1f},{eh[1]:.1f},{eh[2]:.1f}]"
+                            )
+                        else:
+                            surface_str += (
+                                f", n_dot_up={rim_debug.get('n_dot_up')}"
+                            )
+                        controller._rim_debug = None
+                    # ═══ END OF NEW BLOCK ═══
                     controller._last_surface_debug = None
+
                 action_explanations.append(
                     f"source: {source}, type: {act_name}, "
                     f"params: [{action_params[0]:.2f}, "
@@ -2309,7 +2340,7 @@ class RLGoalApproachExperiment:
                 dominant_source_key = "q_store"
             elif dominant_source.startswith("q_"):
                 dominant_source_key = "q_store"
-            elif dominant_source == "sac":
+            elif dominant_source.startswith("sac_"):
                 dominant_source_key = "sac"
             else:
                 dominant_source_key = "heuristic"
@@ -2359,7 +2390,7 @@ class RLGoalApproachExperiment:
                 sac_episode_steps.append(ep_steps)
 
             # Snapshot every N episodes
-            if self.visualise and (episode + 1) % 50 <= 3 and (episode + 1) >= 0:
+            if self.visualise and (episode + 1) % 50 <= 15 and (episode + 1) >= 0 and dominant_source_key == "heuristic":
                 vis_dir = (
                     Path(adaptive_log_dir)
                     / "visualizations"

@@ -895,6 +895,304 @@ class RLGoalApproachController:
             self._orbit_direction_age = 0
 
             if not same_side or path_blocked:
+                # ═══ Horizontal surface (rim/top/bottom) detection ═══
+                # On horizontal surfaces the agent is already at or near
+                # an edge. Crawling toward goal will naturally trigger
+                # edge traversal to descend/ascend to the target side.
+                # No need for CRAWL_TO_EDGE or DETACH.
+                point_normal = sensor_data.get("point_normal")
+                up_dir = np.asarray(
+                    sensor_data.get("up_direction", [0, 0, 1]),
+                    dtype=float,
+                )
+                if point_normal is not None:
+                    n = np.asarray(point_normal, dtype=float)
+                    n_len = np.linalg.norm(n)
+                    if n_len > 1e-8:
+                        n = n / n_len
+                        is_horizontal = (
+                            abs(float(np.dot(n, up_dir))) > 0.85
+                        )
+
+                        if is_horizontal:
+                            return (
+                                "CRAWL_TO_GOAL",
+                                None,
+                                f"on horizontal surface, crawl to goal "
+                                f"(dist={distance:.0f}, "
+                                f"ss={same_side}, "
+                                f"pb={path_blocked})",
+                            )
+
+                stuck_threshold = self.config.get(
+                    "stuck_threshold", 0.15
+                )
+                eff = (
+                    self._compute_movement_efficiency(window=20)
+                )
+                if eff < stuck_threshold:
+                    fly_dir = (
+                        self._compute_detach_fly_direction(
+                            current_pose,
+                            sensor_data,
+                        )
+                    )
+                    return (
+                        "DETACH_NEEDED",
+                        fly_dir,
+                        f"stuck, consider detach "
+                        f"(dist={distance:.0f}, "
+                        f"eff={eff:.2f}, "
+                        f"ss={same_side}, "
+                        f"pb={path_blocked})",
+                    )
+
+                edge_dir = (
+                    self._compute_crawl_to_edge_direction(
+                        current_pose,
+                        sensor_data,
+                    )
+                )
+                return (
+                    "CRAWL_TO_EDGE",
+                    edge_dir,
+                    f"crawling to edge "
+                    f"(dist={distance:.0f}, "
+                    f"ss={same_side}, "
+                    f"pb={path_blocked})",
+                )
+            return (
+                "CRAWL_TO_GOAL",
+                None,
+                f"crawl to goal "
+                f"(dist={distance:.0f}, "
+                f"ss={same_side}, "
+                f"pb={path_blocked})",
+            )
+
+        # ═══ IN AIR ═══
+        else:
+            landing_threshold = (
+                8.0 * self.action_space.free_step
+            )
+
+            # EMERGENCY LANDING
+            if depth < 5.0:
+                return (
+                    "LAND",
+                    None,
+                    f"emergency landing, "
+                    f"depth={depth:.1f}mm "
+                    f"(dist={distance:.0f})",
+                )
+
+            # Close to goal + path clear → land
+            if (
+                distance < landing_threshold
+                and not path_blocked
+            ):
+                self._cached_orbit_direction = None
+                self._orbit_direction_age = 0
+                return (
+                    "LAND",
+                    None,
+                    f"near goal, landing "
+                    f"(dist={distance:.0f})",
+                )
+
+            # Path blocked → must bypass obstacle
+            if path_blocked:
+                fly_dir = getattr(
+                    self, "_cached_fly_direction", None
+                )
+
+                extents = sensor_data.get(
+                    "object_extents", [84, 84, 84]
+                )
+                max_extent = float(max(extents))
+
+                center_raw = sensor_data.get(
+                    "object_center"
+                )
+                too_far = False
+                dist_from_center = 0.0
+                if center_raw is not None:
+                    center = np.asarray(
+                        center_raw, dtype=float
+                    )
+                    dist_from_center = float(
+                        np.linalg.norm(
+                            current_pose[:3] - center
+                        )
+                    )
+                    too_far = (
+                        dist_from_center
+                        > max_extent * 1.5
+                    )
+
+                # Fallback: clear stale cache
+                if fly_dir is not None and not too_far:
+                    depth_now = sensor_data.get(
+                        "depth", 100.0
+                    )
+                    if (
+                        depth_now >= 100.0
+                        and len(self._distance_history)
+                        > 30
+                    ):
+                        recent_min = min(
+                            self._distance_history[-30:]
+                        )
+                        if distance > recent_min + 10.0:
+                            logger.debug(
+                                f"FLY_CACHE_STALE: "
+                                f"depth=100, "
+                                f"dist={distance:.0f}, "
+                                f"recent_min="
+                                f"{recent_min:.0f}, "
+                                f"clearing cache"
+                            )
+                            self._cached_fly_direction = (
+                                None
+                            )
+                            self._cached_orbit_direction = (
+                                None
+                            )
+                            fly_dir = None
+
+                if fly_dir is not None and not too_far:
+                    return (
+                        "FLY_TO_EDGE",
+                        fly_dir.copy(),
+                        f"bypassing, cached dir "
+                        f"(dist={distance:.0f}, "
+                        f"from_center="
+                        f"{dist_from_center:.0f})",
+                    )
+                else:
+                    orbit_age = getattr(
+                        self,
+                        "_orbit_direction_age",
+                        0,
+                    )
+                    cached_orbit = getattr(
+                        self,
+                        "_cached_orbit_direction",
+                        None,
+                    )
+
+                    if (
+                        cached_orbit is None
+                        or orbit_age > 10
+                    ):
+                        orbit_dir = (
+                            self._compute_orbit_direction(
+                                current_pose, sensor_data
+                            )
+                        )
+                        if orbit_dir is not None:
+                            self._cached_orbit_direction = (
+                                orbit_dir
+                            )
+                            self._orbit_direction_age = 0
+                            self._cached_fly_direction = (
+                                None
+                            )
+                        else:
+                            orbit_dir = cached_orbit
+                    else:
+                        orbit_dir = cached_orbit
+                        self._orbit_direction_age = (
+                            orbit_age + 1
+                        )
+
+                    if orbit_dir is not None:
+                        return (
+                            "FLY_TO_EDGE",
+                            orbit_dir.copy(),
+                            f"orbiting, age="
+                            f"{self._orbit_direction_age}"
+                            f" (dist={distance:.0f}, "
+                            f"from_center="
+                            f"{dist_from_center:.0f})",
+                        )
+
+                    return (
+                        "FLY_TO_GOAL",
+                        None,
+                        f"bypass fallback "
+                        f"(dist={distance:.0f})",
+                    )
+
+            # ═══ Path NOT blocked — hysteresis ═══
+            path_clear_streak = getattr(
+                self, "_path_clear_streak", 0
+            )
+
+            if path_clear_streak >= 3:
+                self._cached_orbit_direction = None
+                self._orbit_direction_age = 0
+                return (
+                    "FLY_TO_GOAL",
+                    None,
+                    f"path clear "
+                    f"{path_clear_streak} steps "
+                    f"(dist={distance:.0f})",
+                )
+
+            prev_phase = getattr(
+                self, "_prev_phase", None
+            )
+            if prev_phase == "FLY_TO_EDGE":
+                cached_dir = getattr(
+                    self,
+                    "_cached_fly_direction",
+                    None,
+                )
+                if cached_dir is None:
+                    cached_dir = getattr(
+                        self,
+                        "_cached_orbit_direction",
+                        None,
+                    )
+                return (
+                    "FLY_TO_EDGE",
+                    cached_dir,
+                    f"path clear but hysteresis "
+                    f"(streak={path_clear_streak}, "
+                    f"dist={distance:.0f})",
+                )
+
+            # Default: fly to goal
+            self._cached_orbit_direction = None
+            self._orbit_direction_age = 0
+            return (
+                "FLY_TO_GOAL",
+                None,
+                f"path clear, fly to goal "
+                f"(dist={distance:.0f})",
+            )
+
+    def _determine_phase_old(
+        self,
+        state: np.ndarray,
+        sensor_data: Dict[str, Any],
+        current_pose: np.ndarray,
+    ) -> Tuple[str, Optional[np.ndarray], str]:
+        on_object = float(state[11]) > 0.5
+        same_side = sensor_data.get("same_side", True)
+        path_blocked = sensor_data.get("path_blocked", False)
+        distance = float(state[13])
+        depth = sensor_data.get("depth", 100.0)
+
+        goal_pos = self._current_goal[:3]
+
+        # ═══ ON SURFACE ═══
+        if on_object:
+            self._cached_orbit_direction = None
+            self._orbit_direction_age = 0
+
+            if not same_side or path_blocked:
                 stuck_threshold = self.config.get(
                     "stuck_threshold", 0.15
                 )
@@ -2529,38 +2827,247 @@ class RLGoalApproachController:
                     step = float(
                         self.action_space.surface_step
                     )
-
                     if path_blocked_now:
-                        # Path blocked — crawl toward
-                        # edge using fly direction
-                        edge_dir = (
-                            self._compute_detach_fly_direction(
-                                current_pose,
-                                sensor_data,
-                            )
+                        # ═══ Check if on horizontal surface ═══
+                        up_dir_raw = sensor_data.get(
+                            "up_direction", [0, 0, 1]
                         )
-                        if edge_dir is not None:
-                            e_t = (
-                                edge_dir
-                                - np.dot(
-                                    edge_dir, n_hat
-                                )
+                        up_dir_vec = np.asarray(
+                            up_dir_raw, dtype=float
+                        )
+                        is_horizontal_surface = (
+                            abs(float(np.dot(n_hat, up_dir_vec)))
+                            > 0.85
+                        )
+
+                        if is_horizontal_surface:
+                            e_world = (
+                                self._current_goal[:3]
+                                - current_pose[:3]
+                            )
+                            e_t_horiz = (
+                                e_world
+                                - np.dot(e_world, n_hat)
                                 * n_hat
                             )
-                            e_t_len = np.linalg.norm(
-                                e_t
+                            e_t_horiz_len = np.linalg.norm(
+                                e_t_horiz
                             )
-                            if e_t_len > 1e-8:
-                                e_t = (
-                                    e_t
-                                    / e_t_len
-                                    * step
-                                    * 3.0
+
+                            vertical_component = abs(
+                                float(np.dot(e_world, n_hat))
+                            )
+                            total_len = np.linalg.norm(e_world)
+
+                            _dbg_horiz_ratio = None
+                            _dbg_away_weight = None
+
+                            if (
+                                total_len > 1e-8
+                                and vertical_component
+                                / total_len
+                                > 0.3
+                                and e_t_horiz_len > 1e-8
+                            ):
+                                center_raw = sensor_data.get(
+                                    "object_center"
                                 )
+                                if center_raw is not None:
+                                    center = np.asarray(
+                                        center_raw, dtype=float
+                                    )
+                                    away_from_center = (
+                                        current_pose[:3] - center
+                                    )
+                                    away_from_center_t = (
+                                        away_from_center
+                                        - np.dot(
+                                            away_from_center,
+                                            n_hat,
+                                        )
+                                        * n_hat
+                                    )
+                                    away_len = np.linalg.norm(
+                                        away_from_center_t
+                                    )
+
+                                    if away_len > 1e-8:
+                                        away_dir = (
+                                            away_from_center_t
+                                            / away_len
+                                        )
+
+                                        # Determine which edge to
+                                        # push toward: inner or outer.
+                                        # Compare radial distance of
+                                        # goal vs agent from center.
+                                        # If goal is closer to center
+                                        # → push inward (toward center)
+                                        # If goal is farther
+                                        # → push outward (away)
+                                        goal_from_center = (
+                                            self._current_goal[:3]
+                                            - center
+                                        )
+                                        goal_from_center_t = (
+                                            goal_from_center
+                                            - np.dot(
+                                                goal_from_center,
+                                                n_hat,
+                                            )
+                                            * n_hat
+                                        )
+                                        goal_radial = float(
+                                            np.linalg.norm(
+                                                goal_from_center_t
+                                            )
+                                        )
+                                        agent_radial = float(
+                                            away_len
+                                        )
+
+                                        if (
+                                            goal_radial
+                                            < agent_radial
+                                        ):
+                                            away_dir = -away_dir
+
+                                        e_t_horiz_norm = (
+                                            e_t_horiz
+                                            / e_t_horiz_len
+                                        )
+                                        horiz_ratio = (
+                                            e_t_horiz_len
+                                            / (
+                                                vertical_component
+                                                + 1e-8
+                                            )
+                                        )
+                                        away_weight = float(
+                                            np.clip(
+                                                0.8
+                                                - horiz_ratio
+                                                * 0.8,
+                                                0.0,
+                                                0.8,
+                                            )
+                                        )
+                                        goal_weight = (
+                                            1.0 - away_weight
+                                        )
+
+                                        _dbg_horiz_ratio = (
+                                            horiz_ratio
+                                        )
+                                        _dbg_away_weight = (
+                                            away_weight
+                                        )
+
+                                        e_t = (
+                                            e_t_horiz_norm
+                                            * goal_weight
+                                            + away_dir
+                                            * away_weight
+                                        )
+                                        e_t = (
+                                            e_t
+                                            / (
+                                                np.linalg.norm(
+                                                    e_t
+                                                )
+                                                + 1e-12
+                                            )
+                                            * max(
+                                                e_t_horiz_len,
+                                                step * 3.0,
+                                            )
+                                        )
+                                    else:
+                                        e_t = e_t_horiz
+                                else:
+                                    e_t = e_t_horiz
+                            else:
+                                e_t = e_t_horiz
+
+                            # Save rim debug for logging
+                            self._rim_debug = {
+                                "is_horizontal": True,
+                                "up_dir": up_dir_vec.tolist(),
+                                "e_t_horiz": e_t_horiz.tolist(),
+                                "horiz_len": round(
+                                    float(e_t_horiz_len), 2
+                                ),
+                                "vert_comp": round(
+                                    float(vertical_component),
+                                    2,
+                                ),
+                                "horiz_ratio": (
+                                    round(
+                                        float(
+                                            _dbg_horiz_ratio
+                                        ),
+                                        3,
+                                    )
+                                    if _dbg_horiz_ratio
+                                    is not None
+                                    else None
+                                ),
+                                "away_weight": (
+                                    round(
+                                        float(
+                                            _dbg_away_weight
+                                        ),
+                                        3,
+                                    )
+                                    if _dbg_away_weight
+                                    is not None
+                                    else None
+                                ),
+                            }
+
+                        else:
+                            self._rim_debug = {
+                                "is_horizontal": False,
+                                "n_dot_up": round(
+                                    float(
+                                        np.dot(
+                                            n_hat,
+                                            up_dir_vec,
+                                        )
+                                    ),
+                                    3,
+                                ),
+                            }
+
+                            edge_dir = (
+                                self._compute_detach_fly_direction(
+                                    current_pose,
+                                    sensor_data,
+                                )
+                            )
+                            if edge_dir is not None:
+                                e_t = (
+                                    edge_dir
+                                    - np.dot(
+                                        edge_dir,
+                                        n_hat,
+                                    )
+                                    * n_hat
+                                )
+                                e_t_len = (
+                                    np.linalg.norm(e_t)
+                                )
+                                if e_t_len > 1e-8:
+                                    e_t = (
+                                        e_t
+                                        / e_t_len
+                                        * step
+                                        * 3.0
+                                    )
+                                else:
+                                    e_t = None
                             else:
                                 e_t = None
-                        else:
-                            e_t = None
                     else:
                         # Path clear — crawl toward
                         # goal with geodesic
@@ -2839,7 +3346,7 @@ class RLGoalApproachController:
                                     "phase": "CRAWL_TO_GOAL",
                                     "e_t": e_t.tolist(),
                                     "e_t_direct": e_t_direct.tolist(),
-                                    "e_world": (rot.apply(local_pos_error)).tolist(),
+                                    "e_world": (rot.apply(local_pos_error)).tolist() if not path_blocked_now else None,
                                     "goal_dir_world": e_world_direct.tolist(),
                                     "n_hat": n_hat.tolist(),
                                     "best_dir": best,
@@ -2848,6 +3355,7 @@ class RLGoalApproachController:
                                     "tangential_dist": round(tangential_dist, 2),
                                     "use_geodesic": use_geodesic if not path_blocked_now else False,
                                     "path_blocked": path_blocked_now,
+                                    "is_horizontal": is_horizontal_surface if path_blocked_now else False,
                                     "agent_rot": current_pose[3:6].tolist(),
                                 }
                         else:
@@ -2859,6 +3367,7 @@ class RLGoalApproachController:
                                 "n_hat": n_hat.tolist(),
                                 "goal_dir_world": (self._current_goal[:3] - current_pose[:3]).tolist(),
                             }
+
         bias += surface_move
         components["surface_move"] = surface_move
 
