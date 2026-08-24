@@ -9,9 +9,9 @@ experiment:
     seed: 42
     visualise: false
     regenerate_scripts: true
-    do_train: false
-    do_eval: false
-    do_heur_eval: true
+    do_train: true
+    do_eval: true
+    do_heur_eval: false
     do_bc_train: false
     do_sac_train: false
     do_sac_eval: false
@@ -23,39 +23,175 @@ experiment:
     sac_eval_seeds: [77]
     adapt_seed: 99
 
-    promote_threshold: 0.7
-    promote_window: 100
+    promote_threshold: 0.75
+    promote_window: 300
 
     curriculum_levels:
-      - [10.0, 60.0]
-      - [10.0, 80.0]
-      #- [10.0, 120.0]
+      - [10.0, 60.0]    # L0: same_side, no path_blocked
+      - [10.0, 80.0]    # L1: same_side, path_blocked
+      - [10.0, 120.0]   # L2: different sides
 
     curriculum_filters:
       - {same_side: true, path_blocked: false}
       - {same_side: true, path_blocked: true}
-      #- {same_side: false}
+      - {same_side: false}
 
+    # ═══════════════════════════════════════════
+    # PHASE 1: Primitives (from scratch)
+    # ═══════════════════════════════════════════
     training_stages:
+      # ── Phase 1: Primitives ──
+      - mesh: cube
+        episodes: 2000
+        epsilon_start: 1.0
+        epsilon_min: 0.15
+        load_mode: null
+        warmup_episodes: 150
+        promote_threshold: 0.85
+        promote_window: 200
+        curriculum_filters:
+          - {same_side: true, path_blocked: false}
+          - {same_side: true, path_blocked: true}
+          - {}
+
+      - mesh: sphere
+        episodes: 2000
+        epsilon_start: 0.7
+        epsilon_min: 0.12
+        load_mode: auto
+        warmup_episodes: 80
+        promote_threshold: 0.85
+        promote_window: 200
+        curriculum_filters:
+          - {same_side: true, path_blocked: false}
+          - {same_side: true, path_blocked: true}
+          - {}
+
+      - mesh: cylinder
+        episodes: 2000
+        epsilon_start: 0.5
+        epsilon_min: 0.10
+        load_mode: auto
+        warmup_episodes: 80
+        promote_threshold: 0.85
+        promote_window: 200
+        curriculum_filters:
+          - {same_side: true, path_blocked: false}
+          - {same_side: true, path_blocked: true}
+          - {}
+
+      - mesh: flat_square
+        episodes: 1000
+        epsilon_start: 0.4
+        epsilon_min: 0.10
+        load_mode: auto
+        warmup_episodes: 50
+        promote_threshold: 0.85
+        promote_window: 150
+        curriculum_filters:
+          - {same_side: true, path_blocked: false}
+          - {same_side: true, path_blocked: true}
+          - {}
+
+      # ── Phase 2: Hollow objects ──
+      - mesh: vase
+        episodes: 3000
+        epsilon_start: 0.5
+        epsilon_min: 0.10
+        load_mode: auto
+        warmup_episodes: 100
+        promote_threshold: 0.70
+        promote_window: 300
+
       - mesh: mug
         episodes: 3000
-        epsilon_start: 1.0
-        epsilon_min: 0.3
-        load_mode: null
+        epsilon_start: 0.5
+        epsilon_min: 0.10
+        load_mode: auto
+        warmup_episodes: 100
+        promote_threshold: 0.65
+        promote_window: 300
 
-    eval_meshes: [sphere]
-    eval_episodes_per_level: 50
-    # BC data composition
-    bc_q_store_fraction: 0.0    # 0.0 = only heuristic, 0.2 = 20% Q-store
+      # ── Phase 3: Reinforcement on new points ──
+      - mesh: vase
+        episodes: 1000
+        epsilon_start: 0.3
+        epsilon_min: 0.08
+        load_mode: auto
+        pool_seed: 201
+        warmup_episodes: 30
+        promote_threshold: 0.70
+        promote_window: 200
+
+      - mesh: mug
+        episodes: 1000
+        epsilon_start: 0.3
+        epsilon_min: 0.08
+        load_mode: auto
+        pool_seed: 202
+        warmup_episodes: 30
+        promote_threshold: 0.65
+        promote_window: 200
+        
+    # ═══════════════════════════════════════════
+    # EVAL: train objects + held-out
+    # ═══════════════════════════════════════════
+    eval_meshes:
+      # Train set — primitives
+      - mesh: cube
+        curriculum_filters:
+          - {same_side: true, path_blocked: false}
+          - {same_side: true, path_blocked: true}
+          - {}
+      - mesh: sphere
+        curriculum_filters:
+          - {same_side: true, path_blocked: false}
+          - {same_side: true, path_blocked: true}
+          - {}
+      - mesh: cylinder
+        curriculum_filters:
+          - {same_side: true, path_blocked: false}
+          - {same_side: true, path_blocked: true}
+          - {}
+      - mesh: flat_square
+        curriculum_filters:
+          - {same_side: true, path_blocked: false}
+          - {same_side: true, path_blocked: true}
+          - {}
+      # Train set — hollow
+      - vase
+      - mug
+      # Held-out — primitives
+      - mesh: cone
+        pool_seed: 55
+        curriculum_filters:
+          - {same_side: true, path_blocked: false}
+          - {same_side: true, path_blocked: true}
+          - {}
+      - mesh: thin_cylinder
+        pool_seed: 56
+        curriculum_filters:
+          - {same_side: true, path_blocked: false}
+          - {same_side: true, path_blocked: true}
+          - {}
+      # Held-out — hollow
+      - mesh: cup
+        pool_seed: 57
+
+    eval_episodes_per_level: 100
+
+    # BC config (not used in Q-only pipeline)
+    bc_q_store_fraction: 0.0
     bc_total_target: null
-    bc_action_min_pct: 0.01       # 1% от total
-    bc_action_min_absolute: 100   # минимум 100 примеров
+    bc_action_min_pct: 0.01
+    bc_action_min_absolute: 100
 
     rl_config:
       state_dim: 22
       stuck_threshold: 0.05
-      warmup_episodes: 500
+      warmup_episodes: 100     # per level warmup
       air_start_enabled: true
+
       # Feature weights for HNSW stores
       feature_weights_free:
         3: 0.3
@@ -84,6 +220,7 @@ experiment:
         18: 0.3
         20: 1.5
         21: 1.5
+
       mode: train_adapt_epsilon
       goal_threshold: 4.0
       max_points: 500000
@@ -92,12 +229,16 @@ experiment:
       adaptive_sigma: true
       insert_threshold: 0.50
       auto_calibrate: false
+
+      # Rewards
       reward_goal_reached: 30.0
       reward_timeout: -12.0
       reward_surface_violation: -12.0
       reward_step_penalty: -0.2
       reward_near_goal_on_surface: 0.5
       reward_progress: 3.0
+
+      # Action space
       surface_step: 3.0
       free_step: 8.0
       free_step_small: 2.0
@@ -105,12 +246,14 @@ experiment:
       num_actions: 24
       rotation_step_big: 15.0
       free_step_backward: 2.0
-      # Tactical Q-store rewrite
-      eval_epsilon: 0.02 # 0.02
+
+      # Tactical Q-store
+      eval_epsilon: 0.02
+
       # Strategic Q-store
       strategic_epsilon_start: 1.0
       strategic_epsilon_min: 0.3
-      strategic_eval_epsilon: 0.02 # 0.02
+      strategic_eval_epsilon: 0.02
       strategic_reward_switch_success: 1.0
       strategic_reward_switch_wrong_side: -0.3
       strategic_reward_switch_collision: -0.5
@@ -124,6 +267,7 @@ experiment:
       strategic_reward_stay_orbit_stuck: -0.05
       strategic_reward_stay_should_have: 0.2
 
+    # SAC (not used in Q-only pipeline)
     sac_config:
       load_mode: null
       goal_threshold: 4.0
@@ -137,7 +281,6 @@ experiment:
       actor_warmup_per_level: 100
       buffer_capacity: 1000000
       bc_reserve_fraction: 0.20
-      # bc_lambda_decay: 0.99999 — будет вычисляться
       max_steps_per_goal: 500
       eval_interval: 500
       eval_episodes: 50
@@ -145,15 +288,19 @@ experiment:
       use_cql: true
       cql_alpha: 1.0
 
-    sac_meshes: [mug]
+    sac_meshes: [cube, sphere, cylinder, vase, mug]
     sac_episodes_per_mesh:
-      mug: 1000
+      cube: 1000
+      sphere: 1000
+      cylinder: 1000
+      vase: 2000
+      mug: 2000
     sac_eval_episodes_per_level: 100
 
-    adaptive_mesh: vase
+    adaptive_mesh: cup
     adaptive_episodes: 1000
     offline_check_window: 100
 
     logging:
-      run_name: rl_goal_approach
+      run_name: q_store_generalization
       output_dir: ${oc.env:MONTY_LOGS}

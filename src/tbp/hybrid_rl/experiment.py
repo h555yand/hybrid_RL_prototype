@@ -473,16 +473,40 @@ class RLGoalApproachExperiment:
             episodes = stage["episodes"]
             epsilon_start = stage["epsilon_start"]
             load_mode = stage.get("load_mode")
+            pool_seed = stage.get("pool_seed", None)
+
+            # Per-stage overrides with global fallback
+            stage_curriculum_levels = stage.get(
+                "curriculum_levels", self.curriculum_levels
+            )
+            stage_curriculum_filters = stage.get(
+                "curriculum_filters", self.curriculum_filters
+            )
+            stage_warmup = stage.get(
+                "warmup_episodes",
+                self.rl_config.get("warmup_episodes", 100),
+            )
+            stage_promote_threshold = stage.get(
+                "promote_threshold", self.promote_threshold
+            )
+            stage_promote_window = stage.get(
+                "promote_window", self.promote_window
+            )
 
             logger.info(
                 "STAGE %d/%d: %s, episodes=%d, eps=%.2f, "
-                "load_mode=%s",
+                "load_mode=%s, pool_seed=%s, "
+                "warmup=%d, promote=%.2f/%d",
                 stage_idx + 1,
                 len(self.training_stages),
                 mesh_name,
                 episodes,
                 epsilon_start,
                 load_mode,
+                pool_seed,
+                stage_warmup,
+                stage_promote_threshold,
+                stage_promote_window,
             )
 
             stage_cfg = {
@@ -492,20 +516,31 @@ class RLGoalApproachExperiment:
                     "epsilon_min", 0.05
                 ),
                 "num_episodes": episodes,
+                "warmup_episodes": stage_warmup,
                 "unfreeze_normalization": (
                     load_mode is not None
                 ),
             }
 
+            # Determine seeds and prefix for pool generation
+            if pool_seed is not None:
+                pool_seeds = [pool_seed]
+                pool_prefix = (
+                    f"train_{mesh_name}_ps{pool_seed}"
+                )
+            else:
+                pool_seeds = self.train_seeds
+                pool_prefix = f"train_{mesh_name}"
+
             train_pools = get_or_generate_pools(
                 mesh_path=mesh_path,
-                seeds=self.train_seeds,
+                seeds=pool_seeds,
                 episodes_per_level=episodes,
                 scripts_dir=self.scripts_dir,
-                curriculum_levels=self.curriculum_levels,
+                curriculum_levels=stage_curriculum_levels,
                 regenerate=self.regenerate_scripts,
-                prefix=f"train_{mesh_name}",
-                curriculum_filters=self.curriculum_filters,
+                prefix=pool_prefix,
+                curriculum_filters=stage_curriculum_filters,
             )
 
             for seed in self.train_seeds:
@@ -514,7 +549,12 @@ class RLGoalApproachExperiment:
                     load_mode, "q_store", seed
                 )
 
-                seed_pools = train_pools.get(seed)
+                lookup_seed = (
+                    pool_seed
+                    if pool_seed is not None
+                    else seed
+                )
+                seed_pools = train_pools.get(lookup_seed)
                 episode_pools = (
                     seed_pools.get("levels")
                     if seed_pools
@@ -522,12 +562,14 @@ class RLGoalApproachExperiment:
                 )
 
                 curriculum_config = {
-                    "levels": self.curriculum_levels,
-                    "filters": self.curriculum_filters,
+                    "levels": stage_curriculum_levels,
+                    "filters": stage_curriculum_filters,
                     "promote_threshold": (
-                        self.promote_threshold
+                        stage_promote_threshold
                     ),
-                    "promote_window": self.promote_window,
+                    "promote_window": (
+                        stage_promote_window
+                    ),
                 }
 
                 run_result = run_episodes(
@@ -554,12 +596,26 @@ class RLGoalApproachExperiment:
                     "stage": stage_idx,
                     "mesh": mesh_name,
                     "seed": seed,
+                    "pool_seed": pool_seed,
                     "epsilon_start": epsilon_start,
                     "epsilon_min": stage.get(
                         "epsilon_min", 0.05
                     ),
                     "load_mode": load_mode,
                     "episodes": episodes,
+                    "warmup_episodes": stage_warmup,
+                    "promote_threshold": (
+                        stage_promote_threshold
+                    ),
+                    "promote_window": (
+                        stage_promote_window
+                    ),
+                    "curriculum_levels": (
+                        stage_curriculum_levels
+                    ),
+                    "curriculum_filters": (
+                        stage_curriculum_filters
+                    ),
                     "success_rate": run_result.get(
                         "success_rate"
                     ),
@@ -577,7 +633,6 @@ class RLGoalApproachExperiment:
 
             trained_meshes.append(mesh_name)
 
-        # Save meta
         for seed in self.train_seeds:
             self._save_meta(
                 "q_store",
@@ -604,24 +659,58 @@ class RLGoalApproachExperiment:
         all_bc_transitions: list[Any] = []
         all_eval_results: dict[str, Any] = {}
 
-        for mesh_name in self.eval_meshes:
+        for mesh_entry in self.eval_meshes:
+            # Support both "cube" and {mesh, pool_seed, curriculum_filters}
+            if isinstance(mesh_entry, dict):
+                mesh_name = mesh_entry["mesh"]
+                eval_pool_seed = mesh_entry.get("pool_seed", None)
+                eval_curriculum_filters = mesh_entry.get(
+                    "curriculum_filters", self.curriculum_filters
+                )
+                eval_curriculum_levels = mesh_entry.get(
+                    "curriculum_levels", self.curriculum_levels
+                )
+            else:
+                mesh_name = mesh_entry
+                eval_pool_seed = None
+                eval_curriculum_filters = self.curriculum_filters
+                eval_curriculum_levels = self.curriculum_levels
+
             mesh_path = str(
                 self.data_dir / f"{mesh_name}.stl"
             )
-            logger.info("Evaluating: %s", mesh_name)
+            logger.info(
+                "Evaluating: %s (pool_seed=%s)",
+                mesh_name,
+                eval_pool_seed,
+            )
+
+            if eval_pool_seed is not None:
+                pool_seeds = [eval_pool_seed]
+                pool_prefix = f"eval_{mesh_name}_ps{eval_pool_seed}"
+            else:
+                pool_seeds = self.eval_seeds
+                pool_prefix = f"eval_{mesh_name}"
 
             eval_pools = get_or_generate_pools(
                 mesh_path=mesh_path,
-                seeds=self.eval_seeds,
+                seeds=pool_seeds,
                 episodes_per_level=(
                     self.eval_episodes_per_level
                 ),
                 scripts_dir=self.scripts_dir,
-                curriculum_levels=self.curriculum_levels,
+                curriculum_levels=eval_curriculum_levels,
                 regenerate=self.regenerate_scripts,
-                prefix=f"eval_{mesh_name}",
-                curriculum_filters=self.curriculum_filters,
+                prefix=pool_prefix,
+                curriculum_filters=eval_curriculum_filters,
             )
+
+            # Remap pool keys if custom seed used
+            if eval_pool_seed is not None:
+                remapped_pools: dict[int, Any] = {}
+                for es in self.eval_seeds:
+                    remapped_pools[es] = eval_pools[eval_pool_seed]
+                eval_pools = remapped_pools
 
             eval_results, bc_transitions = (
                 run_eval_per_seed(
@@ -638,7 +727,7 @@ class RLGoalApproachExperiment:
                         self.eval_episodes_per_level
                     ),
                     mesh_name=mesh_name,
-                    visualise=self.visualise
+                    visualise=self.visualise,
                 )
             )
 
@@ -659,9 +748,7 @@ class RLGoalApproachExperiment:
         if all_bc_transitions:
             bc_output = self.data_dir / "bc_data.pkl"
             with bc_output.open("wb") as f:
-                pickle.dump(  # noqa: S301
-                    all_bc_transitions, f
-                )
+                pickle.dump(all_bc_transitions, f)
             logger.info(
                 "BC data: %d transitions",
                 len(all_bc_transitions),
@@ -670,17 +757,8 @@ class RLGoalApproachExperiment:
     # ══════════════════════════════════════════════════════
     # Behavioral Cloning
     # ══════════════════════════════════════════════════════
-
     def _run_heuristic_eval(self) -> list[Any]:
-        """Collect BC data using pure heuristic policy.
-
-        Runs evaluation with epsilon=1.0 (100% heuristic) on all
-        eval meshes to collect expert demonstrations with natural
-        action distribution.
-
-        Returns:
-            List of PSACTransition with level tags.
-        """
+        """Collect BC data using pure heuristic policy."""
         logger.info("=" * 60)
         logger.info("Heuristic Expert Data Collection")
         logger.info("=" * 60)
@@ -697,26 +775,57 @@ class RLGoalApproachExperiment:
 
         all_heuristic_transitions: list[Any] = []
 
-        for mesh_name in self.eval_meshes:
+        for mesh_entry in self.eval_meshes:
+            if isinstance(mesh_entry, dict):
+                mesh_name = mesh_entry["mesh"]
+                eval_pool_seed = mesh_entry.get("pool_seed", None)
+                eval_curriculum_filters = mesh_entry.get(
+                    "curriculum_filters", self.curriculum_filters
+                )
+                eval_curriculum_levels = mesh_entry.get(
+                    "curriculum_levels", self.curriculum_levels
+                )
+            else:
+                mesh_name = mesh_entry
+                eval_pool_seed = None
+                eval_curriculum_filters = self.curriculum_filters
+                eval_curriculum_levels = self.curriculum_levels
+
             mesh_path = str(
                 self.data_dir / f"{mesh_name}.stl"
             )
             logger.info(
-                "Heuristic eval: %s", mesh_name
+                "Heuristic eval: %s (pool_seed=%s)",
+                mesh_name,
+                eval_pool_seed,
             )
+
+            if eval_pool_seed is not None:
+                pool_seeds = [eval_pool_seed]
+                pool_prefix = f"heuristic_{mesh_name}_ps{eval_pool_seed}"
+            else:
+                pool_seeds = self.eval_seeds
+                pool_prefix = f"heuristic_{mesh_name}"
 
             heuristic_pools = get_or_generate_pools(
                 mesh_path=mesh_path,
-                seeds=self.eval_seeds,
+                seeds=pool_seeds,
                 episodes_per_level=(
                     self.eval_episodes_per_level
                 ),
                 scripts_dir=self.scripts_dir,
-                curriculum_levels=self.curriculum_levels,
+                curriculum_levels=eval_curriculum_levels,
                 regenerate=self.regenerate_scripts,
-                prefix=f"heuristic_{mesh_name}",
-                curriculum_filters=self.curriculum_filters,
+                prefix=pool_prefix,
+                curriculum_filters=eval_curriculum_filters,
             )
+
+            # Remap pool keys if custom seed used
+            if eval_pool_seed is not None:
+                remapped_pools: dict[int, Any] = {}
+                for es in self.eval_seeds:
+                    remapped_pools[es] = heuristic_pools[eval_pool_seed]
+                heuristic_pools = remapped_pools
 
             _, heuristic_transitions = (
                 run_eval_per_seed(
@@ -752,7 +861,7 @@ class RLGoalApproachExperiment:
             pickle.dump(all_heuristic_transitions, f)
             logger.info(
                 "Saved %d heuristic transitions to %s",
-                len(heuristic_transitions),
+                len(all_heuristic_transitions),
                 heuristic_cache_path,
             )
         logger.info(
@@ -760,6 +869,7 @@ class RLGoalApproachExperiment:
             len(all_heuristic_transitions),
         )
         return all_heuristic_transitions
+
 
     def _run_bc_train(self) -> None:
         """Train BC model from collected data.

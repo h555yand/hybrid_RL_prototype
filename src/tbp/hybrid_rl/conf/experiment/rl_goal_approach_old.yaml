@@ -1,0 +1,159 @@
+# @package _global_
+
+defaults:
+  - /logging: silent_warning_train
+
+experiment:
+  _target_: tbp.hybrid_rl.experiment.RLGoalApproachExperiment
+  config:
+    seed: 42
+    visualise: false
+    regenerate_scripts: true
+    do_train: true
+    do_eval: true
+    do_heur_eval: false
+    do_bc_train: false
+    do_sac_train: false
+    do_sac_eval: false
+    do_adaptive: false
+
+    train_seeds: [11]
+    eval_seeds: [44]
+    sac_seed: 55
+    sac_eval_seeds: [77]
+    adapt_seed: 99
+
+    promote_threshold: 0.8
+    promote_window: 500
+
+    curriculum_levels:
+      - [10.0, 60.0]
+      - [10.0, 80.0]
+      - [10.0, 120.0]
+
+    curriculum_filters:
+      - {same_side: true, path_blocked: false}
+      - {same_side: true, path_blocked: true}
+      - {same_side: false}
+
+    training_stages:
+      - mesh: mug
+        episodes: 4000
+        epsilon_start: 1.0
+        epsilon_min: 0.1
+        load_mode: null
+
+    eval_meshes: [mug]
+    eval_episodes_per_level: 100
+    # BC data composition
+    bc_q_store_fraction: 0.0    # 0.0 = only heuristic, 0.2 = 20% Q-store
+    bc_total_target: null
+    bc_action_min_pct: 0.01       # 1% от total
+    bc_action_min_absolute: 100   # минимум 100 примеров
+
+    rl_config:
+      state_dim: 22
+      stuck_threshold: 0.05
+      warmup_episodes: 500
+      air_start_enabled: true
+      # Feature weights for HNSW stores
+      feature_weights_free:
+        3: 0.3
+        4: 0.3
+        5: 0.3
+        6: 0.0
+        7: 0.0
+        8: 0.0
+        9: 0.0
+        10: 0.0
+        11: 0.0
+        12: 0.0
+        19: 0.5
+        20: 0.0
+        21: 0.0
+      feature_weights_surface:
+        3: 0.0
+        4: 0.0
+        5: 0.0
+        6: 0.1
+        7: 0.1
+        8: 0.1
+        10: 0.1
+        11: 0.0
+        14: 0.0
+        18: 0.3
+        20: 1.5
+        21: 1.5
+      mode: train_adapt_epsilon
+      goal_threshold: 4.0
+      max_points: 500000
+      k_neighbors: 7
+      max_steps_per_goal: 500
+      adaptive_sigma: true
+      insert_threshold: 0.50
+      auto_calibrate: false
+      reward_goal_reached: 30.0
+      reward_timeout: -12.0
+      reward_surface_violation: -12.0
+      reward_step_penalty: -0.2
+      reward_near_goal_on_surface: 0.5
+      reward_progress: 3.0
+      surface_step: 3.0
+      free_step: 8.0
+      free_step_small: 2.0
+      rotation_step: 5.0
+      num_actions: 24
+      rotation_step_big: 15.0
+      free_step_backward: 2.0
+      # Tactical Q-store rewrite
+      eval_epsilon: 0.02 # 0.02
+      # Strategic Q-store
+      strategic_epsilon_start: 1.0
+      strategic_epsilon_min: 0.3
+      strategic_eval_epsilon: 0.02 # 0.02
+      strategic_reward_switch_success: 1.0
+      strategic_reward_switch_wrong_side: -0.3
+      strategic_reward_switch_collision: -0.5
+      strategic_reward_stay_when_needed: -0.1
+      strategic_reward_stay_correct: 0.3
+      strategic_alpha_stay_multiplier: 0.1
+      strategic_alpha_switch_multiplier: 1.0
+      strategic_reward_stay_when_clear: -0.3
+      strategic_reward_switch_when_clear: 0.3
+      strategic_reward_stay_orbit_progress: 0.02
+      strategic_reward_stay_orbit_stuck: -0.05
+      strategic_reward_stay_should_have: 0.2
+
+    sac_config:
+      load_mode: null
+      goal_threshold: 4.0
+      gamma: 0.99
+      tau: 0.005
+      lr_actor: 0.00003
+      lr_critic: 0.0003
+      batch_size: 256
+      bc_lambda_init: 5.0
+      bc_lambda_min: 2.0
+      actor_warmup_per_level: 100
+      buffer_capacity: 1000000
+      bc_reserve_fraction: 0.20
+      # bc_lambda_decay: 0.99999 — будет вычисляться
+      max_steps_per_goal: 500
+      eval_interval: 500
+      eval_episodes: 50
+      use_strategic_override: false
+      use_cql: true
+      cql_alpha: 1.0
+
+    sac_meshes: [mug]
+    sac_episodes_per_mesh:
+      mug: 1000
+    sac_eval_episodes_per_level: 100
+
+    adaptive_mesh: vase
+    adaptive_episodes: 1000
+    offline_check_window: 100
+
+    logging:
+      run_name: rl_goal_approach
+      output_dir: ${oc.env:MONTY_LOGS}
