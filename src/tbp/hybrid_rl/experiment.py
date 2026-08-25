@@ -211,7 +211,14 @@ class RLGoalApproachExperiment:
             "eval_meshes",
             ["cube", "cylinder", "mug", "cup"],
         )
-
+        # BC mesh filter: which meshes to include in BC training data
+        # If not specified, uses all eval_meshes (backward compatible)
+        self.bc_mesh_names: set[str] = set(
+            self.config.get(
+                "bc_mesh_names",
+                [],  # empty = use all eval_meshes
+            )
+        )
     # ══════════════════════════════════════════════════════
     # Model path helpers
     # ══════════════════════════════════════════════════════
@@ -302,6 +309,266 @@ class RLGoalApproachExperiment:
             json.dump(meta, f, indent=2)
         logger.info("Meta saved to %s", meta_path)
 
+    @staticmethod
+    def _balance_bc_transitions(
+        transitions: list,
+        total_target: int = 100000,
+        mesh_weights: dict[str, float] | None = None,
+        level_weights: dict[int, float] | None = None,
+        min_per_group: int = 50,
+        action_min_pct: float = 0.01,
+        action_min_absolute: int = 100,
+    ) -> list:
+        """Balance BC transitions by (mesh, level) with
+        complexity weights, then balance action types on
+        the full dataset.
+
+        Pipeline:
+        1. Group by (mesh_id, level)
+        2. Weighted sample per group
+        3. Concatenate
+        4. Balance rare action types on full dataset
+        5. Shuffle
+
+        Args:
+            transitions: All BC transitions.
+            total_target: Target size before action balance.
+            mesh_weights: Per-mesh complexity weights.
+            level_weights: Per-level difficulty weights.
+            min_per_group: Minimum samples to include group.
+            action_min_pct: Min fraction for action balance.
+            action_min_absolute: Min count for action balance.
+
+        Returns:
+            Balanced transitions.
+        """
+        if mesh_weights is None:
+            mesh_weights = {}
+        if level_weights is None:
+            level_weights = {0: 1.0, 1: 1.5, 2: 2.0}
+
+        type_names = (
+            ExperienceExtractor.get_type_names()
+        )
+        mesh_id_to_name = {
+            v: k
+            for k, v in (
+                ExperienceExtractor
+                .MESH_NAME_TO_ID.items()
+            )
+        }
+
+        # ═══ Step 1: Group by (mesh_id, level) ═══
+        groups: dict[tuple[int, int], list] = {}
+        for tr in transitions:
+            mesh_id = getattr(tr, "mesh_id", -1)
+            level = getattr(tr, "level", 0)
+            key = (mesh_id, level)
+            if key not in groups:
+                groups[key] = []
+            groups[key].append(tr)
+
+        # ═══ Step 2: Log before ═══
+        logger.info(
+            "BC balance BEFORE (%d total):",
+            len(transitions),
+        )
+        for (mid, level), trs in sorted(
+            groups.items()
+        ):
+            mname = mesh_id_to_name.get(
+                mid, f"mesh_{mid}"
+            )
+            action_counts: dict[str, int] = {}
+            for tr in trs:
+                aname = type_names.get(
+                    tr.action_type,
+                    f"type_{tr.action_type}",
+                )
+                action_counts[aname] = (
+                    action_counts.get(aname, 0) + 1
+                )
+            top_actions = dict(
+                sorted(
+                    action_counts.items(),
+                    key=lambda x: -x[1],
+                )[:5]
+            )
+            logger.info(
+                "  %s/L%d: %d transitions, "
+                "actions: %s",
+                mname,
+                level,
+                len(trs),
+                top_actions,
+            )
+
+        # ═══ Step 3: Compute weighted targets ═══
+        group_weights: dict[
+            tuple[int, int], float
+        ] = {}
+        for mid, level in groups:
+            mname = mesh_id_to_name.get(
+                mid, f"mesh_{mid}"
+            )
+            mw = mesh_weights.get(mname, 1.0)
+            lw = level_weights.get(level, 1.0)
+            group_weights[(mid, level)] = mw * lw
+
+        total_weight = max(
+            sum(group_weights.values()), 1e-8
+        )
+
+        group_targets: dict[
+            tuple[int, int], int
+        ] = {}
+        for key, weight in group_weights.items():
+            group_targets[key] = max(
+                min_per_group,
+                int(
+                    total_target
+                    * weight
+                    / total_weight
+                ),
+            )
+
+        # ═══ Step 4: Weighted sample per group ═══
+        after_weighted: list = []
+        for (mid, level), trs in sorted(
+            groups.items()
+        ):
+            mname = mesh_id_to_name.get(
+                mid, f"mesh_{mid}"
+            )
+            target = group_targets[(mid, level)]
+
+            if len(trs) < min_per_group:
+                after_weighted.extend(trs)
+                logger.info(
+                    "  %s/L%d: kept all %d (too few)",
+                    mname,
+                    level,
+                    len(trs),
+                )
+                continue
+
+            if len(trs) > target:
+                indices = np.random.permutation(
+                    len(trs)
+                )[:target]
+                sampled = [trs[i] for i in indices]
+            elif len(trs) < target:
+                indices = np.random.choice(
+                    len(trs), target, replace=True
+                )
+                sampled = [trs[i] for i in indices]
+            else:
+                sampled = list(trs)
+
+            after_weighted.extend(sampled)
+
+            mw = mesh_weights.get(mname, 1.0)
+            lw = level_weights.get(level, 1.0)
+            logger.info(
+                "  %s/L%d: %d → %d "
+                "(target=%d, mw=%.1f, lw=%.1f)",
+                mname,
+                level,
+                len(trs),
+                len(sampled),
+                target,
+                mw,
+                lw,
+            )
+
+        logger.info(
+            "After weighted sampling: "
+            "%d transitions",
+            len(after_weighted),
+        )
+
+        # ═══ Step 5: Balance action types ═══
+        balanced = (
+            RLGoalApproachExperiment
+            ._balance_by_action_type(
+                after_weighted,
+                min_pct=action_min_pct,
+                min_absolute=action_min_absolute,
+            )
+        )
+
+        np.random.shuffle(balanced)
+
+        # ═══ Step 6: Log after ═══
+        after_mesh: dict[str, int] = {}
+        after_level: dict[int, int] = {}
+        after_action: dict[str, int] = {}
+        for tr in balanced:
+            mname = mesh_id_to_name.get(
+                getattr(tr, "mesh_id", -1),
+                "unknown",
+            )
+            level = getattr(tr, "level", 0)
+            aname = type_names.get(
+                tr.action_type,
+                f"type_{tr.action_type}",
+            )
+            after_mesh[mname] = (
+                after_mesh.get(mname, 0) + 1
+            )
+            after_level[level] = (
+                after_level.get(level, 0) + 1
+            )
+            after_action[aname] = (
+                after_action.get(aname, 0) + 1
+            )
+
+        total = max(len(balanced), 1)
+        logger.info(
+            "BC balance AFTER (%d total):",
+            len(balanced),
+        )
+
+        logger.info("  By mesh:")
+        for mname in sorted(after_mesh.keys()):
+            count = after_mesh[mname]
+            logger.info(
+                "    %s: %d (%.1f%%)",
+                mname,
+                count,
+                100.0 * count / total,
+            )
+
+        logger.info("  By level:")
+        for level in sorted(after_level.keys()):
+            count = after_level[level]
+            logger.info(
+                "    L%d: %d (%.1f%%)",
+                level,
+                count,
+                100.0 * count / total,
+            )
+
+        logger.info("  By action type:")
+        for aname in sorted(
+            after_action.keys(),
+            key=lambda x: -after_action[x],
+        ):
+            count = after_action[aname]
+            logger.info(
+                "    %s: %d (%.1f%%)",
+                aname,
+                count,
+                100.0 * count / total,
+            )
+
+        logger.info(
+            "BC balance: %d → %d transitions",
+            len(transitions),
+            len(balanced),
+        )
+        return balanced
+    
     @staticmethod
     def _balance_by_action_type(
         transitions: list,
@@ -655,7 +922,7 @@ class RLGoalApproachExperiment:
     # ══════════════════════════════════════════════════════
 
     def _run_eval(self) -> None:
-        """Run Q-learning eval on all meshes, collect BC data."""
+        """Run Q-learning eval on all meshes, save per-mesh BC data."""
         logger.info("=" * 60)
         logger.info("Eval on all meshes")
         logger.info("=" * 60)
@@ -665,11 +932,13 @@ class RLGoalApproachExperiment:
             "mode": "eval",
         }
 
-        all_bc_transitions: list[Any] = []
         all_eval_results: dict[str, Any] = {}
 
+        # ═══ NEW: directory for per-mesh BC data ═══
+        bc_per_mesh_dir = self.data_dir / "bc_per_mesh"
+        bc_per_mesh_dir.mkdir(parents=True, exist_ok=True)
+
         for mesh_entry in self.eval_meshes:
-            # Support both "cube" and {mesh, pool_seed, curriculum_filters}
             if isinstance(mesh_entry, dict):
                 mesh_name = mesh_entry["mesh"]
                 eval_pool_seed = mesh_entry.get("pool_seed", None)
@@ -714,7 +983,6 @@ class RLGoalApproachExperiment:
                 curriculum_filters=eval_curriculum_filters,
             )
 
-            # Remap pool keys if custom seed used
             if eval_pool_seed is not None:
                 remapped_pools: dict[int, Any] = {}
                 for es in self.eval_seeds:
@@ -741,7 +1009,21 @@ class RLGoalApproachExperiment:
             )
 
             all_eval_results[mesh_name] = eval_results
-            all_bc_transitions.extend(bc_transitions)
+
+            # ═══ NEW: save per-mesh BC data ═══
+            if bc_transitions:
+                bc_mesh_path = (
+                    bc_per_mesh_dir
+                    / f"bc_qstore_{mesh_name}.pkl"
+                )
+                with bc_mesh_path.open("wb") as f:
+                    pickle.dump(bc_transitions, f)
+                logger.info(
+                    "  %s: %d transitions saved to %s",
+                    mesh_name,
+                    len(bc_transitions),
+                    bc_mesh_path,
+                )
 
             mesh_output = (
                 self.data_dir
@@ -753,21 +1035,9 @@ class RLGoalApproachExperiment:
         eval_output = self.data_dir / "eval_result_all.json"
         with eval_output.open("w") as f:
             json.dump(all_eval_results, f, indent=2)
-
-        if all_bc_transitions:
-            bc_output = self.data_dir / "bc_data.pkl"
-            with bc_output.open("wb") as f:
-                pickle.dump(all_bc_transitions, f)
-            logger.info(
-                "BC data: %d transitions",
-                len(all_bc_transitions),
-            )
-
-    # ══════════════════════════════════════════════════════
-    # Behavioral Cloning
-    # ══════════════════════════════════════════════════════
+            
     def _run_heuristic_eval(self) -> list[Any]:
-        """Collect BC data using pure heuristic policy."""
+        """Run heuristic eval on all meshes, save per-mesh BC data."""
         logger.info("=" * 60)
         logger.info("Heuristic Expert Data Collection")
         logger.info("=" * 60)
@@ -782,7 +1052,10 @@ class RLGoalApproachExperiment:
             "air_start_in_eval": True,
         }
 
-        all_heuristic_transitions: list[Any] = []
+        all_heuristic_results: dict[str, Any] = {}
+
+        bc_per_mesh_dir = self.data_dir / "bc_per_mesh"
+        bc_per_mesh_dir.mkdir(parents=True, exist_ok=True)
 
         for mesh_entry in self.eval_meshes:
             if isinstance(mesh_entry, dict):
@@ -811,7 +1084,9 @@ class RLGoalApproachExperiment:
 
             if eval_pool_seed is not None:
                 pool_seeds = [eval_pool_seed]
-                pool_prefix = f"heuristic_{mesh_name}_ps{eval_pool_seed}"
+                pool_prefix = (
+                    f"heuristic_{mesh_name}_ps{eval_pool_seed}"
+                )
             else:
                 pool_seeds = self.eval_seeds
                 pool_prefix = f"heuristic_{mesh_name}"
@@ -829,14 +1104,15 @@ class RLGoalApproachExperiment:
                 curriculum_filters=eval_curriculum_filters,
             )
 
-            # Remap pool keys if custom seed used
             if eval_pool_seed is not None:
                 remapped_pools: dict[int, Any] = {}
                 for es in self.eval_seeds:
-                    remapped_pools[es] = heuristic_pools[eval_pool_seed]
+                    remapped_pools[es] = heuristic_pools[
+                        eval_pool_seed
+                    ]
                 heuristic_pools = remapped_pools
 
-            _, heuristic_transitions = (
+            heuristic_results, heuristic_transitions = (
                 run_eval_per_seed(
                     data_dir=self.data_dir,
                     runs_dir=self.runs_dir,
@@ -856,91 +1132,135 @@ class RLGoalApproachExperiment:
                 )
             )
 
-            all_heuristic_transitions.extend(
-                heuristic_transitions
-            )
-            logger.info(
-                "Heuristic %s: %d transitions",
-                mesh_name,
-                len(heuristic_transitions),
-            )
+            all_heuristic_results[mesh_name] = heuristic_results
 
-        heuristic_cache_path = self.data_dir / "bc_data_heuristic.pkl"
-        with heuristic_cache_path.open("wb") as f:
-            pickle.dump(all_heuristic_transitions, f)
-            logger.info(
-                "Saved %d heuristic transitions to %s",
-                len(all_heuristic_transitions),
-                heuristic_cache_path,
-            )
-        logger.info(
-            "Total heuristic transitions: %d",
-            len(all_heuristic_transitions),
+            # ═══ NEW: save per-mesh heuristic BC data ═══
+            if heuristic_transitions:
+                bc_mesh_path = (
+                    bc_per_mesh_dir
+                    / f"bc_heuristic_{mesh_name}.pkl"
+                )
+                with bc_mesh_path.open("wb") as f:
+                    pickle.dump(heuristic_transitions, f)
+                logger.info(
+                    "Heuristic %s: %d transitions saved to %s",
+                    mesh_name,
+                    len(heuristic_transitions),
+                    bc_mesh_path,
+                )
+
+        # Save heuristic eval results
+        heuristic_eval_path = (
+            self.data_dir / "heuristic_eval_result_all.json"
         )
-        return all_heuristic_transitions
+        with heuristic_eval_path.open("w") as f:
+            json.dump(all_heuristic_results, f, indent=2)
+        logger.info(
+            "Heuristic eval results saved to %s",
+            heuristic_eval_path,
+        )
 
+        # ═══ REMOVED: no more monolithic bc_data_heuristic.pkl ═══
+        # Per-mesh files are in bc_per_mesh/ directory
+        return []  # no need to return transitions anymore
+
+    # ══════════════════════════════════════════════════════
+    # Behavioral Cloning
+    # ══════════════════════════════════════════════════════
 
     def _run_bc_train(self) -> None:
-        """Train BC model from collected data.
-
-        Combines Q-store eval data with heuristic expert data,
-        balances by (mesh, level), and trains BC model.
-        """
+        """Train BC model from per-mesh eval data."""
         logger.info("=" * 60)
         logger.info("BC Training")
         logger.info("=" * 60)
 
-        # Collect heuristic expert data (with caching)
         bc_data_combined_path = (
             self.data_dir / "bc_data_combined.pkl"
         )
         if bc_data_combined_path.exists():
             logger.info(
-                "Loading cached bc_data_combined "
-                "data from %s",
+                "Loading cached bc_data_combined from %s",
                 bc_data_combined_path,
             )
             with bc_data_combined_path.open("rb") as f:
                 bc_transitions = pickle.load(f)
             logger.info(
-                "Loaded %d cached bc_data_combined "
-                "transitions",
+                "Loaded %d cached transitions",
                 len(bc_transitions),
             )
         else:
-            # ═══ Load heuristic data (primary source) ═══
-            heuristic_cache_path = (
-                self.data_dir / "bc_data_heuristic.pkl"
+            # ═══ Load per-mesh BC data ═══
+            bc_per_mesh_dir = (
+                self.data_dir / "bc_per_mesh"
             )
-            if heuristic_cache_path.exists():
-                logger.info(
-                    "Loading cached heuristic data "
-                    "from %s",
-                    heuristic_cache_path,
+            if not bc_per_mesh_dir.exists():
+                logger.error(
+                    "bc_per_mesh/ not found. "
+                    "Run do_eval and do_heur_eval first."
                 )
-                with heuristic_cache_path.open(
-                    "rb"
-                ) as f:
-                    heuristic_transitions = (
-                        pickle.load(f)
+                return
+
+            bc_mesh_names = self.bc_mesh_names
+            heuristic_transitions = []
+            q_store_transitions = []
+
+            # Discover available files
+            available_heuristic = sorted(
+                bc_per_mesh_dir.glob(
+                    "bc_heuristic_*.pkl"
+                )
+            )
+            available_qstore = sorted(
+                bc_per_mesh_dir.glob(
+                    "bc_qstore_*.pkl"
+                )
+            )
+
+            logger.info(
+                "BC per-mesh directory: %s",
+                bc_per_mesh_dir,
+            )
+            logger.info(
+                "  Available heuristic: %s",
+                [p.stem for p in available_heuristic],
+            )
+            logger.info(
+                "  Available Q-store: %s",
+                [p.stem for p in available_qstore],
+            )
+            logger.info(
+                "  BC mesh filter: %s",
+                (
+                    list(bc_mesh_names)
+                    if bc_mesh_names
+                    else "ALL"
+                ),
+            )
+
+            # Load heuristic data (primary source)
+            for pkl_path in available_heuristic:
+                mesh_name = pkl_path.stem.replace(
+                    "bc_heuristic_", ""
+                )
+                if (
+                    bc_mesh_names
+                    and mesh_name not in bc_mesh_names
+                ):
+                    logger.info(
+                        "  SKIP heuristic %s (held-out)",
+                        mesh_name,
                     )
+                    continue
+                with pkl_path.open("rb") as f:
+                    transitions = pickle.load(f)
+                heuristic_transitions.extend(transitions)
                 logger.info(
-                    "Loaded %d cached heuristic "
-                    "transitions",
-                    len(heuristic_transitions),
-                )
-            else:
-                heuristic_transitions = (
-                    self._run_heuristic_eval()
-                )
-                logger.info(
-                    "Collected %d heuristic "
-                    "transitions",
-                    len(heuristic_transitions),
+                    "  LOAD heuristic %s: %d transitions",
+                    mesh_name,
+                    len(transitions),
                 )
 
-            # ═══ Optional: add small fraction of
-            #     Q-store eval data ═══
+            # Load Q-store data (optional fraction)
             q_store_fraction = float(
                 self.config.get(
                     "bc_q_store_fraction", 0.0
@@ -949,46 +1269,55 @@ class RLGoalApproachExperiment:
             q_store_transitions_used = []
 
             if q_store_fraction > 0.0:
-                bc_path = (
-                    self.data_dir / "bc_data.pkl"
-                )
-                if bc_path.exists():
-                    with bc_path.open("rb") as f:
-                        q_store_transitions = (
-                            pickle.load(f)
-                        )
-                    max_q = int(
-                        len(heuristic_transitions)
-                        * q_store_fraction
+                for pkl_path in available_qstore:
+                    mesh_name = pkl_path.stem.replace(
+                        "bc_qstore_", ""
                     )
                     if (
-                        len(q_store_transitions)
-                        > max_q
+                        bc_mesh_names
+                        and mesh_name
+                        not in bc_mesh_names
                     ):
-                        indices = (
-                            np.random.permutation(
-                                len(
-                                    q_store_transitions
-                                )
-                            )[:max_q]
+                        logger.info(
+                            "  SKIP Q-store %s (held-out)",
+                            mesh_name,
                         )
-                        q_store_transitions_used = [
-                            q_store_transitions[i]
-                            for i in indices
-                        ]
-                    else:
-                        q_store_transitions_used = (
-                            q_store_transitions
-                        )
-                    logger.info(
-                        "Q-store data: %d → %d "
-                        "(fraction=%.1f%%)",
-                        len(q_store_transitions),
-                        len(
-                            q_store_transitions_used
-                        ),
-                        q_store_fraction * 100,
+                        continue
+                    with pkl_path.open("rb") as f:
+                        transitions = pickle.load(f)
+                    q_store_transitions.extend(
+                        transitions
                     )
+                    logger.info(
+                        "  LOAD Q-store %s: "
+                        "%d transitions",
+                        mesh_name,
+                        len(transitions),
+                    )
+
+                max_q = int(
+                    len(heuristic_transitions)
+                    * q_store_fraction
+                )
+                if len(q_store_transitions) > max_q:
+                    indices = np.random.permutation(
+                        len(q_store_transitions)
+                    )[:max_q]
+                    q_store_transitions_used = [
+                        q_store_transitions[i]
+                        for i in indices
+                    ]
+                else:
+                    q_store_transitions_used = (
+                        q_store_transitions
+                    )
+                logger.info(
+                    "Q-store data: %d → %d "
+                    "(fraction=%.1f%%)",
+                    len(q_store_transitions),
+                    len(q_store_transitions_used),
+                    q_store_fraction * 100,
+                )
 
             # ═══ Combine ═══
             bc_transitions = (
@@ -1003,38 +1332,41 @@ class RLGoalApproachExperiment:
                 len(bc_transitions),
             )
 
-            # ═══ Balance by (mesh, level) ═══
+            # ═══ Balance by (mesh, level) + action types ═══
             bc_total_target = self.config.get(
                 "bc_total_target", None
             )
-            if bc_total_target is not None:
-                bc_transitions = (
-                    self._filter_bc_transitions(
-                        bc_transitions,
-                        total_target=int(
-                            bc_total_target
-                        ),
-                    )
-                )
 
-            # ═══ Balance rare action types ═══
-            bc_transitions = (
-                self._balance_by_action_type(
-                    bc_transitions,
-                    min_pct=float(
-                        self.config.get(
-                            "bc_action_min_pct", 0.01
-                        )
-                    ),
-                    min_absolute=int(
-                        self.config.get(
-                            "bc_action_min_absolute",
-                            100,
-                        )
-                    ),
-                )
+            bc_transitions = self._balance_bc_transitions(
+                bc_transitions,
+                total_target=(
+                    int(bc_total_target)
+                    if bc_total_target is not None
+                    else len(bc_transitions)
+                ),
+                mesh_weights=self.config.get(
+                    "bc_mesh_weights", {}
+                ),
+                level_weights={
+                    int(k): float(v)
+                    for k, v in self.config.get(
+                        "bc_level_weights",
+                        {0: 1.0, 1: 1.5, 2: 2.0},
+                    ).items()
+                },
+                min_per_group=int(
+                    self.config.get("bc_min_per_group", 50)
+                ),
+                action_min_pct=float(
+                    self.config.get("bc_action_min_pct", 0.01)
+                ),
+                action_min_absolute=int(
+                    self.config.get(
+                        "bc_action_min_absolute", 100
+                    )
+                ),
             )
-            
+
             np.random.shuffle(bc_transitions)
 
             logger.info(
@@ -1043,17 +1375,17 @@ class RLGoalApproachExperiment:
             )
 
             # Save combined
-            with bc_data_combined_path.open(
-                "wb"
-            ) as f:
+            with bc_data_combined_path.open("wb") as f:
                 pickle.dump(bc_transitions, f)
 
-        # Train BC
+        # ═══ Train BC ═══
         num_types = len(
             ExperienceExtractor.get_type_names()
         )
         trainer = BCTrainer(
-            state_dim=self.rl_config.get("state_dim", 20),
+            state_dim=self.rl_config.get(
+                "state_dim", 20
+            ),
             num_types=num_types,
         )
         trainer.train(
@@ -1072,7 +1404,9 @@ class RLGoalApproachExperiment:
 
         # ═══ Strategic BC Training ═══
         logger.info("=" * 40)
-        logger.info("Strategic BC Training (two separate)")
+        logger.info(
+            "Strategic BC Training (two separate)"
+        )
         logger.info("=" * 40)
 
         for seed in self.train_seeds:
@@ -1087,13 +1421,17 @@ class RLGoalApproachExperiment:
                 )
                 continue
 
-            controller = RLGoalApproachController.load(
-                q_dir,
-                agent_id=f"strategic_bc_seed_{seed}",
-                config={
-                    **self.rl_config,
-                    "mode": "eval",
-                },
+            controller = (
+                RLGoalApproachController.load(
+                    q_dir,
+                    agent_id=(
+                        f"strategic_bc_seed_{seed}"
+                    ),
+                    config={
+                        **self.rl_config,
+                        "mode": "eval",
+                    },
+                )
             )
 
             strategic_bc_dir = str(
@@ -1233,15 +1571,15 @@ class RLGoalApproachExperiment:
                 json.dump(
                     strategic_bc_stats, f, indent=2
                 )
-            logger.info(
-                "Strategic BC stats saved to %s",
-                strategic_stats_path,
-            )
+
         self._save_meta(
             "bc",
             None,
             {
                 **bc_stats,
+                "bc_mesh_names": list(
+                    self.bc_mesh_names
+                ),
                 "heuristic_transitions": len(
                     bc_transitions
                 ),
@@ -1251,7 +1589,11 @@ class RLGoalApproachExperiment:
                     )
                 ),
             },
-            list(self.eval_meshes),
+            (
+                list(self.bc_mesh_names)
+                if self.bc_mesh_names
+                else list(self.eval_meshes)
+            ),
         )
         logger.info(
             "BC complete: val_acc=%.4f, "
@@ -1259,7 +1601,7 @@ class RLGoalApproachExperiment:
             bc_stats["val_accuracy"],
             bc_stats["total_transitions"],
         )
-
+        
     # ══════════════════════════════════════════════════════
     # SAC training
     # ══════════════════════════════════════════════════════
@@ -2029,6 +2371,11 @@ class RLGoalApproachExperiment:
             logger.info(
                 "Loading SAC from training: %s",
                 self._sac_model_dir(self.sac_seed),
+            )
+            
+        if sac_trainer is not None:
+            sac_trainer.buffer.set_current_mesh(
+                self.adaptive_mesh
             )
 
         # Strategic SAC

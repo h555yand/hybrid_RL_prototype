@@ -8,19 +8,19 @@ experiment:
   config:
     seed: 42
     visualise: false
-    regenerate_scripts: false
-    do_train: false
-    do_eval: false
+    regenerate_scripts: true
+    do_train: true
+    do_eval: true
     do_heur_eval: false
     do_bc_train: false
-    do_sac_train: true
-    do_sac_eval: true
+    do_sac_train: false
+    do_sac_eval: false
     do_adaptive: false
 
     train_seeds: [11]
     eval_seeds: [44]
     sac_seed: 55
-    sac_eval_seeds: [44]
+    sac_eval_seeds: [77]
     adapt_seed: 99
 
     promote_threshold: 0.75
@@ -195,22 +195,20 @@ experiment:
     # ═══ BC balancing ═══
     bc_total_target: null
     bc_mesh_weights:
-      cube: 0.8         # простой, но даёт базовые навыки flat surface
-      sphere: 0.8        # простой, curved surface — полезно для cone
-      flat_square: 0.5   # очень простой, мало нового
-      cylinder: 1.5      # edge traversal — ключевой для cone, thin_cylinder
-      vase: 2.0          # hollow навигация — ключевой для cup
-      mug: 2.5           # самый сложный, handle+rim — максимум данных
-
+      cube: 1.0
+      sphere: 1.0
+      flat_square: 0.8
+      cylinder: 1.2
+      vase: 1.8
+      mug: 2.0
     bc_level_weights:
       0: 1.0
       1: 1.5
-      2: 2.5    # увеличил с 2.0 — L2 самый важный для генерализации
-      
+      2: 2.0
     bc_min_per_group: 50
     bc_action_min_pct: 0.01
     bc_action_min_absolute: 100
-    bc_q_store_fraction: 0.3
+    bc_q_store_fraction: 0.0
 
     rl_config:
       state_dim: 22
@@ -312,15 +310,13 @@ experiment:
       use_cql: true
       cql_alpha: 1.0
 
-    sac_meshes: [cube, sphere, cylinder, flat_square, vase, mug]
+    sac_meshes: [cube, sphere, cylinder, vase, mug]
     sac_episodes_per_mesh:
       cube: 1000
       sphere: 1000
       cylinder: 1000
-      flat_square: 500
       vase: 2000
       mug: 2000
-
     sac_eval_episodes_per_level: 100
 
     adaptive_mesh: cup
@@ -328,5 +324,5 @@ experiment:
     offline_check_window: 100
 
     logging:
-      run_name: sac_generalization
+      run_name: q_store_generalization
       output_dir: ${oc.env:MONTY_LOGS}

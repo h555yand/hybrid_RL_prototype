@@ -214,6 +214,7 @@ class ExperienceExtractor:
     def convert_trajectory(
         self,
         transitions: List[Dict[str, Any]],
+        level: int = 0,
     ) -> List[PSACTransition]:
         result = []
         for i, tr in enumerate(transitions):
@@ -236,18 +237,22 @@ class ExperienceExtractor:
                 ),
                 done=done,
                 mesh_id=self.mesh_id,
+                level=level,
             ))
         return result
 
     def convert_all_trajectories(
         self,
         all_trails: List[List[Dict[str, Any]]],
+        level: int = 0,
     ) -> List[PSACTransition]:
         all_transitions = []
         for trail in all_trails:
-            all_transitions.extend(self.convert_trajectory(trail))
+            all_transitions.extend(
+                self.convert_trajectory(trail, level=level)
+            )
         return all_transitions
-
+    
     @staticmethod
     def get_param_dims() -> Dict[int, int]:
         return {

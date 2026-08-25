@@ -331,6 +331,7 @@ class AdaptiveTrainingManager:
             )
         )
         added = 0
+        mesh_name = Path(self.mesh_path).stem
         for tr in all_normalized:
             if tr.next_state is not None:
                 self.sac_trainer.buffer.add(
@@ -340,6 +341,7 @@ class AdaptiveTrainingManager:
                     reward=tr.reward,
                     next_state=tr.next_state,
                     done=tr.done,
+                    mesh_name=mesh_name,
                 )
                 added += 1
 
@@ -357,9 +359,14 @@ class AdaptiveTrainingManager:
         old_bc_lambda = self.sac_trainer.bc_lambda
         self.sac_trainer.bc_lambda = self.sac_trainer.bc_lambda_init
 
+        mesh_name = Path(self.mesh_path).stem
         for step_i in range(self.online_sac_update_steps):
-            batch = self.sac_trainer.buffer.sample(
-                self.sac_trainer.batch_size
+            batch = self.sac_trainer.buffer.sample_balanced(
+                self.sac_trainer.batch_size,
+                current_mesh=mesh_name,
+                current_ratio=0.5,
+                bc_ratio=0.1,
+                elite_ratio=0.1,
             )
 
             # CQL critic every step
@@ -502,7 +509,9 @@ class AdaptiveTrainingManager:
             self.sac_trainer.cql_alpha = 1.0
             old_eval_interval = self.sac_trainer.eval_interval
             self.sac_trainer.eval_interval = 100
-
+            self.sac_trainer.buffer.set_current_mesh(
+                Path(self.mesh_path).stem
+            )
             self.sac_trainer.train(
                 env=self.env,
                 controller=self.controller,

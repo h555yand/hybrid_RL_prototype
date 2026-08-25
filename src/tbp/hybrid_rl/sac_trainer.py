@@ -31,11 +31,11 @@ import torch.nn.functional as F
 from .action_interpreter import ActionInterpreter
 from .experience_extractor import ExperienceExtractor, PSACTransition
 from .lightweight_env import LightweightEnv
-from .replay_buffer import ReplayBuffer
 from .rl_goal_approach_controller import RLGoalApproachController
 from .sac_actor import SACActorNetwork
 from .twin_critic import TwinCritic
 from .strategic_sac import StrategicSAC
+from .replay_buffer import ObjectPartitionedBuffer
 
 logger = logging.getLogger(__name__)
 
@@ -115,9 +115,14 @@ class PSACTrainer:
         self.target_entropy_type = -np.log(1.0 / num_types) * 0.5
         self.target_entropy_param = -max_params * 0.5
 
-        self.buffer = ReplayBuffer(
-            buffer_capacity, state_dim, max_params,
-            bc_reserve_fraction=0.15,
+        self.buffer = ObjectPartitionedBuffer(
+            capacity_per_object=buffer_capacity // 8,
+            state_dim=state_dim,
+            max_params=max_params,
+            bc_capacity_per_object=int(
+                buffer_capacity * 0.15 / 8
+            ),
+            elite_capacity_per_object=5000,
         )
 
         self.bc_lambda = bc_lambda_init
@@ -1310,6 +1315,9 @@ class PSACTrainer:
         """Run SAC training loop with strategic override."""
         interpreter = ActionInterpreter(env)
 
+        # ═══ Set current mesh on buffer ═══
+        self.buffer.set_current_mesh(mesh_name)
+
         # Visualization setup
         visualizer = None
         if visualise and save_dir:
@@ -1330,18 +1338,16 @@ class PSACTrainer:
         best_critic_target_dict = None
         best_extra = None
 
-        # ═══ NEW: strategic episode tracking ═══
+        # Strategic episode tracking
         strategic_detach_count = 0
         strategic_direction_count = 0
 
-        # ═══ Actor warmup per curriculum level ═══
+        # Actor warmup per curriculum level
         actor_warmup_until = (
             self.actor_warmup_per_level
         )
 
-        # ═══ BC lambda decay ═══
-        # Estimate effective training steps
-        # (after first warmup, all levels)
+        # BC lambda decay
         effective_episodes = max(
             1,
             num_episodes
@@ -1420,49 +1426,56 @@ class PSACTrainer:
                     np.array(ep_data["goal_rot"]),
                 ])
             else:
-                    env.reset()
-                    start_pos = env.get_pose()[:3]
+                env.reset()
+                start_pos = env.get_pose()[:3]
 
-                    require_same_side = level_filter.get("same_side", None)
-                    require_path_blocked = level_filter.get("path_blocked", None)
-                    max_goal_attempts = (
-                        50
-                        if (require_same_side is not None or require_path_blocked is not None)
-                        else 1
+                require_same_side = level_filter.get("same_side", None)
+                require_path_blocked = level_filter.get("path_blocked", None)
+                max_goal_attempts = (
+                    50
+                    if (
+                        require_same_side is not None
+                        or require_path_blocked is not None
                     )
+                    else 1
+                )
 
-                    goal_pose = None
-                    for _attempt in range(max_goal_attempts):
-                        candidate = env.get_random_surface_point(
-                            reference_pos=start_pos,
-                            min_dist=min_dist,
-                            max_dist=max_dist,
-                            max_attempts=2000,
-                            mesh_sample=True,
+                goal_pose = None
+                for _attempt in range(max_goal_attempts):
+                    candidate = env.get_random_surface_point(
+                        reference_pos=start_pos,
+                        min_dist=min_dist,
+                        max_dist=max_dist,
+                        max_attempts=2000,
+                        mesh_sample=True,
+                    )
+                    if require_same_side is not None:
+                        from .episode_pools import _is_reachable_by_surface
+                        same_side = _is_reachable_by_surface(
+                            env, start_pos, candidate[:3]
                         )
-                        if require_same_side is not None:
-                            from .episode_pools import _is_reachable_by_surface
-                            same_side = _is_reachable_by_surface(env, start_pos, candidate[:3])
-                            if same_side != require_same_side:
-                                continue
-                        if require_path_blocked is not None:
-                            env._current_goal = np.concatenate([candidate[:3], candidate[3:]])
-                            sensor = env.get_sensor_data()
-                            pb = sensor.get("path_blocked", False)
-                            if pb != require_path_blocked:
-                                continue
-                        goal_pose = candidate
-                        break
+                        if same_side != require_same_side:
+                            continue
+                    if require_path_blocked is not None:
+                        env._current_goal = np.concatenate([
+                            candidate[:3], candidate[3:]
+                        ])
+                        sensor = env.get_sensor_data()
+                        pb = sensor.get("path_blocked", False)
+                        if pb != require_path_blocked:
+                            continue
+                    goal_pose = candidate
+                    break
 
-                    if goal_pose is None:
-                        goal_pose = candidate
+                if goal_pose is None:
+                    goal_pose = candidate
 
             controller.set_new_goal(
                 goal_pose, env.get_pose()[:3]
             )
             env.set_goal(goal_pose)
 
-            # ═══ Air start: every 3rd episode ═══
+            # Air start: every 3rd episode
             if episode % 3 == 2:
                 air_sensor = env.get_sensor_data()
                 air_normal = air_sensor.get(
@@ -1529,19 +1542,20 @@ class PSACTrainer:
             current_poses: list[np.ndarray] = []
             action_explanations: list[str] = []
 
-            # ═══ NEW: per-episode strategic tracking ═══
-            # Per-episode tracking
+            # Per-episode strategic tracking
             ep_had_strategic_detach = False
             ep_detach_states: list[np.ndarray] = []
 
-            # В начале эпизода:
             prev_sensor_data = None
+
+            # ═══ Track episode transitions for elite buffer ═══
+            ep_transitions: list[tuple] = []
 
             for step in range(self.max_steps_per_goal):
                 self.total_steps += 1
                 local_steps += 1
 
-                # ═══ Strategic override (optional) ═══
+                # Strategic override (optional)
                 strategic_type = None
                 strategic_source = None
 
@@ -1561,8 +1575,6 @@ class PSACTrainer:
                     ep_had_strategic_detach = True
                     strategic_detach_count += 1
 
-                    # Save detach state for
-                    # retrospective update
                     if (
                         self.strategic_detach_sac
                         is not None
@@ -1615,7 +1627,7 @@ class PSACTrainer:
                         + self.param_mean
                     )
 
-                    # ═══ Action masks ═══
+                    # Action masks
                     action_type, action_params = (
                         self._apply_action_masks(
                             action_type,
@@ -1717,11 +1729,24 @@ class PSACTrainer:
                     (action_params - self.param_mean)
                     / (self.param_std + 1e-8)
                 )
+
+                # ═══ Add to buffer with mesh_name ═══
                 self.buffer.add(
                     state, action_type,
                     action_params_norm,
                     reward, next_state, done,
+                    mesh_name=mesh_name,
                 )
+
+                # ═══ Track for elite buffer ═══
+                ep_transitions.append((
+                    state.copy(),
+                    action_type,
+                    action_params_norm.copy(),
+                    reward,
+                    next_state.copy(),
+                    done,
+                ))
 
                 episode_reward += reward
                 state = next_state
@@ -1736,8 +1761,18 @@ class PSACTrainer:
                     >= self.batch_size
                 ):
                     for _ in range(updates_per_step):
-                        batch = self.buffer.sample(
-                            self.batch_size
+                        # ═══ Balanced sampling ═══
+                        batch = (
+                            self.buffer
+                            .sample_balanced(
+                                self.batch_size,
+                                current_mesh=(
+                                    mesh_name
+                                ),
+                                current_ratio=0.5,
+                                bc_ratio=0.1,
+                                elite_ratio=0.1,
+                            )
                         )
 
                         if self.use_cql:
@@ -1800,8 +1835,22 @@ class PSACTrainer:
             else:
                 ep_result = "collision"
 
+            # ═══ Add elite transitions ═══
+            if episode_success:
+                for (
+                    s, at, ap, r, ns, d
+                ) in ep_transitions:
+                    self.buffer.add_elite(
+                        s, at, ap, r, ns, d,
+                        mesh_name=mesh_name,
+                    )
+
             if visualizer:
-                if ((episode + 1) % log_interval) <= 0 and (episode + 1) >= log_interval:
+                if (
+                    (episode + 1) % log_interval
+                ) <= 0 and (
+                    episode + 1
+                ) >= log_interval:
                     visualizer.save_episode(
                         env=env,
                         episode=episode,
@@ -1812,8 +1861,7 @@ class PSACTrainer:
                         actions=action_explanations,
                     )
 
-            # ═══ NEW: strategic SAC online update ═══
-            # ═══ Strategic SAC update (only when enabled) ═══
+            # Strategic SAC update (only when enabled)
             if self.use_strategic_override:
                 # Retrospective detach update
                 if (
@@ -1865,7 +1913,7 @@ class PSACTrainer:
                         self \
                             .strategic_direction_sac \
                             .update(num_steps=20)
-                        
+
             rolling_history.append(episode_success)
             if len(rolling_history) >= 50:
                 rolling_rate = (
@@ -1890,7 +1938,9 @@ class PSACTrainer:
                         curriculum_levels=(
                             curriculum_levels
                         ),
-                        curriculum_filters=curriculum_filters,
+                        curriculum_filters=(
+                            curriculum_filters
+                        ),
                         num_episodes=self.eval_episodes,
                     )
                 )
@@ -1973,7 +2023,9 @@ class PSACTrainer:
                         curr_level += 1
                         success_window = []
                         actor_warmup_until = (
-                            episode + self.actor_warmup_per_level
+                            episode
+                            + self
+                            .actor_warmup_per_level
                         )
                         # Reset best model for
                         # new level
@@ -1983,8 +2035,16 @@ class PSACTrainer:
                         best_critic_target_dict = None
                         best_extra = None
                         level_filter = {}
-                        if curriculum_filters and curr_level < len(curriculum_filters):
-                            level_filter = curriculum_filters[curr_level]
+                        if (
+                            curriculum_filters
+                            and curr_level
+                            < len(curriculum_filters)
+                        ):
+                            level_filter = (
+                                curriculum_filters[
+                                    curr_level
+                                ]
+                            )
                         logger.info(
                             "SAC Curriculum: "
                             "promoted to level %d "
@@ -2013,12 +2073,22 @@ class PSACTrainer:
                     if episode < actor_warmup_until
                     else ""
                 )
+                # ═══ Log buffer stats ═══
+                buf_stats = self.buffer.get_stats()
+                buf_summary = ", ".join(
+                    f"{name}={info['online']}"
+                    f"+{info['bc']}bc"
+                    f"+{info['elite']}el"
+                    for name, info in buf_stats.get(
+                        "objects", {}
+                    ).items()
+                )
                 logger.info(
                     "Episode %d/%d: reward=%.1f, "
                     "steps=%d, mesh_rate=%.3f, "
                     "rolling=%.3f, best_eval=%.3f, "
                     "bc_lambda=%.4f, alpha_t=%.3f, "
-                    "alpha_p=%.3f, buf=%d, "
+                    "alpha_p=%.3f, buf=%d (%s), "
                     "s_detach=%d, s_dir=%d%s%s",
                     episode + 1,
                     num_episodes,
@@ -2031,6 +2101,7 @@ class PSACTrainer:
                     self.alpha_type,
                     self.alpha_param,
                     len(self.buffer),
+                    buf_summary,
                     strategic_detach_count,
                     strategic_direction_count,
                     warmup_tag,
@@ -2075,7 +2146,7 @@ class PSACTrainer:
 
         if save_dir:
             self.save(save_dir)
-
+            
     def save(self, dirpath: str) -> None:
         """Save SAC model to directory."""
         dirpath = Path(dirpath)
