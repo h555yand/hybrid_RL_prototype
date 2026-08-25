@@ -759,12 +759,56 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
 
         # Set warmup flag for controller
         if curriculum is not None:
-            controller._force_warmup = (
-                curriculum.is_warmup
+            was_warmup = getattr(
+                controller, '_force_warmup', False
             )
+            controller._force_warmup = curriculum.is_warmup
+
             if curriculum.is_warmup:
                 controller.epsilon = 1.0
                 controller.strategic_epsilon = 1.0
+            elif was_warmup and not curriculum.is_warmup:
+                # Warmup just ended — reset to epsilon_start
+                eps_start = cfg.get("epsilon_start", 0.5)
+                eps_min = cfg.get("epsilon_min", 0.05)
+                controller.epsilon = eps_start
+                controller.strategic_epsilon = cfg.get(
+                    "strategic_epsilon_start", eps_start
+                )
+
+                # Recalculate decay for remaining episodes
+                remaining = num_episodes - episode - 1
+                remaining_warmup = (
+                    curriculum.warmup_per_level
+                    * (len(curriculum.levels)
+                    - curriculum.level_idx - 1)
+                )
+                effective_remaining = max(
+                    1, remaining - remaining_warmup
+                )
+
+                if eps_start > eps_min:
+                    new_decay = (
+                        eps_min / eps_start
+                    ) ** (1.0 / effective_remaining)
+                    controller.epsilon_decay = new_decay
+                    if (
+                        controller.strategic_epsilon_decay
+                        is not None
+                    ):
+                        controller.strategic_epsilon_decay = (
+                            new_decay
+                        )
+
+                logger.info(
+                    "Warmup ended at ep %d: epsilon=%.3f, "
+                    "decay=%.6f (→ %.3f over %d ep)",
+                    episode + 1,
+                    eps_start,
+                    controller.epsilon_decay,
+                    eps_min,
+                    effective_remaining,
+                )
         else:
             controller._force_warmup = False
 
