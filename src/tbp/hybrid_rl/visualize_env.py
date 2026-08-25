@@ -39,7 +39,6 @@ _AGENT_SPHERE_RADIUS = 0.5
 _GOAL_SPHERE_RADIUS = 0.7
 _TRAIL_SPHERE_RADIUS = 0.3
 _GAZE_ARROW_LENGTH = 3
-_CAMERA_DISTANCE_MULTIPLIER = 1.8
 _NORM_EPSILON = 1e-12
 _CROSS_PRODUCT_THRESHOLD = 1e-8
 _TEXT_PADDING = 2
@@ -47,6 +46,10 @@ _TEXT_Y_START = 5
 _TEXT_X_START = 5
 _TEXT_LINE_SPACING = 3
 _BG_ALPHA = 200
+_FOV = 45.0
+_CAMERA_DISTANCE_MULTIPLIER = 1.5
+# ва числа: `2.0 → 1.5` (камера ближе) и `60.0 → 45.0` (уже угол обзора = зум). 
+# Если будет слишком близко — подкрутите обратно, например `1.7` и `50.0`. Если хочется ещё ближе — `1.2` и `40.0`.
 
 
 def _build_scene(
@@ -110,7 +113,7 @@ def _compute_camera_transform(
     scene: trimesh.Scene,
     agent_pos: np.ndarray,
     goal_pos: np.ndarray,
-    fixed_offset_multiplier: float = 2.0,
+    fixed_offset_multiplier: float = _CAMERA_DISTANCE_MULTIPLIER,
 ) -> np.ndarray:
     """Вычисляет ракурс камеры, центрируясь на детали, но разворачиваясь к агенту."""
     center = scene.bounds.mean(axis=0)
@@ -221,6 +224,7 @@ def render_frame_to_file(
     result: str = "",
     trail_poses: list[np.ndarray] | None = None,
     resolution: tuple[int, int] = (1024, 768),
+    fov: float = _FOV,
 ) -> None:
     """Render a frame to a PNG file with text annotation.
 
@@ -244,17 +248,13 @@ def render_frame_to_file(
     camera_transform = _compute_camera_transform(
         scene=scene,
         agent_pos=agent_pose[:3],
-        goal_pos=goal_pose[:3],
-        fixed_offset_multiplier=2.0  # Уменьшите до 1.5, если хотите покрупнее
+        goal_pos=goal_pose[:3]
     )
     scene.camera_transform = camera_transform
 
-    # ВАЖНО ДЛЯ OFF-LINE РЕНДЕРА:
-    # Задаем фокусное расстояние (FOV) и расширяем плоскости отсечения,
-    # чтобы стены и объекты гарантированно попадали в рендер и не исчезали.
-    scene.camera.fov = (60.0, 60.0)
+    scene.camera.fov = (fov, fov)
     scene.camera.z_near = 1.0
-    scene.camera.z_far = 100000.0  # Огромное расстояние, чтобы видеть всю карту
+    scene.camera.z_far = 100000.0
     scene.camera.resolution = resolution
 
     filepath.parent.mkdir(parents=True, exist_ok=True)
@@ -422,6 +422,8 @@ def save_episode_frames(
         ep_dir,
         result,
     )
+    # save video
+    create_video_from_episode(ep_dir, fps=5)
 
 def visualize_scene(
     env: LightweightEnv,
@@ -451,6 +453,63 @@ def visualize_agent_goal(
     """
     scene = _build_scene(env, agent_pose, goal_pose)
     scene.show(smooth=False)
+
+def create_video_from_episode(
+    episode_dir: Path,
+    output_path: Path | None = None,
+    fps: int = 5,
+) -> Path | None:
+    """Создаёт MP4 видео из сохранённых PNG кадров эпизода.
+
+    Args:
+        episode_dir: Папка с step_XXX.png файлами (например output/ep_00001_L0_success/).
+        output_path: Путь для сохранения видео. По умолчанию episode_dir/episode.mp4.
+        fps: Кадров в секунду.
+
+    Returns:
+        Path к видео или None при ошибке.
+    """
+    import glob
+
+    frames_pattern = str(episode_dir / "step_*.png")
+    frame_paths = sorted(glob.glob(frames_pattern))
+
+    if not frame_paths:
+        logger.warning("No frames found in %s", episode_dir)
+        return None
+
+    if output_path is None:
+        output_path = episode_dir / "episode.mp4"
+
+    try:
+        import imageio.v2 as imageio
+        frames = [imageio.imread(p) for p in frame_paths]
+        imageio.mimwrite(str(output_path), frames, fps=fps, codec='libx264')
+        logger.info("Video saved: %s (%d frames, %d fps)", output_path, len(frames), fps)
+        return output_path
+    except ImportError:
+        # Fallback на OpenCV
+        import cv2
+        first = cv2.imread(frame_paths[0])
+        h, w = first.shape[:2]
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        writer = cv2.VideoWriter(str(output_path), fourcc, fps, (w, h))
+        for p in frame_paths:
+            writer.write(cv2.imread(p))
+        writer.release()
+        logger.info("Video saved (cv2): %s (%d frames)", output_path, len(frame_paths))
+        return output_path
+
+
+def create_all_videos(output_dir: Path, fps: int = 5) -> None:
+    """Создаёт видео для всех эпизодов в директории визуализаций.
+
+    Args:
+        output_dir: Корневая папка визуализаций (visualizations_stage_mesh/).
+    """
+    episode_dirs = sorted(d for d in output_dir.iterdir() if d.is_dir())
+    for ep_dir in episode_dirs:
+        create_video_from_episode(ep_dir, fps=fps)
 
 class EpisodeVisualizer:
     """Manages episode visualization with per-level filtering.

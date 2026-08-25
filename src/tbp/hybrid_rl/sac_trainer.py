@@ -457,6 +457,8 @@ class PSACTrainer:
                     else None
                 ),
                 done=tr.done,
+                mesh_id=tr.mesh_id,  # ← ДОБАВИТЬ
+                level=tr.level,      # ← ДОБАВИТЬ
             ))
         return normalized
 
@@ -2146,7 +2148,7 @@ class PSACTrainer:
 
         if save_dir:
             self.save(save_dir)
-            
+
     def save(self, dirpath: str) -> None:
         """Save SAC model to directory."""
         dirpath = Path(dirpath)

@@ -1373,6 +1373,98 @@ class RLGoalApproachExperiment:
                 "BC data: %d total after balancing",
                 len(bc_transitions),
             )
+            # ═══ Save detailed BC composition report ═══
+            mesh_id_to_name = {
+                v: k
+                for k, v in (
+                    ExperienceExtractor
+                    .MESH_NAME_TO_ID.items()
+                )
+            }
+            type_names = ExperienceExtractor.get_type_names()
+
+            bc_composition = {}
+            for tr in bc_transitions:
+                mname = mesh_id_to_name.get(
+                    getattr(tr, "mesh_id", -1), "unknown"
+                )
+                level = getattr(tr, "level", 0)
+                key = f"{mname}/L{level}"
+                if key not in bc_composition:
+                    bc_composition[key] = {
+                        "count": 0,
+                        "actions": {},
+                        "mesh": mname,
+                        "level": level,
+                    }
+                bc_composition[key]["count"] += 1
+                aname = type_names.get(
+                    tr.action_type,
+                    f"type_{tr.action_type}",
+                )
+                bc_composition[key]["actions"][aname] = (
+                    bc_composition[key]["actions"]
+                    .get(aname, 0) + 1
+                )
+
+            total = max(len(bc_transitions), 1)
+            bc_report = {
+                "total_transitions": len(bc_transitions),
+                "has_next_state": sum(
+                    1 for tr in bc_transitions
+                    if tr.next_state is not None
+                ),
+                "missing_next_state": sum(
+                    1 for tr in bc_transitions
+                    if tr.next_state is None
+                ),
+                "per_group": {
+                    k: {
+                        **v,
+                        "pct": round(
+                            100.0 * v["count"] / total, 1
+                        ),
+                    }
+                    for k, v in sorted(
+                        bc_composition.items()
+                    )
+                },
+                "per_mesh_total": {},
+                "per_level_total": {},
+                "per_action_total": {},
+            }
+
+            # Aggregate by mesh
+            for k, v in bc_composition.items():
+                mname = v["mesh"]
+                bc_report["per_mesh_total"][mname] = (
+                    bc_report["per_mesh_total"]
+                    .get(mname, 0) + v["count"]
+                )
+            # Aggregate by level
+            for k, v in bc_composition.items():
+                lkey = f"L{v['level']}"
+                bc_report["per_level_total"][lkey] = (
+                    bc_report["per_level_total"]
+                    .get(lkey, 0) + v["count"]
+                )
+            # Aggregate by action
+            for k, v in bc_composition.items():
+                for aname, count in v["actions"].items():
+                    bc_report["per_action_total"][aname] = (
+                        bc_report["per_action_total"]
+                        .get(aname, 0) + count
+                    )
+
+            bc_composition_path = (
+                self.data_dir / "bc_composition_report.json"
+            )
+            with bc_composition_path.open("w") as f:
+                json.dump(bc_report, f, indent=2)
+            logger.info(
+                "BC composition report saved to %s",
+                bc_composition_path,
+            )
 
             # Save combined
             with bc_data_combined_path.open("wb") as f:
@@ -2372,7 +2464,7 @@ class RLGoalApproachExperiment:
                 "Loading SAC from training: %s",
                 self._sac_model_dir(self.sac_seed),
             )
-            
+
         if sac_trainer is not None:
             sac_trainer.buffer.set_current_mesh(
                 self.adaptive_mesh
