@@ -5,16 +5,18 @@ defaults:
 
 experiment:
   _target_: tbp.hybrid_rl.experiment.RLGoalApproachExperiment
+
   config:
     seed: 42
-    visualise: false
+    # Visualization: null | text | pictures | video
+    visualise: pictures
     regenerate_scripts: false
     do_train: false
     do_eval: false
     do_heur_eval: false
     do_bc_train: false
     do_sac_train: true
-    do_sac_eval: true
+    do_sac_eval: false
     do_adaptive: false
 
     train_seeds: [11]
@@ -23,8 +25,8 @@ experiment:
     sac_eval_seeds: [44]
     adapt_seed: 99
 
-    promote_threshold: 0.75
-    promote_window: 300
+    promote_threshold: 0.6
+    promote_window: 200
 
     curriculum_levels:
       - [10.0, 60.0]    # L0: same_side, no path_blocked
@@ -302,7 +304,7 @@ experiment:
       batch_size: 256
       bc_lambda_init: 5.0
       bc_lambda_min: 2.0
-      actor_warmup_per_level: 100
+      actor_warmup_per_level: 50
       buffer_capacity: 1000000
       bc_reserve_fraction: 0.20
       max_steps_per_goal: 500
@@ -312,14 +314,13 @@ experiment:
       use_cql: true
       cql_alpha: 1.0
 
-    sac_meshes: [cube, sphere, cylinder, flat_square, vase, mug]
     sac_episodes_per_mesh:
-      cube: 1000
-      sphere: 1000
-      cylinder: 1000
-      flat_square: 500
-      vase: 2000
-      mug: 2000
+      #cube: 1000
+      #sphere: 1000
+      #cylinder: 1000
+      #flat_square: 500
+      vase: 1000
+      #mug: 2000
 
     sac_eval_episodes_per_level: 100
 

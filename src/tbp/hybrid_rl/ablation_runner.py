@@ -55,7 +55,7 @@ def run_eval_per_seed(  # noqa: PLR0913
     collect_bc: bool = False,
     episodes_per_level: int | None = None,
     mesh_name: str = "",
-    visualise=False,
+    visualise=None,
     log_prefix="eval",
 ) -> tuple[dict[str, Any], list[Any]]:
     """Run evaluation across seeds and curriculum levels.
@@ -537,7 +537,7 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
     curriculum_config: dict[str, Any] | None = None,
     episode_script: list[dict[str, Any]] | None = None,
     episode_pools: list[list[dict[str, Any]]] | None = None,
-    visualise: bool = False,
+    visualise = None,
     episodes_per_level: int | None = None,
     level_idx=0,
     save_on_exit: bool = True,

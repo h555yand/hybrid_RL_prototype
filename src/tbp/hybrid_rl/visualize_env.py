@@ -11,6 +11,12 @@
 
 Provides functions for rendering agent trajectories, saving episode frames
 as PNG images with action annotations, and interactive scene visualization.
+
+Visualization modes:
+    - null/false: no visualization
+    - text: save actions.txt and meta.json only
+    - pictures: text + PNG frames
+    - video: text + PNG frames + MP4 video
 """
 
 from __future__ import annotations
@@ -35,9 +41,9 @@ logger = logging.getLogger(__name__)
 _MIN_RENDER_BYTES = 100
 _FONT_SIZE_OVERLAY = 12
 _MAX_LINE_LENGTH = 100
-_AGENT_SPHERE_RADIUS = 0.5
-_GOAL_SPHERE_RADIUS = 0.7
-_TRAIL_SPHERE_RADIUS = 0.3
+_AGENT_SPHERE_RADIUS = 1.0
+_GOAL_SPHERE_RADIUS = 1.4
+_TRAIL_SPHERE_RADIUS = 0.6
 _GAZE_ARROW_LENGTH = 3
 _NORM_EPSILON = 1e-12
 _CROSS_PRODUCT_THRESHOLD = 1e-8
@@ -46,10 +52,10 @@ _TEXT_Y_START = 5
 _TEXT_X_START = 5
 _TEXT_LINE_SPACING = 3
 _BG_ALPHA = 200
-_FOV = 45.0
-_CAMERA_DISTANCE_MULTIPLIER = 1.5
-# ва числа: `2.0 → 1.5` (камера ближе) и `60.0 → 45.0` (уже угол обзора = зум). 
-# Если будет слишком близко — подкрутите обратно, например `1.7` и `50.0`. Если хочется ещё ближе — `1.2` и `40.0`.
+_FOV = 50.0
+_CAMERA_DISTANCE_MULTIPLIER = 1.7
+_DETAIL_STEPS = 50
+_FRAME_INTERVAL = 50
 
 
 def _build_scene(
@@ -57,6 +63,7 @@ def _build_scene(
     agent_pose: np.ndarray,
     goal_pose: np.ndarray,
     trail_poses: list[np.ndarray] | None = None,
+    mesh_alpha: int = 80,
 ) -> trimesh.Scene:
     """Build a trimesh scene for rendering.
 
@@ -65,46 +72,77 @@ def _build_scene(
         agent_pose: Agent pose [x, y, z, roll, pitch, yaw].
         goal_pose: Goal pose [x, y, z, roll, pitch, yaw].
         trail_poses: Optional list of previous agent poses for trail.
+        mesh_alpha: Mesh transparency (0=invisible, 255=opaque).
 
     Returns:
         Configured trimesh Scene with mesh, agent, goal, and trail.
     """
     scene = trimesh.Scene()
 
-    axis = trimesh.creation.axis(origin_size=2.0, axis_length=10)
+    axis = trimesh.creation.axis(
+        origin_size=2.0, axis_length=10
+    )
     scene.add_geometry(axis, geom_name="world_axis")
-    scene.add_geometry(env.mesh, geom_name="mesh")
+
+    mesh_copy = env.mesh.copy()
+    mesh_copy.visual.face_colors = [
+        200, 200, 200, mesh_alpha
+    ]
+    scene.add_geometry(mesh_copy, geom_name="mesh")
 
     agent_pos = agent_pose[:3]
     agent_rot = agent_pose[3:]
 
     agent_sphere = trimesh.primitives.Sphere(
-        radius=_AGENT_SPHERE_RADIUS, center=agent_pos
+        radius=_AGENT_SPHERE_RADIUS,
+        center=agent_pos,
     )
-    agent_sphere.visual.face_colors = [0, 0, 255, 255]
-    scene.add_geometry(agent_sphere, geom_name="agent")
+    agent_sphere.visual.face_colors = [
+        0, 50, 255, 255
+    ]
+    scene.add_geometry(
+        agent_sphere, geom_name="agent"
+    )
 
-    rot = Rotation.from_euler("xyz", agent_rot, degrees=True)
+    rot = Rotation.from_euler(
+        "xyz", agent_rot, degrees=True
+    )
     forward_dir = rot.apply([0, 0, -1])
     line_vertices = np.array([
-        agent_pos, agent_pos + forward_dir * _GAZE_ARROW_LENGTH
+        agent_pos,
+        agent_pos
+        + forward_dir * _GAZE_ARROW_LENGTH,
     ])
-    arrow = trimesh.load_path(line_vertices, colors=[[255, 0, 0, 255]])
+    arrow = trimesh.load_path(
+        line_vertices,
+        colors=[[255, 0, 0, 255]],
+    )
     scene.add_geometry(arrow, geom_name="gaze")
 
     goal_sphere = trimesh.primitives.Sphere(
-        radius=_GOAL_SPHERE_RADIUS, center=goal_pose[:3]
+        radius=_GOAL_SPHERE_RADIUS,
+        center=goal_pose[:3],
     )
-    goal_sphere.visual.face_colors = [0, 255, 0, 255]
-    scene.add_geometry(goal_sphere, geom_name="goal")
+    goal_sphere.visual.face_colors = [
+        0, 255, 0, 255
+    ]
+    scene.add_geometry(
+        goal_sphere, geom_name="goal"
+    )
 
     if trail_poses:
         for i, pose in enumerate(trail_poses):
             trail_sphere = trimesh.primitives.Sphere(
-                radius=_TRAIL_SPHERE_RADIUS, center=pose[:3]
+                radius=_TRAIL_SPHERE_RADIUS,
+                center=pose[:3],
             )
-            trail_sphere.visual.face_colors = [255, 255, 0, 128]
-            scene.add_geometry(trail_sphere, geom_name=f"trail_{i}")
+            trail_sphere.visual.face_colors = [
+                255, 165, 0, 255
+            ]
+            scene.add_geometry(
+                trail_sphere,
+                geom_name=f"trail_{i}",
+            )
 
     return scene
 
@@ -115,34 +153,59 @@ def _compute_camera_transform(
     goal_pos: np.ndarray,
     fixed_offset_multiplier: float = _CAMERA_DISTANCE_MULTIPLIER,
 ) -> np.ndarray:
-    """Вычисляет ракурс камеры, центрируясь на детали, но разворачиваясь к агенту."""
-    center = scene.bounds.mean(axis=0)
-    
-    # ИСПРАВЛЕНО: вычитаем минимальные границы из максимальных
-    mesh_size = float(np.linalg.norm(scene.bounds[1] - scene.bounds[0]))
-    camera_distance = mesh_size * fixed_offset_multiplier
+    """Compute camera looking at midpoint between agent and goal.
 
-    to_agent = agent_pos - center
-    to_agent_norm = np.linalg.norm(to_agent)
-    
+    Camera positioned above and to the side, looking at the
+    midpoint between agent and goal. Works for both solid
+    and hollow objects.
+    """
+    midpoint = (agent_pos + goal_pos) / 2.0
+
+    mesh_size = float(
+        np.linalg.norm(
+            scene.bounds[1] - scene.bounds[0]
+        )
+    )
+    camera_distance = (
+        mesh_size * fixed_offset_multiplier
+    )
+
+    mesh_center = scene.bounds.mean(axis=0)
+    to_agent = agent_pos - mesh_center
+    to_agent_horiz = to_agent.copy()
+    to_agent_horiz[2] = 0
+    to_agent_norm = np.linalg.norm(to_agent_horiz)
+
     if to_agent_norm > 1e-5:
-        dir_to_agent = to_agent / to_agent_norm
+        dir_horiz = to_agent_horiz / to_agent_norm
     else:
-        dir_to_agent = np.array([1.0, 0.0, 0.0])
+        to_goal = goal_pos - mesh_center
+        to_goal[2] = 0
+        tg_norm = np.linalg.norm(to_goal)
+        if tg_norm > 1e-5:
+            dir_horiz = -to_goal / tg_norm
+        else:
+            dir_horiz = np.array([1.0, 0.0, 0.0])
 
-    camera_pos = center + dir_to_agent * (camera_distance * 0.8)
-    camera_pos[2] += camera_distance * 0.5  # ИСПРАВЛЕНО: прибавляем строго к оси Z (высота)
+    camera_pos = (
+        midpoint
+        + dir_horiz * camera_distance * 0.7
+    )
+    camera_pos[2] = (
+        max(agent_pos[2], goal_pos[2])
+        + camera_distance * 0.5
+    )
 
-    forward = center - camera_pos
+    forward = midpoint - camera_pos
     forward /= np.linalg.norm(forward) + 1e-6
 
     world_up = np.array([0.0, 0.0, 1.0])
     right = np.cross(forward, world_up)
-    
+
     if np.linalg.norm(right) < 1e-3:
         world_up = np.array([0.0, 1.0, 0.0])
         right = np.cross(forward, world_up)
-        
+
     right /= np.linalg.norm(right) + 1e-6
     up = np.cross(right, forward)
     up /= np.linalg.norm(up) + 1e-6
@@ -163,30 +226,23 @@ def _add_text_to_image(
     distance: float = 0.0,
     result: str = "",
 ) -> bytes:
-    """Add text overlay on top of a PNG image.
-
-    Args:
-        png_bytes: Raw PNG image bytes.
-        text: Action description text.
-        step_num: Current step number.
-        distance: Distance to goal in mm.
-        result: Episode result ("success", "collision", "timeout").
-
-    Returns:
-        PNG image bytes with text overlay.
-    """
+    """Add text overlay on top of a PNG image."""
     img = Image.open(io.BytesIO(png_bytes))
     draw = ImageDraw.Draw(img)
 
     try:
         font = ImageFont.truetype(
-            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+            "/usr/share/fonts/truetype/"
+            "dejavu/DejaVuSansMono.ttf",
             _FONT_SIZE_OVERLAY,
         )
     except OSError:
         font = ImageFont.load_default()
 
-    header = f"Step {step_num} | dist={distance:.1f}mm | {result}"
+    header = (
+        f"Step {step_num} | "
+        f"dist={distance:.1f}mm | {result}"
+    )
     lines = [header]
     lines.extend(
         text[i:i + _MAX_LINE_LENGTH]
@@ -195,7 +251,9 @@ def _add_text_to_image(
 
     y = _TEXT_Y_START
     for line in lines:
-        text_bbox = draw.textbbox((_TEXT_X_START, y), line, font=font)
+        text_bbox = draw.textbbox(
+            (_TEXT_X_START, y), line, font=font
+        )
         draw.rectangle(
             [
                 text_bbox[0] - _TEXT_PADDING,
@@ -205,8 +263,14 @@ def _add_text_to_image(
             ],
             fill=(0, 0, 0, _BG_ALPHA),
         )
-        draw.text((_TEXT_X_START, y), line, fill="white", font=font)
-        y += text_bbox[3] - text_bbox[1] + _TEXT_LINE_SPACING
+        draw.text(
+            (_TEXT_X_START, y), line,
+            fill="white", font=font,
+        )
+        y += (
+            text_bbox[3] - text_bbox[1]
+            + _TEXT_LINE_SPACING
+        )
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")
@@ -226,60 +290,145 @@ def render_frame_to_file(
     resolution: tuple[int, int] = (1024, 768),
     fov: float = _FOV,
 ) -> None:
-    """Render a frame to a PNG file with text annotation.
+    """Render a split-view frame: solid + x-ray."""
+    half_res = (resolution[0] // 2, resolution[1])
 
-    Args:
-        env: LightweightEnv instance.
-        agent_pose: Agent pose [x, y, z, roll, pitch, yaw].
-        goal_pose: Goal pose [x, y, z, roll, pitch, yaw].
-        filepath: Output PNG file path.
-        text: Action description text to overlay.
-        step_num: Current step number.
-        distance: Distance to goal in mm.
-        result: Episode result string.
-        trail_poses: Optional list of previous poses for trail visualization.
-        resolution: Image resolution (width, height).
-
-    Raises:
-        RuntimeError: If the rendered image is empty or too small.
-    """
-    scene = _build_scene(env, agent_pose, goal_pose, trail_poses)
-
-    camera_transform = _compute_camera_transform(
-        scene=scene,
+    cam = _compute_camera_transform(
+        _build_scene(
+            env, agent_pose, goal_pose,
+            trail_poses, mesh_alpha=255,
+        ),
         agent_pos=agent_pose[:3],
-        goal_pos=goal_pose[:3]
+        goal_pos=goal_pose[:3],
     )
-    scene.camera_transform = camera_transform
-
-    scene.camera.fov = (fov, fov)
-    scene.camera.z_near = 1.0
-    scene.camera.z_far = 100000.0
-    scene.camera.resolution = resolution
 
     filepath.parent.mkdir(parents=True, exist_ok=True)
 
     try:
-        png_data = scene.save_image(resolution=resolution, visible=False, smooth=False)
+        # Solid view
+        scene_solid = _build_scene(
+            env, agent_pose, goal_pose,
+            trail_poses, mesh_alpha=255,
+        )
+        scene_solid.camera_transform = cam
+        scene_solid.camera.fov = (fov, fov)
+        scene_solid.camera.z_near = 1.0
+        scene_solid.camera.z_far = 100000.0
+        scene_solid.camera.resolution = half_res
+        png_solid = scene_solid.save_image(
+            resolution=half_res,
+            visible=False, smooth=False,
+        )
 
-        if png_data is None or len(png_data) < _MIN_RENDER_BYTES:
+        # X-ray view
+        scene_xray = _build_scene(
+            env, agent_pose, goal_pose,
+            trail_poses, mesh_alpha=60,
+        )
+        scene_xray.camera_transform = cam
+        scene_xray.camera.fov = (fov, fov)
+        scene_xray.camera.z_near = 1.0
+        scene_xray.camera.z_far = 100000.0
+        scene_xray.camera.resolution = half_res
+        png_xray = scene_xray.save_image(
+            resolution=half_res,
+            visible=False, smooth=False,
+        )
+
+        if (
+            png_solid is None
+            or png_xray is None
+            or len(png_solid) < _MIN_RENDER_BYTES
+            or len(png_xray) < _MIN_RENDER_BYTES
+        ):
             msg = "Empty render output"
             raise RuntimeError(msg)
 
+        # Merge side by side
+        img_left = Image.open(io.BytesIO(png_solid))
+        img_right = Image.open(io.BytesIO(png_xray))
+        merged = Image.new(
+            "RGBA", (resolution[0], resolution[1]),
+        )
+        merged.paste(img_left, (0, 0))
+        merged.paste(img_right, (half_res[0], 0))
+
+        # Text overlay
         if text:
-            png_data = _add_text_to_image(
-                png_data, text, step_num, distance, result
+            draw = ImageDraw.Draw(merged)
+            try:
+                font = ImageFont.truetype(
+                    "/usr/share/fonts/truetype/"
+                    "dejavu/DejaVuSansMono.ttf",
+                    _FONT_SIZE_OVERLAY,
+                )
+            except OSError:
+                font = ImageFont.load_default()
+
+            header = (
+                f"Step {step_num} | "
+                f"dist={distance:.1f}mm | "
+                f"{result}"
             )
+            lines = [header]
+            lines.extend(
+                text[i:i + _MAX_LINE_LENGTH]
+                for i in range(
+                    0, len(text), _MAX_LINE_LENGTH
+                )
+            )
+            y = _TEXT_Y_START
+            for line in lines:
+                bbox = draw.textbbox(
+                    (_TEXT_X_START, y),
+                    line, font=font,
+                )
+                draw.rectangle(
+                    [
+                        bbox[0] - _TEXT_PADDING,
+                        bbox[1] - 1,
+                        bbox[2] + _TEXT_PADDING,
+                        bbox[3] + 1,
+                    ],
+                    fill=(0, 0, 0, _BG_ALPHA),
+                )
+                draw.text(
+                    (_TEXT_X_START, y), line,
+                    fill="white", font=font,
+                )
+                y += (
+                    bbox[3] - bbox[1]
+                    + _TEXT_LINE_SPACING
+                )
+
+            draw.text(
+                (10, resolution[1] - 20),
+                "SOLID", fill="white", font=font,
+            )
+            draw.text(
+                (half_res[0] + 10, resolution[1] - 20),
+                "X-RAY", fill="white", font=font,
+            )
+
+        buf = io.BytesIO()
+        merged.save(buf, format="PNG")
         with filepath.open("wb") as f:
-            f.write(png_data)
+            f.write(buf.getvalue())
+
     except (RuntimeError, OSError):
         txt_path = filepath.with_suffix(".txt")
         with txt_path.open("w") as f:
-            f.write(f"Step: {step_num}, Distance: {distance:.1f}mm\n")
+            f.write(
+                f"Step: {step_num}, "
+                f"Distance: {distance:.1f}mm\n"
+            )
             f.write(f"Agent: {agent_pose.tolist()}\n")
             f.write(f"Goal: {goal_pose.tolist()}\n")
             f.write(f"Action: {text}\n")
-        logger.warning("Render failed for %s", filepath, exc_info=True)
+        logger.warning(
+            "Render failed for %s",
+            filepath, exc_info=True,
+        )
 
 
 def save_episode_frames(
@@ -290,53 +439,67 @@ def save_episode_frames(
     output_dir: Path,
     episode_id: str,
     result: str = "unknown",
-    timeout_frame_interval: int = 50,
+    timeout_frame_interval: int = _FRAME_INTERVAL,
+    render_mode: str = "text",
 ) -> None:
-    """Save frames of an episode with action annotations.
-
-    For timeout episodes, saves only every Nth frame and the last frame
-    to avoid excessive file generation. For success and collision episodes,
-    saves all frames.
+    """Save episode frames with action annotations.
 
     Args:
         env: LightweightEnv instance.
         goal_pose: Target pose [6D].
         episode_poses: List of agent poses at each step.
-        episode_actions: List of action descriptions (action_explanations).
+        episode_actions: List of action descriptions.
         output_dir: Root directory for saving.
         episode_id: Unique episode identifier.
-        result: Episode result ("success", "collision", "timeout").
-        timeout_frame_interval: For timeout episodes, save every Nth frame.
+        result: Episode result.
+        timeout_frame_interval: Save every Nth frame after detail_steps.
+        render_mode: "text" | "pictures" | "video".
     """
     ep_dir = output_dir / episode_id
     ep_dir.mkdir(parents=True, exist_ok=True)
 
-    # Always save full action log
+    # ═══ Always save action log ═══
     log_path = ep_dir / "actions.txt"
     with log_path.open("w") as f:
         f.write(f"Result: {result}\n")
         f.write(f"Goal: {goal_pose.tolist()}\n")
         f.write(f"Steps: {len(episode_actions)}\n")
         if episode_poses:
-            f.write(f"Start: {episode_poses[0].tolist()}\n")
-            f.write(f"End: {episode_poses[-1].tolist()}\n")
-            start_dist = float(
-                np.linalg.norm(goal_pose[:3] - episode_poses[0][:3])
+            f.write(
+                f"Start: "
+                f"{episode_poses[0].tolist()}\n"
             )
-            end_dist = float(
-                np.linalg.norm(goal_pose[:3] - episode_poses[-1][:3])
+            f.write(
+                f"End: "
+                f"{episode_poses[-1].tolist()}\n"
             )
-            f.write(f"Start distance: {start_dist:.1f}mm\n")
-            f.write(f"End distance: {end_dist:.1f}mm\n")
+            start_dist = float(np.linalg.norm(
+                goal_pose[:3] - episode_poses[0][:3]
+            ))
+            end_dist = float(np.linalg.norm(
+                goal_pose[:3] - episode_poses[-1][:3]
+            ))
+            f.write(
+                f"Start distance: "
+                f"{start_dist:.1f}mm\n"
+            )
+            f.write(
+                f"End distance: "
+                f"{end_dist:.1f}mm\n"
+            )
         f.write("\n")
         for i, action in enumerate(episode_actions):
             if i < len(episode_poses):
-                dist = float(
-                    np.linalg.norm(goal_pose[:3] - episode_poses[i][:3])
-                )
+                dist = float(np.linalg.norm(
+                    goal_pose[:3]
+                    - episode_poses[i][:3]
+                ))
             else:
                 dist = 0.0
-            f.write(f"Step {i+1:03d} (dist={dist:.1f}mm): {action}\n")
+            f.write(
+                f"Step {i+1:03d} "
+                f"(dist={dist:.1f}mm): {action}\n"
+            )
 
     meta = {
         "episode_id": episode_id,
@@ -344,24 +507,28 @@ def save_episode_frames(
         "goal_pose": goal_pose.tolist(),
         "num_steps": len(episode_actions),
         "start_pose": (
-            episode_poses[0].tolist() if episode_poses else None
+            episode_poses[0].tolist()
+            if episode_poses else None
         ),
         "end_pose": (
-            episode_poses[-1].tolist() if episode_poses else None
+            episode_poses[-1].tolist()
+            if episode_poses else None
         ),
     }
     meta_path = ep_dir / "meta.json"
     with meta_path.open("w") as f:
         json.dump(meta, f, indent=2)
 
-    # Determine which frames to save
-    is_timeout = result == "timeout"
+    if render_mode == "text":
+        return
+
+    # ═══ Render frames ═══
     last_step = len(episode_poses) - 1
 
-    def should_save_frame(step_idx: int) -> bool:
-        if not is_timeout:
-            return True
+    def should_save_frame(step_idx):
         if step_idx == 0:
+            return True
+        if step_idx <= _DETAIL_STEPS:
             return True
         if step_idx == last_step:
             return True
@@ -369,13 +536,13 @@ def save_episode_frames(
             return True
         return False
 
-    trail_so_far: list[np.ndarray] = []
+    trail_so_far = []
     saved_count = 0
 
     if episode_poses:
-        distance = float(
-            np.linalg.norm(goal_pose[:3] - episode_poses[0][:3])
-        )
+        distance = float(np.linalg.norm(
+            goal_pose[:3] - episode_poses[0][:3]
+        ))
         if should_save_frame(0):
             render_frame_to_file(
                 env=env,
@@ -399,14 +566,17 @@ def save_episode_frames(
                 if (i - 1) < len(episode_actions)
                 else "unknown"
             )
-            distance = float(
-                np.linalg.norm(goal_pose[:3] - episode_poses[i][:3])
-            )
+            distance = float(np.linalg.norm(
+                goal_pose[:3]
+                - episode_poses[i][:3]
+            ))
             render_frame_to_file(
                 env=env,
                 agent_pose=episode_poses[i],
                 goal_pose=goal_pose,
-                filepath=ep_dir / f"step_{i:03d}.png",
+                filepath=(
+                    ep_dir / f"step_{i:03d}.png"
+                ),
                 text=action_text,
                 step_num=i,
                 distance=distance,
@@ -422,20 +592,20 @@ def save_episode_frames(
         ep_dir,
         result,
     )
-    # save video
-    create_video_from_episode(ep_dir, fps=5)
+
+    if render_mode == "video":
+        create_video_from_episode(ep_dir, fps=5)
+
 
 def visualize_scene(
     env: LightweightEnv,
     goal_pose: np.ndarray,
 ) -> None:
-    """Show interactive visualization of the scene.
-
-    Args:
-        env: LightweightEnv instance.
-        goal_pose: Goal pose [x, y, z, roll, pitch, yaw].
-    """
-    scene = _build_scene(env, env.get_pose(), goal_pose)
+    """Show interactive visualization of the scene."""
+    scene = _build_scene(
+        env, env.get_pose(), goal_pose,
+        mesh_alpha=255,
+    )
     scene.show(smooth=False)
 
 
@@ -444,38 +614,31 @@ def visualize_agent_goal(
     agent_pose: np.ndarray,
     goal_pose: np.ndarray,
 ) -> None:
-    """Show interactive visualization of agent and goal.
-
-    Args:
-        env: LightweightEnv instance.
-        agent_pose: Agent pose [x, y, z, roll, pitch, yaw].
-        goal_pose: Goal pose [x, y, z, roll, pitch, yaw].
-    """
-    scene = _build_scene(env, agent_pose, goal_pose)
+    """Show interactive visualization of agent and goal."""
+    scene = _build_scene(
+        env, agent_pose, goal_pose,
+        mesh_alpha=255,
+    )
     scene.show(smooth=False)
+
 
 def create_video_from_episode(
     episode_dir: Path,
     output_path: Path | None = None,
     fps: int = 5,
 ) -> Path | None:
-    """Создаёт MP4 видео из сохранённых PNG кадров эпизода.
-
-    Args:
-        episode_dir: Папка с step_XXX.png файлами (например output/ep_00001_L0_success/).
-        output_path: Путь для сохранения видео. По умолчанию episode_dir/episode.mp4.
-        fps: Кадров в секунду.
-
-    Returns:
-        Path к видео или None при ошибке.
-    """
+    """Create MP4 video from saved PNG frames."""
     import glob
 
-    frames_pattern = str(episode_dir / "step_*.png")
+    frames_pattern = str(
+        episode_dir / "step_*.png"
+    )
     frame_paths = sorted(glob.glob(frames_pattern))
 
     if not frame_paths:
-        logger.warning("No frames found in %s", episode_dir)
+        logger.warning(
+            "No frames found in %s", episode_dir
+        )
         return None
 
     if output_path is None:
@@ -483,51 +646,65 @@ def create_video_from_episode(
 
     try:
         import imageio.v2 as imageio
-        frames = [imageio.imread(p) for p in frame_paths]
-        imageio.mimwrite(str(output_path), frames, fps=fps, codec='libx264')
-        logger.info("Video saved: %s (%d frames, %d fps)", output_path, len(frames), fps)
+        frames = [
+            imageio.imread(p) for p in frame_paths
+        ]
+        imageio.mimwrite(
+            str(output_path), frames,
+            fps=fps, codec='libx264',
+        )
+        logger.info(
+            "Video saved: %s (%d frames, %d fps)",
+            output_path, len(frames), fps,
+        )
         return output_path
-    except ImportError:
-        # Fallback на OpenCV
-        import cv2
-        first = cv2.imread(frame_paths[0])
-        h, w = first.shape[:2]
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        writer = cv2.VideoWriter(str(output_path), fourcc, fps, (w, h))
-        for p in frame_paths:
-            writer.write(cv2.imread(p))
-        writer.release()
-        logger.info("Video saved (cv2): %s (%d frames)", output_path, len(frame_paths))
-        return output_path
+    except Exception:
+        try:
+            import cv2
+            first = cv2.imread(frame_paths[0])
+            h, w = first.shape[:2]
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            writer = cv2.VideoWriter(
+                str(output_path), fourcc, fps, (w, h)
+            )
+            for p in frame_paths:
+                writer.write(cv2.imread(p))
+            writer.release()
+            logger.info(
+                "Video saved (cv2): %s (%d frames)",
+                output_path, len(frame_paths),
+            )
+            return output_path
+        except Exception:
+            logger.warning(
+                "Video creation skipped: %s",
+                episode_dir,
+            )
+            return None
 
 
-def create_all_videos(output_dir: Path, fps: int = 5) -> None:
-    """Создаёт видео для всех эпизодов в директории визуализаций.
-
-    Args:
-        output_dir: Корневая папка визуализаций (visualizations_stage_mesh/).
-    """
-    episode_dirs = sorted(d for d in output_dir.iterdir() if d.is_dir())
+def create_all_videos(
+    output_dir: Path, fps: int = 5
+) -> None:
+    """Create videos for all episodes in directory."""
+    episode_dirs = sorted(
+        d for d in output_dir.iterdir()
+        if d.is_dir()
+    )
     for ep_dir in episode_dirs:
         create_video_from_episode(ep_dir, fps=fps)
 
+
 class EpisodeVisualizer:
     """Manages episode visualization with per-level filtering.
-    
-    Saves limited number of episodes per result type per curriculum level
-    to avoid excessive file generation while ensuring coverage.
-    
-    Usage:
-        visualizer = EpisodeVisualizer(
-            output_dir=Path("results"),
-            mesh_name="cube",
-            stage="sac_train",
-        )
-        # In episode loop:
-        visualizer.save_episode(
-            env, episode, level, "success",
-            goal_pose, poses, actions,
-        )
+
+    Saves limited number of episodes per result type per
+    curriculum level.
+
+    Visualization modes:
+        - "text": actions.txt + meta.json only
+        - "pictures": text + PNG frames (split view)
+        - "video": text + PNG frames + MP4 video
     """
 
     def __init__(
@@ -537,29 +714,37 @@ class EpisodeVisualizer:
         stage: str = "train",
         max_per_type_per_level: int = 3,
         num_levels: int = 3,
-        timeout_frame_interval: int = 100,
+        timeout_frame_interval: int = _FRAME_INTERVAL,
+        visualize_mode: str = "text",
     ):
-        self.output_dir = output_dir / f"visualizations_{stage}_{mesh_name}"
+        self.output_dir = (
+            output_dir
+            / f"visualizations_{stage}_{mesh_name}"
+        )
         self.max_per_type = max_per_type_per_level
-        self.timeout_frame_interval = timeout_frame_interval
+        self.timeout_frame_interval = (
+            timeout_frame_interval
+        )
+        self.visualize_mode = visualize_mode
 
         self.counts: dict[str, int] = {}
         for level in range(num_levels):
-            for result in ("success", "collision", "timeout"):
-                self.counts[f"level_{level}_{result}"] = 0
+            for result in (
+                "success", "collision", "timeout"
+            ):
+                self.counts[
+                    f"level_{level}_{result}"
+                ] = 0
 
-    def should_save(self, level: int, result: str) -> bool:
-        """Check if we should save this episode.
-
-        Args:
-            level: Curriculum level index.
-            result: Episode result ("success", "collision", "timeout").
-
-        Returns:
-            True if under the limit for this level+result combination.
-        """
+    def should_save(
+        self, level: int, result: str
+    ) -> bool:
+        """Check if we should save this episode."""
         key = f"level_{level}_{result}"
-        return self.counts.get(key, 0) < self.max_per_type
+        return (
+            self.counts.get(key, 0)
+            < self.max_per_type
+        )
 
     def save_episode(
         self,
@@ -571,22 +756,15 @@ class EpisodeVisualizer:
         poses: list[np.ndarray],
         actions: list[str],
     ) -> None:
-        """Save episode visualization if under limit.
-
-        Args:
-            env: Environment instance for rendering.
-            episode: Episode number.
-            level: Curriculum level index.
-            result: Episode result ("success", "collision", "timeout").
-            goal_pose: Target pose array.
-            poses: List of agent poses during episode.
-            actions: List of action description strings.
-        """
+        """Save episode visualization if under limit."""
         if not self.should_save(level, result):
             return
 
         key = f"level_{level}_{result}"
-        episode_id = f"ep_{episode + 1:05d}_L{level}_{result}"
+        episode_id = (
+            f"ep_{episode + 1:05d}"
+            f"_L{level}_{result}"
+        )
 
         save_episode_frames(
             env=env,
@@ -596,10 +774,14 @@ class EpisodeVisualizer:
             output_dir=self.output_dir,
             episode_id=episode_id,
             result=result,
-            timeout_frame_interval=self.timeout_frame_interval,
+            timeout_frame_interval=(
+                self.timeout_frame_interval
+            ),
+            render_mode=self.visualize_mode,
         )
         self.counts[key] += 1
 
     def get_stats(self) -> dict[str, int]:
         """Return current save counts."""
         return dict(self.counts)
+    

@@ -102,7 +102,12 @@ class RLGoalApproachExperiment:
             self.config["logging"]["output_dir"]
         )
         self.run_name = self.config["logging"]["run_name"]
-        self.visualise = self.config.get("visualise", False)
+
+        raw_vis = self.config.get("visualise", False)
+        if raw_vis is False or raw_vis is None:
+            self.visualise = None
+        else:
+            self.visualise = str(raw_vis)
 
         # Directories
         self.data_dir = self.output_dir / "data"
@@ -1901,14 +1906,10 @@ class RLGoalApproachExperiment:
                 ),
             )
 
-        for mesh_name in self.sac_meshes:
+        for mesh_name, num_episodes in self.sac_episodes_per_mesh.items():
             mesh_path = str(
                 self.data_dir / f"{mesh_name}.stl"
             )
-            num_episodes = self.sac_episodes_per_mesh.get(
-                mesh_name, 2000
-            )
-
             logger.info(
                 "SAC Training: %s, %d episodes",
                 mesh_name,
@@ -1953,16 +1954,13 @@ class RLGoalApproachExperiment:
                 mesh_name=mesh_name,
             )
 
-            sac_stats = trainer.get_training_stats()
+            mesh_stat = trainer._get_current_mesh_stats()
             result_path = (
                 self.data_dir
                 / f"sac_train_result_{mesh_name}.json"
             )
             with result_path.open("w") as f:
-                json.dump(sac_stats, f, indent=2)
-            mesh_stat = sac_stats["mesh_stats"].get(
-                mesh_name, {}
-            )
+                json.dump(mesh_stat, f, indent=2)
             logger.info(
                 "SAC %s: rate=%.3f",
                 mesh_name,

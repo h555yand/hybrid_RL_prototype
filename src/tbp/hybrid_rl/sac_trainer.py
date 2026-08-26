@@ -158,6 +158,16 @@ class PSACTrainer:
         self._episode_steps: list[int] = []
         self._critic_losses: deque[float] = deque(maxlen=1000)
         self._actor_losses: deque[float] = deque(maxlen=1000)
+        # Per-level tracking (reset on mesh change)
+        self._level_episodes: dict[int, int] = {}
+        self._level_goals: dict[int, int] = {}
+        self._level_collisions: dict[int, int] = {}
+        self._level_timeouts: dict[int, int] = {}
+        self._level_steps: dict[int, list[int]] = {}
+        self._level_success_steps: dict[int, list[int]] = {}
+        self._level_rewards: dict[int, list[float]] = {}
+        self._level_action_counts: dict[int, dict[int, int]] = {}
+        self._level_collision_counts: dict[int, dict[int, int]] = {}
 
         # Mesh tracking
         self._mesh_stats: dict[str, dict[str, Any]] = {}
@@ -1076,8 +1086,8 @@ class PSACTrainer:
             self._mesh_stats[self._current_mesh] = (
                 self._get_current_mesh_stats()
             )
-        # Reset per-mesh counters
         self._current_mesh = mesh_name
+        self.buffer.set_current_mesh(mesh_name)
         self._mesh_episodes = 0
         self._mesh_goals = 0
         self._action_type_counts = {}
@@ -1086,63 +1096,119 @@ class PSACTrainer:
         self._episode_steps = []
         self._critic_losses = deque(maxlen=1000)
         self._actor_losses = deque(maxlen=1000)
+        # Per-level reset
+        self._level_episodes = {}
+        self._level_goals = {}
+        self._level_collisions = {}
+        self._level_timeouts = {}
+        self._level_steps = {}
+        self._level_success_steps = {}
+        self._level_rewards = {}
+        self._level_action_counts = {}
+        self._level_collision_counts = {}
 
     def _get_current_mesh_stats(self) -> dict[str, Any]:
-        """Get stats for the current mesh only.
-
-        Returns:
-            Dict with per-mesh training statistics.
-        """
+        """Get stats for the current mesh — per-level breakdown."""
         type_names = ExperienceExtractor.get_type_names()
+
+        # ═══ Per-level stats ═══
+        per_level = {}
+        for lvl in sorted(self._level_episodes.keys()):
+            lvl_ep = self._level_episodes.get(lvl, 0)
+            lvl_goals = self._level_goals.get(lvl, 0)
+            lvl_col = self._level_collisions.get(lvl, 0)
+            lvl_to = self._level_timeouts.get(lvl, 0)
+            lvl_steps = self._level_steps.get(lvl, [])
+            lvl_suc_steps = self._level_success_steps.get(
+                lvl, []
+            )
+            lvl_rewards = self._level_rewards.get(lvl, [])
+            lvl_actions = self._level_action_counts.get(
+                lvl, {}
+            )
+            lvl_collisions = (
+                self._level_collision_counts.get(lvl, {})
+            )
+
+            lvl_total_actions = max(
+                sum(lvl_actions.values()), 1
+            )
+            lvl_ep_safe = max(lvl_ep, 1)
+
+            per_level[f"level_{lvl}"] = {
+                "episodes": lvl_ep,
+                "success_rate": round(
+                    lvl_goals / lvl_ep_safe, 4
+                ),
+                "timeout_rate": round(
+                    lvl_to / lvl_ep_safe, 4
+                ),
+                "collision_rate": round(
+                    lvl_col / lvl_ep_safe, 4
+                ),
+                "goals": lvl_goals,
+                "timeouts": lvl_to,
+                "collisions": lvl_col,
+                "mean_episode_steps": round(
+                    float(np.mean(lvl_steps))
+                    if lvl_steps
+                    else 0,
+                    1,
+                ),
+                "mean_success_steps": round(
+                    float(np.mean(lvl_suc_steps))
+                    if lvl_suc_steps
+                    else 0,
+                    1,
+                ),
+                "total_steps_per_goal": round(
+                    sum(lvl_steps)
+                    / max(lvl_goals, 1),
+                    1,
+                ),
+                "mean_episode_reward": round(
+                    float(np.mean(lvl_rewards))
+                    if lvl_rewards
+                    else 0,
+                    2,
+                ),
+                "action_distribution": {
+                    type_names.get(
+                        k, f"type_{k}"
+                    ): {
+                        "count": v,
+                        "rate": round(
+                            v / lvl_total_actions,
+                            4,
+                        ),
+                    }
+                    for k, v in sorted(
+                        lvl_actions.items()
+                    )
+                },
+                "collision_stats": {
+                    type_names.get(
+                        k, f"type_{k}"
+                    ): v
+                    for k, v in lvl_collisions.items()
+                },
+            }
+
+        # ═══ Mesh-level summary ═══
         total_actions = max(
             sum(self._action_type_counts.values()), 1
         )
-
-        collision_rate_per_type = {}
-        for type_id, col_count in self._collision_counts.items():
-            total_calls = self._action_type_counts.get(
-                type_id, 0
-            )
-            name = type_names.get(type_id, f"type_{type_id}")
-            collision_rate_per_type[name] = {
-                "collisions": col_count,
-                "total_calls": total_calls,
-                "rate": round(
-                    col_count / max(total_calls, 1), 4
-                ),
-            }
+        all_success_steps = []
+        for lvl_ss in self._level_success_steps.values():
+            all_success_steps.extend(lvl_ss)
 
         return {
             "episodes": self._mesh_episodes,
             "goals": self._mesh_goals,
-            "success_rate": (
+            "success_rate": round(
                 self._mesh_goals
-                / max(self._mesh_episodes, 1)
-            ),
-            "steps_per_success": round(
-                sum(self._episode_steps)
-                / max(self._mesh_goals, 1),
-                1,
-            ),
-            "action_distribution": {
-                type_names.get(k, f"type_{k}"): {
-                    "count": v,
-                    "rate": round(v / total_actions, 4),
-                }
-                for k, v in sorted(
-                    self._action_type_counts.items()
-                )
-            },
-            "collision_stats": {
-                type_names.get(k, f"type_{k}"): v
-                for k, v in self._collision_counts.items()
-            },
-            "collision_rate_per_type": collision_rate_per_type,
-            "mean_episode_reward": round(
-                float(np.mean(self._episode_rewards))
-                if self._episode_rewards
-                else 0,
-                2,
+                / max(self._mesh_episodes, 1),
+                4,
             ),
             "mean_episode_steps": round(
                 float(np.mean(self._episode_steps))
@@ -1150,6 +1216,40 @@ class PSACTrainer:
                 else 0,
                 1,
             ),
+            "mean_success_steps": round(
+                float(np.mean(all_success_steps))
+                if all_success_steps
+                else 0,
+                1,
+            ),
+            "total_steps_per_goal": round(
+                sum(self._episode_steps)
+                / max(self._mesh_goals, 1),
+                1,
+            ),
+            "mean_episode_reward": round(
+                float(np.mean(self._episode_rewards))
+                if self._episode_rewards
+                else 0,
+                2,
+            ),
+            "action_distribution": {
+                type_names.get(k, f"type_{k}"): {
+                    "count": v,
+                    "rate": round(
+                        v / total_actions, 4
+                    ),
+                }
+                for k, v in sorted(
+                    self._action_type_counts.items()
+                )
+            },
+            "collision_stats": {
+                type_names.get(k, f"type_{k}"): v
+                for k, v in (
+                    self._collision_counts.items()
+                )
+            },
             "critic_loss_avg": round(
                 float(np.mean(self._critic_losses))
                 if self._critic_losses
@@ -1163,38 +1263,28 @@ class PSACTrainer:
                 4,
             ),
             "alpha_type": round(self.alpha_type, 4),
-            "alpha_param": round(self.alpha_param, 4),
+            "alpha_param": round(
+                self.alpha_param, 4
+            ),
             "bc_lambda": round(self.bc_lambda, 6),
+            "buffer_stats": self.buffer.get_stats(),
+            "per_level": per_level,
         }
 
     def get_training_stats(self) -> dict[str, Any]:
-        """Get comprehensive training statistics.
+        """Get per-mesh training statistics.
 
-        Returns:
-            Dict with per-mesh stats, current mesh stats,
-            and global counters.
+        Each mesh is independent — no cumulative totals.
         """
-        # Finalize current mesh
         if self._current_mesh:
             self._mesh_stats[self._current_mesh] = (
                 self._get_current_mesh_stats()
             )
 
         return {
-            "total_episodes": self.total_episodes,
-            "total_steps": self.total_steps,
-            "total_goals_reached": self.total_goals_reached,
-            "success_rate": (
-                self.total_goals_reached
-                / max(self.total_episodes, 1)
-            ),
-            "alpha_type": round(self.alpha_type, 4),
-            "alpha_param": round(self.alpha_param, 4),
-            "bc_lambda": round(self.bc_lambda, 6),
-            "buffer_size": len(self.buffer),
             "mesh_stats": dict(self._mesh_stats),
         }
-    
+        
     def _apply_action_masks(
         self,
         action_type: int,
@@ -1311,7 +1401,7 @@ class PSACTrainer:
         promote_threshold: float = 0.5,
         promote_window: int = 100,
         episode_pools: dict[str, Any] | None = None,
-        visualise: bool = False,
+        visualise = None,
         mesh_name: str = "",
     ) -> None:
         """Run SAC training loop with strategic override."""
@@ -1328,10 +1418,13 @@ class PSACTrainer:
                 output_dir=Path(save_dir),
                 mesh_name=mesh_name,
                 stage="sac_train",
+                max_per_type_per_level=5,  # больше для debug
+                timeout_frame_interval=50,  # чаще кадры для 
+                visualize_mode=visualise
             )
 
         curr_level = 0
-        success_window: list[bool] = []
+        success_window: deque[bool] = deque(maxlen=promote_window)
         rolling_history: deque[bool] = deque(maxlen=200)
         best_rolling_rate = 0.0
         best_eval_rate = 0.0
@@ -1722,9 +1815,61 @@ class PSACTrainer:
                     if strategic_type is not None
                     else ""
                 )
+
+                # ═══ Detailed action explanation ═══
+                phase = getattr(
+                    controller, "_current_phase",
+                    "UNKNOWN",
+                )
+                on_obj = "S" if state_raw[11] > 0.5 else "A"
+
+                param_str = ""
+                if action_type == 0:
+                    # MoveTangentially: angle + step
+                    sin_a = float(action_params[0])
+                    cos_a = float(action_params[1])
+                    angle = float(
+                        np.degrees(
+                            np.arctan2(sin_a, cos_a)
+                        )
+                    )
+                    step_sz = float(action_params[2])
+                    param_str = (
+                        f"ang={angle:.0f}° "
+                        f"step={step_sz:.1f}"
+                    )
+                elif action_type == 1:
+                    # MoveLinear: distance
+                    param_str = (
+                        f"dist={float(action_params[0]):.1f}"
+                    )
+                elif action_type in (2, 3, 4):
+                    # Turn/Look/SensorRotate: angle
+                    sin_a = float(action_params[0])
+                    cos_a = float(action_params[1])
+                    rot_angle = float(
+                        np.degrees(
+                            np.arctan2(sin_a, cos_a)
+                        )
+                    )
+                    param_str = f"rot={rot_angle:.1f}°"
+                elif action_type == 7:
+                    param_str = "detach"
+
+                # Progress info
+                progress = prev_distance - distance
+                progress_str = (
+                    f"+{progress:.1f}"
+                    if progress > 0
+                    else f"{progress:.1f}"
+                )
+
                 action_explanations.append(
-                    f"SAC{source_tag}: {act_name}, "
-                    f"dist={distance:.1f}mm"
+                    f"{on_obj}|{phase}|"
+                    f"{act_name}({param_str})|"
+                    f"d={distance:.1f} "
+                    f"Δ={progress_str}|"
+                    f"SAC{source_tag}"
                 )
 
                 action_params_norm = (
@@ -1847,21 +1992,75 @@ class PSACTrainer:
                         mesh_name=mesh_name,
                     )
 
-            if visualizer:
-                if (
-                    (episode + 1) % log_interval
-                ) <= 0 and (
-                    episode + 1
-                ) >= log_interval:
-                    visualizer.save_episode(
-                        env=env,
-                        episode=episode,
-                        level=curr_level,
-                        result=ep_result,
-                        goal_pose=goal_pose,
-                        poses=current_poses,
-                        actions=action_explanations,
+            # ═══ Per-level tracking ═══
+            lvl = curr_level
+            self._level_episodes[lvl] = (
+                self._level_episodes.get(lvl, 0) + 1
+            )
+            if lvl not in self._level_steps:
+                self._level_steps[lvl] = []
+                self._level_success_steps[lvl] = []
+                self._level_rewards[lvl] = []
+                self._level_action_counts[lvl] = {}
+                self._level_collision_counts[lvl] = {}
+                self._level_goals[lvl] = 0
+                self._level_collisions[lvl] = 0
+                self._level_timeouts[lvl] = 0
+
+            self._level_steps[lvl].append(step + 1)
+            self._level_rewards[lvl].append(
+                episode_reward
+            )
+
+            if episode_success:
+                self._level_goals[lvl] = (
+                    self._level_goals.get(lvl, 0) + 1
+                )
+                self._level_success_steps[lvl].append(
+                    step + 1
+                )
+            elif ep_result == "collision":
+                self._level_collisions[lvl] = (
+                    self._level_collisions.get(lvl, 0)
+                    + 1
+                )
+            elif ep_result == "timeout":
+                self._level_timeouts[lvl] = (
+                    self._level_timeouts.get(lvl, 0)
+                    + 1
+                )
+
+            # Per-level action counts from this episode
+            for s, at, ap, r, ns, d in ep_transitions:
+                self._level_action_counts[lvl][at] = (
+                    self._level_action_counts[lvl]
+                    .get(at, 0) + 1
+                )
+
+            # Per-level collision counts
+            if ep_result == "collision":
+                # Last action caused collision
+                if ep_transitions:
+                    col_at = ep_transitions[-1][1]
+                    self._level_collision_counts[lvl][
+                        col_at
+                    ] = (
+                        self._level_collision_counts[
+                            lvl
+                        ].get(col_at, 0)
+                        + 1
                     )
+
+            if visualizer:
+                visualizer.save_episode(
+                    env=env,
+                    episode=episode,
+                    level=curr_level,
+                    result=ep_result,
+                    goal_pose=goal_pose,
+                    poses=current_poses,
+                    actions=action_explanations,
+                )
 
             # Strategic SAC update (only when enabled)
             if self.use_strategic_override:
@@ -2011,19 +2210,14 @@ class PSACTrainer:
             if curriculum_levels:
                 success_window.append(episode_success)
                 if (
-                    len(success_window)
-                    == promote_window
-                    and curr_level
-                    < len(curriculum_levels) - 1
+                    len(success_window) == promote_window
+                    and curr_level < len(curriculum_levels) - 1
                     and episode >= actor_warmup_until
                 ):
-                    rate = (
-                        sum(success_window)
-                        / promote_window
-                    )
+                    rate = sum(success_window) / promote_window
                     if rate >= promote_threshold:
                         curr_level += 1
-                        success_window = []
+                        success_window = deque(maxlen=promote_window)
                         actor_warmup_until = (
                             episode
                             + self
