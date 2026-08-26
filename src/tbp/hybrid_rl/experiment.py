@@ -2217,13 +2217,7 @@ class RLGoalApproachExperiment:
                                     )
                                 )
                             atype = at[0].item()
-                            aparams = (
-                                ap[0].numpy()
-                                * sac_trainer
-                                .param_std
-                                + sac_trainer
-                                .param_mean
-                            )
+                            aparams = ap[0].numpy()
 
                             # Action masks
                             atype, aparams = (

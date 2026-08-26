@@ -342,7 +342,10 @@ class Arbitrator:
     ) -> Tuple[int, np.ndarray]:
         state_norm = state
         if self.state_mean is not None:
-            state_norm = (state - self.state_mean) / (self.state_std + 1e-8)
+            state_norm = (
+                (state - self.state_mean)
+                / (self.state_std + 1e-8)
+            )
 
         on_object = state[11] > 0.5
 
@@ -352,46 +355,104 @@ class Arbitrator:
                 state_norm.astype(np.float32)
             ).unsqueeze(0)
 
-            type_logits, param_mus, param_log_stds = self.sac_actor(state_t)
+            # ═══ Use sample_eval with masks ═══
+            # First get logits for masking
+            type_logits, _, _ = self.sac_actor(
+                state_t
+            )
 
             if not on_object:
                 type_logits[0, 0] = -1e9
                 type_logits[0, 7] = -1e9
             if on_object:
                 type_logits[0, 1] = -1e9
-            if self.controller._consecutive_detach_count >= 3:
+            if (
+                self.controller
+                ._consecutive_detach_count >= 3
+            ):
                 type_logits[0, 7] = -1e9
 
             temperature = 0.3
-            type_probs = torch.softmax(type_logits / temperature, dim=-1)
+            type_probs = torch.softmax(
+                type_logits / temperature, dim=-1
+            )
             type_probs = type_probs.clamp(min=1e-8)
-            type_probs = type_probs / type_probs.sum(dim=-1, keepdim=True)
-            type_dist = torch.distributions.Categorical(type_probs)
+            type_probs = type_probs / type_probs.sum(
+                dim=-1, keepdim=True
+            )
+            type_dist = (
+                torch.distributions.Categorical(
+                    type_probs
+                )
+            )
             action_type_t = type_dist.sample()
             action_type = action_type_t[0].item()
 
-            dim = self._param_dims.get(action_type, 0)
-            if (
-                dim > 0
-                and action_type in param_mus
-                and self.param_mean is not None
-            ):
-                mu = param_mus[action_type][0]
-                log_std = param_log_stds[action_type][0]
-                std = (log_std.exp() * temperature).clamp(min=1e-6)
-                normal = torch.distributions.Normal(mu, std)
-                params_sample = normal.rsample().numpy()
-                params = (
-                    params_sample[:dim] * self.param_std[:dim]
-                    + self.param_mean[:dim]
+            # ═══ Get params via sample_eval ═══
+            # sample_eval returns squashed+scaled
+            _, ap, _, _ = (
+                self.sac_actor.sample_eval(
+                    state_t, temperature=temperature
                 )
-                padded = np.zeros(3, dtype=np.float32)
-                padded[:dim] = params
+            )
+            # But type was sampled with masks above,
+            # so get params for that specific type
+            dim = self._param_dims.get(
+                action_type, 0
+            )
+            if dim > 0:
+                # Re-extract params for chosen type
+                # from forward + squash
+                _, param_mus, param_log_stds = (
+                    self.sac_actor(state_t)
+                )
+                if action_type in param_mus:
+                    mu = param_mus[action_type][0]
+                    log_std = param_log_stds[
+                        action_type
+                    ][0]
+                    std = (
+                        log_std.exp() * temperature
+                    ).clamp(min=1e-6)
+                    normal = (
+                        torch.distributions.Normal(
+                            mu, std
+                        )
+                    )
+                    raw_sample = normal.rsample()
+                    squashed = torch.tanh(raw_sample)
+
+                    scale, center = (
+                        self.sac_actor
+                        ._get_scale_center(
+                            action_type
+                        )
+                    )
+                    if scale is not None:
+                        scaled = (
+                            squashed * scale[:dim]
+                            + center[:dim]
+                        )
+                    else:
+                        scaled = squashed
+
+                    padded = np.zeros(
+                        3, dtype=np.float32
+                    )
+                    padded[:dim] = (
+                        scaled.numpy()
+                    )
+                else:
+                    padded = np.zeros(
+                        3, dtype=np.float32
+                    )
             else:
-                padded = np.zeros(3, dtype=np.float32)
+                padded = np.zeros(
+                    3, dtype=np.float32
+                )
 
         return action_type, padded
-
+    
     def _get_sac_params_for_type(
         self, state: np.ndarray, forced_type: int
     ) -> np.ndarray:
@@ -415,10 +476,24 @@ class Arbitrator:
                 and forced_type in param_mus
                 and self.param_mean is not None
             ):
-                raw = param_mus[forced_type][0].numpy()
-                params = (
-                    raw[:dim] * self.param_std[:dim] + self.param_mean[:dim]
+                raw_mu = param_mus[forced_type][0]
+                squashed = torch.tanh(raw_mu)
+                # Need to import ACTION_PARAM_BOUNDS
+                from .sac_actor import ACTION_PARAM_BOUNDS
+                bounds = ACTION_PARAM_BOUNDS.get(
+                    forced_type, []
                 )
+                if bounds:
+                    for i, (lo, hi) in enumerate(
+                        bounds[:dim]
+                    ):
+                        center = (hi + lo) / 2.0
+                        scale = (hi - lo) / 2.0
+                        squashed[i] = (
+                            squashed[i] * scale
+                            + center
+                        )
+                params = squashed.numpy()[:dim]
                 padded = np.zeros(3, dtype=np.float32)
                 padded[:dim] = params
                 return padded

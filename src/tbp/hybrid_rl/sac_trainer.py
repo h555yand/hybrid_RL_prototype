@@ -438,40 +438,45 @@ class PSACTrainer:
         )
 
     def _normalize_bc_transitions(
-        self, transitions: list[PSACTransition]
-    ) -> list[PSACTransition]:
+        self, transitions
+    ):
         normalized = []
         for tr in transitions:
-            norm_state = self.normalize_state(tr.state)
+            norm_state = self.normalize_state(
+                tr.state
+            )
             norm_next = (
                 self.normalize_state(tr.next_state)
                 if tr.next_state is not None
                 else None
             )
-            norm_params = (
-                tr.action_params
-                - self.param_mean[:len(tr.action_params)]
-            ) / (self.param_std[:len(tr.action_params)] + 1e-8)
+            # ═══ Params: keep as-is (real scale) ═══
             padded_params = np.zeros(
                 self.max_params, dtype=np.float32
             )
-            padded_params[:len(norm_params)] = norm_params
-            normalized.append(PSACTransition(
-                state=norm_state.astype(np.float32),
-                action_type=tr.action_type,
-                action_params=padded_params,
-                reward=tr.reward,
-                next_state=(
-                    norm_next.astype(np.float32)
-                    if norm_next is not None
-                    else None
-                ),
-                done=tr.done,
-                mesh_id=tr.mesh_id,  # ← ДОБАВИТЬ
-                level=tr.level,      # ← ДОБАВИТЬ
-            ))
+            padded_params[
+                : len(tr.action_params)
+            ] = tr.action_params
+            normalized.append(
+                PSACTransition(
+                    state=norm_state.astype(
+                        np.float32
+                    ),
+                    action_type=tr.action_type,
+                    action_params=padded_params,
+                    reward=tr.reward,
+                    next_state=(
+                        norm_next.astype(np.float32)
+                        if norm_next is not None
+                        else None
+                    ),
+                    done=tr.done,
+                    mesh_id=tr.mesh_id,
+                    level=tr.level,
+                )
+            )
         return normalized
-
+    
     def normalize_state(
         self, state: np.ndarray
     ) -> np.ndarray:
@@ -773,8 +778,7 @@ class PSACTrainer:
                 for i in bc_indices
             ])
             bc_params = torch.FloatTensor(
-                (bc_params_raw - self.param_mean)
-                / (self.param_std + 1e-8)
+                bc_params_raw
             )
 
             type_logits, param_mus, _ = self.actor(bc_states)
@@ -789,10 +793,26 @@ class PSACTrainer:
                 mask = bc_types == type_id
                 if mask.sum() == 0:
                     continue
-                pred = param_mus[type_id][mask]
-                target = bc_params[mask, :dim]
+                pred_mu = param_mus[type_id][mask]
+                target_raw = bc_params[mask, :dim]
+                # Scale target to [-1,1] then atanh
+                scale = self.actor._scales.get(type_id)
+                center = self.actor._centers.get(type_id)
+                if scale is not None:
+                    target_norm = (
+                        (target_raw - center[:dim])
+                        / (scale[:dim] + 1e-8)
+                    )
+                    target_norm = target_norm.clamp(
+                        -0.999, 0.999
+                    )
+                    target_pretanh = torch.atanh(
+                        target_norm
+                    )
+                else:
+                    target_pretanh = target_raw
                 param_loss = param_loss + F.mse_loss(
-                    pred, target
+                    pred_mu, target_pretanh
                 )
 
             bc_loss = type_loss + param_loss
@@ -1004,11 +1024,7 @@ class PSACTrainer:
                             )
                         )
                     action_type = at[0].item()
-                    action_params = (
-                        ap[0].numpy()
-                        * self.param_std
-                        + self.param_mean
-                    )
+                    action_params = ap[0].numpy()
 
                     # ═══ Action masks ═══
                     action_type, action_params = (
@@ -1362,17 +1378,29 @@ class PSACTrainer:
                     ).item()
                 )
                 if action_type in param_mus:
-                    raw_params = (
+                    # Forward gives raw mu, need to
+                    # squash and scale
+                    raw_mu = (
                         param_mus[action_type][0]
-                        .numpy()
                     )
-                    dim = len(raw_params)
+                    squashed = torch.tanh(raw_mu)
+                    scale, center = (
+                        self.actor
+                        ._get_scale_center(
+                            action_type
+                        )
+                    )
+                    dim = len(raw_mu)
+                    if scale is not None:
+                        scaled = (
+                            squashed * scale[:dim]
+                            + center[:dim]
+                        )
+                    else:
+                        scaled = squashed
                     action_params = (
-                        raw_params
-                        * self.param_std[:dim]
-                        + self.param_mean[:dim]
+                        scaled.numpy()
                     )
-                    # Pad to max_params
                     padded = np.zeros(
                         3, dtype=np.float32
                     )
@@ -1717,10 +1745,7 @@ class PSACTrainer:
                             self.actor.sample(state_t)
                         )
                     action_type = at[0].item()
-                    action_params = (
-                        ap[0].numpy() * self.param_std
-                        + self.param_mean
-                    )
+                    action_params = ap[0].numpy()
 
                     # Action masks
                     action_type, action_params = (
@@ -1872,15 +1897,10 @@ class PSACTrainer:
                     f"SAC{source_tag}"
                 )
 
-                action_params_norm = (
-                    (action_params - self.param_mean)
-                    / (self.param_std + 1e-8)
-                )
-
                 # ═══ Add to buffer with mesh_name ═══
                 self.buffer.add(
                     state, action_type,
-                    action_params_norm,
+                    action_params,
                     reward, next_state, done,
                     mesh_name=mesh_name,
                 )
@@ -1889,7 +1909,7 @@ class PSACTrainer:
                 ep_transitions.append((
                     state.copy(),
                     action_type,
-                    action_params_norm.copy(),
+                    action_params.copy(),
                     reward,
                     next_state.copy(),
                     done,
