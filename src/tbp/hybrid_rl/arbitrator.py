@@ -297,7 +297,10 @@ class Arbitrator:
 
         q_score = 0.0
         if q_confidence > 0.1 and q_spread > 0.5:
-            q_score = (0.5 * q_confidence + 0.7) * q_track
+            q_score = min(
+            (0.5 * q_confidence + 0.7) * q_track,
+            q_track,
+        )
 
         sac_score = 0.0
         if has_sac:
