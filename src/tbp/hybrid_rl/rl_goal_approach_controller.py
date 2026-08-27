@@ -31,6 +31,74 @@ from .experience_extractor import ExperienceExtractor
 logger = logging.getLogger(__name__)
 
 
+class RunningQStats:
+    """Welford's online algorithm for tracking Q-value distribution.
+
+    Tracks running mean and variance of Q-values returned by
+    get_q_values across all queries. Used to:
+    - Normalize advantage (Q - V) to a common scale
+    - Compute V_normalized to determine state quality
+    - Decide trust level in Q-values vs heuristic
+
+    The warmup period ensures statistics are stable before use.
+    Before warmup completes, all normalization is identity.
+    """
+
+    def __init__(self, warmup: int = 200):
+        self.mean = 0.0
+        self.var = 1.0
+        self.count = 0
+        self.warmup = warmup
+
+    def update(self, q_values: np.ndarray):
+        """Update running statistics with a new Q-value vector.
+
+        Args:
+            q_values: Q-values array [num_actions] from one query.
+        """
+        for q in q_values:
+            self.count += 1
+            delta = q - self.mean
+            self.mean += delta / self.count
+            delta2 = q - self.mean
+            self.var += (delta * delta2 - self.var) / self.count
+
+    @property
+    def std(self) -> float:
+        return max(np.sqrt(max(self.var, 0.0)), 1e-4)
+
+    @property
+    def is_warmed_up(self) -> bool:
+        return self.count >= self.warmup
+
+    def normalize_value(self, v: float) -> float:
+        """Normalize a single value relative to global Q distribution.
+
+        Args:
+            v: Raw value (typically V = mean of Q-values for a state).
+
+        Returns:
+            Z-score of v relative to global Q distribution.
+            Returns 0.0 if not warmed up.
+        """
+        if not self.is_warmed_up:
+            return 0.0
+        return (v - self.mean) / self.std
+
+    def normalize_advantage(self, advantage: np.ndarray) -> np.ndarray:
+        """Normalize advantage vector by global Q std.
+
+        Args:
+            advantage: Raw advantage array (Q - V).
+
+        Returns:
+            Advantage divided by global std. Identity if not warmed up.
+        """
+        if not self.is_warmed_up:
+            return advantage
+        return advantage / self.std
+
+
 class RLGoalApproachController:
     """Q-learning controller that moves agent toward goal pose.
 
@@ -216,6 +284,9 @@ class RLGoalApproachController:
             "collision_other": 0,
         }
         self.temperature_override = None
+        # Running Q statistics for advantage-based action selection (v2)
+        self._running_q_stats_free = RunningQStats(warmup=200)
+        self._running_q_stats_surface = RunningQStats(warmup=200)
         self._collision_stats = {}
         self._last_detach_sub_steps = 1
         self._consecutive_detach_count = 0
@@ -402,12 +473,22 @@ class RLGoalApproachController:
                 self._on_episode_done(state, termination_reason)
                 return None, None
 
-        action_index, explanation = self._choose_action(
-            state=state,
-            current_pose=current_pose,
-            sensor_data=sensor_data,
-            explain=True,
-        )
+        if self.config.get(
+            "action_selection_version", "v1"
+        ) == "v2":
+            action_index, explanation = self._choose_action_v2(
+                state=state,
+                current_pose=current_pose,
+                sensor_data=sensor_data,
+                explain=True,
+            )
+        else:
+            action_index, explanation = self._choose_action(
+                state=state,
+                current_pose=current_pose,
+                sensor_data=sensor_data,
+                explain=True,
+            )
 
         self._prev_state = state
         self._prev_sensor_data = sensor_data
@@ -2111,7 +2192,667 @@ class RLGoalApproachController:
             f"Q recommends: {q_action_name} - {q_recommends}; "
             f"Heuristics: {h_action_name} - {h_recommends}. "
         )
-    
+
+    def _choose_action_v2(
+        self,
+        state: np.ndarray,
+        current_pose: np.ndarray,
+        sensor_data: Dict[str, Any],
+        explain: bool = False,
+    ):
+        """Action selection with advantage-based Q/heuristic blending.
+
+        Key differences from v1 (_choose_action):
+
+        1. No min-max normalization — preserves absolute Q scale.
+           v1 uses _normalize_values (min-max to [-1,+1]) which destroys
+           information about whether Q-values are globally good or bad.
+           "Best of terrible" looks identical to "best of excellent".
+
+        2. Advantage decomposition: Q(s,a) = V(s) + A(s,a)
+           V = mean(Q) = how good is this state overall
+           A = Q - V = how much better is this action than average
+           Only A is used for action ranking. V controls trust.
+
+        3. V-baseline controls Q trust:
+           V >> global_mean → state is well-known and good → trust Q
+           V << global_mean → state is bad/unknown → trust heuristic
+           This prevents "best of worst" problem.
+
+        4. Confidence from HNSW store:
+           proximity × experience × consistency
+           Low confidence → more heuristic, higher temperature
+
+        5. Epsilon role changed:
+           v1: epsilon = blend ratio between Q and heuristic
+           v2: epsilon = exploration noise (random prob + temperature)
+           Trust in Q is determined by data quality, not by schedule.
+
+        Blend formula:
+            q_trust = confidence × q_quality(V_normalized)
+            combined = q_trust × A_norm + (1 - q_trust) × h_norm
+            action ~ softmax(combined / temperature)
+
+        Temperature:
+            T = base × (0.1 + 0.9 × eps) × (1 - q_trust)
+            High eps or low trust → high T → more exploration
+            Low eps and high trust → low T → greedy exploitation
+        """
+        store = self._select_store(state)
+        running_stats = (
+            self._running_q_stats_surface
+            if state[11] > 0.5
+            else self._running_q_stats_free
+        )
+
+        # ═══ GET Q-VALUES WITH CONFIDENCE ═══
+        q_values, confidence_info = (
+            store.get_q_values_with_confidence(state)
+        )
+        confidence = confidence_info["overall"]
+
+        # Update running statistics (skip zero vectors — no data)
+        if np.max(np.abs(q_values)) > 1e-8:
+            running_stats.update(q_values)
+
+        # ═══ COMPUTE ADVANTAGE ═══
+        V = float(np.mean(q_values))
+        A = q_values - V
+
+        # ═══ HEURISTIC ═══
+        heuristic, heuristic_components = (
+            self._compute_heuristic_bias(
+                state=state,
+                current_pose=current_pose,
+                sensor_data=sensor_data,
+                prev_action=self._last_action,
+            )
+        )
+
+        # ═══ NORMALIZE BOTH TO COMPARABLE SCALE ═══
+        if running_stats.is_warmed_up:
+            A_norm = running_stats.normalize_advantage(A)
+        else:
+            A_norm = A
+
+        h_std = float(np.std(heuristic))
+        if h_std > 1e-8:
+            h_norm = (heuristic - np.mean(heuristic)) / h_std
+        else:
+            h_norm = np.zeros_like(heuristic)
+
+        # ═══ COMPUTE Q-TRUST ═══
+        has_q_data = (
+            store.next_id > 0
+            and np.max(np.abs(q_values)) > 1e-6
+        )
+
+        if has_q_data and running_stats.is_warmed_up:
+            V_norm = running_stats.normalize_value(V)
+            q_quality = float(
+                np.clip(0.5 + 0.3 * V_norm, 0.05, 0.95)
+            )
+            q_trust = confidence * q_quality
+        elif has_q_data:
+            q_trust = confidence * 0.5
+        else:
+            q_trust = 0.0
+
+        q_trust = float(np.clip(q_trust, 0.0, 0.95))
+
+        # ═══ BLEND ═══
+        combined = q_trust * A_norm + (1.0 - q_trust) * h_norm
+
+        # ═══ EPSILON → EXPLORATION NOISE ═══
+        eps = self._get_current_epsilon()
+
+        base_temperature = 0.5
+        trust_factor = float(max(1.0 - q_trust, 0.3))
+        temperature = (
+            base_temperature
+            * (0.1 + 0.9 * eps)
+            * trust_factor
+        )
+        temperature = float(np.clip(temperature, 0.01, 2.0))
+
+        # Warmup: pure heuristic with greedy selection
+        warmup_episodes = int(
+            self.config.get("warmup_episodes", 0)
+        )
+        if (
+            warmup_episodes > 0
+            and self._total_episodes <= warmup_episodes
+        ):
+            combined = h_norm.copy()
+            temperature = 0.001
+            q_trust = 0.0
+
+        if self.temperature_override is not None:
+            temperature = self.temperature_override
+
+        # ═══ ACTION MASK ═══
+        combined = self.apply_action_mask(combined, state)
+
+        is_random_override = False
+        is_strategic_override = False
+        action_index = None
+        strategic_source = None
+
+        # ═══ STRATEGIC LEVEL (unchanged from v1) ═══
+        current_phase = getattr(
+            self, "_current_phase", "CRAWL_TO_GOAL"
+        )
+        on_object = state[11] > 0.5
+
+        self._episode_phase_counts[current_phase] = (
+            self._episode_phase_counts.get(
+                current_phase, 0
+            )
+            + 1
+        )
+
+        s_eps = self.strategic_epsilon
+        cfg = self.config
+
+        if on_object:
+            same_side = sensor_data.get("same_side", True)
+            path_blocked = sensor_data.get(
+                "path_blocked", False
+            )
+
+            t_state = (
+                self._compute_detach_transition_state(
+                    state,
+                    sensor_data,
+                    movement_efficiency=(
+                        self._compute_movement_efficiency(
+                            window=20
+                        )
+                    ),
+                )
+            )
+            strategic_q = (
+                self.strategic_detach.get_q_values(t_state)
+            )
+            strategic_h = (
+                self._compute_strategic_heuristic(
+                    current_phase, on_object=True
+                )
+            )
+
+            has_data = (
+                self.strategic_detach.next_id > 0
+                and np.max(np.abs(strategic_q)) > 1e-6
+            )
+            if has_data:
+                sq_norm = self._normalize_values(
+                    strategic_q
+                )
+                sh_norm = self._normalize_values(
+                    strategic_h
+                )
+                strategic_combined = (
+                    (1 - s_eps) * sq_norm
+                    + s_eps * sh_norm
+                )
+            else:
+                strategic_combined = strategic_h.copy()
+
+            should_switch = (
+                strategic_combined[1]
+                > strategic_combined[0]
+            )
+
+            if (
+                should_switch
+                and self._can_detach(state)
+                and (not same_side or path_blocked)
+            ):
+                action_index = (
+                    self.action_space.IDX_DETACH
+                )
+                strategic_source = (
+                    f"detach_switch("
+                    f"q=[{strategic_q[0]:.2f},"
+                    f"{strategic_q[1]:.2f}],"
+                    f"h=[{strategic_h[0]:.1f},"
+                    f"{strategic_h[1]:.1f}],"
+                    f"eps={s_eps:.2f})"
+                )
+                self._strategic_stats[
+                    "detach_memory_triggered"
+                ] += 1
+
+                self._pending_strategic_detach.append(
+                    {
+                        "state": t_state.copy(),
+                        "step": len(
+                            self._episode_transitions
+                        ),
+                        "phase_was_detach_needed": (
+                            current_phase
+                            == "DETACH_NEEDED"
+                        ),
+                        "same_side_before": same_side,
+                        "path_blocked_before": (
+                            path_blocked
+                        ),
+                        "dist_before": float(
+                            state[13]
+                        ),
+                    }
+                )
+            else:
+                if not same_side or path_blocked:
+                    strategic_source = (
+                        f"detach_stay("
+                        f"q=[{strategic_q[0]:.2f},"
+                        f"{strategic_q[1]:.2f}],"
+                        f"eps={s_eps:.2f})"
+                    )
+                    self._strategic_stats[
+                        "detach_heuristic_fallback"
+                    ] += 1
+
+        elif not on_object:
+            d_state = (
+                self._compute_direction_transition_state(
+                    state, sensor_data, current_pose
+                )
+            )
+            strategic_q = (
+                self.strategic_direction.get_q_values(
+                    d_state
+                )
+            )
+
+            path_blocked = sensor_data.get(
+                "path_blocked", False
+            )
+
+            strategic_h = np.zeros(2)
+            if path_blocked:
+                strategic_h[1] += 3.0
+                strategic_h[0] -= 1.0
+            else:
+                strategic_h[0] += 3.0
+                strategic_h[1] -= 3.0
+
+            has_data = (
+                self.strategic_direction.next_id > 0
+                and np.max(np.abs(strategic_q)) > 1e-6
+            )
+            if has_data:
+                sq_norm = self._normalize_values(
+                    strategic_q
+                )
+                sh_norm = self._normalize_values(
+                    strategic_h
+                )
+                dir_combined = (
+                    (1 - s_eps) * sq_norm
+                    + s_eps * sh_norm
+                )
+            else:
+                dir_combined = strategic_h.copy()
+
+            should_bypass = (
+                dir_combined[1] > dir_combined[0]
+            )
+
+            if should_bypass:
+                if self._current_phase != "FLY_TO_EDGE":
+                    self._current_phase = "FLY_TO_EDGE"
+                strategic_source = (
+                    f"direction_bypass("
+                    f"q=[{strategic_q[0]:.2f},"
+                    f"{strategic_q[1]:.2f}],"
+                    f"h=[{strategic_h[0]:.1f},"
+                    f"{strategic_h[1]:.1f}],"
+                    f"eps={s_eps:.2f})"
+                )
+                self._strategic_stats[
+                    "direction_memory_keep_edge"
+                ] += 1
+            else:
+                if (
+                    self._current_phase
+                    == "FLY_TO_EDGE"
+                ):
+                    self._current_phase = "FLY_TO_GOAL"
+                    self._cached_fly_direction = None
+                strategic_source = (
+                    f"direction_goal("
+                    f"q=[{strategic_q[0]:.2f},"
+                    f"{strategic_q[1]:.2f}],"
+                    f"h=[{strategic_h[0]:.1f},"
+                    f"{strategic_h[1]:.1f}],"
+                    f"eps={s_eps:.2f})"
+                )
+                self._strategic_stats[
+                    "direction_memory_to_goal"
+                ] += 1
+
+            if not path_blocked:
+                self._path_clear_streak += 1
+            else:
+                self._path_clear_streak = 0
+
+        self._prev_phase = current_phase
+
+        # ═══ SOFTMAX SAMPLING (tactical level) ═══
+        if action_index is None:
+            p_random = 0.05 * eps
+
+            if np.random.random() < p_random:
+                is_random_override = True
+                valid_mask = np.ones(
+                    self.num_actions, dtype=bool
+                )
+                masked_check = self.apply_action_mask(
+                    np.zeros(self.num_actions), state
+                )
+                valid_mask[masked_check < -1e8] = False
+                if (
+                    state[11] > 0.5
+                    and state[13]
+                    < 5.0
+                    * self.action_space.surface_step
+                ):
+                    valid_mask[
+                        self.action_space.IDX_DETACH
+                    ] = False
+
+                valid_indices = np.where(valid_mask)[0]
+                action_index = int(
+                    np.random.choice(valid_indices)
+                )
+                probs = np.zeros(self.num_actions)
+                probs[action_index] = 1.0
+            else:
+                v = combined / temperature
+                v = v - np.max(v)
+                exp_v = np.exp(v)
+                probs = exp_v / exp_v.sum()
+                action_index = int(
+                    np.random.choice(len(probs), p=probs)
+                )
+        else:
+            probs = np.zeros(self.num_actions)
+            probs[action_index] = 1.0
+
+        # ═══ RECORD PENDING TRANSITIONS ═══
+        if (
+            action_index == self.action_space.IDX_DETACH
+            and on_object
+        ):
+            already_recorded = (
+                self._pending_strategic_detach
+                and self._pending_strategic_detach[-1][
+                    "step"
+                ]
+                == len(self._episode_transitions)
+            )
+            if not already_recorded:
+                same_side = sensor_data.get(
+                    "same_side", True
+                )
+                path_blocked = sensor_data.get(
+                    "path_blocked", False
+                )
+                t_state = (
+                    self._compute_detach_transition_state(
+                        state,
+                        sensor_data,
+                        movement_efficiency=(
+                            self._compute_movement_efficiency(
+                                window=20
+                            )
+                        ),
+                    )
+                )
+                self._pending_strategic_detach.append(
+                    {
+                        "state": t_state.copy(),
+                        "step": len(
+                            self._episode_transitions
+                        ),
+                        "phase_was_detach_needed": (
+                            current_phase
+                            == "DETACH_NEEDED"
+                        ),
+                        "same_side_before": same_side,
+                        "path_blocked_before": (
+                            path_blocked
+                        ),
+                        "dist_before": float(
+                            state[13]
+                        ),
+                    }
+                )
+
+        self._prev_phase = current_phase
+
+        # ═══ DETACH COUNTER ═══
+        chosen_name = self.action_space.get_info(
+            action_index
+        ).name
+        if chosen_name == "detach":
+            self._consecutive_detach_count += 1
+        else:
+            self._consecutive_detach_count = 0
+
+        if not explain:
+            return action_index, None
+
+        # ═══ EXPLANATION ═══
+        best_q_action = int(np.argmax(q_values))
+        best_h_action = int(np.argmax(heuristic))
+
+        contributions = {
+            name: float(np.max(bias))
+            for name, bias in heuristic_components.items()
+        }
+        dominant_heuristic = (
+            max(contributions, key=contributions.get)
+            if contributions
+            else "none"
+        )
+
+        prob_of_chosen = float(probs[action_index])
+
+        V_norm_val = (
+            round(
+                running_stats.normalize_value(V), 3
+            )
+            if running_stats.is_warmed_up
+            else None
+        )
+
+        explanation = {
+            "chosen_action": {
+                "index": action_index,
+                "name": self.action_space.get_info(
+                    action_index
+                ).name,
+                "probability": prob_of_chosen,
+            },
+            "sampling_method": (
+                "strategic_override"
+                if is_strategic_override
+                else "random_exploration"
+                if is_random_override
+                else "softmax_sampling"
+            ),
+            "strategic_source": strategic_source,
+            "temperature": temperature,
+            "epsilon": eps,
+            "has_q_data": has_q_data,
+            "q_trust": round(q_trust, 3),
+            "confidence": confidence_info,
+            "V_baseline": round(V, 4),
+            "V_normalized": V_norm_val,
+            "advantage_range": [
+                round(float(np.min(A)), 4),
+                round(float(np.max(A)), 4),
+            ],
+            "running_q_mean": round(
+                running_stats.mean, 4
+            ),
+            "running_q_std": round(
+                running_stats.std, 4
+            ),
+            "blend": (
+                f"{q_trust*100:.0f}% Q-advantage + "
+                f"{(1-q_trust)*100:.0f}% heuristic"
+            ),
+            "is_random_override": is_random_override,
+            "action_probabilities": {
+                self.action_space.get_info(i).name: float(
+                    probs[i]
+                )
+                for i in range(self.num_actions)
+            },
+            "advice": {
+                "q_recommends": {
+                    "index": best_q_action,
+                    "name": self.action_space.get_info(
+                        best_q_action
+                    ).name,
+                },
+                "heuristic_recommends": {
+                    "index": best_h_action,
+                    "name": self.action_space.get_info(
+                        best_h_action
+                    ).name,
+                },
+            },
+            "dominant_heuristic": dominant_heuristic,
+            "heuristic_contributions": contributions,
+            "confidence_detail": confidence_info,
+            "is_confident": prob_of_chosen > 0.7,
+            "interpretation": "",
+        }
+
+        # ═══ INTERPRETATION STRING ═══
+        trust_desc = (
+            "high"
+            if q_trust > 0.6
+            else "medium"
+            if q_trust > 0.3
+            else "low"
+        )
+        v_desc = (
+            "good"
+            if V > 0.5
+            else "neutral"
+            if V > -0.5
+            else "bad"
+        )
+
+        if is_random_override:
+            interp = (
+                f"##### Random: {chosen_name} "
+                f"- {action_index} "
+                f"epsilon {eps}."
+            )
+        elif is_strategic_override:
+            interp = (
+                f"##### Strategic: {chosen_name} "
+                f"- {action_index} "
+                f"epsilon {eps}."
+            )
+        else:
+            q_action_name = (
+                self.action_space.get_info(
+                    best_q_action
+                ).name
+            )
+            h_action_name = (
+                self.action_space.get_info(
+                    best_h_action
+                ).name
+            )
+            interp = (
+                f"##### Softmax: {chosen_name}, "
+                f"prob={prob_of_chosen:.0%}, "
+                f"T={temperature:.3f}. "
+                f"Q-trust={q_trust:.0%} "
+                f"({trust_desc}), "
+                f"V={V:.2f} ({v_desc}). "
+                f"Q→{q_action_name}, "
+                f"H→{h_action_name} "
+                f"(dominant: {dominant_heuristic})."
+            )
+
+        # ═══ DEBUG PREFIX ═══
+        same_side = sensor_data.get("same_side", True)
+        path_blocked = sensor_data.get(
+            "path_blocked", False
+        )
+        depth = sensor_data.get("depth", 100.0)
+
+        subgoal_str = ""
+        if (
+            getattr(
+                self, "_current_subgoal_dir", None
+            )
+            is not None
+        ):
+            sd = self._current_subgoal_dir
+            subgoal_str = (
+                f"|sd=[{sd[0]:.2f},"
+                f"{sd[1]:.2f},{sd[2]:.2f}]"
+            )
+
+        normal_str = ""
+        pn = sensor_data.get("point_normal")
+        if pn is not None:
+            normal_str = (
+                f"|n=[{pn[0]:.2f},"
+                f"{pn[1]:.2f},{pn[2]:.2f}]"
+            )
+
+        pos_str = (
+            f"|pos=[{current_pose[0]:.1f},"
+            f"{current_pose[1]:.1f},"
+            f"{current_pose[2]:.1f}]"
+        )
+
+        debug_prefix = (
+            f"[phase={current_phase}|"
+            f"ss={int(same_side)}|"
+            f"pb={int(path_blocked)}|"
+            f"d={depth:.1f}"
+            f"|al={float(state[12]):.2f}"
+            f"|qt={q_trust:.2f}"
+            f"|V={V:.2f}"
+            f"|T={temperature:.3f}"
+            f"{subgoal_str}"
+            f"{normal_str}"
+            f"{pos_str}]"
+        )
+
+        if strategic_source:
+            debug_prefix += (
+                f"[strat={strategic_source}]"
+            )
+
+        explanation["interpretation"] = (
+            f"[phase={current_phase}] "
+            + debug_prefix
+            + " "
+            + interp
+        )
+
+        if strategic_source:
+            explanation["interpretation"] = (
+                f"[strategic={strategic_source}] "
+                + explanation["interpretation"]
+            )
+
+        return action_index, explanation
+
     def _choose_action(
         self,
         state: np.ndarray,
@@ -5583,7 +6324,47 @@ class RLGoalApproachController:
                 ]
             ),
         }
-
+        # v2 action selection diagnostics
+        if (
+            self.config.get(
+                "action_selection_version", "v1"
+            )
+            == "v2"
+        ):
+            stats["action_selection_v2"] = {
+                "running_q_free": {
+                    "mean": round(
+                        self._running_q_stats_free.mean,
+                        4,
+                    ),
+                    "std": round(
+                        self._running_q_stats_free.std,
+                        4,
+                    ),
+                    "count": (
+                        self._running_q_stats_free.count
+                    ),
+                    "is_warmed_up": (
+                        self._running_q_stats_free.is_warmed_up
+                    ),
+                },
+                "running_q_surface": {
+                    "mean": round(
+                        self._running_q_stats_surface.mean,
+                        4,
+                    ),
+                    "std": round(
+                        self._running_q_stats_surface.std,
+                        4,
+                    ),
+                    "count": (
+                        self._running_q_stats_surface.count
+                    ),
+                    "is_warmed_up": (
+                        self._running_q_stats_surface.is_warmed_up
+                    ),
+                },
+            }
         return stats
 
     def update_only(self, current_pose, sensor_data, action_index):
@@ -5707,6 +6488,34 @@ class RLGoalApproachController:
                 os.path.join(dirpath, "strategic_sac")
             )
 
+        # Save running Q statistics (v2)
+        running_q = {
+            "free_mean": np.array(
+                [self._running_q_stats_free.mean]
+            ),
+            "free_var": np.array(
+                [self._running_q_stats_free.var]
+            ),
+            "free_count": np.array(
+                [self._running_q_stats_free.count]
+            ),
+            "surface_mean": np.array(
+                [self._running_q_stats_surface.mean]
+            ),
+            "surface_var": np.array(
+                [self._running_q_stats_surface.var]
+            ),
+            "surface_count": np.array(
+                [self._running_q_stats_surface.count]
+            ),
+        }
+        np.savez(
+            os.path.join(
+                dirpath, "running_q_stats.npz"
+            ),
+            **running_q,
+        )
+
         logger.info("Controller saved to %s", dirpath)
 
     @classmethod
@@ -5802,6 +6611,55 @@ class RLGoalApproachController:
             controller.strategic_sac = StrategicSAC.load(
                 strategic_sac_path
             )
+
+        # Load running Q statistics (v2)
+        rq_path = os.path.join(
+            dirpath, "running_q_stats.npz"
+        )
+        if pathlib.Path(rq_path).exists():
+            try:
+                rq = np.load(
+                    rq_path, allow_pickle=False
+                )
+                controller._running_q_stats_free.mean = float(
+                    rq["free_mean"][0]
+                )
+                controller._running_q_stats_free.var = float(
+                    rq["free_var"][0]
+                )
+                controller._running_q_stats_free.count = int(
+                    rq["free_count"][0]
+                )
+                controller._running_q_stats_surface.mean = float(
+                    rq["surface_mean"][0]
+                )
+                controller._running_q_stats_surface.var = float(
+                    rq["surface_var"][0]
+                )
+                controller._running_q_stats_surface.count = int(
+                    rq["surface_count"][0]
+                )
+                logger.info(
+                    f"Loaded running Q stats: "
+                    f"free(mean="
+                    f"{controller._running_q_stats_free.mean:.3f}"
+                    f", std="
+                    f"{controller._running_q_stats_free.std:.3f}"
+                    f", n="
+                    f"{controller._running_q_stats_free.count}"
+                    f"), surface(mean="
+                    f"{controller._running_q_stats_surface.mean:.3f}"
+                    f", std="
+                    f"{controller._running_q_stats_surface.std:.3f}"
+                    f", n="
+                    f"{controller._running_q_stats_surface.count}"
+                    f")"
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Could not load running Q stats: %s",
+                    exc,
+                )
 
         logger.info(
             f"Controller loaded from {dirpath}: "

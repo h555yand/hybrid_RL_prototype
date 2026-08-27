@@ -18,8 +18,11 @@ import numpy as np
 import torch
 
 from .experience_extractor import ExperienceExtractor
-from .rl_goal_approach_controller import RLGoalApproachController
 from .sac_actor import SACActorNetwork
+from .rl_goal_approach_controller import (
+    RLGoalApproachController,
+    RunningQStats,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -130,9 +133,62 @@ class Arbitrator:
         self._param_dims = ExperienceExtractor.get_param_dims()
         self._type_names = ExperienceExtractor.get_type_names()
 
+        # Running Q statistics for v2-style confidence
+        self._running_q_stats_free = RunningQStats(
+            warmup=200
+        )
+        self._running_q_stats_surface = RunningQStats(
+            warmup=200
+        )
+        self._warmup_running_stats()
+
         # Strategic SAC references
         self._sac_strategic_detach: Optional[Any] = None
         self._sac_strategic_direction: Optional[Any] = None
+
+    def _warmup_running_stats(self):
+        """Warm up RunningQStats from existing Q-store points.
+
+        Samples up to MAX_WARMUP_POINTS from each store
+        to initialize mean/std without waiting for 200
+        online queries.
+        """
+        MAX_WARMUP_POINTS = 10000
+
+        for store, stats in [
+            (
+                self.controller.q_store_free,
+                self._running_q_stats_free,
+            ),
+            (
+                self.controller.q_store_surface,
+                self._running_q_stats_surface,
+            ),
+        ]:
+            if not store.points:
+                continue
+
+            pids = list(store.points.keys())
+            if len(pids) > MAX_WARMUP_POINTS:
+                pids = np.random.choice(
+                    pids,
+                    size=MAX_WARMUP_POINTS,
+                    replace=False,
+                )
+
+            for pid in pids:
+                stats.update(
+                    store.points[pid].q_values
+                )
+
+            logger.info(
+                f"Arbitrator warmup {store.name}: "
+                f"mean={stats.mean:.3f}, "
+                f"std={stats.std:.3f}, "
+                f"n={stats.count}, "
+                f"points_sampled={len(pids)}, "
+                f"points_total={len(store.points)}"
+            )
 
     def start_episode(self, level: int):
         if level != self._current_level:
@@ -241,7 +297,7 @@ class Arbitrator:
 
         q_score = 0.0
         if q_confidence > 0.1 and q_spread > 0.5:
-            q_score = (0.3 * q_confidence + 0.7) * q_track
+            q_score = (0.5 * q_confidence + 0.7) * q_track
 
         sac_score = 0.0
         if has_sac:
@@ -501,6 +557,131 @@ class Arbitrator:
         return np.zeros(3, dtype=np.float32)
 
     def _get_q_action(self, state):
+        store = self.controller._select_store(state)
+        running_stats = (
+            self._running_q_stats_surface
+            if state[11] > 0.5
+            else self._running_q_stats_free
+        )
+
+        if store.next_id == 0:
+            return 0, 0.0, 0.0
+
+        # ═══ Get Q-values with confidence (v2 style) ═══
+        q_values, confidence_info = (
+            store.get_q_values_with_confidence(state)
+        )
+        confidence = confidence_info["overall"]
+
+        # Update running stats
+        if np.max(np.abs(q_values)) > 1e-8:
+            running_stats.update(q_values)
+
+        # ═══ Compute V-based quality (v2 style) ═══
+        V = float(np.mean(q_values))
+        if running_stats.is_warmed_up:
+            V_norm = running_stats.normalize_value(V)
+            if V_norm >= 0:
+                # Позитив: мягкий буст
+                boost = float(np.clip(V_norm * 0.15, 0.0, 0.3))
+                q_confidence = min(confidence * (1.0 + boost), 0.95)
+            else:
+                # Негатив: сильный штраф
+                penalty = float(np.clip(-V_norm * 0.3, 0.0, 0.5))
+                q_confidence = confidence * (1.0 - penalty)
+        else:
+            q_confidence = confidence
+
+        # ═══ Apply masks ═══
+        q_values = self.controller.apply_action_mask(
+            q_values, state
+        )
+
+        # Strategic detach override
+        on_object = state[11] > 0.5
+        if on_object:
+            sensor_proxy = self._get_sensor_proxy()
+            if sensor_proxy is not None:
+                same_side = sensor_proxy.get(
+                    "same_side", True
+                )
+                path_blocked = sensor_proxy.get(
+                    "path_blocked", False
+                )
+                if (
+                    (not same_side or path_blocked)
+                    and self.controller._can_detach(
+                        state
+                    )
+                ):
+                    t_state = (
+                        self.controller
+                        ._compute_detach_transition_state(
+                            state,
+                            sensor_proxy,
+                            movement_efficiency=(
+                                self.controller
+                                ._compute_movement_efficiency(
+                                    window=20
+                                )
+                            ),
+                        )
+                    )
+                    s_q = (
+                        self.controller
+                        .strategic_detach
+                        .get_q_values(t_state)
+                    )
+                    if (
+                        self.controller
+                        .strategic_detach.next_id > 0
+                        and s_q[1] > s_q[0]
+                    ):
+                        detach_idx = (
+                            self.controller
+                            .action_space.IDX_DETACH
+                        )
+                        q_values[detach_idx] = (
+                            np.max(q_values) + 1.0
+                        )
+
+        if (
+            self.controller
+            ._consecutive_detach_count >= 3
+        ):
+            q_values[
+                self.controller.action_space.IDX_DETACH
+            ] = -1e9
+
+        # ═══ Q-spread ═══
+        valid = q_values > -1e8
+        if valid.sum() > 1:
+            q_spread = float(
+                np.max(q_values[valid])
+                - np.min(q_values[valid])
+            )
+        else:
+            q_spread = 0.0
+
+        # ═══ Action selection via softmax ═══
+        eps = self.controller._get_current_epsilon()
+        temperature = max(
+            np.clip(0.5 * eps, 0.01, 0.5), 0.05
+        )
+
+        v = q_values.copy()
+        v[~valid] = -1e9
+        v = v / temperature
+        v = v - np.max(v)
+        exp_v = np.exp(v)
+        probs = exp_v / exp_v.sum()
+        q_action = int(
+            np.random.choice(len(probs), p=probs)
+        )
+
+        return q_action, q_confidence, q_spread
+    
+    def _get_q_action_v1(self, state):
         store = self.controller._select_store(state)
 
         if store.next_id == 0:

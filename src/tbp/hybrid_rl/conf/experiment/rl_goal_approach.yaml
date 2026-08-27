@@ -9,13 +9,13 @@ experiment:
   config:
     seed: 42
     # Visualization: null | text | pictures | video
-    visualise: pictures
-    regenerate_scripts: false
-    do_train: false
-    do_eval: false
-    do_heur_eval: false
+    visualise: null
+    regenerate_scripts: true
+    do_train: true
+    do_eval: true
+    do_heur_eval: true
     do_bc_train: false
-    do_sac_train: true
+    do_sac_train: false
     do_sac_eval: false
     do_adaptive: false
 
@@ -44,11 +44,11 @@ experiment:
     training_stages:
       # ── Phase 1: Primitives ──
       - mesh: cube
-        episodes: 2000
+        episodes: 1000
         epsilon_start: 1.0
         epsilon_min: 0.15
         load_mode: null
-        warmup_episodes: 150
+        warmup_episodes: 100
         promote_threshold: 0.85
         promote_window: 200
         curriculum_filters:
@@ -57,8 +57,8 @@ experiment:
           - {}
 
       - mesh: sphere
-        episodes: 2000
-        epsilon_start: 0.7
+        episodes: 1000
+        epsilon_start: 1.0
         epsilon_min: 0.12
         load_mode: auto
         warmup_episodes: 80
@@ -70,8 +70,8 @@ experiment:
           - {}
 
       - mesh: cylinder
-        episodes: 2000
-        epsilon_start: 0.5
+        episodes: 1000
+        epsilon_start: 1.0
         epsilon_min: 0.10
         load_mode: auto
         warmup_episodes: 80
@@ -84,12 +84,38 @@ experiment:
 
       - mesh: flat_square
         episodes: 1000
-        epsilon_start: 0.4
+        epsilon_start: 1.0
         epsilon_min: 0.10
         load_mode: auto
-        warmup_episodes: 50
+        warmup_episodes: 80
+        promote_threshold: 0.8
+        promote_window: 200
+        curriculum_filters:
+          - {same_side: true, path_blocked: false}
+          - {same_side: true, path_blocked: true}
+          - {}
+      
+      - mesh: cone
+        episodes: 1000
+        epsilon_start: 1.0
+        epsilon_min: 0.10
+        load_mode: auto
+        warmup_episodes: 80
+        promote_threshold: 0.8
+        promote_window: 200
+        curriculum_filters:
+          - {same_side: true, path_blocked: false}
+          - {same_side: true, path_blocked: true}
+          - {}
+
+      - mesh: thin_cylinder
+        episodes: 1000
+        epsilon_start: 1.0
+        epsilon_min: 0.10
+        load_mode: auto
+        warmup_episodes: 80
         promote_threshold: 0.85
-        promote_window: 150
+        promote_window: 200
         curriculum_filters:
           - {same_side: true, path_blocked: false}
           - {same_side: true, path_blocked: true}
@@ -97,8 +123,8 @@ experiment:
 
       # ── Phase 2: Hollow objects ──
       - mesh: vase
-        episodes: 3000
-        epsilon_start: 0.5
+        episodes: 2000
+        epsilon_start: 1.0
         epsilon_min: 0.10
         load_mode: auto
         warmup_episodes: 100
@@ -106,12 +132,12 @@ experiment:
         promote_window: 300
 
       - mesh: mug
-        episodes: 3000
-        epsilon_start: 0.5
+        episodes: 2000
+        epsilon_start: 1.0
         epsilon_min: 0.10
         load_mode: auto
         warmup_episodes: 100
-        promote_threshold: 0.65
+        promote_threshold: 0.7
         promote_window: 300
 
       # ── Phase 3: Reinforcement on new points ──
@@ -132,7 +158,7 @@ experiment:
         load_mode: auto
         pool_seed: 202
         warmup_episodes: 30
-        promote_threshold: 0.65
+        promote_threshold: 0.7
         promote_window: 200
 
     # ═══════════════════════════════════════════
@@ -160,22 +186,19 @@ experiment:
           - {same_side: true, path_blocked: false}
           - {same_side: true, path_blocked: true}
           - {}
-      # Train set — hollow
-      - vase
-      - mug
-      # Held-out — primitives
       - mesh: cone
-        pool_seed: 55
         curriculum_filters:
           - {same_side: true, path_blocked: false}
           - {same_side: true, path_blocked: true}
           - {}
       - mesh: thin_cylinder
-        pool_seed: 56
         curriculum_filters:
           - {same_side: true, path_blocked: false}
           - {same_side: true, path_blocked: true}
           - {}
+      # Train set — hollow
+      - vase
+      - mug
       # Held-out — hollow
       - mesh: cup
         pool_seed: 57
@@ -295,14 +318,14 @@ experiment:
 
     # SAC (not used in Q-only pipeline)
     sac_config:
-      load_mode: null
+      load_mode: auto
       goal_threshold: 4.0
       gamma: 0.99
       tau: 0.005
       lr_actor: 0.00003
       lr_critic: 0.0003
       batch_size: 256
-      bc_lambda_init: 5.0
+      bc_lambda_init: 2.0
       bc_lambda_min: 0.5
       actor_warmup_per_level: 50
       buffer_capacity: 1000000
@@ -319,15 +342,15 @@ experiment:
       #sphere: 1000
       #cylinder: 1000
       #flat_square: 500
-      vase: 1000
-      #mug: 2000
+      #vase: 1000
+      mug: 1000
 
     sac_eval_episodes_per_level: 100
 
     adaptive_mesh: cup
-    adaptive_episodes: 1000
+    adaptive_episodes: 2000
     offline_check_window: 100
 
     logging:
-      run_name: sac_generalization
+      run_name: Q_generalization-v2
       output_dir: ${oc.env:MONTY_LOGS}

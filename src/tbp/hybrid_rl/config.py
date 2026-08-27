@@ -93,6 +93,7 @@ DEFAULT_CONFIG = {
     # Eval learning rate multiplier
     "eval_alpha_multiplier": 0.1,  # alpha × 0.1 в eval mode
     "temperature_override": None,
+    "action_selection_version": "v1",
     "warmup_episodes": 40,
     "air_start_enabled": True,
     "stuck_threshold": 0.15,

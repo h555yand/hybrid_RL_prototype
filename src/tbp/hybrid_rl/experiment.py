@@ -2582,15 +2582,18 @@ class RLGoalApproachExperiment:
             )
 
             goal_pose = None
+            is_fallback_episode = False
+
             for _attempt in range(max_goal_attempts):
-                candidate = (
-                    env.get_random_surface_point(
-                        reference_pos=start_pos,
-                        min_dist=min_dist,
-                        max_dist=max_dist,
-                        max_attempts=2000,
-                        mesh_sample=True,
-                    )
+                env.reset()  # ← новый start каждую попытку
+                start_pos = env.get_pose()[:3]
+
+                candidate = env.get_random_surface_point(
+                    reference_pos=start_pos,
+                    min_dist=min_dist,
+                    max_dist=max_dist,
+                    max_attempts=2000,
+                    mesh_sample=True,
                 )
 
                 if require_same_side is not None:
@@ -2613,7 +2616,23 @@ class RLGoalApproachExperiment:
                 break
 
             if goal_pose is None:
-                goal_pose = candidate
+                logger.warning(
+                    "Adaptive ep %d: L%d filter %s not satisfied "
+                    "in %d attempts, using unfiltered goal",
+                    episode, adaptive_level, level_filter,
+                    max_goal_attempts,
+                )
+                env.reset()
+                start_pos = env.get_pose()[:3]
+                goal_pose = env.get_random_surface_point(
+                    reference_pos=start_pos,
+                    min_dist=min_dist,
+                    max_dist=max_dist,
+                    max_attempts=2000,
+                    mesh_sample=True,
+                )
+                is_fallback_episode = True
+
 
             controller.set_new_goal(goal_pose, start_pos)
             env.set_goal(goal_pose)
@@ -2837,7 +2856,8 @@ class RLGoalApproachExperiment:
             manager.arbitrator.on_episode_end(success)
 
             # Curriculum promote
-            adaptive_promote_window.append(success)
+            if not is_fallback_episode:
+                adaptive_promote_window.append(success)
             if (
                 len(adaptive_promote_window)
                 > adaptive_promote_window_size
@@ -2940,7 +2960,7 @@ class RLGoalApproachExperiment:
                 sac_episode_steps.append(ep_steps)
 
             # Snapshot every N episodes
-            if self.visualise and (episode + 1) % 50 <= 15 and (episode + 1) >= 0 and dominant_source_key == "heuristic":
+            if self.visualise and (episode + 1) % 50 <= 15 and (episode + 1) >= 0:
                 vis_dir = (
                     Path(adaptive_log_dir)
                     / "visualizations"

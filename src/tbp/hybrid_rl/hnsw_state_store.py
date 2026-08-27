@@ -289,7 +289,121 @@ class HNSWStateStore:
     # ══════════════════════════════════════════════════════════
     # GET Q-VALUES
     # ══════════════════════════════════════════════════════════
+    def get_q_values_with_confidence(
+        self, state: np.ndarray
+    ) -> tuple:
+        """Get Q-values and confidence estimate via KNN interpolation.
 
+        Same interpolation logic as get_q_values, but additionally
+        computes a confidence score indicating how much we should
+        trust the returned Q-values.
+
+        Confidence components:
+            proximity: fraction of max possible kernel weight achieved.
+                High when neighbors are close, low when far.
+            experience: weighted average visit count of neighbors.
+                High when neighbors have been updated many times.
+            consistency: fraction of neighbors that agree on best action.
+                High when neighbors all recommend the same action.
+            overall: product of all three (conservative estimate).
+
+        Args:
+            state: Raw (unnormalized) state vector [state_dim].
+
+        Returns:
+            Tuple of (q_values, confidence_info):
+                q_values: np.ndarray [num_actions]
+                confidence_info: dict with keys:
+                    proximity (float 0..1)
+                    experience (float 0..1)
+                    consistency (float 0..1)
+                    overall (float 0..1)
+        """
+        empty_confidence = {
+            "proximity": 0.0,
+            "experience": 0.0,
+            "consistency": 0.0,
+            "overall": 0.0,
+        }
+
+        if self.next_id == 0:
+            return np.zeros(self.num_actions), empty_confidence
+
+        norm_state = self._normalize(state)
+        k = min(self.k_neighbors, self.next_id)
+
+        labels, distances = self._index.knn_query(
+            norm_state.reshape(1, -1), k=k
+        )
+        labels = labels[0]
+        distances = distances[0]
+
+        # ═══ Exact match ═══
+        if distances[0] < self.insert_threshold ** 2:
+            point = self.points[labels[0]]
+            point.visit_count += 1
+            point.last_step = self.global_step
+
+            visit_conf = min(point.visit_count / 10.0, 1.0)
+            return point.q_values.copy(), {
+                "proximity": 1.0,
+                "experience": visit_conf,
+                "consistency": 1.0,
+                "overall": visit_conf,
+            }
+
+        # ═══ Kernel weights ═══
+        sigma = self._get_sigma(distances)
+        weights = self._gaussian_kernel(distances, sigma)
+        weight_sum = weights.sum()
+
+        if weight_sum < self.min_weight_threshold:
+            return np.zeros(self.num_actions), empty_confidence
+
+        # ═══ Confidence components ═══
+
+        # 1. Proximity: what fraction of max possible weight
+        proximity = float(min(weight_sum / k, 1.0))
+
+        # 2. Experience: kernel-weighted average visit count
+        visit_counts = np.array([
+            self.points[l].visit_count for l in labels
+        ], dtype=float)
+        weighted_visits = float(
+            np.sum(weights * visit_counts) / weight_sum
+        )
+        experience = float(min(weighted_visits / 10.0, 1.0))
+
+        # 3. Consistency: do neighbors agree on best action?
+        neighbor_best_actions = [
+            int(np.argmax(self.points[l].q_values))
+            for l in labels
+        ]
+        from collections import Counter
+        action_counts = Counter(neighbor_best_actions)
+        most_common_count = action_counts.most_common(1)[0][1]
+        consistency = float(
+            most_common_count / len(neighbor_best_actions)
+        )
+
+        # Overall confidence (conservative: product)
+        overall = float(proximity * experience * consistency)
+
+        # ═══ Q-value interpolation (same as get_q_values) ═══
+        weights /= weight_sum
+        q_values = np.zeros(self.num_actions)
+        for i, label in enumerate(labels):
+            q_values += weights[i] * self.points[label].q_values
+
+        confidence_info = {
+            "proximity": proximity,
+            "experience": experience,
+            "consistency": consistency,
+            "overall": overall,
+        }
+
+        return q_values, confidence_info
+    
     def get_q_values(self, state):
         """Get Q-values for a state via KNN interpolation.
 

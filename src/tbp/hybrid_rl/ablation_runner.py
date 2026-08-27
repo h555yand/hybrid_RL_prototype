@@ -613,6 +613,7 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
             output_dir=Path(save_dir),
             mesh_name=mesh_label,
             stage=stage_label,
+            visualize_mode=visualise
         )
 
     # Validate episode sources
