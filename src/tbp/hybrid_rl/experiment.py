@@ -2987,25 +2987,26 @@ class RLGoalApproachExperiment:
                 sac_episode_steps.append(ep_steps)
 
             # Snapshot every N episodes
-            if self.visualise and (episode + 1) % 42 <= 0 and (episode + 1) >= 0:
+            if self.visualise and (episode + 1) % 42 <= 5 and (episode + 1) >= 0:
                 vis_dir = (
                     Path(adaptive_log_dir)
                     / "visualizations"
                 )
-                _maybe_save_visualization(
-                    controller=controller,
-                    env=env,
-                    episode=episode,
-                    ep_result=termination,
-                    goal_pose=goal_pose,
-                    current_poses=current_poses,
-                    action_explanations=action_explanations,
-                    vis_dir=vis_dir,
-                    vis_filter=None,
-                    vis_counts=None,
-                    timeout_frame_interval=50,
-                    visualize_mode=self.visualise
-                )
+                if termination != "success":
+                    _maybe_save_visualization(
+                        controller=controller,
+                        env=env,
+                        episode=episode,
+                        ep_result=termination,
+                        goal_pose=goal_pose,
+                        current_poses=current_poses,
+                        action_explanations=action_explanations,
+                        vis_dir=vis_dir,
+                        vis_filter=None,
+                        vis_counts=None,
+                        timeout_frame_interval=50,
+                        visualize_mode=self.visualise
+                    )
 
             if (episode + 1) % _ADAPTIVE_LOG_INTERVAL == 0:
                 stats = manager.get_stats()
@@ -3105,6 +3106,18 @@ class RLGoalApproachExperiment:
                         ),
                         "sac_success_rate": arb_stats.get(
                             "sac_success_rate", 0
+                        ),
+                        "heuristic_success_rate": arb_stats.get(
+                            "heuristic_success_rate", 0
+                        ),
+                        "arbitrage_only": arb_stats.get(
+                            "arbitrage_only", {}
+                        ),
+                        "per_level_track_record": arb_stats.get(
+                            "per_level_track_record", {}
+                        ),
+                        "is_calibrating": arb_stats.get(
+                            "is_calibrating", False
                         ),
                     },
                     "manager": {

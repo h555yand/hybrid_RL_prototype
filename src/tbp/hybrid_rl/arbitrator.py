@@ -145,6 +145,14 @@ class Arbitrator:
         # Strategic SAC references
         self._sac_strategic_detach: Optional[Any] = None
         self._sac_strategic_direction: Optional[Any] = None
+        # Arbitrage-only stats (excluding calibration)
+        self._arbitrage_stats = {
+            "q_store_chosen": 0,
+            "sac_chosen": 0,
+            "blend_chosen": 0,
+            "heuristic_chosen": 0,
+            "total_decisions": 0,
+        }
 
     def _warmup_running_stats(self):
         """Warm up RunningQStats from existing Q-store points.
@@ -298,9 +306,9 @@ class Arbitrator:
         q_score = 0.0
         if q_confidence > 0.1 and q_spread > 0.5:
             q_score = min(
-            (0.5 * q_confidence + 0.7) * q_track,
-            q_track,
-        )
+                (0.5 * q_confidence + 0.7) * q_track,
+                q_track,
+            )
 
         sac_score = 0.0
         if has_sac:
@@ -320,7 +328,7 @@ class Arbitrator:
             )
             h_type = ExperienceExtractor.DISCRETE_TO_PSAC[h_action][0]
             h_params = self._discrete_to_params(h_action)
-            self.stats["heuristic_chosen"] += 1
+            self._record_decision("heuristic")
             self.heuristic_chosen_actions[
                 self._type_names.get(h_type, f"type_{h_type}")
             ] += 1
@@ -336,7 +344,7 @@ class Arbitrator:
                 forced_params = self._get_sac_params_for_type(state, q_type)
             else:
                 forced_params = q_params
-            self.stats["q_store_chosen"] += 1
+            self._record_decision("q_store")
             self.q_chosen_actions[q_name] += 1
             self._current_episode_sources.append("q_store")
             return q_type, forced_params, (
@@ -345,7 +353,7 @@ class Arbitrator:
 
         # Q more confident, types disagree → Q type + Q params
         if q_score > sac_score and q_type != sac_type:
-            self.stats["q_store_chosen"] += 1
+            self._record_decision("q_store")
             self.q_chosen_actions[q_name] += 1
             self._current_episode_sources.append("q_store")
             return q_type, q_params, (
@@ -361,7 +369,7 @@ class Arbitrator:
                 blend_padded[:dim] = blended
             else:
                 blend_padded = sac_params.copy()
-            self.stats["blend_chosen"] += 1
+            self._record_decision("blend")
             self.blend_chosen_actions[q_name] += 1
             self._current_episode_sources.append("blend")
             return q_type, blend_padded, (
@@ -371,7 +379,7 @@ class Arbitrator:
         # SAC wins
         if has_sac:
             sac_n = self._type_names.get(sac_type, f"type_{sac_type}")
-            self.stats["sac_chosen"] += 1
+            self._record_decision("sac")
             self.sac_chosen_actions[sac_n] += 1
             self._current_episode_sources.append("sac")
             return sac_type, sac_params, (
@@ -379,10 +387,16 @@ class Arbitrator:
             )
 
         # Fallback Q (no SAC)
-        self.stats["q_store_chosen"] += 1
+        self._record_decision("q_store")
         self.q_chosen_actions[q_name] += 1
         self._current_episode_sources.append("q_store")
         return q_type, q_params, "q_fallback"
+
+    def _record_decision(self, source: str):
+        """Record decision in both total and arbitrage-only stats."""
+        self.stats[f"{source}_chosen"] += 1
+        self._arbitrage_stats[f"{source}_chosen"] += 1
+        self._arbitrage_stats["total_decisions"] += 1
 
     def _get_track(self, results: deque) -> float:
         if len(results) < self._min_eval_per_source:
