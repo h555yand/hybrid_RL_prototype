@@ -386,8 +386,14 @@ class HNSWStateStore:
             most_common_count / len(neighbor_best_actions)
         )
 
-        # Overall confidence (conservative: product)
-        overall = float(proximity * experience * consistency)
+        # Overall confidence (weighted average)
+        # Proximity most important (data exists nearby),
+        # experience and consistency equally weighted.
+        overall = float(
+            0.4 * proximity
+            + 0.3 * experience
+            + 0.3 * consistency
+        )
 
         # ═══ Q-value interpolation (same as get_q_values) ═══
         weights /= weight_sum
@@ -1039,7 +1045,7 @@ class HNSWStateStore:
 
     @classmethod
     def load_with_index(
-        cls, filepath: str, extra_cfg
+        cls, filepath: str, extra_cfg, name: str = "not defined",
     ) -> "HNSWStateStore":
         base = filepath[:-4] if filepath.endswith(".npz") else filepath
         npz_path = base + ".npz"
@@ -1071,7 +1077,7 @@ class HNSWStateStore:
         }
         store_cfg.update(extra_cfg or {})
 
-        store = cls(config=store_cfg)
+        store = cls(config=store_cfg, name=name)
         store.global_step = global_step
         store._state_mean = data["state_mean"]
         store._state_std = data["state_std"]
@@ -1144,7 +1150,7 @@ class HNSWStateStore:
         return store
     
     @classmethod
-    def load(cls, filepath: str, extra_cfg) -> "HNSWStateStore":
+    def load(cls, filepath: str, extra_cfg, name: str = "not defined") -> "HNSWStateStore":
         data = np.load(filepath, allow_pickle=False)
 
         config = data["config"]
@@ -1163,7 +1169,7 @@ class HNSWStateStore:
         }
         store_cfg.update(extra_cfg or {})
 
-        store = cls(config=store_cfg)
+        store = cls(config=store_cfg, name=name)
         store.global_step = global_step
         store._state_mean = data["state_mean"]
         store._state_std = data["state_std"]

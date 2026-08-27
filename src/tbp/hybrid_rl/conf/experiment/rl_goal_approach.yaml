@@ -9,15 +9,15 @@ experiment:
   config:
     seed: 42
     # Visualization: null | text | pictures | video
-    visualise: null
-    regenerate_scripts: true
-    do_train: true
-    do_eval: true
-    do_heur_eval: true
+    visualise: pictures
+    regenerate_scripts: false
+    do_train: false
+    do_eval: false
+    do_heur_eval: false
     do_bc_train: false
     do_sac_train: false
     do_sac_eval: false
-    do_adaptive: false
+    do_adaptive: true
 
     train_seeds: [11]
     eval_seeds: [44]
@@ -348,7 +348,7 @@ experiment:
     sac_eval_episodes_per_level: 100
 
     adaptive_mesh: cup
-    adaptive_episodes: 2000
+    adaptive_episodes: 1000
     offline_check_window: 100
 
     logging:

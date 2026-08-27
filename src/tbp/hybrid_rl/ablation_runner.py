@@ -142,7 +142,9 @@ def run_eval_per_seed(  # noqa: PLR0913
                 "collision_rate_per_action": stats.get(
                     "collision_rate_per_action", {}
                 ),
-                "steps_per_success": stats.get("steps_per_success", 0),
+                "mean_episode_steps": stats.get("mean_episode_steps", 0),
+                "mean_success_steps": stats.get("mean_success_steps", 0),
+                "total_steps_per_goal": stats.get("total_steps_per_goal", 0),
                 "surface_air_ratio": stats.get(
                     "surface_air_ratio", {}
                 ),
@@ -479,6 +481,8 @@ def _maybe_save_visualization(  # noqa: PLR0913
     vis_dir: Path,
     vis_filter: dict[str, Any]=None,
     vis_counts: dict[str, int]=None,
+    timeout_frame_interval=50,
+    visualize_mode="text"
 ) -> None:
     """Save episode visualization if it matches the filter criteria.
 
@@ -520,6 +524,8 @@ def _maybe_save_visualization(  # noqa: PLR0913
             output_dir=vis_dir,
             episode_id=episode_id,
             result=ep_result,
+            timeout_frame_interval=timeout_frame_interval,
+            render_mode=visualize_mode,
         )
         if vis_counts:
             vis_counts[ep_result] += 1

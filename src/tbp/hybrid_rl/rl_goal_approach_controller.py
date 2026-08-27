@@ -316,6 +316,8 @@ class RLGoalApproachController:
             "phase_counts": {},
         }
         self._episode_phase_counts: Dict[str, int] = {}
+        self._episode_steps_history: List[int] = []
+        self._success_steps_history: List[int] = []
 
         logger.info(
             f"RLGoalApproachController initialized: "
@@ -5964,7 +5966,10 @@ class RLGoalApproachController:
             f"success_rate="
             f"{self._total_goals_reached}/{self._total_episodes}"
         )
-
+        
+        self._episode_steps_history.append(self._steps)
+        if goal_reached:
+            self._success_steps_history.append(self._steps)
         # ═══ Reset ═══
         self._current_goal = None
         self._current_max_extent = None
@@ -6009,10 +6014,17 @@ class RLGoalApproachController:
                 collision_count
             ) / max(total_calls, 1)
 
-        steps_per_success = float(self._total_steps) / max(
-            self._total_goals_reached, 1
+        total_steps_per_goal = round(
+            float(self._total_steps) / max(self._total_goals_reached, 1), 1,
         )
-
+        mean_episode_steps = round(
+            float(np.mean(self._episode_steps_history))
+            if self._episode_steps_history else 0, 1,
+        )
+        mean_success_steps = round(
+            float(np.mean(self._success_steps_history))
+            if self._success_steps_history else 0, 1,
+        )
         surface_actions = {
             "move_tangentially",
             "orient_horizontal",
@@ -6051,7 +6063,9 @@ class RLGoalApproachController:
             "collision_stats": dict(self._collision_stats),
             "global_action_counts": dict(self._global_action_counts),
             "collision_rate_per_action": collision_rate_per_action,
-            "steps_per_success": steps_per_success,
+            "total_steps_per_goal": total_steps_per_goal,
+            "mean_episode_steps": mean_episode_steps,
+            "mean_success_steps": mean_success_steps,
             "surface_air_ratio": {
                 "surface_steps": surface_steps,
                 "air_steps": air_steps,
@@ -6542,6 +6556,7 @@ class RLGoalApproachController:
                     dirpath, "q_store_free"
                 ),
                 extra_cfg=free_cfg,
+                name="free",
             )
         )
 
@@ -6557,6 +6572,7 @@ class RLGoalApproachController:
                     dirpath, "q_store_surface"
                 ),
                 extra_cfg=surface_cfg,
+                name="surface",
             )
         )
 
@@ -6571,7 +6587,7 @@ class RLGoalApproachController:
                 "k_neighbors": cfg.get("transition_k_neighbors", 5),
             }
             controller.strategic_detach = HNSWStateStore.load_with_index(
-                detach_base, extra_cfg=s_detach_cfg
+                detach_base, extra_cfg=s_detach_cfg, name="strategic_detach"
             )
 
         direction_base = os.path.join(dirpath, "strategic_direction")
@@ -6584,7 +6600,7 @@ class RLGoalApproachController:
                 "k_neighbors": cfg.get("transition_k_neighbors", 5),
             }
             controller.strategic_direction = HNSWStateStore.load_with_index(
-                direction_base, extra_cfg=s_dir_cfg
+                direction_base, extra_cfg=s_dir_cfg, name="strategic_direction"
             )
 
         state_data = np.load(

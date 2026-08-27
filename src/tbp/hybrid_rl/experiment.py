@@ -2093,6 +2093,8 @@ class RLGoalApproachExperiment:
             action_counts: dict[int, int] = {}
             collision_counts: dict[int, int] = {}
             total_steps = 0
+            episode_steps_list: list[int] = []
+            success_steps_list: list[int] = []
 
             for eval_seed in self.sac_eval_seeds:
                 pool = sac_eval_pools[eval_seed][
@@ -2139,7 +2141,7 @@ class RLGoalApproachExperiment:
                     success = False
                     collision = False
 
-                    for _ in range(
+                    for step_idx in range(
                         sac_trainer.max_steps_per_goal
                     ):
                         pose = env.get_pose()
@@ -2294,6 +2296,8 @@ class RLGoalApproachExperiment:
                             )
                             break
 
+                    ep_step_count = step_idx + 1
+                    episode_steps_list.append(ep_step_count)
                     total += 1
                     if success:
                         successes += 1
@@ -2331,6 +2335,19 @@ class RLGoalApproachExperiment:
                 "success_rate": successes / count,
                 "timeout_rate": timeouts / count,
                 "collision_rate": collisions / count,
+                # ═══ NEW ═══
+                "mean_episode_steps": round(
+                    float(np.mean(episode_steps_list))
+                    if episode_steps_list else 0, 1,
+                ),
+                "mean_success_steps": round(
+                    float(np.mean(success_steps_list))
+                    if success_steps_list else 0, 1,
+                ),
+                "total_steps_per_goal": round(
+                    total_steps / max(successes, 1),
+                    1,
+                ),
                 "action_distribution": {
                     type_names.get(
                         k, f"type_{k}"
@@ -2354,13 +2371,6 @@ class RLGoalApproachExperiment:
                 },
                 "collision_rate_per_type": (
                     collision_rate_per_type
-                ),
-                "steps_per_success": round(
-                    total_steps / max(successes, 1),
-                    1,
-                ),
-                "mean_episode_steps": round(
-                    total_steps / max(total, 1), 1
                 ),
             }
 
@@ -2512,6 +2522,12 @@ class RLGoalApproachExperiment:
         }
         total_steps_adaptive = 0
         rolling_successes: list[bool] = []
+        # ═══ Episode length tracking ═══
+        all_episode_steps: list[int] = []
+        all_success_steps: list[int] = []
+        # Per-level
+        level_episode_steps: dict[int, list[int]] = {}
+        level_success_steps: dict[int, list[int]] = {}
 
         adaptive_log_dir = (
             self.data_dir
@@ -2795,6 +2811,17 @@ class RLGoalApproachExperiment:
             total_episodes_rate = (
                 sum(ep_successes) / len(ep_successes)
             )
+            # ═══ Track episode length ═══
+            all_episode_steps.append(ep_steps)
+            if success:
+                all_success_steps.append(ep_steps)
+
+            if adaptive_level not in level_episode_steps:
+                level_episode_steps[adaptive_level] = []
+                level_success_steps[adaptive_level] = []
+            level_episode_steps[adaptive_level].append(ep_steps)
+            if success:
+                level_success_steps[adaptive_level].append(ep_steps)
 
             # Determine termination
             if success:
@@ -2960,7 +2987,7 @@ class RLGoalApproachExperiment:
                 sac_episode_steps.append(ep_steps)
 
             # Snapshot every N episodes
-            if self.visualise and (episode + 1) % 50 <= 15 and (episode + 1) >= 0:
+            if self.visualise and (episode + 1) % 42 <= 0 and (episode + 1) >= 0:
                 vis_dir = (
                     Path(adaptive_log_dir)
                     / "visualizations"
@@ -2976,6 +3003,8 @@ class RLGoalApproachExperiment:
                     vis_dir=vis_dir,
                     vis_filter=None,
                     vis_counts=None,
+                    timeout_frame_interval=50,
+                    visualize_mode=self.visualise
                 )
 
             if (episode + 1) % _ADAPTIVE_LOG_INTERVAL == 0:
@@ -2988,7 +3017,9 @@ class RLGoalApproachExperiment:
                 total_act = max(
                     sum(action_counts.values()), 1
                 )
-
+                successes_count = sum(
+                    1 for e in episode_log if e["success"]
+                )
                 snapshot = {
                     "episode": episode + 1,
                     "rolling_success_rate": round(
@@ -3016,6 +3047,18 @@ class RLGoalApproachExperiment:
                         for e in episode_log
                         if e["termination"] == "timeout"
                     ),
+                    "mean_episode_steps": round(
+                        float(np.mean(all_episode_steps))
+                        if all_episode_steps else 0, 1,
+                    ),
+                    "mean_success_steps": round(
+                        float(np.mean(all_success_steps))
+                        if all_success_steps else 0, 1,
+                    ),
+                    "total_steps_per_goal": round(
+                        total_steps_adaptive
+                        / max(successes_count, 1), 1,
+                    ),
                     "source_distribution": {
                         k: round(v / total_src, 3)
                         for k, v in source_counts.items()
@@ -3034,18 +3077,6 @@ class RLGoalApproachExperiment:
                     },
                     "collision_stats": dict(
                         collision_counts
-                    ),
-                    "steps_per_success": round(
-                        total_steps_adaptive
-                        / max(
-                            sum(
-                                1
-                                for e in episode_log
-                                if e["success"]
-                            ),
-                            1,
-                        ),
-                        1,
                     ),
                     "arbitrator": {
                         "q_store_rate": arb_stats.get(
@@ -3229,11 +3260,40 @@ class RLGoalApproachExperiment:
             "timeout_rate": round(
                 timeouts / max(total_ep, 1), 4
             ),
-            "steps_per_success": round(
+            "mean_episode_steps": round(
+                float(np.mean(all_episode_steps))
+                if all_episode_steps else 0, 1,
+            ),
+            "mean_success_steps": round(
+                float(np.mean(all_success_steps))
+                if all_success_steps else 0, 1,
+            ),
+            "total_steps_per_goal": round(
                 total_steps_adaptive
                 / max(successes, 1),
                 1,
             ),
+            # Per-level breakdown
+            "per_level_steps": {
+                f"level_{lvl}": {
+                    "mean_episode_steps": round(
+                        float(np.mean(steps_list))
+                        if steps_list else 0, 1,
+                    ),
+                    "mean_success_steps": round(
+                        float(np.mean(
+                            level_success_steps.get(lvl, [])
+                        ))
+                        if level_success_steps.get(lvl) else 0, 1,
+                    ),
+                    "episodes": len(steps_list),
+                    "successes": len(
+                        level_success_steps.get(lvl, [])
+                    ),
+                }
+                for lvl, steps_list
+                in sorted(level_episode_steps.items())
+            },
             "source_distribution": {
                 k: round(v / total_src, 4)
                 for k, v in source_counts.items()
