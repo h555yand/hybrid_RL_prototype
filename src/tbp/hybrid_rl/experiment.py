@@ -2008,29 +2008,73 @@ class RLGoalApproachExperiment:
 
         all_results: dict[str, Any] = {}
 
-        for mesh_name in self.eval_meshes:
+        for mesh_entry in self.eval_meshes:
+            # ═══ Parse mesh entry (dict or string) ═══
+            if isinstance(mesh_entry, dict):
+                mesh_name = mesh_entry["mesh"]
+                eval_pool_seed = mesh_entry.get(
+                    "pool_seed", None
+                )
+                eval_curriculum_filters = mesh_entry.get(
+                    "curriculum_filters",
+                    self.curriculum_filters,
+                )
+                eval_curriculum_levels = mesh_entry.get(
+                    "curriculum_levels",
+                    self.curriculum_levels,
+                )
+            else:
+                mesh_name = mesh_entry
+                eval_pool_seed = None
+                eval_curriculum_filters = self.curriculum_filters
+                eval_curriculum_levels = self.curriculum_levels
+
             mesh_path = str(
                 self.data_dir / f"{mesh_name}.stl"
             )
-            logger.info("SAC Eval: %s", mesh_name)
+            logger.info(
+                "SAC Eval: %s (pool_seed=%s)",
+                mesh_name,
+                eval_pool_seed,
+            )
+
+            # ═══ Determine pool seeds and prefix ═══
+            if eval_pool_seed is not None:
+                pool_seeds = [eval_pool_seed]
+                pool_prefix = (
+                    f"sac_eval_{mesh_name}_ps{eval_pool_seed}"
+                )
+            else:
+                pool_seeds = self.sac_eval_seeds
+                pool_prefix = f"sac_eval_{mesh_name}"
 
             sac_eval_pools = get_or_generate_pools(
                 mesh_path=mesh_path,
-                seeds=self.sac_eval_seeds,
+                seeds=pool_seeds,
                 episodes_per_level=(
                     self.sac_eval_episodes_per_level
                 ),
                 scripts_dir=self.scripts_dir,
-                curriculum_levels=self.curriculum_levels,
+                curriculum_levels=eval_curriculum_levels,
                 regenerate=self.regenerate_scripts,
-                prefix=f"sac_eval_{mesh_name}",
-                curriculum_filters=self.curriculum_filters,
+                prefix=pool_prefix,
+                curriculum_filters=eval_curriculum_filters,
             )
+
+            # ═══ Remap pools if using shared pool_seed ═══
+            if eval_pool_seed is not None:
+                remapped_pools: dict[int, Any] = {}
+                for es in self.sac_eval_seeds:
+                    remapped_pools[es] = sac_eval_pools[
+                        eval_pool_seed
+                    ]
+                sac_eval_pools = remapped_pools
 
             results = self._eval_sac_on_pools(
                 sac_trainer=sac_trainer,
                 sac_eval_pools=sac_eval_pools,
                 mesh_path=mesh_path,
+                curriculum_levels=eval_curriculum_levels,
             )
             all_results[mesh_name] = results
 
@@ -2067,6 +2111,7 @@ class RLGoalApproachExperiment:
         sac_trainer: PSACTrainer,
         sac_eval_pools: dict[int, dict[str, Any]],
         mesh_path: str,
+        curriculum_levels: list[tuple[float, float]] | None = None,
     ) -> dict[str, Any]:
         """Run SAC evaluation on episode pools.
 
@@ -2074,10 +2119,15 @@ class RLGoalApproachExperiment:
             sac_trainer: Trained PSACTrainer instance.
             sac_eval_pools: Episode pools keyed by seed.
             mesh_path: Path to the mesh file.
+            curriculum_levels: Per-mesh curriculum levels.
+                Falls back to self.curriculum_levels if None.
 
         Returns:
             Dict with per-level evaluation results.
         """
+        if curriculum_levels is None:
+            curriculum_levels = self.curriculum_levels
+
         type_names = ExperienceExtractor.get_type_names()
         results: dict[str, Any] = {}
         sample_seed = self.sac_eval_seeds[0]
@@ -2301,13 +2351,14 @@ class RLGoalApproachExperiment:
                     total += 1
                     if success:
                         successes += 1
+                        success_steps_list.append(ep_step_count)
                     elif collision:
                         collisions += 1
                     else:
                         timeouts += 1
 
             count = max(total, 1)
-            bounds = self.curriculum_levels[level_idx]
+            bounds = curriculum_levels[level_idx]
             total_act = max(
                 sum(action_counts.values()), 1
             )
@@ -2335,7 +2386,6 @@ class RLGoalApproachExperiment:
                 "success_rate": successes / count,
                 "timeout_rate": timeouts / count,
                 "collision_rate": collisions / count,
-                # ═══ NEW ═══
                 "mean_episode_steps": round(
                     float(np.mean(episode_steps_list))
                     if episode_steps_list else 0, 1,

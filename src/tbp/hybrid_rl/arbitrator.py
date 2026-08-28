@@ -277,6 +277,19 @@ class Arbitrator:
             if q_type == sac_type:
                 self.agreement_count += 1
 
+        # === Q confident override (highest priority) ===
+        # Q-store learned this state well — trust it
+        # regardless of track record or calibration
+        if q_confidence > 0.7 and q_spread > 3.0:
+            self._record_decision("q_store")
+            self.q_chosen_actions[q_name] += 1
+            self._current_episode_sources.append("q_store")
+            return q_type, q_params, (
+                f"q_confident("
+                f"conf={q_confidence:.2f},"
+                f"spread={q_spread:.1f})"
+            )
+
         # === Calibration: forced source ===
         if self._is_calibrating:
             if self._calibration_source == "q_store":
@@ -318,8 +331,7 @@ class Arbitrator:
 
         # === Decision ===
 
-        # Heuristic fallback: ML track worse than heuristic,
-        # or ML has no useful signal for this state
+        # Heuristic fallback
         if best_ml_track < h_track * 0.75 or (
             q_score < 0.1 and sac_score < h_track * 0.5
         ):
@@ -330,42 +342,43 @@ class Arbitrator:
             h_params = self._discrete_to_params(h_action)
             self._record_decision("heuristic")
             self.heuristic_chosen_actions[
-                self._type_names.get(h_type, f"type_{h_type}")
+                self._type_names.get(
+                    h_type, f"type_{h_type}"
+                )
             ] += 1
             self._current_episode_sources.append("heuristic")
             return h_type, h_params, (
-                f"heuristic(qs={q_score:.2f},ss={sac_score:.2f},"
-                f"ht={h_track:.2f},mt={best_ml_track:.2f})"
+                f"heuristic(qs={q_score:.2f},"
+                f"ss={sac_score:.2f},"
+                f"ht={h_track:.2f},"
+                f"mt={best_ml_track:.2f})"
             )
 
-        # Q much more confident → Q type + SAC params
-        if q_score > sac_score * 1.5 and q_score > 0.2:
-            if has_sac:
-                forced_params = self._get_sac_params_for_type(state, q_type)
-            else:
-                forced_params = q_params
-            self._record_decision("q_store")
-            self.q_chosen_actions[q_name] += 1
-            self._current_episode_sources.append("q_store")
-            return q_type, forced_params, (
-                f"q_dominant(qs={q_score:.2f},ss={sac_score:.2f})"
-            )
-
-        # Q more confident, types disagree → Q type + Q params
+        # Q score > SAC, types disagree → Q type + Q params
         if q_score > sac_score and q_type != sac_type:
             self._record_decision("q_store")
             self.q_chosen_actions[q_name] += 1
             self._current_episode_sources.append("q_store")
             return q_type, q_params, (
-                f"q_veto(qs={q_score:.2f},ss={sac_score:.2f})"
+                f"q_veto(qs={q_score:.2f},"
+                f"ss={sac_score:.2f})"
             )
 
-        # Q more confident, types agree → blend params
-        if q_score > sac_score and q_type == sac_type and has_sac:
+        # Q score > SAC, types agree → blend params
+        if (
+            q_score > sac_score
+            and q_type == sac_type
+            and has_sac
+        ):
             dim = self._param_dims.get(q_type, 0)
             if dim > 0:
-                blended = 0.5 * q_params[:dim] + 0.5 * sac_params[:dim]
-                blend_padded = np.zeros(3, dtype=np.float32)
+                blended = (
+                    0.5 * q_params[:dim]
+                    + 0.5 * sac_params[:dim]
+                )
+                blend_padded = np.zeros(
+                    3, dtype=np.float32
+                )
                 blend_padded[:dim] = blended
             else:
                 blend_padded = sac_params.copy()
@@ -373,17 +386,21 @@ class Arbitrator:
             self.blend_chosen_actions[q_name] += 1
             self._current_episode_sources.append("blend")
             return q_type, blend_padded, (
-                f"blend(qs={q_score:.2f},ss={sac_score:.2f})"
+                f"blend(qs={q_score:.2f},"
+                f"ss={sac_score:.2f})"
             )
 
         # SAC wins
         if has_sac:
-            sac_n = self._type_names.get(sac_type, f"type_{sac_type}")
+            sac_n = self._type_names.get(
+                sac_type, f"type_{sac_type}"
+            )
             self._record_decision("sac")
             self.sac_chosen_actions[sac_n] += 1
             self._current_episode_sources.append("sac")
             return sac_type, sac_params, (
-                f"sac(qs={q_score:.2f},ss={sac_score:.2f})"
+                f"sac(qs={q_score:.2f},"
+                f"ss={sac_score:.2f})"
             )
 
         # Fallback Q (no SAC)
@@ -391,7 +408,7 @@ class Arbitrator:
         self.q_chosen_actions[q_name] += 1
         self._current_episode_sources.append("q_store")
         return q_type, q_params, "q_fallback"
-
+    
     def _record_decision(self, source: str):
         """Record decision in both total and arbitrage-only stats."""
         self.stats[f"{source}_chosen"] += 1
@@ -972,6 +989,53 @@ class Arbitrator:
             "is_calibrating": self._is_calibrating,
             "current_level": self._current_level,
             "per_level_track_record": level_stats,
+            "arbitrage_only": {
+                "total_decisions": self._arbitrage_stats[
+                    "total_decisions"
+                ],
+                "q_store_rate": round(
+                    self._arbitrage_stats["q_store_chosen"]
+                    / max(
+                        self._arbitrage_stats[
+                            "total_decisions"
+                        ],
+                        1,
+                    ),
+                    3,
+                ),
+                "sac_rate": round(
+                    self._arbitrage_stats["sac_chosen"]
+                    / max(
+                        self._arbitrage_stats[
+                            "total_decisions"
+                        ],
+                        1,
+                    ),
+                    3,
+                ),
+                "blend_rate": round(
+                    self._arbitrage_stats["blend_chosen"]
+                    / max(
+                        self._arbitrage_stats[
+                            "total_decisions"
+                        ],
+                        1,
+                    ),
+                    3,
+                ),
+                "heuristic_rate": round(
+                    self._arbitrage_stats[
+                        "heuristic_chosen"
+                    ]
+                    / max(
+                        self._arbitrage_stats[
+                            "total_decisions"
+                        ],
+                        1,
+                    ),
+                    3,
+                ),
+            },
             "q_proposed_top": _top_actions(self.q_proposed_actions),
             "sac_proposed_top": _top_actions(self.sac_proposed_actions),
             "q_chosen_top": _top_actions(self.q_chosen_actions),
