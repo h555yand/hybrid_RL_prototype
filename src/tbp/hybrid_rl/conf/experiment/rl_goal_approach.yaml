@@ -354,8 +354,10 @@ experiment:
     sac_eval_episodes_per_level: 50
 
     adaptive_mesh: cup
-    adaptive_episodes: 1000
+    adaptive_episodes: 2000
+
     offline_check_window: 100
+
 
     logging:
       run_name: Q_generalization-v2

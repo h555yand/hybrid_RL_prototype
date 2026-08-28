@@ -30,8 +30,11 @@ from .ablation_runner import run_episodes
 from .arbitrator import Arbitrator
 from .experience_extractor import ExperienceExtractor
 from .lightweight_env import LightweightEnv
-from .rl_goal_approach_controller import RLGoalApproachController
 from .sac_trainer import PSACTrainer
+from .rl_goal_approach_controller import (
+    RLGoalApproachController,
+    RunningQStats,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +48,7 @@ class AdaptiveTrainingManager:
         config: Dict[str, Any],
         runs_dir: str,
         mesh_path: str,
-        mastered_threshold: float = 0.80,
+        mastered_threshold: float = 0.95,
         offline_threshold: float = 0.40,
         monitor_window: int = 100,
         online_sac_update_every: int = 200,
@@ -402,6 +405,24 @@ class AdaptiveTrainingManager:
             self.success_rate,
         )
 
+        # Log pre-offline track records
+        current_level = self.arbitrator._current_level
+        for source_name, results_dict in [
+            ("Q", self.arbitrator._level_q_results),
+            ("SAC", self.arbitrator._level_sac_results),
+            ("Heuristic", self.arbitrator._level_heuristic_results),
+        ]:
+            for level, results in results_dict.items():
+                if results:
+                    logger.info(
+                        "Pre-offline %s track L%d: %.3f "
+                        "(%d episodes)",
+                        source_name,
+                        level,
+                        sum(results) / len(results),
+                        len(results),
+                    )
+
         current_level = self.arbitrator._current_level
         all_levels = list(
             self.config.get("curriculum_levels", [[10, 120]])
@@ -469,6 +490,10 @@ class AdaptiveTrainingManager:
             config={**self.config, "mode": "adaptive"},
         )
         self.arbitrator.controller = self.controller
+        # Re-warmup RunningQStats after offline retrain
+        self.arbitrator._running_q_stats_free = RunningQStats(warmup=200)
+        self.arbitrator._running_q_stats_surface = RunningQStats(warmup=200)
+        self.arbitrator._warmup_running_stats()
 
         self.arbitrator._level_q_results.clear()
         self.arbitrator._level_sac_results.clear()
@@ -478,8 +503,61 @@ class AdaptiveTrainingManager:
         self.arbitrator._episodes_on_level = 0
 
         q_rate = train_result.get("success_rate", 0.0)
-        logger.info("OFFLINE Q complete: rate=%.3f", q_rate)
+        q_retrain_result = {
+            "episodes": self.offline_q_episodes,
+            "success_rate": q_rate,
+            "curriculum_stats": train_result.get(
+                "curriculum_stats", {}
+            ),
+            "stats": {
+                k: v
+                for k, v in train_result.get(
+                    "stats", {}
+                ).items()
+                if k in (
+                    "total_episodes",
+                    "total_steps",
+                    "total_goals_reached",
+                    "success_rate",
+                    "termination_counts",
+                    "termination_rates",
+                    "q_store_free",
+                    "q_store_surface",
+                    "collision_stats",
+                    "steps_per_success",
+                )
+            },
+            "phase_metrics": train_result.get(
+                "phase_metrics", {}
+            ),
+        }
 
+        q_retrain_path = (
+            Path(self.q_save_dir)
+            / "offline_retrain_result.json"
+        )
+        q_retrain_path.parent.mkdir(
+            parents=True, exist_ok=True
+        )
+        try:
+            import json
+            with q_retrain_path.open("w") as f:
+                json.dump(
+                    q_retrain_result, f, indent=2
+                )
+        except Exception as exc:
+            logger.warning(
+                "Could not save Q retrain result: %s",
+                exc,
+            )
+
+        logger.info(
+            "OFFLINE Q complete: rate=%.3f, "
+            "saved to %s",
+            q_rate,
+            q_retrain_path,
+        )
+        
         success_trails = train_result.get("success_trails", [])
 
         if (
@@ -532,9 +610,41 @@ class AdaptiveTrainingManager:
 
             self.online_transitions_raw = []
 
+            # Log SAC retrain results
+            sac_stats = self.sac_trainer.get_stats() if hasattr(self.sac_trainer, 'get_stats') else {}
+            sac_retrain_result = {
+                "episodes": self.offline_sac_episodes,
+                "sac_stats": sac_stats,
+                "bc_data_size": len(all_bc),
+                "success_trails_used": len(success_trails),
+            }
+            
+            sac_retrain_path = (
+                Path(self.sac_save_dir)
+                / "offline_retrain_result.json"
+            )
+            sac_retrain_path.parent.mkdir(
+                parents=True, exist_ok=True
+            )
+            try:
+                import json
+                with sac_retrain_path.open("w") as f:
+                    json.dump(
+                        sac_retrain_result, f, indent=2
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Could not save SAC retrain result: %s",
+                    exc,
+                )
+
             logger.info(
-                "OFFLINE SAC complete: %d episodes",
+                "OFFLINE SAC complete: %d episodes, "
+                "bc=%d, trails=%d, saved to %s",
                 self.offline_sac_episodes,
+                len(all_bc),
+                len(success_trails),
+                sac_retrain_path,
             )
         else:
             logger.info(
