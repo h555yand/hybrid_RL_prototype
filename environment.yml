@@ -3,7 +3,7 @@
 # ## Miniconda or Anaconda
 #
 # Linux
-#     $ conda env create -f environment.yml
+#     $ conda env create -f environment.yml --solver=libmamba
 # MacOS
 #     $ conda env create -f environment.yml --subdir=osx-64
 # If you are using the zsh shell, run:
@@ -26,6 +26,7 @@ channels:
   - defaults
 
 dependencies:
+  - python=3.8
   - thousandbrainsproject::tbp.monty==0.33.0 # TODO: Pin to desired tbp.monty version for reproducibility
   - pip
   - pip:
