@@ -9,7 +9,7 @@ experiment:
   config:
     seed: 42
     # Visualization: null | text | pictures | video
-    visualise: pictures
+    visualise: text
     regenerate_scripts: false
     do_train: false
     do_eval: false
@@ -325,7 +325,7 @@ experiment:
       lr_actor: 0.00003
       lr_critic: 0.0003
       batch_size: 256
-      bc_lambda_init: 2.0
+      bc_lambda_init: 5.0
       bc_lambda_min: 0.5
       actor_warmup_per_level: 50
       buffer_capacity: 1000000
@@ -348,11 +348,11 @@ experiment:
     sac_eval_episodes_per_level: 100
 
     adaptive_mesh: cup
-    adaptive_episodes: 2000
+    adaptive_episodes: 3000
 
     offline_check_window: 100
 
 
     logging:
-      run_name: Q_generalization-v2
+      run_name: Q_generalization-v2-sac
       output_dir: ${oc.env:MONTY_LOGS}

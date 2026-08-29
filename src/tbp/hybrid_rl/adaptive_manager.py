@@ -196,7 +196,10 @@ class AdaptiveTrainingManager:
         sac_track = self.arbitrator._get_track(
             self.arbitrator._level_sac_results[current_level]
         )
-        best_ml_track = max(q_track, sac_track)
+        blend_track = self.arbitrator._get_track(
+            self.arbitrator._level_blend_results[current_level]
+        )
+        best_ml_track = max(q_track, sac_track, blend_track)
 
         if best_ml_track < h_track * 0.5:
             if (
@@ -498,6 +501,7 @@ class AdaptiveTrainingManager:
         self.arbitrator._level_q_results.clear()
         self.arbitrator._level_sac_results.clear()
         self.arbitrator._level_heuristic_results.clear()
+        self.arbitrator._level_blend_results.clear()
         self.arbitrator._calibration_counter = 0
         self.arbitrator._is_calibrating = True
         self.arbitrator._episodes_on_level = 0
@@ -557,7 +561,7 @@ class AdaptiveTrainingManager:
             q_rate,
             q_retrain_path,
         )
-        
+
         success_trails = train_result.get("success_trails", [])
 
         if (

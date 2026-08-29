@@ -2585,12 +2585,27 @@ class RLGoalApproachExperiment:
         )
         adaptive_log_dir.mkdir(parents=True, exist_ok=True)
 
-        q_terminations: dict[str, int] = {
-            "success": 0, "collision": 0, "timeout": 0,
-        }
-        sac_terminations: dict[str, int] = {
-            "success": 0, "collision": 0, "timeout": 0,
-        }
+        # Per-level per-source tracking
+        per_level_source_stats: dict[int, dict[str, dict]] = {}
+
+        def _get_level_source(lvl, src):
+                if lvl not in per_level_source_stats:
+                    per_level_source_stats[lvl] = {}
+                if src not in per_level_source_stats[lvl]:
+                    per_level_source_stats[lvl][src] = {
+                        "success": 0,
+                        "collision": 0,
+                        "timeout": 0,
+                        "final_distances": [],
+                        "episode_steps": [],
+                        "success_steps": [],
+                    }
+                return per_level_source_stats[lvl][src]
+        
+        blend_final_distances: list[float] = []
+        blend_episode_steps: list[int] = []
+        heuristic_final_distances: list[float] = []
+        heuristic_episode_steps: list[int] = []
         q_final_distances: list[float] = []
         sac_final_distances: list[float] = []
         q_episode_steps: list[int] = []
@@ -2753,7 +2768,6 @@ class RLGoalApproachExperiment:
 
                 ep_steps += 1
                 total_steps_adaptive += 1
-                ep_sources.append(source)
                 ep_actions.append(discrete_idx)
 
                 # Track action type
@@ -2834,7 +2848,9 @@ class RLGoalApproachExperiment:
                 )
 
                 # Track source
-                if source.startswith("blend"):
+                if source.startswith("q_confident_blend"):
+                    source_key = "blend"
+                elif source.startswith("blend"):
                     source_key = "blend"
                 elif source.startswith("q_"):
                     source_key = "q_store"
@@ -2848,6 +2864,7 @@ class RLGoalApproachExperiment:
                 source_counts[source_key] = (
                     source_counts.get(source_key, 0) + 1
                 )
+                ep_sources.append(source_key)
 
                 if done:
                     break
@@ -2975,22 +2992,11 @@ class RLGoalApproachExperiment:
             from collections import Counter
 
             source_counter = Counter(ep_sources)
-            dominant_source = (
+            dominant_source_key = (
                 source_counter.most_common(1)[0][0]
                 if ep_sources
-                else "none"
+                else "heuristic"
             )
-            # Normalize dominant source for tracking
-            if dominant_source in (
-                "blend", "q_type_sac_params",
-            ):
-                dominant_source_key = "q_store"
-            elif dominant_source.startswith("q_"):
-                dominant_source_key = "q_store"
-            elif dominant_source.startswith("sac_"):
-                dominant_source_key = "sac"
-            else:
-                dominant_source_key = "heuristic"
 
             # Per-episode log
             start_dist = float(
@@ -3010,7 +3016,8 @@ class RLGoalApproachExperiment:
                 "steps": ep_steps,
                 "start_distance": round(start_dist, 1),
                 "final_distance": round(final_dist, 1),
-                "dominant_source": dominant_source,
+                "dominant_source": dominant_source_key,
+                "last_source_detail": source,
                 "rolling_success_rate": round(
                     rolling_rate, 3
                 ),
@@ -3018,23 +3025,19 @@ class RLGoalApproachExperiment:
                 "curriculum_level": adaptive_level,
             })
 
-            # Per-source termination and distance tracking
-            if dominant_source_key == "q_store":
-                q_terminations[termination] = (
-                    q_terminations.get(termination, 0) + 1
-                )
-                q_final_distances.append(
-                    round(final_dist, 1)
-                )
-                q_episode_steps.append(ep_steps)
-            elif dominant_source_key == "sac":
-                sac_terminations[termination] = (
-                    sac_terminations.get(termination, 0) + 1
-                )
-                sac_final_distances.append(
-                    round(final_dist, 1)
-                )
-                sac_episode_steps.append(ep_steps)
+            # Per-source per-level tracking
+            src_stats = _get_level_source(
+                adaptive_level, dominant_source_key
+            )
+            src_stats[termination] = (
+                src_stats.get(termination, 0) + 1
+            )
+            src_stats["final_distances"].append(
+                round(final_dist, 1)
+            )
+            src_stats["episode_steps"].append(ep_steps)
+            if success:
+                src_stats["success_steps"].append(ep_steps)
 
             # Snapshot every N episodes
             if self.visualise and (episode + 1) % 42 <= 5 and (episode + 1) >= 0:
@@ -3160,6 +3163,9 @@ class RLGoalApproachExperiment:
                         "heuristic_success_rate": arb_stats.get(
                             "heuristic_success_rate", 0
                         ),
+                        "blend_success_rate": arb_stats.get(
+                            "blend_success_rate", 0
+                        ),
                         "arbitrage_only": arb_stats.get(
                             "arbitrage_only", {}
                         ),
@@ -3180,86 +3186,77 @@ class RLGoalApproachExperiment:
                         ),
                     },
                     "per_source_analysis": {
-                        "q_store": {
-                            "terminations": dict(
-                                q_terminations
-                            ),
-                            "chosen_actions": (
-                                arb_stats.get(
-                                    "q_chosen_top", {}
-                                )
-                            ),
-                            "proposed_actions": (
-                                arb_stats.get(
-                                    "q_proposed_top", {}
-                                )
-                            ),
-                            "mean_final_distance": round(
-                                float(
-                                    np.mean(
-                                        q_final_distances
+                        lvl_key: {
+                            src_name: {
+                                "terminations": {
+                                    k: v
+                                    for k, v in src_data.items()
+                                    if k in (
+                                        "success",
+                                        "collision",
+                                        "timeout",
                                     )
-                                )
-                                if q_final_distances
-                                else 0,
-                                1,
-                            ),
-                            "near_miss_count": sum(
-                                1
-                                for d in q_final_distances
-                                if 2.0 < d <= 5.0
-                            ),
-                            "mean_episode_steps": round(
-                                float(
-                                    np.mean(
-                                        q_episode_steps
+                                },
+                                "total_episodes": (
+                                    src_data.get("success", 0)
+                                    + src_data.get("collision", 0)
+                                    + src_data.get("timeout", 0)
+                                ),
+                                "success_rate": round(
+                                    src_data.get("success", 0)
+                                    / max(
+                                        src_data.get("success", 0)
+                                        + src_data.get("collision", 0)
+                                        + src_data.get("timeout", 0),
+                                        1,
+                                    ),
+                                    3,
+                                ),
+                                "mean_final_distance": round(
+                                    float(
+                                        np.mean(
+                                            src_data[
+                                                "final_distances"
+                                            ]
+                                        )
                                     )
-                                )
-                                if q_episode_steps
-                                else 0,
-                                1,
-                            ),
-                        },
-                        "sac": {
-                            "terminations": dict(
-                                sac_terminations
-                            ),
-                            "chosen_actions": (
-                                arb_stats.get(
-                                    "sac_chosen_top", {}
-                                )
-                            ),
-                            "proposed_actions": (
-                                arb_stats.get(
-                                    "sac_proposed_top", {}
-                                )
-                            ),
-                            "mean_final_distance": round(
-                                float(
-                                    np.mean(
-                                        sac_final_distances
+                                    if src_data[
+                                        "final_distances"
+                                    ]
+                                    else 0,
+                                    1,
+                                ),
+                                "near_miss_count": sum(
+                                    1
+                                    for d in src_data[
+                                        "final_distances"
+                                    ]
+                                    if 2.0 < d <= 5.0
+                                ),
+                                "mean_success_steps": round(
+                                    float(
+                                        np.mean(
+                                            src_data.get(
+                                                "success_steps",
+                                                [],
+                                            )
+                                        )
                                     )
-                                )
-                                if sac_final_distances
-                                else 0,
-                                1,
-                            ),
-                            "near_miss_count": sum(
-                                1
-                                for d in sac_final_distances
-                                if 2.0 < d <= 5.0
-                            ),
-                            "mean_episode_steps": round(
-                                float(
-                                    np.mean(
-                                        sac_episode_steps
+                                    if src_data.get(
+                                        "success_steps"
                                     )
-                                )
-                                if sac_episode_steps
-                                else 0,
-                                1,
-                            ),
-                        },
+                                    else 0,
+                                    1,
+                                ),
+                            }
+                            for src_name, src_data in level_data.items()
+                        }
+                        for lvl_key, level_data in {
+                            f"level_{lvl}": sources
+                            for lvl, sources in sorted(
+                                per_level_source_stats.items()
+                            )
+                        }.items()
                     },
                 }
                 snapshot_log.append(snapshot)
@@ -3375,74 +3372,77 @@ class RLGoalApproachExperiment:
             "snapshots": snapshot_log,
             "episode_log": episode_log,
             "per_source_analysis": {
-                "q_store": {
-                    "terminations": dict(q_terminations),
-                    "mean_final_distance": round(
-                        float(np.mean(q_final_distances))
-                        if q_final_distances
-                        else 0,
-                        1,
-                    ),
-                    "near_miss_count": sum(
-                        1
-                        for d in q_final_distances
-                        if 2.0 < d <= 5.0
-                    ),
-                    "near_miss_rate": round(
-                        sum(
-                            1
-                            for d in q_final_distances
-                            if 2.0 < d <= 5.0
-                        )
-                        / max(len(q_final_distances), 1),
-                        3,
-                    ),
-                    "mean_episode_steps": round(
-                        float(np.mean(q_episode_steps))
-                        if q_episode_steps
-                        else 0,
-                        1,
-                    ),
-                    "total_episodes": len(
-                        q_final_distances
-                    ),
-                },
-                "sac": {
-                    "terminations": dict(sac_terminations),
-                    "mean_final_distance": round(
-                        float(np.mean(sac_final_distances))
-                        if sac_final_distances
-                        else 0,
-                        1,
-                    ),
-                    "near_miss_count": sum(
-                        1
-                        for d in sac_final_distances
-                        if 2.0 < d <= 5.0
-                    ),
-                    "near_miss_rate": round(
-                        sum(
-                            1
-                            for d in sac_final_distances
-                            if 2.0 < d <= 5.0
-                        )
-                        / max(
-                            len(sac_final_distances), 1
+                lvl_key: {
+                    src_name: {
+                        "terminations": {
+                            k: v
+                            for k, v in src_data.items()
+                            if k in (
+                                "success",
+                                "collision",
+                                "timeout",
+                            )
+                        },
+                        "total_episodes": (
+                            src_data.get("success", 0)
+                            + src_data.get("collision", 0)
+                            + src_data.get("timeout", 0)
                         ),
-                        3,
-                    ),
-                    "mean_episode_steps": round(
-                        float(
-                            np.mean(sac_episode_steps)
-                        )
-                        if sac_episode_steps
-                        else 0,
-                        1,
-                    ),
-                    "total_episodes": len(
-                        sac_final_distances
-                    ),
-                },
+                        "success_rate": round(
+                            src_data.get("success", 0)
+                            / max(
+                                src_data.get("success", 0)
+                                + src_data.get("collision", 0)
+                                + src_data.get("timeout", 0),
+                                1,
+                            ),
+                            3,
+                        ),
+                        "mean_final_distance": round(
+                            float(
+                                np.mean(
+                                    src_data[
+                                        "final_distances"
+                                    ]
+                                )
+                            )
+                            if src_data[
+                                "final_distances"
+                            ]
+                            else 0,
+                            1,
+                        ),
+                        "near_miss_count": sum(
+                            1
+                            for d in src_data[
+                                "final_distances"
+                            ]
+                            if 2.0 < d <= 5.0
+                        ),
+                        "mean_success_steps": round(
+                            float(
+                                np.mean(
+                                    src_data.get(
+                                        "success_steps",
+                                        [],
+                                    )
+                                )
+                            )
+                            if src_data.get(
+                                "success_steps"
+                            )
+                            else 0,
+                            1,
+                        ),
+                    }
+                    for src_name, src_data in level_data.items()
+                }
+                for lvl_key, level_data in {
+                    f"level_{lvl}": sources
+                    for lvl, sources in sorted(
+                        per_level_source_stats.items()
+                    )
+                }.items()
             },
         }
 
