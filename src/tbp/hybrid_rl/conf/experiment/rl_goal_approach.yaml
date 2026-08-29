@@ -16,8 +16,8 @@ experiment:
     do_heur_eval: false
     do_bc_train: false
     do_sac_train: false
-    do_sac_eval: false
-    do_adaptive: true
+    do_sac_eval: true
+    do_adaptive: false
 
     train_seeds: [11]
     eval_seeds: [44]
@@ -25,7 +25,7 @@ experiment:
     sac_eval_seeds: [44]
     adapt_seed: 99
 
-    promote_threshold: 0.6
+    promote_threshold: 0.7
     promote_window: 200
 
     curriculum_levels:
@@ -214,6 +214,8 @@ experiment:
       - sphere
       - cylinder
       - flat_square
+      - cone
+      - thin_cylinder
       - vase
       - mug
 
@@ -222,15 +224,17 @@ experiment:
     bc_mesh_weights:
       cube: 0.8         # простой, но даёт базовые навыки flat surface
       sphere: 0.8        # простой, curved surface — полезно для cone
-      flat_square: 0.5   # очень простой, мало нового
       cylinder: 1.5      # edge traversal — ключевой для cone, thin_cylinder
+      flat_square: 0.5   # очень простой, мало нового
+      cone: 0.5
+      thin_cylinder: 0.5
       vase: 2.0          # hollow навигация — ключевой для cup
       mug: 2.5           # самый сложный, handle+rim — максимум данных
 
     bc_level_weights:
       0: 1.0
       1: 1.5
-      2: 2.5    # увеличил с 2.0 — L2 самый важный для генерализации
+      2: 2.0    # увеличил с 2.0 — L2 самый важный для генерализации
       
     bc_min_per_group: 50
     bc_action_min_pct: 0.01
@@ -318,13 +322,14 @@ experiment:
 
     # SAC (not used in Q-only pipeline)
     sac_config:
-      load_mode: auto
+      load_mode: null
       goal_threshold: 4.0
       gamma: 0.99
       tau: 0.005
       lr_actor: 0.00003
       lr_critic: 0.0003
       batch_size: 256
+      bc_lambda_init: 5.0
       bc_lambda_init: 5.0
       bc_lambda_min: 0.5
       actor_warmup_per_level: 50
@@ -338,14 +343,16 @@ experiment:
       cql_alpha: 1.0
 
     sac_episodes_per_mesh:
-      #cube: 1000
-      #sphere: 1000
-      #cylinder: 1000
-      #flat_square: 500
-      #vase: 1000
+      cube: 500
+      sphere: 500
+      cylinder: 500
+      flat_square: 500
+      cone: 500
+      thin_cylinder: 500
+      vase: 1000
       mug: 1000
 
-    sac_eval_episodes_per_level: 100
+    sac_eval_episodes_per_level: 50
 
     adaptive_mesh: cup
     adaptive_episodes: 3000
