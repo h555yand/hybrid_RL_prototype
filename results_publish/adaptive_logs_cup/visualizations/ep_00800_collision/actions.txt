@@ -1,0 +1,98 @@
+Result: collision
+Goal: [15.889764540331313, 27.419078252822313, 9.074078806670798, 46.63382432342547, 65.64171070845367, -71.64807723701422]
+Steps: 90
+Start: [9.024091544108682, -34.712693554958946, 1.1550956909250374, 122.54311515536006, 59.5894098348399, 42.88802848174046]
+End: [31.16321824401233, -17.024040017126794, 0.294917834196486, 176.5630490458375, -66.13846723420521, -94.25224737076488]
+Start distance: 63.0mm
+End distance: 47.8mm
+
+Step 001 (dist=63.0mm): source: q_confirms_sac(conf=0.60,spread=5.1), type: MoveTangentially, params: [0.42, 0.96, 3.86], dist=63.0, phase=CRAWL_TO_GOAL, ss=0, pb=1, n=[0.23,-0.93,-0.27]
+Step 002 (dist=61.6mm): source: q_confirms_sac(conf=0.69,spread=6.3), type: MoveTangentially, params: [-0.32, 0.85, 2.07], dist=61.6, phase=CRAWL_TO_GOAL, ss=0, pb=1, n=[0.32,-0.91,-0.27]
+Step 003 (dist=62.5mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: MoveTangentially, params: [0.59, 0.84, 1.59], dist=62.5, phase=CRAWL_TO_GOAL, ss=0, pb=1, n=[0.23,-0.93,-0.27]
+Step 004 (dist=61.9mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: MoveTangentially, params: [-0.47, 0.90, 1.63], dist=61.9, phase=CRAWL_TO_GOAL, ss=0, pb=1, n=[0.32,-0.91,-0.27]
+Step 005 (dist=62.5mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: MoveTangentially, params: [0.37, 0.88, 2.15], dist=62.5, phase=CRAWL_TO_GOAL, ss=0, pb=1, n=[0.23,-0.93,-0.27]
+Step 006 (dist=61.7mm): source: q_confirms_sac(conf=0.61,spread=6.3), type: MoveTangentially, params: [-0.62, 0.92, 2.37], dist=61.7, phase=CRAWL_TO_GOAL, ss=0, pb=1, n=[0.32,-0.91,-0.27]
+Step 007 (dist=62.6mm): source: q_confirms_sac(conf=0.59,spread=5.4), type: MoveTangentially, params: [0.63, 0.81, 2.80], dist=62.6, phase=CRAWL_TO_GOAL, ss=0, pb=1, n=[0.23,-0.93,-0.27]
+Step 008 (dist=61.6mm): source: q_confirms_sac(conf=0.91,spread=6.3), type: MoveTangentially, params: [-0.49, 0.87, 1.70], dist=61.6, phase=CRAWL_TO_GOAL, ss=0, pb=1, n=[0.32,-0.91,-0.27]
+Step 009 (dist=62.3mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: MoveTangentially, params: [0.24, 0.96, 3.13], dist=62.3, phase=CRAWL_TO_GOAL, ss=0, pb=1, n=[0.32,-0.91,-0.27]
+Step 010 (dist=61.3mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: MoveTangentially, params: [-0.46, 0.94, 2.78], dist=61.3, phase=CRAWL_TO_GOAL, ss=0, pb=1, n=[0.32,-0.91,-0.27]
+Step 011 (dist=62.3mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: Detach, params: [0.00, 0.00, 0.00], dist=62.3, phase=CRAWL_TO_GOAL, ss=0, pb=1, n=[0.23,-0.93,-0.27]
+Step 012 (dist=69.9mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: Turn, params: [-0.05, 0.94, 0.00], dist=69.9, phase=CRAWL_TO_GOAL, ss=0, pb=1
+Step 013 (dist=69.9mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: Turn, params: [0.03, 0.99, 0.00], dist=69.9, phase=CRAWL_TO_GOAL, ss=0, pb=1
+Step 014 (dist=69.9mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: Turn, params: [-0.36, 0.99, 0.00], dist=69.9, phase=CRAWL_TO_GOAL, ss=0, pb=1
+Step 015 (dist=69.9mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: Look, params: [0.25, 0.98, 0.00], dist=69.9, phase=CRAWL_TO_GOAL, ss=0, pb=1
+Step 016 (dist=69.9mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: Look, params: [-0.22, 0.97, 0.00], dist=69.9, phase=CRAWL_TO_GOAL, ss=0, pb=1
+Step 017 (dist=69.9mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: Look, params: [0.16, 0.98, 0.00], dist=69.9, phase=CRAWL_TO_GOAL, ss=0, pb=1
+Step 018 (dist=69.9mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: Look, params: [-0.18, 0.98, 0.00], dist=69.9, phase=CRAWL_TO_GOAL, ss=0, pb=1
+Step 019 (dist=69.9mm): source: q_sac_conflict(q=MoveLinear,sac=Look,conf=0.61,spread=10.0), type: Turn, params: [0.26, 0.97, 0.00], dist=69.9, phase=FLY_TO_EDGE, ss=0, pb=1
+Step 020 (dist=69.9mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: MoveLinear, params: [-4.40, 0.00, 0.00], dist=69.9, phase=FLY_TO_EDGE, ss=0, pb=1
+Step 021 (dist=67.9mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: Look, params: [-0.08, 0.93, 0.00], dist=67.9, phase=FLY_TO_EDGE, ss=0, pb=1
+Step 022 (dist=67.9mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: MoveLinear, params: [1.94, 0.00, 0.00], dist=67.9, phase=FLY_TO_EDGE, ss=0, pb=1
+Step 023 (dist=68.7mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: Look, params: [-0.41, 0.99, 0.00], dist=68.7, phase=FLY_TO_EDGE, ss=0, pb=1
+Step 024 (dist=68.7mm): source: q_sac_conflict(q=MoveLinear,sac=Look,conf=0.61,spread=10.0), type: Turn, params: [0.26, 0.97, 0.00], dist=68.7, phase=FLY_TO_EDGE, ss=0, pb=1
+Step 025 (dist=68.7mm): source: q_sac_conflict(q=MoveLinear,sac=Look,conf=0.59,spread=9.9), type: Look, params: [-0.26, 0.97, 0.00], dist=68.7, phase=FLY_TO_EDGE, ss=0, pb=1
+Step 026 (dist=68.7mm): source: q_sac_conflict(q=MoveLinear,sac=Look,conf=0.58,spread=10.1), type: Turn, params: [0.26, 0.97, 0.00], dist=68.7, phase=FLY_TO_EDGE, ss=0, pb=1
+Step 027 (dist=68.7mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: Look, params: [-0.34, 0.98, 0.00], dist=68.7, phase=FLY_TO_EDGE, ss=0, pb=1
+Step 028 (dist=68.7mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: Look, params: [-0.35, 0.99, 0.00], dist=68.7, phase=FLY_TO_EDGE, ss=0, pb=1
+Step 029 (dist=68.7mm): source: q_confirms_sac(conf=0.60,spread=10.8), type: MoveLinear, params: [-5.14, 0.00, 0.00], dist=68.7, phase=FLY_TO_EDGE, ss=0, pb=1, n=[0.57,-0.77,-0.27]
+Step 030 (dist=72.1mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: Look, params: [-0.15, 1.00, 0.00], dist=72.1, phase=FLY_TO_EDGE, ss=0, pb=1, n=[0.57,-0.77,-0.27]
+Step 031 (dist=72.1mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: MoveLinear, params: [7.29, 0.00, 0.00], dist=72.1, phase=FLY_TO_EDGE, ss=0, pb=1, n=[0.32,-0.91,-0.27]
+Step 032 (dist=66.9mm): source: q_sac_conflict(q=MoveLinear,sac=Look,conf=0.66,spread=10.7), type: Look, params: [0.09, 1.00, 0.00], dist=66.9, phase=FLY_TO_EDGE, ss=0, pb=1, n=[0.32,-0.91,-0.27]
+Step 033 (dist=66.9mm): source: q_confirms_sac(conf=0.66,spread=10.6), type: MoveLinear, params: [0.30, 0.00, 0.00], dist=66.9, phase=FLY_TO_EDGE, ss=0, pb=1, n=[0.41,-0.87,-0.27]
+Step 034 (dist=66.7mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: MoveLinear, params: [-3.52, 0.00, 0.00], dist=66.7, phase=FLY_TO_EDGE, ss=0, pb=1, n=[0.41,-0.87,-0.27]
+Step 035 (dist=69.0mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: MoveLinear, params: [-1.37, 0.00, 0.00], dist=69.0, phase=FLY_TO_EDGE, ss=0, pb=1, n=[0.41,-0.87,-0.27]
+Step 036 (dist=70.0mm): source: q_sac_conflict(q=MoveLinear,sac=Look,conf=0.78,spread=10.5), type: Look, params: [-0.09, 1.00, 0.00], dist=70.0, phase=FLY_TO_EDGE, ss=0, pb=1, n=[0.41,-0.87,-0.27]
+Step 037 (dist=70.0mm): source: q_sac_conflict(q=MoveLinear,sac=Look,conf=0.97,spread=10.5), type: Look, params: [0.09, 1.00, 0.00], dist=70.0, phase=FLY_TO_EDGE, ss=0, pb=1, n=[0.32,-0.91,-0.27]
+Step 038 (dist=70.0mm): source: q_confirms_sac(conf=0.97,spread=10.5), type: MoveLinear, params: [0.87, 0.00, 0.00], dist=70.0, phase=FLY_TO_EDGE, ss=0, pb=1, n=[0.41,-0.87,-0.27]
+Step 039 (dist=69.4mm): source: q_confirms_sac(conf=0.98,spread=10.5), type: MoveLinear, params: [-2.46, 0.00, 0.00], dist=69.4, phase=FLY_TO_EDGE, ss=0, pb=1, n=[0.41,-0.87,-0.27]
+Step 040 (dist=71.1mm): source: q_confirms_sac(conf=0.98,spread=10.4), type: MoveLinear, params: [11.98, 0.00, 0.00], dist=71.1, phase=FLY_TO_EDGE, ss=0, pb=1, n=[0.41,-0.87,-0.27]
+Step 041 (dist=63.3mm): source: q_confirms_sac(conf=0.73,spread=10.6), type: MoveLinear, params: [-2.88, 0.00, 0.00], dist=63.3, phase=FLY_TO_EDGE, ss=0, pb=1, n=[0.41,-0.87,-0.27]
+Step 042 (dist=65.0mm): source: q_confirms_sac(conf=0.98,spread=10.4), type: MoveLinear, params: [1.52, 0.00, 0.00], dist=65.0, phase=FLY_TO_EDGE, ss=0, pb=1, n=[0.41,-0.87,-0.27]
+Step 043 (dist=64.1mm): source: q_confirms_sac(conf=0.98,spread=10.4), type: MoveLinear, params: [-1.60, 0.00, 0.00], dist=64.1, phase=FLY_TO_EDGE, ss=0, pb=1, n=[0.41,-0.87,-0.27]
+Step 044 (dist=65.1mm): source: q_confirms_sac(conf=0.98,spread=10.3), type: MoveLinear, params: [-0.24, 0.00, 0.00], dist=65.1, phase=FLY_TO_EDGE, ss=0, pb=1, n=[0.41,-0.87,-0.27]
+Step 045 (dist=65.2mm): source: q_confirms_sac(conf=0.99,spread=10.3), type: MoveLinear, params: [-1.51, 0.00, 0.00], dist=65.2, phase=FLY_TO_EDGE, ss=0, pb=1, n=[0.41,-0.87,-0.27]
+Step 046 (dist=66.2mm): source: q_confirms_sac(conf=0.99,spread=10.3), type: MoveLinear, params: [-3.79, 0.00, 0.00], dist=66.2, phase=FLY_TO_EDGE, ss=0, pb=1, n=[0.41,-0.87,-0.27]
+Step 047 (dist=68.7mm): source: q_confirms_sac(conf=0.99,spread=10.3), type: MoveLinear, params: [-4.01, 0.00, 0.00], dist=68.7, phase=FLY_TO_EDGE, ss=0, pb=1, n=[0.41,-0.87,-0.27]
+Step 048 (dist=71.5mm): source: q_sac_conflict(q=MoveLinear,sac=Look,conf=0.99,spread=10.3), type: Turn, params: [0.09, 1.00, 0.00], dist=71.5, phase=FLY_TO_EDGE, ss=0, pb=1, n=[0.41,-0.87,-0.27]
+Step 049 (dist=71.5mm): source: q_sac_conflict(q=MoveLinear,sac=Look,conf=0.71,spread=10.7), type: Look, params: [-0.09, 1.00, 0.00], dist=71.5, phase=FLY_TO_EDGE, ss=0, pb=1, n=[0.41,-0.87,-0.27]
+Step 050 (dist=71.5mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: Look, params: [0.06, 1.00, 0.00], dist=71.5, phase=FLY_TO_EDGE, ss=0, pb=1, n=[0.32,-0.91,-0.27]
+Step 051 (dist=71.5mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: MoveLinear, params: [12.09, 0.00, 0.00], dist=71.5, phase=FLY_TO_EDGE, ss=0, pb=1, n=[0.41,-0.87,-0.27]
+Step 052 (dist=62.7mm): source: q_confirms_sac(conf=0.99,spread=10.3), type: MoveLinear, params: [-1.82, 0.00, 0.00], dist=62.7, phase=FLY_TO_EDGE, ss=0, pb=1, n=[0.41,-0.87,-0.27]
+Step 053 (dist=64.0mm): source: q_confirms_sac(conf=0.69,spread=10.5), type: MoveLinear, params: [0.65, 0.00, 0.00], dist=64.0, phase=FLY_TO_EDGE, ss=0, pb=1, n=[0.41,-0.87,-0.27]
+Step 054 (dist=63.5mm): source: q_confirms_sac(conf=0.99,spread=10.3), type: MoveLinear, params: [-1.29, 0.00, 0.00], dist=63.5, phase=FLY_TO_EDGE, ss=0, pb=1, n=[0.41,-0.87,-0.27]
+Step 055 (dist=64.4mm): source: q_confirms_sac(conf=0.99,spread=10.2), type: MoveLinear, params: [2.72, 0.00, 0.00], dist=64.4, phase=FLY_TO_EDGE, ss=0, pb=1, n=[0.41,-0.87,-0.27]
+Step 056 (dist=62.6mm): source: q_confirms_sac(conf=0.99,spread=10.2), type: MoveLinear, params: [0.03, 0.00, 0.00], dist=62.6, phase=FLY_TO_EDGE, ss=0, pb=1, n=[0.41,-0.87,-0.27]
+Step 057 (dist=62.5mm): source: q_confirms_sac(conf=0.70,spread=10.5), type: MoveLinear, params: [0.31, 0.00, 0.00], dist=62.5, phase=FLY_TO_EDGE, ss=0, pb=1, n=[0.41,-0.87,-0.27]
+Step 058 (dist=62.3mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: MoveLinear, params: [-1.45, 0.00, 0.00], dist=62.3, phase=FLY_TO_EDGE, ss=0, pb=1, n=[0.41,-0.87,-0.27]
+Step 059 (dist=63.3mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: MoveLinear, params: [-1.92, 0.00, 0.00], dist=63.3, phase=FLY_TO_EDGE, ss=0, pb=1, n=[0.41,-0.87,-0.27]
+Step 060 (dist=64.6mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: MoveLinear, params: [-0.85, 0.00, 0.00], dist=64.6, phase=FLY_TO_EDGE, ss=0, pb=1, n=[0.41,-0.87,-0.27]
+Step 061 (dist=65.2mm): source: q_confirms_sac(conf=0.68,spread=10.5), type: MoveLinear, params: [-2.32, 0.00, 0.00], dist=65.2, phase=FLY_TO_EDGE, ss=0, pb=1, n=[0.41,-0.87,-0.27]
+Step 062 (dist=66.9mm): source: q_confirms_sac(conf=0.97,spread=10.5), type: MoveLinear, params: [-0.04, 0.00, 0.00], dist=66.9, phase=FLY_TO_EDGE, ss=0, pb=1, n=[0.41,-0.87,-0.27]
+Step 063 (dist=66.9mm): source: q_confirms_sac(conf=0.97,spread=10.5), type: MoveLinear, params: [-2.55, 0.00, 0.00], dist=66.9, phase=FLY_TO_EDGE, ss=0, pb=1, n=[0.41,-0.87,-0.27]
+Step 064 (dist=68.8mm): source: q_confirms_sac(conf=0.74,spread=10.6), type: MoveLinear, params: [6.67, 0.00, 0.00], dist=68.8, phase=FLY_TO_EDGE, ss=0, pb=1, n=[0.41,-0.87,-0.27]
+Step 065 (dist=64.0mm): source: q_confirms_sac(conf=0.71,spread=10.5), type: MoveLinear, params: [0.66, 0.00, 0.00], dist=64.0, phase=FLY_TO_EDGE, ss=0, pb=1, n=[0.41,-0.87,-0.27]
+Step 066 (dist=63.6mm): source: q_confirms_sac(conf=0.99,spread=10.2), type: MoveLinear, params: [1.07, 0.00, 0.00], dist=63.6, phase=FLY_TO_EDGE, ss=0, pb=1, n=[0.41,-0.87,-0.27]
+Step 067 (dist=62.8mm): source: q_confirms_sac(conf=0.71,spread=10.5), type: MoveLinear, params: [1.80, 0.00, 0.00], dist=62.8, phase=FLY_TO_EDGE, ss=0, pb=1, n=[0.41,-0.87,-0.27]
+Step 068 (dist=61.6mm): source: q_confirms_sac(conf=0.70,spread=10.5), type: MoveLinear, params: [2.67, 0.00, 0.00], dist=61.6, phase=FLY_TO_EDGE, ss=0, pb=1, n=[0.41,-0.87,-0.27]
+Step 069 (dist=59.9mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: MoveTangentially, params: [-0.89, 0.98, 2.16], dist=59.9, phase=FLY_TO_EDGE, ss=0, pb=1, n=[0.41,-0.87,-0.27]
+Step 070 (dist=61.9mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: MoveTangentially, params: [-0.78, 0.72, 1.26], dist=61.9, phase=FLY_TO_EDGE, ss=0, pb=1, n=[0.32,-0.91,-0.27]
+Step 071 (dist=62.2mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: MoveTangentially, params: [0.61, 0.89, 2.33], dist=62.2, phase=FLY_TO_EDGE, ss=0, pb=1, n=[0.23,-0.93,-0.27]
+Step 072 (dist=61.4mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: MoveTangentially, params: [-0.51, 0.85, 2.70], dist=61.4, phase=FLY_TO_EDGE, ss=0, pb=1, n=[0.32,-0.91,-0.27]
+Step 073 (dist=62.3mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: MoveTangentially, params: [0.66, 0.89, 1.59], dist=62.3, phase=FLY_TO_EDGE, ss=0, pb=1, n=[0.23,-0.93,-0.27]
+Step 074 (dist=61.8mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: MoveTangentially, params: [-0.52, 0.91, 2.41], dist=61.8, phase=FLY_TO_EDGE, ss=0, pb=1, n=[0.32,-0.91,-0.27]
+Step 075 (dist=62.5mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: MoveTangentially, params: [0.79, 0.87, 3.65], dist=62.5, phase=FLY_TO_EDGE, ss=0, pb=1, n=[0.23,-0.93,-0.27]
+Step 076 (dist=61.3mm): source: q_sac_conflict(q=MoveTangentially,sac=Detach,conf=0.73,spread=6.1), type: MoveTangentially, params: [-1.00, -0.00, 3.00], dist=61.3, phase=CRAWL_TO_EDGE, ss=0, pb=1, n=[0.32,-0.91,-0.27], e_t=[0.8,-2.3,8.7], best_dir=6, scores=[-14.24, -50.71, -62.75, -43.3, -3.76, 32.71, 44.75, 25.3], e_t_direct=[22.8,6.9,4.2], goal_w=[4.5,57.9,19.6]
+Step 077 (dist=61.3mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: Detach, params: [0.00, 0.00, 0.00], dist=61.3, phase=CRAWL_TO_EDGE, ss=0, pb=1, n=[0.32,-0.91,-0.27]
+Step 078 (dist=68.7mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: Look, params: [0.42, 0.99, 0.00], dist=68.7, phase=CRAWL_TO_EDGE, ss=0, pb=1
+Step 079 (dist=68.7mm): source: q_confirms_sac(conf=0.74,spread=9.6), type: MoveLinear, params: [10.34, 0.00, 0.00], dist=68.7, phase=CRAWL_TO_EDGE, ss=0, pb=1
+Step 080 (dist=69.8mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: MoveLinear, params: [4.85, 0.00, 0.00], dist=69.8, phase=CRAWL_TO_EDGE, ss=0, pb=1
+Step 081 (dist=70.8mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: MoveLinear, params: [-1.12, 0.00, 0.00], dist=70.8, phase=CRAWL_TO_EDGE, ss=0, pb=1
+Step 082 (dist=70.5mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: Look, params: [0.26, 0.99, 0.00], dist=70.5, phase=CRAWL_TO_EDGE, ss=0, pb=1
+Step 083 (dist=70.5mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: Look, params: [0.33, 0.99, 0.00], dist=70.5, phase=CRAWL_TO_EDGE, ss=0, pb=1
+Step 084 (dist=70.5mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: Look, params: [0.29, 0.99, 0.00], dist=70.5, phase=CRAWL_TO_EDGE, ss=0, pb=1
+Step 085 (dist=70.5mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: Look, params: [0.27, 1.00, 0.00], dist=70.5, phase=CRAWL_TO_EDGE, ss=0, pb=1
+Step 086 (dist=70.5mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: Look, params: [0.17, 0.97, 0.00], dist=70.5, phase=CRAWL_TO_EDGE, ss=0, pb=1
+Step 087 (dist=70.5mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: Look, params: [0.12, 0.96, 0.00], dist=70.5, phase=CRAWL_TO_EDGE, ss=0, pb=1, n=[0.66,0.38,0.64]
+Step 088 (dist=70.5mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: Look, params: [0.07, 1.00, 0.00], dist=70.5, phase=CRAWL_TO_EDGE, ss=0, pb=1
+Step 089 (dist=70.5mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: MoveLinear, params: [24.79, 0.00, 0.00], dist=70.5, phase=CRAWL_TO_EDGE, ss=0, pb=1, n=[0.91,-0.32,-0.27]
+Step 090 (dist=47.8mm): source: sac(qt=0.50,st=0.62,bt=0.70,ht=0.80,h_eps=0.180), type: MoveLinear, params: [5.14, 0.00, 0.00], dist=47.8, phase=CRAWL_TO_GOAL, ss=0, pb=1, n=[0.91,-0.32,-0.27]
