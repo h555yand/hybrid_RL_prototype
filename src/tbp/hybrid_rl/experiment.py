@@ -2555,6 +2555,8 @@ class RLGoalApproachExperiment:
             offline_check_window=self.config.get("offline_check_window", 50),
             promote_threshold=self.promote_threshold,
             promote_window=self.promote_window,
+            online_sac_update_every=100,
+            online_sac_update_steps=40,
         )
         manager.sac_trainer = sac_trainer
 
@@ -2877,18 +2879,20 @@ class RLGoalApproachExperiment:
                 )
 
                 # Track source
-                if source.startswith("q_confident_blend"):
+                if source.startswith("q_confirms_sac"):
                     source_key = "blend"
-                elif source.startswith("blend"):
+                elif source.startswith("q_sac_conflict"):
+                    source_key = "heuristic"
+                elif source.startswith("q_confident"):
                     source_key = "blend"
-                elif source.startswith("q_"):
-                    source_key = "q_store"
-                elif source.startswith("sac"):
-                    source_key = "sac"
                 elif source.startswith("heuristic"):
                     source_key = "heuristic"
+                elif source.startswith("sac"):
+                    source_key = "sac"
+                elif source.startswith("q_"):
+                    source_key = "q_store"
                 else:
-                    source_key = "other"
+                    source_key = "sac"
 
                 source_counts[source_key] = (
                     source_counts.get(source_key, 0) + 1

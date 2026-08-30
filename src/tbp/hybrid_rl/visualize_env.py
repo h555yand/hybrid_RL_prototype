@@ -530,7 +530,7 @@ def save_episode_frames(
             return True
         if step_idx <= _DETAIL_STEPS:
             return True
-        if step_idx == last_step:
+        if step_idx >= (last_step - int(timeout_frame_interval * 0.5)):
             return True
         if step_idx % timeout_frame_interval == 0:
             return True

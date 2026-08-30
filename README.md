@@ -126,36 +126,216 @@ In future when SAC is trained we use it as **skills to propose continuous action
 
 
 **Below is explanation of the main components**:
+## Adaptive Arbitrage
 
-## State Vector (15D)
-The agent sees a 15-dimensional state vector. Everything is in the agent's local coordinate frame — this is important for generalization, because going from A to B requires the same actions regardless of absolute position in the world.
-Three groups of features:
+The adaptive arbitrage system is the deployment-time decision layer that combines all learned knowledge (Q-store, SAC, heuristics) and continues learning on new objects. It consists of two components: the **Arbitrator** (per-step action source selection) and the **AdaptiveTrainingManager** (episode-level performance monitoring and retraining).
+
+### Arbitrator — Per-Step Action Source Selection
+
+The Arbitrator decides which action source to use **on every step**. It receives proposals from Q-store and SAC, evaluates their reliability, and picks the best source.
+
+[Full realization here](src/tbp/hybrid_rl/arbitrator.py)
+
+#### Decision Logic
+
+```
+Step 1: Get proposals from all sources
+  → Q-store: softmax sample from Q-values (with strategic detach override)
+  → SAC: sample from actor network (continuous params)
+  → Heuristic: geometric rules (fallback)
+
+Step 2: Q-confident override
+  IF q_confidence ≥ adaptive_threshold AND q_spread > 3.0:
+    IF q_type == sac_type → use SAC params (Q confirms SAC = "blend")
+    IF q_type != sac_type → use heuristic (conflict = neither trusted)
+
+Step 3: Track record scoring
+  Compute per-level success rates for Q, SAC, blend, heuristic
+  IF worst_ML_track < heuristic_track AND heuristic_budget not exhausted:
+    → use heuristic (ML is underperforming)
+
+Step 4: Default
+  → use SAC (or Q fallback if no SAC)
+```
+
+#### Key Design Decisions
+
+**Per-level track records**: Success rates are tracked separately for each curriculum level. Level 0 (easy, 10-40mm) may have different source reliability than level 2 (hard, 10-120mm). Each source (Q, SAC, blend, heuristic) maintains a sliding window of 50 episode outcomes per level.
+
+**Dynamic heuristic epsilon**: Instead of a fixed heuristic fallback rate, the budget is proportional to the gap between heuristic and ML performance:
+```
+heuristic_eps = max(h_track - worst_ml_track, 0.1)
+```
+When ML is close to heuristic performance → minimal heuristic usage (10%). When ML is far below → more heuristic (up to the full gap). This prevents heuristic from dominating when ML is learning, while providing a safety net when ML fails.
+
+**Q-confidence with V-baseline**: Q-confidence from HNSW store is adjusted by the state value baseline:
+- V above global mean → boost confidence (well-known good state)
+- V below global mean → reduce confidence (unknown/bad state)
+
+This prevents Q-store from being overconfident in unfamiliar regions.
+
+**Agreement tracking**: When Q and SAC propose the same action type, the "blend" source is recorded. This tracks whether the two systems are converging — high agreement rate suggests both have learned similar policies.
+
+**Episode attribution**: At episode end, the dominant source (most steps) determines which track record gets updated. This is a simplification — ideally each step's contribution would be weighted, but dominant-source attribution is robust and simple.
+
+#### Source Selection Summary
+
+| Source | When chosen | What it provides |
+|--------|-------------|------------------|
+| **Q-store** | High confidence, no SAC available | Discrete action → converted to type + params |
+| **SAC** | Default when available, ML track ≥ heuristic | Continuous action type + params from actor network |
+| **Blend** | Q and SAC agree on type, Q is confident | SAC params with Q confirmation (highest trust) |
+| **Heuristic** | Q/SAC conflict, or ML underperforming heuristic | Geometric rules → discrete action → type + params |
+
+### AdaptiveTrainingManager — Episode-Level Performance Monitor
+
+The AdaptiveTrainingManager monitors rolling success rate and decides the training mode. It wraps the Arbitrator and manages online/offline learning.
+
+[Full realization here](src/tbp/hybrid_rl/adaptive_manager.py)
+
+#### Three Operating Modes
+
+| Mode | Condition | Behavior |
+|------|-----------|----------|
+| **online** | 40-95% success rate (default) | Full Q-learning every step. Periodic SAC updates (critic CQL + actor with BC). Adaptive epsilon based on success rate |
+| **mastered** | >95% success rate sustained | Light tuning only. Epsilon = 0.02. System has learned the object |
+| **offline** | Best ML track < heuristic × 0.5, sustained | Emergency full retrain. Q-learning (500 ep, ε: 1.0→0.3) + SAC retrain (300 ep). Resets track records after |
+
+#### Online SAC Updates
+
+Every `online_sac_update_every` episodes (default 100), the manager performs a mini SAC training session:
+
+1. **Critic warmup**: First N updates are critic-only (CQL). Actor is frozen to prevent catastrophic forgetting before critic has calibrated
+2. **CQL critic**: Conservative Q-Learning prevents overestimation on the new object's state distribution
+3. **Actor updates**: After warmup, actor updates every 10th step with reduced learning rate (×0.1) and strong BC regularization
+4. **BC lambda decay**: Gradually frees actor from behavioral cloning constraint (×0.95 per update cycle)
+
+Transitions are collected selectively:
+- **Success trajectories**: Always collected (buffer + BC data)
+- **Failure trajectories**: Collected with probability `min(0.3, success_rate × 0.5)` — critic needs some negatives but not too many
+
+#### Offline Retrain Pipeline
+
+Triggered when ML sources consistently underperform heuristics (with safeguards):
+- Minimum `min_online_before_offline` episodes before first offline (default 300)
+- Maximum `max_offline_iterations` total (default 2)
+- Cooldown `post_offline_cooldown` episodes after each offline (default 200)
+
+The offline pipeline:
+1. Save current Q-store
+2. Run Q-learning training (`offline_q_episodes`, default 500) with warmup and curriculum
+3. Reload improved Q-store, reset Arbitrator track records
+4. If SAC available and enough success trails: retrain SAC with combined BC data (old objects + new trails)
+5. Reset success history, enter online mode
+
+#### Mode Transition Diagram
+
+```
+                    ┌──────────┐
+         ┌─────────│  online   │◄────────────┐
+         │         └────┬──────┘             │
+         │              │                     │
+    success > 95%   ML << heuristic      post-retrain
+         │              │                     │
+         ▼              ▼                     │
+   ┌──────────┐   ┌──────────┐               │
+   │ mastered │   │ offline  │───────────────┘
+   └──────────┘   └──────────┘
+         │              
+    success < 95%       
+         │              
+         └──────► online
+```
+
+### Integration: How Arbitrator and Manager Work Together
+
+```
+Episode loop:
+  1. Manager.get_action(state, pose, sensor)
+     → Arbitrator.decide() → (action_type, params, source)
+  2. Environment.step(action)
+  3. Controller.update_only() → Q-store learns from transition
+  4. Repeat until done
+
+  5. Manager.on_episode_complete(success, transitions)
+     → Update success history
+     → Arbitrator.on_episode_end(success) → update track records
+     → decide_mode() → online/mastered/offline
+     → If online: collect transitions, maybe SAC update
+     → If offline: trigger full retrain pipeline
+     → If mastered: reduce epsilon to 0.02
+```
+
+> "The key insight is that the Arbitrator operates at step level (which source per action) while the Manager operates at episode level (how to train). The Arbitrator doesn't know about training — it just picks the best source based on track records. The Manager doesn't know about individual actions — it just monitors success rate and triggers retraining when needed. This separation keeps both components simple and testable."
+
+---
+
+## State Vector (22D)
+The agent sees a 22-dimensional state vector. Everything is in the agent's local coordinate frame — this is important for generalization, because going from A to B requires the same actions regardless of absolute position in the world.
+Five groups of features:
 
 > **Where is the goal?** Position error — 3D direction to goal. Rotation error — how much to turn. Distance — scalar. These tell the agent 'the goal is 30mm ahead and to the left.'
 >
-> **What surface am I on?** Surface normal, mean curvature, Gaussian curvature, on_object flag. These tell the agent 'I'm on a curved wall' or 'I'm in the air.'
+> **What surface am I on?** Surface normal, principal curvatures (k1, k2), on_object flag, normalized depth. These tell the agent 'I'm on a curved wall' or 'I'm in the air.'
 >
-> **How is the goal oriented relative to the surface?** Alignment — dot product of goal direction and surface normal. Normalized depth. Alignment is the key feature — when it's negative, the goal is behind the surface, and the agent needs to detach and fly. When it's positive, the agent can crawl along the surface.
+> **How is the goal oriented relative to the surface?** Alignment — dot product of goal direction and surface normal. When it's negative, the goal is behind the surface, and the agent needs to detach and fly. When it's positive, the agent can crawl along the surface.
 >
-> The state is action-space independent — it describes the situation, not what actions are available
+> **Goal surface context.** Goal normal in agent's local frame — tells the agent how the goal surface is oriented relative to current position. Path blocked flag — whether direct line to goal intersects the object. Movement efficiency — ratio of net displacement to total movement over recent steps, detecting oscillation/stagnation.
+>
+> **Projected goal direction.** 2D projection of goal direction onto the tangent plane (when on surface) or onto the XY plane of the agent frame (when in air). Gives the agent a direct signal for which surface direction to crawl.
+>
+> The state is action-space independent — it describes the situation, not what actions are available.
 
-I started with 13D and expanded to **15D** during testing. The additional features (mean curvature, Gaussian curvature) improved surface navigation.
-The state vector is action-space independent — it describes the agent's situation relative to the goal, not the specific actions available.  
+I started with 13D, expanded to 15D (adding curvatures), then to **22D** during development. The additional features (goal normal, path blocked, movement efficiency, projected direction) significantly improved navigation on complex objects like mugs and cups.
+
 | Index | Feature | Description |
 |----------|----------|----------|
 | 0-2   | position_error [x, y, z]   | direction to goal in agent's local frame   |
 | 3-5   | rotation_error [pitch, yaw, roll]   | orientation error (normalized angles)   |
 | 6-8   | local_normal   | surface normal in agent's local frame   |
-| 9   | mean curvature   | mean curvature   |
-| 10   | Gaussian curvature   | Gaussian curvature   |
+| 9   | k1   | principal curvature (max absolute)   |
+| 10   | k2   | principal curvature (min absolute)   |
 | 11   | on_object   | whether sensor on object surface   |
 | 12   | alignment   | dot(goal_direction, surface_normal)   |
 | 13   | distance   | Euclidean distance to goal   |
 | 14   | norm_depth   | normalized depth to nearest surface   |
+| 15-17 | goal_normal_local | goal surface normal in agent's local frame |
+| 18 | path_blocked | whether direct path to goal is blocked by object (0/1) |
+| 19 | movement_efficiency | net displacement / total movement over recent window (0..1) |
+| 20-21 | projected_goal_2d | goal direction projected onto tangent plane (on surface) or agent XY plane (in air) |
+
+### Strategic State Vectors
+
+In addition to the main 22D tactical state, the system uses two compact strategic state vectors for high-level decisions. These are stored in separate HNSW graphs (`strategic_detach` and `strategic_direction`) and control phase transitions rather than individual actions.
+
+#### Detach Decision State (5D)
+Used to decide whether to stay on surface (crawl) or switch to air (detach). Stored in `strategic_detach` Q-store with 2 actions: stay=0, switch=1.
+
+| Index | Feature | Description |
+|-------|---------|-------------|
+| 0 | normal_agreement | dot(agent_normal, goal_normal) — are agent and goal on same side? |
+| 1 | alignment | dot(goal_direction, agent_normal) — is goal reachable by crawling? |
+| 2 | norm_distance | distance / object_extent — relative distance to goal |
+| 3 | path_blocked | whether direct path to goal is blocked (0/1) |
+| 4 | movement_efficiency | recent crawl efficiency — detects stagnation |
+
+#### Direction Decision State (5D)
+Used when in air to decide whether to fly directly to goal (action=0) or bypass/orbit around obstacle (action=1). Stored in `strategic_direction` Q-store with 2 actions: fly_to_goal=0, bypass=1.
+
+| Index | Feature | Description |
+|-------|---------|-------------|
+| 0 | lateral_deviation | how far off-axis the goal is (0=ahead, 1=side) |
+| 1 | alignment | dot(goal_direction, agent_normal) |
+| 2 | norm_distance | distance / object_extent — relative distance |
+| 3 | angle_to_goal | dot(forward, goal_direction) — how well aimed at goal |
+| 4 | path_blocked | whether direct path is blocked (0/1) |
+
+> "The strategic states are intentionally compact (5D vs 22D). High-level decisions like 'should I detach?' depend on a few geometric relationships, not on fine-grained curvature or exact position. Compact states mean the strategic Q-stores learn faster with fewer samples and generalize better across objects. Strategic state are used only for Q-stores, SAC as neaural network is able to find similar dependencies from 22D tactical state"
 
 
-## ActionSpace (25D) - What agent can do
-There are 25 discrete actions in four categories.
+
+## ActionSpace (24D) - What agent can do
+There are 24 discrete actions in four categories.
 
 > "**Surface movement** — 8 directions of MoveTangentially, plus OrientHorizontal and OrientVertical. This is crawling along the object surface.
 >
@@ -163,14 +343,9 @@ There are 25 discrete actions in four categories.
 >
 > **Orientation** — TurnLeft, TurnRight, LookUp, LookDown, each in normal and big step sizes. 5 degrees and 15 degrees. Big steps for coarse correction, small for fine-tuning.
 >
-> **Macro actions** — Detach and DetachEdge. These are multi-step sequences. Detach lifts off the surface along the normal and flies toward the goal. DetachEdge flies up to the edge of the object and over to the other side. These are critical for navigating around obstacles — you'll see them a lot in the demo.
+> **Macro actions** — Detach. These are multi-step sequences. Detach lifts off the surface along the normal and orient gaze toward goal.
 >
 > The action space is a configurable parameter. Adding or removing actions doesn't require architectural changes
-
-The current prototype uses discrete actions with fixed step sizes.   
-The next step is Parameterized SAC — same action categories but with continuous parameters for distance and angle. This gives the flexibility of continuous control while preserving the interpretability and compatibility with Monty's action primitives.   
-I originally planned a purely continuous action space as a third step, but I now believe Parameterized SAC is sufficient — it solves the fixed-step problem while maintaining compatibility with Monty's MoveTangentially, MoveForward, and other action types.   
-For real robot deployment, these high-level actions map to inverse kinematics, which is a standard robotics problem.
 
 ### How to use action types in RL step by step:
 1. Q-learning and discrete actions - 'What to do' (high level primitives with fixed parameters)
@@ -184,8 +359,8 @@ The policy outputs a vector [Δx, Δy, Δz, Δθ, Δφ] and then interprets this
 4. Mathematical controller (Low-level / Inverse kinematics & Impedance)
 This is 'spinal cord' that receives a command from the neural network (SAC) and instantly calculates the motor actions.
 
-At the beginning I used 18 actions then 2 macro actions and 5 different step / rotation size actions were added:
-### Discrete action space 25D
+At the beginning I used 18 actions then 1 macro actions and 5 different step / rotation size actions were added:
+### Discrete action space 24D
 | Index | Action               | Description                                                                 | Mode     | Parameters |
 |--------|------------------------|-------------------------------------------------------------------------|-----------|-----------|
 | 0–7    | MoveTangentially       | Movement tangent to the surface in 8 directions: 0°, 45°, ..., 315° | surface   | `distance: float`, `direction: VectorXYZ` |
@@ -199,13 +374,12 @@ At the beginning I used 18 actions then 2 macro actions and 5 different step / r
 | 15     | SetSensorRotation (-)  | Rotate the sensor counterclockwise                                          | both       | `rotation_quat: Quaternion` |
 | 16     | OrientHorizontal       | Correction of position and orientation in the horizontal plane (with compensation) | surface   | `rotation_degrees: float`, `left_distance: float`, `forward_distance: float` |
 | 17     | OrientVertical         | Correction of position and orientation in the vertical plane                | surface   | `rotation_degrees: float`, `down_distance: float`, `forward_distance: float` |
-| 18 | Detach | macro | Detach from surface along normal, then fly toward goal |
-| 19 | DetachEdge | macro | Detach from surface along normal, then fly upward to the edge, turn toward goal and fly over to the other side. Used when the goal and agent are on opposite sides of the wall |
-| 20 | MoveForward Small | free | MoveForward on small step |
-| 21 | LOOK_UP_BIG | orient | look up at big rotation |
-| 22 | LOOK_DOWN_BIG | orient | look down at big rotation |
-| 23 | TURN_LEFT_BIG | orient | turn left at big rotation |
-| 24 | TURN_RIGHT_BIG | orient | turn right at big rotation |
+| 18 | Detach | macro | Detach from surface along normal and orient gaze toward goal |
+| 19 | MoveForward Small | free | MoveForward on small step |
+| 20 | LOOK_UP_BIG | orient | look up at big rotation |
+| 21 | LOOK_DOWN_BIG | orient | look down at big rotation |
+| 22 | TURN_LEFT_BIG | orient | turn left at big rotation |
+| 23 | TURN_RIGHT_BIG | orient | turn right at big rotation |
 
 - **Action steps:** Smaller steps reduce collisions but increase episode step length. After many iterartions values were choosen:
    - surface_step: 3.0
@@ -217,246 +391,157 @@ At the beginning I used 18 actions then 2 macro actions and 5 different step / r
 
 
 ## HNSWStateStore
-Update state → normalize → KNN search
+Update state → normalize (with feature weights) → KNN search
 → if near existing point: update it
 → else: insert new point with interpolated init
 
-Get state → normalize → KNN search → kernel interpolation → Q-values
+Get state → normalize (with feature weights) → KNN search → kernel interpolation → Q-values
 
-> "One important design decision: I split the Q-store into two separate HNSW graphs. **q_store_surface** for when the agent is on the object, and **q_store_free** for when it's in the air. The same position in space requires opposite strategies depending on whether you're touching the surface. On the surface — crawl. In the air — steer and fly. Mixing them in one store confused the learning."
+> "One important design decision: I split the Q-store into **four** separate HNSW graphs:
+> - **q_store_surface** — tactical actions when on the object surface
+> - **q_store_free** — tactical actions when in the air
+> - **strategic_detach** — high-level detach/stay decisions (5D state, 2 actions)
+> - **strategic_direction** — high-level fly-to-goal/bypass decisions (5D state, 2 actions)
+>
+> The same position in space requires opposite strategies depending on whether you're touching the surface. On the surface — crawl. In the air — steer and fly. Mixing them in one store confused the learning. Similarly, strategic decisions operate on different features and timescales than tactical action selection, so they get their own stores."
+
+### Key improvements since initial prototype
+
+- **Feature weights**: Per-store configurable weights that boost strategic features in the HNSW distance computation. Surface store and free store can emphasize different state dimensions, so HNSW better distinguishes crawl vs detach states.
+
+- **Normalization freeze**: Running mean/std statistics are computed during a warmup period (`norm_warmup_steps`, default 5000), then frozen. After freeze, the HNSW index is rebuilt with final normalization. This prevents normalization drift from distorting distances between early and late points.
+
+- **Auto-calibration of insert threshold**: The `insert_threshold` (which controls whether to update an existing point or insert a new one) can be automatically calibrated from observed nearest-neighbor distances. This adapts point density to the actual state space coverage.
+
+- **Fast save/load with native HNSW index**: `save_with_index` / `load_with_index` persist the native hnswlib binary alongside point data, avoiding O(N log N) rebuild on load. Falls back to rebuild if the binary is incompatible.
+
+- **Confidence estimation**: `get_q_values_with_confidence` returns not just Q-values but a confidence score composed of proximity (how close are neighbors), experience (how often were they visited), and consistency (do neighbors agree on best action). Used by the v2 action selection to dynamically control Q-trust vs heuristic reliance.
+
+[Realization details here](src/tbp/hybrid_rl/hnsw_state_store.py)
 
 
 ## Reward Function
-> "One important design decision — the reward signal is computed entirely locally in the motor system. No involvement from Learning Modules or CMP. The agent gets three types of feedback:
->
-> **Progress reward** — proportional to how much closer it got to the goal on each step. This is the main learning signal — dense, available every step, not sparse like 'goal reached' alone.
->
-> **Terminal rewards** — a large positive reward for reaching the goal, and penalties for collisions or timeout. Collisions are detected locally through depth and normal changes — if the agent passes through the surface, the episode ends.
->
-> **Step penalty** — a small negative reward every step, which encourages the agent to find efficient paths rather than wandering.
->
-> The key point is that this is self-contained. The motor system knows the goal pose, it knows its current pose, it can compute distance — that's all it needs. This means the RL module doesn't add any computational burden to the Learning Modules."
+> "The reward signal is computed entirely locally in the motor system. No involvement from Learning Modules or CMP. The reward function is **phase-aware** — the same physical event (e.g. moving away from goal) gets different rewards depending on whether the agent is crawling to goal, bypassing an obstacle, or landing."
+
+The reward has evolved from a simple progress + terminal structure to a multi-component system that shapes behavior across all navigation phases:
 
 | Component | Reward | Done? | When |
 |:----------|-------:|:-----:|:-----|
-| Progress (per good step) | ~+3.0 | No | Every step; `(prev_dist - dist) / surface_step × 3.0` |
-| Goal reached | +60.0 | Yes | `distance < goal_threshold (2mm)` |
-| Step penalty | -0.5 | No | Every step |
-| Surface violation | -12.0 | Yes | Agent passed through object (depth < 0.5mm or normal flipped) |
-| Near goal on surface | +0.5 | No | `distance < 3 × surface_step` AND `on_object = true` |
-| Timeout | -12.0 | Yes | `steps >= max_steps_per_goal` |
+| **Progress (per step)** | ~+3.0 | No | `(prev_dist - dist) / surface_step × 3.0`. Phase-aware: reduced penalty during FLY_TO_EDGE and CRAWL_TO_EDGE when moving away from goal is expected |
+| **Subgoal shaping** | ±3.0 | No | Potential-based shaping (Ng et al. 1999). Encourages moving toward object edge when goal is behind surface (alignment < 0). Preserves optimal policy |
+| **Goal reached** | +60.0 | Yes | `distance < goal_threshold (4mm)` |
+| **Step penalty** | -0.5 | No | Every step — encourages efficient paths |
+| **Stagnation penalty** | -0.3 | No | When movement_efficiency < 0.1 on surface — agent is oscillating |
+| **Surface violation** | -12.0 | Yes | Agent passed through object (depth < min_valid_depth or normal flipped) |
+| **Detach collision** | -12.0 | Yes | Collision during macro detach action |
+| **Lost object** | -3.0 | No | Fell off surface unexpectedly (not from intentional detach) |
+| **Timeout** | -12.0 | Yes | `steps >= max_steps_per_goal` |
+| **Near goal on surface** | +0.5 | No | `distance < 3 × surface_step` AND `on_object = true` |
+| **Successful landing** | up to +8.0 | No | Transitioned from air to surface without collision, on correct side. Reward scales with landing quality: `8.0 × max(0, 1 - distance / landing_radius)` |
+| **Correct crawl bonus** | +0.2 | No | On surface, phase=CRAWL_TO_GOAL, making positive progress |
+| **Fly alignment improvement** | ±2.0 | No | In air: reward for improving forward alignment with subgoal (FLY_TO_EDGE) or goal (FLY_TO_GOAL/LAND). Penalizes turning away |
+| **Risky free on surface** | -2.0 | No | MoveLinear action while on surface — high collision risk |
+| **Flying too far** | -2.0 | No | Distance > 1.5 × object_extent while in air — drifting away |
+| **Detach in air** | -5.0 | No | Detach action when already in air — wasteful |
 
-Details of logic here: def _compute_reward(self, state, prev_state, action, collision):
+### Phase-aware progress
+
+The progress reward adapts to the current navigation phase:
+- **CRAWL_TO_GOAL / FLY_TO_GOAL**: Full progress reward — moving toward goal is the objective
+- **FLY_TO_EDGE**: Negative progress scaled to 20% — agent may temporarily move away from goal while bypassing obstacle, and that's expected
+- **CRAWL_TO_EDGE / DETACH_NEEDED**: Progress scaled to 10% — crawling to edge often increases goal distance
+- **Detour mode**: When alignment < threshold and on surface, negative progress is clipped to prevent large penalties for necessary detours
+
+### Subgoal potential shaping
+
+Based on Ng et al. (1999) potential-based reward shaping, which provably preserves the optimal policy:
+
+```
+φ(s) = (1 + alignment) × SCALE    when alignment < 0 and on_object
+φ(s) = (1 + alignment) × SCALE × 0.3   when alignment < 0 and in air
+φ(s) = 0                           when alignment ≥ 0
+
+shaping_reward = γ × φ(s') - φ(s)
+```
+
+This encourages the agent to move toward the object edge (where alignment → 0) when the goal is behind the surface, without distorting the optimal policy.
+
+Details of logic here: `def compute_common_reward` and `def _compute_reward`
 [LINK](src/tbp/hybrid_rl/rl_goal_approach_controller.py)
 
+
 ## Heuristic-Guided Exploration
-> "Before Q-learning has any experience, the agent needs reasonable behavior from step one. That's what heuristics provide. They are geometric rules that bias action selection."
+> "Before Q-learning has any experience, the agent needs reasonable behavior from step one. That's what heuristics provide. They are geometric rules that bias action selection. The heuristic system has evolved from simple directional rules to a **phase-driven architecture** where the current navigation phase determines which heuristic components are active."
 
-> "**On surface, goal reachable** — the surface_move heuristic projects the goal direction onto the tangent plane and picks the best of 8 crawling directions. Simple geometry, works well on convex surfaces.
->
-> **On surface, goal unreachable** — alignment is negative, meaning the goal is behind the surface. The detach heuristic recommends lifting off. If the agent's normal and goal's normal are opposite, it recommends detach_edge to fly over the wall.
->
-> **In the air** — the steer heuristic simulates four rotations, picks the one that best aligns the view with the goal direction, and recommends flying forward. Big rotations when far off, small when almost aligned.
->
-> **Stuck** — if distance hasn't decreased in 5 steps, the stagnation heuristic overrides surface crawling and recommends detach.
->
-> Heuristics provide reasonable behavior from step one, but they alone are not sufficient — Q-learning stores corrections where heuristics were wrong and improves success rate significantly."
+### Phase System
 
-> "The action selection formula is simple: Combined score equals (1 minus epsilon) times Q-values plus epsilon times heuristic bias. Then softmax sampling.
->
-> At the beginning, epsilon is high — mostly heuristic. As the agent learns, epsilon decays — mostly Q-values. But heuristics never fully disappear — they serve as a safety net.
->
-> In adaptive mode, the Arbitrator adds another layer: it compares Q-store confidence with SAC confidence, weighted by each source's track record. The source with the higher score wins. If both scores are zero — heuristic fallback.
+The agent operates in one of six phases, determined by `_determine_phase()` based on geometric analysis of the current situation:
 
-#### Problem with Standard ε-Greedy
+| Phase | Condition | Behavior |
+|-------|-----------|----------|
+| **CRAWL_TO_GOAL** | On surface, same side, path clear | Crawl along surface toward goal using geodesic direction |
+| **CRAWL_TO_EDGE** | On surface, different side or path blocked, still making progress | Crawl toward nearest edge/rim to transition to other side |
+| **DETACH_NEEDED** | On surface, different side or path blocked, stuck (low movement efficiency) | Lift off surface — strategic detach decision |
+| **FLY_TO_GOAL** | In air, path clear | Steer and fly directly toward goal |
+| **FLY_TO_EDGE** | In air, path blocked | Orbit/bypass around object toward edge |
+| **LAND** | In air, close to goal or emergency (depth < 5mm) | Careful approach with small steps, suppress large movements |
 
-Standard ε-greedy exploration selects random actions with probability ε. In a 25-action space, a random action has only small chance of being useful (moving toward the goal). This means the most of exploration steps are wasted, resulting in slow learning and poor initial behavior.
+Phase transitions include **hysteresis** — when path becomes clear during FLY_TO_EDGE, the agent continues bypassing for 3 steps before switching to FLY_TO_GOAL, preventing oscillation.
 
-#### My Approach: Blending Q-Values with Heuristics
+**Horizontal surface detection**: On horizontal surfaces (normal aligned with up_direction > 85°), the agent skips CRAWL_TO_EDGE/DETACH_NEEDED and stays in CRAWL_TO_GOAL, because crawling on a rim naturally leads to edge traversal.
 
-Instead of random exploration, blend learned Q-values with heuristic bias derived geometric reasoning:
+### Heuristic Components
 
-```python
-combined = (1 - ε) × Q_normalized + ε × heuristic_normalized
-action = softmax_sample(combined, temperature=max(0.1, ε))
-A small fraction (ε × 10%) of actions remain purely random to guarantee full action space coverage.
-```
-Transition Schedule
+The heuristic bias is composed of seven independent components, each producing a score vector over all actions:
+
+| # | Component | Active when | Description |
+|---|-----------|-------------|-------------|
+| 0 | **Suppress** | Always | Suppresses detach (strategic decision), sensor rotations, and orient actions (except near goal). Anti-spam guards for consecutive detach |
+| 1 | **Surface move** | On surface | Phase-aware tangential direction scoring. CRAWL_TO_GOAL: geodesic direction using goal normal for great-circle path, with direction hysteresis. CRAWL_TO_EDGE: direction toward edge/rim using subgoal direction. Horizontal rim: blend of goal direction and away-from-center for edge descent |
+| 2 | **Stagnation** | On surface, CRAWL phases | If no progress in 10 steps: penalize current direction, boost perpendicular and opposite directions |
+| 3 | **Steer in air** | In air | Phase-driven steering. Simulates 4 rotations, picks best alignment with effective goal (subgoal for FLY_TO_EDGE, goal for FLY_TO_GOAL). Three regimes: TURN_ONLY (>45°), FLY+TURN (>20°), FLY (aligned). Big rotations for coarse correction, small for fine-tuning. Trapped detection near surface |
+| 4 | **Damp free on surface** | On surface | Strongly suppresses free movement, big rotations, and orient actions — these are dangerous on surface |
+| 5 | **Flyby correction** | In air, not FLY_TO_EDGE | Detects when agent is flying past goal (distance increasing). Suppresses forward movement, boosts corrective rotations. Escalates with consecutive flyby count |
+| 6 | **Orientation cooldown** | On surface | Tracks orientation actions that produce no distance change. After 3 no-effect uses, progressively penalizes that action |
+| 7 | **Landing** | In air, LAND/FLY phases | Near goal: suppress large forward, boost small forward. Emergency (depth < 5mm): only small forward allowed. Overshoot detection: if distance exceeds recent minimum by > free_step, hard suppress forward |
+
+### Two-Level Decision Architecture
+
+Action selection operates on two levels:
+
+**Strategic level** — decides phase transitions using dedicated Q-stores:
+- **Detach decision** (`strategic_detach`, 5D state, 2 actions): Should the agent stay on surface or detach? Blends strategic Q-values with geometric heuristic using strategic epsilon. Retrospective learning: after episode ends, updates detach Q-values based on whether detach actually helped (changed same_side, unblocked path, led to success/collision/timeout)
+- **Direction decision** (`strategic_direction`, 5D state, 2 actions): In air, should the agent fly to goal or bypass? Uses path_blocked and angle_to_goal. Updated retrospectively based on episode outcome
+
+**Tactical level** — selects specific action within the phase determined by strategic level.
+
+### Transition Schedule
 
 | Phase | Epsilon | Behavior |
 |---|-----------|--------|
-| Cold start | 1.0 → 0.5 | Nearly pure heuristic — reasonable from step 1 |
-| Learning | 0.5 → 0.1 | Blend of Q-values and heuristic |
-| inference | 0.1 → 0.05 | Nearly pure Q-values with light heuristic safety net |
+| Warmup | fixed | Pure heuristic with greedy selection — reasonable from step 1 |
+| Cold start | 1.0 → 0.5 | v1: mostly heuristic. v2: low Q-trust, heuristic dominant |
+| Learning | 0.5 → 0.1 | v1: blend shifts to Q. v2: Q-trust grows with confidence |
+| Inference | 0.1 → 0.02 | v1: mostly Q with heuristic safety net. v2: high Q-trust where data exists, heuristic fallback elsewhere |
 
-###	Possible Heuristic examples that use pure geometry and action space parameters
+A small fraction (5% × ε) of actions remain purely random to guarantee full action space coverage.
 
-| # | Heuristic | Description |
-|---|-----------|--------|
-| 1 | Move toward goal | surface - MoveTangentially, distant - MoveForward |
-| 2 | Goal far → fly,  goal close → crawl | surface_crawl vs free |
-| 3 | Goal through surface → detach | LookUp |
-| 4 | In the air navigating by rot_error | TurnRight, TurnLeft, LookDown, LookUp | 
+**Limitation:** Heuristic biases reference specific action indices (e.g., `IDX_DETACH`, `IDX_FREE_FORWARD`). For a different action space, heuristics would need to be adapted. This is by design — heuristics encode domain-specific geometric reasoning that depends on what actions are available.
 
-[Realization details here def _compute_heuristic_bias](src/tbp/hybrid_rl/rl_goal_approach_controller.py)
-
-**Limitation:** Heuristic biases currently reference specific action indices (e.g., `IDX_DETACH`, `IDX_FREE_FORWARD`). For a different action space, heuristics would need to be adapted. This is by design — heuristics encode domain-specific geometric reasoning that depends on what actions are available. A fully action-space independent heuristic system would require a mapping layer between geometric intentions (e.g., "move toward goal") and available actions.
+[Realization details: `_compute_heuristic_bias`, `_determine_phase`, `_choose_action_v2`](src/tbp/hybrid_rl/rl_goal_approach_controller.py)
 
 
 ## Lightweight Enviroment
 To fast test hypophesys and ideas we need to create relevant approximation of Habitat, especially for training policies based on haptics/active perception.
 It should not simulate graphics, but it should accurately reproduces the key physics that are important for training: contact, normals, ray casting, movement on surfaces.
 I suggest to use Trimesh python library for loading and using triangular meshes with an emphasis on watertight surfaces. https://github.com/mikedh/trimesh
-The Lightweight Environment (Trimesh) proved essential for rapid iteration — each experiment takes ~ 1-2 hours to test on my laptop
+The Lightweight Environment (Trimesh) proved essential for rapid iteration — each experiment takes ~ several hours to test on my laptop
 [Details are here](src/tbp/hybrid_rl/lightweight_env.py)
 
-### Obejscts
-To train / test complete action space we can start with these primitives:
-- Cube: trimesh.primitives.Box
-- Cylinder: trimesh.creation.cylinder
-- Mug, Cup, Vase
+### Objects
 [Sizes and realization are](src/tbp/hybrid_rl/mesh_factory.py)
 [Pictures are](results_publish/objects)
 
-
-## Complete Detailed Diagramm
-```mermaid
-flowchart TD
-    subgraph ENV["Environment (Trimesh)"]
-        E_step["step(action)"]
-        E_sensor["get_sensor_data()"]
-        E_pose["get_pose()"]
-    end
-
-    subgraph TRAIN["Training Pipeline"]
-        direction TB
-
-        CURR["Curriculum Levels\ngoal generation\n[10-40] → [20-80] → [40-120] mm"]
-
-        subgraph PHASE1["Phase 1 — Q-Learning (Episodic Memory)"]
-            direction TB
-            CTRL["RLGoalApproach\nController"]
-            CTRL -->|"compute_state\n(pose, sensor)"| STATE["State Vector 15D"]
-            STATE --> QSEL{"on_object?"}
-            QSEL -->|"surface"| QS["q_store_surface\nHNSW graph"]
-            QSEL -->|"free"| QF["q_store_free\nHNSW graph"]
-            QS -->|"kNN + Gaussian\nKernel"| QV["Q-values\nper action"]
-            QF -->|"kNN + Gaussian\nKernel"| QV
-            HEUR["Heuristic Bias\ngeometry-based"] --> BLEND["Blend\n(1-ε)Q + εH\nsoftmax sample"]
-            QV --> BLEND
-            BLEND --> ACT["Discrete\nAction"]
-        end
-
-        subgraph PHASE2["Phase 2 — Behavioral Cloning"]
-            direction TB
-            TRAILS["Success\nTrajectories"] -->|"ExperienceExtractor\nconvert"| BC["BCTrainer\nsupervised\nlearning"]
-            BC --> BCW["SAC Actor\nWeights"]
-        end
-
-        subgraph PHASE3["Phase 3 — SAC Training"]
-            direction TB
-            BCW2["BC Actor\nWeights"] -->|"warm-start"| SAC["PSACTrainer\nActor + Critic"]
-            SAC -->|"sample action"| INTERP["Action\nInterpreter"]
-        end
-
-        CURR -->|"goal_pose"| CTRL
-        CURR -->|"goal_pose"| SAC
-    end
-
-    subgraph DEPLOY["Deployment"]
-        direction TB
-
-        LM["Learning Module\nhypothesis-testing\npolicy"]
-
-        subgraph PHASE4["Phase 4 — Adaptive Arbitrage"]
-            direction TB
-            MGR["Adaptive\nManager"]
-            MGR -->|"get_action"| ARB["Arbitrator"]
-            ARB -->|"get_q_action"| QS2["Q-Store\nkNN lookup"]
-            ARB -->|"get_sac_action"| SAC2["SAC Actor\nforward pass"]
-            ARB -->|"fallback"| HEUR2["Heuristic"]
-            QS2 --> SCORE["Score\nComparison"]
-            SAC2 --> SCORE
-            HEUR2 --> SCORE
-            SCORE -->|"confidence\n× track_record"| BEST["Best\nAction"]
-            BEST --> MGR_OUT["Adaptive\nManager\n→ action"]
-        end
-
-        LM -->|"goal_pose"| MGR
-    end
-
-    %% Phase 1 ↔ Environment
-    ACT -->|"action"| E_step
-    E_sensor -->|"sensor_data"| CTRL
-    E_pose -->|"pose"| CTRL
-    CTRL -->|"reward + TD"| QS
-    CTRL -->|"reward + TD"| QF
-    CTRL -->|"success trails"| TRAILS
-
-    %% Phase 3 ↔ Environment
-    INTERP -->|"execute"| E_step
-    E_sensor -->|"sensor"| SAC
-    E_pose -->|"pose"| SAC
-
-    %% Phase 4 ↔ Environment
-    MGR_OUT -->|"action"| E_step
-    E_sensor -->|"sensor"| MGR
-    E_pose -->|"pose"| MGR
-
-    %% Between training phases
-    BCW -->|"weights"| BCW2
-
-    %% Model transfer: Training → Deployment
-    QS -.->|"Q-store model"| QS2
-    QF -.->|"Q-store model"| QS2
-    SAC -.->|"SAC model"| SAC2
-
-    %% Online learning in deployment
-    MGR -->|"online Q update"| QS2
-    MGR -->|"periodic SAC update"| SAC2
-
-    style ENV fill:#1a3a1a,stroke:#66bb6a,stroke-width:2px,color:#a5d6a7
-    style TRAIN fill:#1a1a2e,stroke:#7f8c8d,stroke-width:2px,color:#bdc3c7
-    style DEPLOY fill:#1a2a1a,stroke:#7f8c8d,stroke-width:2px,color:#bdc3c7
-
-    style CURR fill:#b71c1c,stroke:#ef9a9a,color:#ffebee
-    style LM fill:#b71c1c,stroke:#ef9a9a,color:#ffebee
-
-    style PHASE1 fill:#3e2700,stroke:#ffb74d,stroke-width:2px,color:#ffe0b2
-    style PHASE2 fill:#0a2d4f,stroke:#64b5f6,stroke-width:2px,color:#bbdefb
-    style PHASE3 fill:#1a3a1a,stroke:#81c784,stroke-width:2px,color:#c8e6c9
-    style PHASE4 fill:#2a0845,stroke:#ce93d8,stroke-width:2px,color:#e1bee7
-
-    style E_step fill:#2e7d32,stroke:#a5d6a7,color:#e8f5e9
-    style E_sensor fill:#2e7d32,stroke:#a5d6a7,color:#e8f5e9
-    style E_pose fill:#2e7d32,stroke:#a5d6a7,color:#e8f5e9
-
-    style CTRL fill:#bf360c,stroke:#ffab91,color:#fbe9e7
-    style STATE fill:#4e342e,stroke:#bcaaa4,color:#efebe9
-    style QS fill:#ff6f00,stroke:#ffca28,color:#fff8e1
-    style QF fill:#ff6f00,stroke:#ffca28,color:#fff8e1
-    style QV fill:#5d4037,stroke:#bcaaa4,color:#efebe9
-    style HEUR fill:#827717,stroke:#dce775,color:#f9fbe7
-    style BLEND fill:#4e342e,stroke:#bcaaa4,color:#efebe9
-    style ACT fill:#e65100,stroke:#ffcc80,color:#fff3e0
-
-    style TRAILS fill:#0d47a1,stroke:#90caf9,color:#e3f2fd
-    style BC fill:#1565c0,stroke:#90caf9,color:#e3f2fd
-    style BCW fill:#0d47a1,stroke:#90caf9,color:#e3f2fd
-
-    style BCW2 fill:#2e7d32,stroke:#a5d6a7,color:#e8f5e9
-    style SAC fill:#388e3c,stroke:#a5d6a7,color:#e8f5e9
-    style INTERP fill:#2e7d32,stroke:#a5d6a7,color:#e8f5e9
-
-    style MGR fill:#6a1b9a,stroke:#ce93d8,color:#f3e5f5
-    style ARB fill:#4a148c,stroke:#ce93d8,color:#e1bee7
-    style QS2 fill:#ff6f00,stroke:#ffca28,color:#fff8e1
-    style SAC2 fill:#388e3c,stroke:#a5d6a7,color:#e8f5e9
-    style HEUR2 fill:#827717,stroke:#dce775,color:#f9fbe7
-    style SCORE fill:#4a148c,stroke:#ce93d8,color:#e1bee7
-    style BEST fill:#6a1b9a,stroke:#ce93d8,color:#f3e5f5
-    style MGR_OUT fill:#6a1b9a,stroke:#ce93d8,color:#f3e5f5
-```
 
 
 # Main Proof of Concept Results
@@ -466,234 +551,316 @@ The prototype has been implemented and tested on the Lightweight Environment (Tr
 ## Pipeline Validation
 **The full pipeline works end-to-end: Q-learning → Behavioral Cloning → SAC → Arbitrage**
 
-> "Let me show the training results across objects. I trained Q-learning sequentially — cube first, then cylinder, mug, cup — each stage building on the previous Q-store."
 
-| Stage | Object | Train Success Rate | Eval Success Rate |
-|-------|--------|--------------------|-------------------|
-| Q-learning | cube | 58% | 73% |
-| Q-learning | cylinder | 53% | 67% |
-| Q-learning | mug | 47% | 46% |
-| Q-learning | cup | 51% | 48% |
+### Evaluation Results
 
-> "A few things to note. First, **transfer works** — each new object starts from the previous Q-store, not from scratch. Cylinder benefits from cube experience, mug from both. Second, **eval is higher than train for simple objects** — cube 73% vs 58%, cylinder 53% vs 67%  — because during training epsilon is high and the agent explores, while during eval it exploits learned Q-values. Third, **complex objects are harder** — mug and cup have handles, concavities, thin walls. The agent is more accurate but sometimes runs out of steps — it crawls carefully but slowly. Similar results for mug and cup show that the agent has learned and is working on new target-agent pairs on validation stage."
+#### Training and Evaluation Setup
 
-> "SAC results are below Q-learning, and I want to be transparent about this."
+Training used curriculum with geometric filters to progressively increase difficulty:
 
-| Stage | Object | Train Success Rate | Eval Success Rate |
-|-------|--------|--------------------|-------------------|
-| SAC | cube | 46% | 14% |
-| SAC | cylinder | 68% | 29% |
-| SAC | mug | 47% | 16% |
-| SAC | cup | 51% |  |
+| Level | Distance (mm) | Filter | Description |
+|-------|:------------:|--------|-------------|
+| L0 | 10-60 | same_side=true, path_blocked=false | Easy: goal visible, direct path |
+| L1 | 10-80 | same_side=true, path_blocked=true | Medium: goal on same side but path blocked by surface curvature |
+| L2 | 10-120 | same_side=false | Hard: goal on opposite side of object, requires detach/fly/land |
 
-> "The main issue is high timeout rate — SAC inherited the careful crawling strategy from Behavioral Cloning, and with a 300-step limit it often doesn't reach the goal in time. Q-learning had 500 steps. Also, SAC may need more training episodes and hyperparameter tuning. This is my main area for improvement.
->
-> However, SAC adds value in the adaptive mode — it provides strategic decisions like when to detach, and it generalizes to unfamiliar states."
+All methods trained on: cube, sphere, cylinder, flat_square, cone, thin_cylinder, vase, mug.
+**Cup is unseen** during training — generalization test.
+100 episodes per level per object.
 
-> "The adaptive mode on the vase — a completely new object — shows the hybrid approach working. The vase was never seen during training — Q-store and SAC were trained only on cube, cylinder, mug, and cup. In adaptive mode, Q-store updates every step, SAC gets a small update every 500 episodes. "
-
-| Episode | Q-store weight | SAC weight | Total success rate | Curriculum level |
-|---------|---------------|------------|-------------------|-----------------|
-| 100 | 29% | 71% | 72% | 0 → 1 |
-| 1000 | 32% | 68% | 51% | 2 |
-| 1500 | 45% | 55% | 54% | 2 |
-| 2000 | 55% | 45% | 55% | 2 |
-
-> "Two trends here. First, **Q-store weight increases over time** — from 29% to 55%. At the beginning SAC is more confident because neural networks always output high-confidence predictions. But as Q-store accumulates vase-specific experience and the track record shows Q-store succeeding more often, the arbitrator shifts weight toward Q-store.
->
-> Second, **success rate on level 2 is 55%** — this is the hardest level, 40 to 120mm distance. For comparison, Q-learning eval on known objects at this level is 46-48% for mug and cup. So the adaptive mode on a new object performs comparably to trained models on known objects. And as you saw in the demo Q-learinig and SAC works together quite efficiently during episodes."
-
-
-> "Let me show you what's behind these numbers — how the agent actually behaves on specific episodes, and how it improves over time. I'll show 4 episodes (100, 400, 600, 1300, 1900) that illustrate how it works under hood."
-[You can find detail results with visualizations here](results_publish/adaptive_logs_vase)
-
-
-> "So the demo explains the numbers. 55% on level 2 reflects a mix of clean successes like episodes 600, 1900, and failures caused by timeouts, collitions or the detach_edge bug I showed in episode 1300. Fixing that bug should push the success rate higher."
-
-### Key Findings
-
-**1. Episodic Memory (HNSW State Store) works as proposed.** One-shot/few-shot learning through Q-update is effective. Update hit rate 0.8–0.95 confirms that kNN + Gaussian Kernel interpolation correctly finds and updates similar states. The store grows organically — dense where the agent visits often, sparse where it rarely goes.
-
-**2. Heuristic-Guided Exploration significantly outperforms ε-greedy.** This confirms the hypothesis from the RFC. Pure geometric heuristics (move toward goal, detach when stuck, steer in air) provide reasonable behavior from step 1, and Q-values gradually take over as experience accumulates.
-
-**3. Q-learning improves with experience**  Learning begins working from step 1 and improves success rate even transfering to more complex levels. On training more collitions rate and less timeouts. On validation vice versa. Agent became more accurate but sometimes goes out of step limit per episode. Agent crawls mostly and discrtete actions needs more steps to achieve the target.
-
-**4. SAC results less than Q-learning** It needs more investigation, reason is high timeout rate.
-- SAC steps per episode limit (300) was less than Q-learning (500) as continues actions should be more flexible
-- SAC inherited accurate crawl strategy from Q-learning and it was not enough episodes to study more optimal one
-- Hyperparameters and implementation should be checked one more time
-
-**5. Adaptive arbitrage between episodic memory and skills works.** On the new object vase adaptive arbitrage shows 55% success rate. This is more than independent Q and SAC rates on validation phase for known objects. First, more SAC was choosen, then Q-learinig. Because SAC, as a neural network, is always more confident, but then success statistics help Q-learinig to increase q_store_rate. 
-Agent mostly crawled (move_tangentially action takes more than 50%), but all other actions (orient, free_move, macro categories) are also used in less proportion in proper situations.
-Failures were mostly due to collisions, then timeout (out of step limit per episode).
-
-
-### Training and validation strategy details
-#### Use several oblects from simple to complex: cube, cylinder, mug, cup, vase
-[Sizes and realization are](src/tbp/hybrid_rl/mesh_factory.py)
-[Pictures are](results_publish/objects)
-
-#### Training and validation stages
-- I used the standard Monty approach with [Hynda YAML](src/tbp/hybrid_rl/conf/experiment/rl_goal_approach.yaml) and [experiment.py](src/tbp/hybrid_rl/experiment.py)
-You can reproduce the results by yourself. Example of VSCode settings.json below
-```
-"configurations": [
-   {
-      "name": "RL Goal Approach — Config",
-      "type": "debugpy",
-      "request": "launch",
-      "program": "${workspaceFolder}/run.py",
-      "args": [
-            "--config-dir", "${workspaceFolder}/src/tbp/hybrid_rl/conf",
-            "experiment=rl_goal_approach",
-      ],
-      "cwd": "${workspaceFolder}",
-      "env": {
-            "MONTY_LOGS": "${workspaceFolder}/results",
-            "MONTY_MODELS": "${workspaceFolder}/results/pretrained_models",
-            "MONTY_DATA": "${workspaceFolder}/data"
-      },
-      "console": "integratedTerminal",
-      "justMyCode": false
-   }, 
-]
-```
-- I used curriculum_levels approach from simple to complex tasks depends on distnace between goal and agent:
-      - [10.0, 40.0] # use additional check that agent and goal were on the same side of object
-      - [20.0, 80.0]
-      - [40.0, 120.0]
-   - promote_threshold: 0.6
-   - promote_window: 100
-
-- Stages
-1) Q-learning - train and validate cube, cylinder, mug, cup
-    - training_stages:
+#### Q-Learning training
+    # ═══════════════════════════════════════════
+    # PHASE 1: Primitives (from scratch)
+    # ═══════════════════════════════════════════
+    training_stages:
+      # ── Phase 1: Primitives ──
       - mesh: cube
+        episodes: 1000
+        epsilon_start: 1.0
+        epsilon_min: 0.15
+        load_mode: null
+        warmup_episodes: 100
+        promote_threshold: 0.85
+        promote_window: 200
+        curriculum_filters:
+          - {same_side: true, path_blocked: false}
+          - {same_side: true, path_blocked: true}
+          - {}
+
+      - mesh: sphere
+        episodes: 1000
+        epsilon_start: 1.0
+        epsilon_min: 0.12
+        load_mode: auto
+        warmup_episodes: 80
+        promote_threshold: 0.85
+        promote_window: 200
+        curriculum_filters:
+          - {same_side: true, path_blocked: false}
+          - {same_side: true, path_blocked: true}
+          - {}
+
+      - mesh: cylinder
+        episodes: 1000
+        epsilon_start: 1.0
+        epsilon_min: 0.10
+        load_mode: auto
+        warmup_episodes: 80
+        promote_threshold: 0.85
+        promote_window: 200
+        curriculum_filters:
+          - {same_side: true, path_blocked: false}
+          - {same_side: true, path_blocked: true}
+          - {}
+
+      - mesh: flat_square
+        episodes: 1000
+        epsilon_start: 1.0
+        epsilon_min: 0.10
+        load_mode: auto
+        warmup_episodes: 80
+        promote_threshold: 0.8
+        promote_window: 200
+        curriculum_filters:
+          - {same_side: true, path_blocked: false}
+          - {same_side: true, path_blocked: true}
+          - {}
+      
+      - mesh: cone
+        episodes: 1000
+        epsilon_start: 1.0
+        epsilon_min: 0.10
+        load_mode: auto
+        warmup_episodes: 80
+        promote_threshold: 0.8
+        promote_window: 200
+        curriculum_filters:
+          - {same_side: true, path_blocked: false}
+          - {same_side: true, path_blocked: true}
+          - {}
+
+      - mesh: thin_cylinder
+        episodes: 1000
+        epsilon_start: 1.0
+        epsilon_min: 0.10
+        load_mode: auto
+        warmup_episodes: 80
+        promote_threshold: 0.85
+        promote_window: 200
+        curriculum_filters:
+          - {same_side: true, path_blocked: false}
+          - {same_side: true, path_blocked: true}
+          - {}
+
+      # ── Phase 2: Hollow objects ──
+      - mesh: vase
         episodes: 2000
         epsilon_start: 1.0
         epsilon_min: 0.10
-        load_mode: null # Start from scrtach
-      - mesh: cylinder
-        episodes: 3000
-        epsilon_start: 1.0
-        epsilon_min: 0.10
-        load_mode: auto # use and update previous Q-store
+        load_mode: auto
+        warmup_episodes: 100
+        promote_threshold: 0.70
+        promote_window: 300
+
       - mesh: mug
-        episodes: 7000
+        episodes: 2000
         epsilon_start: 1.0
         epsilon_min: 0.10
-        load_mode: auto # use and update previous Q-store
-      - mesh: cup
-        episodes: 7000
-        epsilon_start: 1.0
-        epsilon_min: 0.10
-        load_mode: auto # use and update previous Q-store
+        load_mode: auto
+        warmup_episodes: 100
+        promote_threshold: 0.7
+        promote_window: 300
 
-    - eval_meshes: [cube, cylinder, mug, cup]
-    - eval_episodes_per_level: 500   
-    
-[You can find details results here](results_publish/Q-learn)
+      # ── Phase 3: Reinforcement on new points ──
+      - mesh: vase
+        episodes: 1000
+        epsilon_start: 0.3
+        epsilon_min: 0.08
+        load_mode: auto
+        pool_seed: 201
+        warmup_episodes: 30
+        promote_threshold: 0.70
+        promote_window: 200
 
-- rl_config:
-      mode: train_adapt_epsilon
-      goal_threshold: 4.0
-      max_points: 500000
-      k_neighbors: 7
-      max_steps_per_goal: 500
-      adaptive_sigma: true
-      insert_threshold: 0.50
-      auto_calibrate: false
-      reward_goal_reached: 60.0
-      reward_timeout: -12.0
-      reward_surface_violation: -12.0
-      reward_step_penalty: -0.5
-      surface_step: 3.0
-      free_step: 8.0
-      free_step_small: 2.0
-      rotation_step: 5.0
-      num_actions: 25
-      rotation_step_big: 15.0
-      free_step_backward: 2.0
+      - mesh: mug
+        episodes: 1000
+        epsilon_start: 0.3
+        epsilon_min: 0.08
+        load_mode: auto
+        pool_seed: 202
+        warmup_episodes: 30
+        promote_threshold: 0.7
+        promote_window: 200
 
+#### Q-Learning Evaluation
 
-2) Collect success trails from Q-learing validation and train Behavioral Cloning (SAC Actor)   
-[You can find details results here](results_publish/BC-train)
-
-3) Train and validate SAC using BC knowledge (BC warm-start)
-    - sac_meshes: [cube, cylinder, mug, cup]
-    - sac_episodes_per_mesh:
-      cube: 1000
-      cylinder: 1500
-      mug: 3000
-      cup: 2000
-    - sac_eval_episodes_per_level: 500
-    - sac_config:
-      load_mode: null
-      goal_threshold: 4.0
-      gamma: 0.99
-      tau: 0.005
-      lr_actor: 0.00001
-      lr_critic: 0.0003
-      batch_size: 256
-      buffer_capacity: 500000
-      bc_lambda_init: 5.0
-      bc_lambda_decay: 0.999999
-      max_steps_per_goal: 300
-      eval_interval: 200
-      eval_episodes: 100
-
-      [You can find details results here](results_publish/SAC)
-
-4) Run adaptive mode with arbitrage and online learning for vase using Q and SAC knowledge from cube, cylinder, mug, cup
-
-Let's describe in more detail adaptive arbitrage mode as it's the one of key feature of the hybrid approach.  
-- Adaptive arbitrage decides which action source to use per step. [Full realization here](src/tbp/hybrid_rl/arbitrator.py)  
-Switches between Q-store (episodic memory), SAC (skill), and heuristic (fallback).
-Main function is def decide(self, state, current_pose, sensor_data):
-Choose action source based on performance. Uses confidence × track_record scoring. 
-When insufficient track record data, uses neutral prior (0.5) to let confidence decide. 
-Heuristic is fallback only when both Q-store and SAC have zero score.
-- Adaptive arbitrage continiously learning. [Full realization here](src/tbp/hybrid_rl/adaptive_manager.py)  
-   - online: Q-store updates every step, SAC updates periodically. Default mode — always learning.
-   - inference_only: no updates. Only when consistently high success rate — system has mastered the object.
-   - offline: full retraining. Only when both sources fail for extended period — emergency mode.
-
-- YAML config for testing
-   - adaptive_mesh: vase
-   - adaptive_episodes: 2000
-   [You can find detail results with visualizations here](results_publish/adaptive_logs_vase)
-   At the beginning the agent used not efficient strategy on new object (timeout, collisions). Then agent learnt object specific and last episodes it moves almast perfectly.
+| Object | L0 | L1 | L2 | Avg |
+|--------|:-:|:-:|:-:|:-:|
+| **sphere** | 100% | 100% | 100% | **100%** |
+| **cube** | 100% | 100% | 90% | **97%** |
+| **cylinder** | 100% | 97% | 94% | **97%** |
+| **thin_cylinder** | 100% | 96% | 92% | **96%** |
+| **vase** | 100% | 100% | 72% | **90%** |
+| **flat_square** | 100% | 97% | 48% | **82%** |
+| **cone** | 95% | 68% | 76% | **80%** |
+| **cup** ★ | 98% | 69% | 69% | **79%** |
+| **mug** | 99% | 72% | 65% | **78%** |
 
 
-### Resuls summary for Q and SAC train and validation
+#### SAC Training
+    sac_episodes_per_mesh:
+      cube: 500
+      sphere: 500
+      cylinder: 500
+      flat_square: 500
+      cone: 500
+      thin_cylinder: 500
+      vase: 1000
+      mug: 1000
 
-| Stage | Method | Success Rate (avg for levels) | Object |
-|-------|--------|-------------|--------|
-| Q-learning (episodic memory) - Train | HNSW + kNN + Heuristic | 58% | cube |
-| Q-learning (episodic memory) - Train | HNSW + kNN + Heuristic | 53% | cylinder |
-| Q-learning (episodic memory) - Train | HNSW + kNN + Heuristic | 47% | mug |
-| Q-learning (episodic memory) - Train | HNSW + kNN + Heuristic | 51% | cup |
-| Q-learning (episodic memory) - Eval | HNSW + kNN + Heuristic | 73% | cube |
-| Q-learning (episodic memory) - Eval | HNSW + kNN + Heuristic | 67% | cylinder |
-| Q-learning (episodic memory) - Eval | HNSW + kNN + Heuristic | 46% | mug |
-| Q-learning (episodic memory) - Eval | HNSW + kNN + Heuristic | 48% | cup |
-| SAC (skill, softmax policy) - Train | BC warm-start → SAC | 46% | cube |
-| SAC (skill, softmax policy) - Train | BC warm-start → SAC | 68% | cylinder |
-| SAC (skill, softmax policy) - Train | BC warm-start → SAC | 41% | mug |
-| SAC (skill, softmax policy) - Train | BC warm-start → SAC | 33% | cup |
-| SAC (skill, softmax policy) - Eval | BC warm-start → SAC | 14% | cube |
-| SAC (skill, softmax policy) - Eval | BC warm-start → SAC | 29% | cylinder |
-| SAC (skill, softmax policy) - Eval | BC warm-start → SAC | 16% | mug |
+#### SAC Evaluation
 
+| Object | L0 | L1 | L2 | Avg |
+|--------|:-:|:-:|:-:|:-:|
+| **sphere** | 100% | 100% | 100% | **100%** |
+| **thin_cylinder** | 100% | 100% | 100% | **100%** |
+| **cylinder** | 100% | 100% | 98% | **99%** |
+| **cube** | 100% | 100% | 94% | **98%** |
+| **vase** | 100% | 100% | 68% | **89%** |
+| **flat_square** | 100% | 86% | 66% | **84%** |
+| **mug** | 100% | 87% | 64% | **84%** |
+| **cup** ★ | 93% | 89% | 66% | **83%** |
+| **cone** | 96% | 66% | 74% | **79%** |
 
-### Resuls summary for adaptive arbitrage mode
-| episode | q_store_weight_rate | sac_weight_rate | action_agreement_rate | q_success_rate | sac_success_rate | total_episodes_success_rate | curriculum level |
-|-------|-------|--------|-------------|--------|--------|--------|--------|
-| 100 | 29% | 71% | 77% | 84% | 61% | 72% | 0 -> 1 |
-| 1000 | 32% | 68% | 76% | 52% | 48% | 51% | 2 |
-| 1500 | 45% | 55% | 76% | 67% | 30% | 54% | 2 |
-| 2000 | 55% | 45% | 75% | 63% | 20% | 55% | 2 |
+#### Heuristic-Only Evaluation
 
+| Object | L0 | L1 | L2 | Avg |
+|--------|:-:|:-:|:-:|:-:|
+| **thin_cylinder** | 100% | 99% | 99% | **99%** |
+| **cylinder** | 100% | 96% | 94% | **97%** |
+| **cube** | 100% | 98% | 91% | **96%** |
+| **vase** | 99% | 98% | 90% | **96%** |
+| **sphere** | 100% | 95% | 89% | **95%** |
+| **cup** | 99% | 84% | 85% | **89%** |
+| **mug** | 100% | 76% | 78% | **85%** |
+| **cone** | 95% | 67% | 78% | **80%** |
+| **flat_square** | 100% | 88% | 51% | **80%** |
+
+★ = unseen during training (generalization test)
+
+#### Cross-Method Comparison (Average across all levels)
+
+| Object | Q-Learning | SAC | Heuristic |
+|--------|:-:|:-:|:-:|
+| **sphere** | 100% | 100% | 95% |
+| **thin_cylinder** | 96% | 100% | 99% |
+| **cylinder** | 97% | 99% | 97% |
+| **cube** | 97% | 98% | 96% |
+| **vase** | 90% | 89% | 96% |
+| **flat_square** | 82% | 84% | 80% |
+| **mug** | 78% | 84% | 85% |
+| **cone** | 80% | 79% | 80% |
+| **cup** ★ | 79% | 83% | 89% |
+| **Average** | **89%** | **91%** | **89%** |
+
+#### Key Findings
+
+**1. Learned policies match hand-crafted heuristics.** Q-learning (89% avg) and SAC (91% avg) achieve performance on par with carefully engineered geometric heuristics (89% avg). This is significant because the heuristics encode months of domain-specific geometric reasoning (geodesic crawling, orbit computation, flyby correction, landing control), while Q-learning and SAC learned equivalent behavior from reward signal alone. SAC slightly outperforms both on average, confirming that the BC warm-start → SAC refinement pipeline works.
+
+**2. Generalization to unseen objects works.** Cup was never seen during training. Q-learning achieves 79%, SAC 83%, heuristic 89% on cup — comparable to performance on trained objects like mug (78%/84%/85%) and cone (80%/79%/80%). This confirms the hypothesis that the 22D state vector captures fundamental geometric relationships (alignment, curvature, path_blocked, normal_agreement) rather than object-specific features. The agent has learned to navigate *geometry*, not specific objects.
+
+**3. Q-store serves as a knowledge base for the full pipeline.** The training pipeline flows: Q-learning builds episodic memory → successful trajectories extracted → Behavioral Cloning trains SAC actor → SAC refines with RL. Each stage builds on the previous. Q-store accumulates geometric experience across objects (1,156 strategic detach points, 9,544 strategic direction points), which transfers to new objects. SAC then smooths and generalizes this discrete experience into continuous actions.
+
+**4. Heuristics provide a strong baseline and safety net.** The heuristic system is not just a bootstrap — it remains competitive at all levels. On complex objects at L2, heuristics sometimes outperform learned policies (vase: 90% heuristic vs 72% Q-learning, cup: 85% vs 69%). This validates the two-level architecture: heuristics handle geometric reasoning reliably, while learned policies add value through experience-based corrections and continuous action parameters.
+
+**5. L2 (opposite sides) remains the primary challenge.** All methods show significant degradation at L2 where the goal is on the opposite side of the object. The failure mode is predominantly timeout — the agent navigates safely but runs out of steps during detach→fly→land sequences. Flat_square is the hardest (48-66% at L2) because its thin geometry makes edge detection and landing particularly difficult.
+
+This complementarity is exactly what the Adaptive Arbitrage system exploits — selecting the best source per step based on track records.
+
+#### Adaptive Arbitrage Evaluation (Cup — unseen object, 2000 episodes)
+
+The adaptive mode combines Q-store, SAC, and heuristics with online learning on a completely new object (cup). The system starts with models trained on 8 other objects and adapts in real-time.
+
+**Overall: 83% rolling success rate at Level 2 after 2000 episodes.**
+
+| Metric | Value |
+|--------|-------|
+| Total episodes | 2,000 |
+| Rolling success rate (last 100) | 83% |
+| Total success rate | 72.9% |
+| Final curriculum level | 2 (hardest) |
+| Mean steps per success | 51.0 |
+| Online SAC updates | 20 |
+| Offline retrains triggered | 0 |
+
+##### Source Distribution
+
+| Source | Step Rate | Success Rate | Role |
+|--------|:-:|:-:|------|
+| **Blend** (Q confirms SAC) | 51.5% | 85.3% | Primary — highest trust, Q validates SAC |
+| **SAC** (standalone) | 25.6% | 83.3% | Secondary — when Q not confident enough to confirm |
+| **Heuristic** (fallback) | 23.0% | 72.2% | Safety net — when ML underperforms |
+| **Q-store** (standalone) | 0.0% | — | Not used alone — always confirms or defers to SAC |
+
+Q-SAC agreement rate: **79%** — the two systems converge on the same action type in 4 out of 5 steps.
+
+##### Per-Level Performance
+
+| Level | Blend | SAC | Heuristic | Best |
+|-------|:-:|:-:|:-:|:-:|
+| L0 (easy) | 92% | 97% | — | SAC |
+| L1 (medium) | 88% | 95% | — | SAC |
+| L2 (hard) | 63% | 71% | 72% | Heuristic |
+
+At L2, heuristic budget increases to 24% (from 5% at L0) because ML sources drop below heuristic track record. The arbitrator automatically allocates more steps to heuristics where they outperform learned policies.
+
+##### Why Q-Store Matters (Even When Heuristics Exist)
+
+> "If heuristics achieve 89% average, why do we need Q-store at all?"
+
+Heuristics are hard-coded geometric functions — they work well but have fundamental limitations:
+
+1. **Heuristics can't learn from experience.** A heuristic that fails on a specific geometry will fail the same way every time. Q-store records what worked and what didn't, building a growing knowledge base. After 2000 episodes on cup, the strategic_direction store grew from 9,544 to 9,555 points — each new point is a learned geometric situation.
+
+2. **Q-store enables confidence-based arbitration.** SAC (as a neural network) always outputs high-confidence predictions — it has no mechanism to signal "I don't know." Q-store provides this missing signal: high confidence + high spread means "I've seen this situation many times and know what to do." Low confidence means "this is unfamiliar territory." The Arbitrator uses Q-confidence to decide when to trust SAC (blend mode, 85.3% success) vs when to fall back to heuristics (72.2% success). Without Q-confidence, every SAC action would be trusted equally, losing the 13% advantage of blend over heuristic.
+
+3. **Q-store is a knowledge base that can be populated from multiple sources.** Currently Q-store learns from:
+   - Online Q-learning updates (every step during adaptive mode)
+   - Retrospective success backup (propagating rewards along successful trajectories)
+   - Strategic detach/direction learning (episode-end retrospective updates)
+
+   In the future, Q-store can be populated from:
+   - **Demonstration learning**: Recording successful robot trajectories and inserting state-action-value triples directly into HNSW graph
+   - **Sim-to-real transfer**: Pre-populating Q-store from simulation, then refining with real-world experience
+   - **Multi-agent knowledge sharing**: Merging Q-stores from multiple robots operating on different objects
+   - **Model-based planning**: Using Monty's learned reference frames as a world model to simulate trajectories and pre-populate Q-values for unvisited states (Dyna-Q style)
+   - **Human corrections**: An operator marks a state as "detach here" or "don't detach here", directly updating strategic Q-values
+
+   Heuristics cannot absorb any of these knowledge sources — they are fixed functions. Q-store is an open knowledge base with a universal insert interface: `update_q_value(state, action, value)`.
+
+4. **Q-store provides the training signal for SAC.** Successful trajectories from Q-learning episodes are extracted, converted to continuous action space via Behavioral Cloning, and used to warm-start SAC. Without Q-store, SAC would need to learn from scratch — which is significantly slower and less stable. The pipeline Q-store → BC → SAC is what enables SAC to achieve 83% on an unseen object from episode 1.
+
+##### Adaptive Mode Dynamics
+
+The system self-regulates without manual intervention:
+
+- **L0-L1**: SAC dominates (95-97% success), heuristic budget stays at minimum (5-10%). The system trusts learned policies.
+- **L2**: SAC drops to 71%, heuristic budget automatically increases to 24%. The arbitrator detects ML underperformance and allocates more steps to the reliable fallback.
+- **Blend mode** (Q confirms SAC) consistently outperforms standalone SAC at L0-L1 (92% vs 97% — SAC is better alone on easy tasks) but provides the critical safety check at L2 where SAC's confidence doesn't correlate with actual success.
+
+### Areas for Improvement
+
+**1. SAC online learning shows limited improvement.** After 20 online SAC updates during 2000 adaptive episodes, SAC success rate did not significantly increase. The likely causes:
+- CQL critic is conservative by design — prevents overestimation but also slows learning
+- Actor updates are heavily regularized (BC lambda, reduced lr, every 10th step) to prevent catastrophic forgetting
+- The new object (cup) has limited successful trajectories for BC data
+- Online mini-batches (40 steps every 100 episodes) may be insufficient for meaningful policy improvement
+
+Potential solutions: larger online update batches, adaptive BC lambda decay based on success rate, curriculum-aware replay buffer prioritization.
+
+**2. L2 collision rate remains high.** 356 collisions across 2000 episodes (17.8%), primarily from MoveLinear actions. The detach→fly→land sequence is the riskiest phase — the agent sometimes flies into the object surface. Better depth-based collision avoidance during flight and more conservative landing approach could reduce this.
+
+**3. Heuristic-ML gap at L2.** On the hardest level, heuristics (72%) slightly outperform blend (63%). This suggests the learned policies haven't fully captured the geometric reasoning needed for opposite-side navigation. More training episodes on complex objects, or explicit curriculum for detach scenarios, could close this gap.
 
 
 # Next Steps
@@ -733,510 +900,3 @@ This turns goal-directed movement into directed exploration — not random, but 
 >
 > **Multi-LM coordination.** When multiple LMs generate competing goal states, the current system picks the highest confidence. With RL navigation, the motor system could also consider reachability — a closer goal might be preferred over a more discriminative but harder-to-reach one."
 
-
-## Q-Store Training & Evaluation — Summary
-
-### Architecture: Two-Level Decision System
-
-The controller uses a **two-level architecture** separating strategic decisions from tactical execution:
-
-**Tactical Level (Q-Store)** — per-step action selection via Q-learning with heuristic-guided exploration. Two separate HNSW-based Q-stores for surface (18D state → 8 tangential directions + orientation actions) and air (18D state → flight/rotation actions). Actions are selected via softmax sampling over a blend of learned Q-values and hand-crafted heuristic bias, weighted by epsilon.
-
-**Strategic Level** — episode-scale decisions using two lightweight HNSW stores (5D state, 2 actions each):
-
-| Store | Decision | State Features | Actions |
-|-------|----------|---------------|---------|
-| **Detach Store** | Stay on surface vs detach | normal_agreement, alignment, norm_distance, path_blocked, movement_efficiency | stay (0), switch (1) |
-| **Direction Store** | Fly direct to goal vs bypass around object | lateral_deviation, alignment, norm_distance, angle_to_goal, path_blocked | fly_to_goal (0), bypass (1) |
-
-Strategic stores are updated **retrospectively** at episode end: the outcome (goal_reached, collision, timeout) is propagated back to all strategic decisions made during the episode. This solves the credit assignment problem — a detach decision at step 5 receives feedback from goal_reached at step 100.
-
-Key design choices:
-- Direction store uses **sampled inserts** (first, last, every 10th air transition) to populate without flooding
-- Detach store updates with `count_visit=True` for primary decisions, `count_visit=False` for retrospective stuck-state propagation
-- Both stores blend learned Q-values with heuristic bias using strategic_epsilon (decays independently from tactical epsilon)
-
-### Training Method
-
-Training uses a **single difficulty level [10–120mm]** covering the full distance range, including opposite-side goals that require detach + flight. This replaces curriculum-based training with progressive levels.
-
-| Parameter | Value |
-|-----------|-------|
-| Episodes | 3000 per mesh |
-| Epsilon | 1.0 → 0.3 (adaptive decay) |
-| Strategic epsilon | 1.0 → 0.3 |
-| Curriculum | Single level [10, 120mm] |
-| Warmup | None (heuristic-guided from start) |
-
-The epsilon schedule means early episodes are **dominated by heuristic bias** (surface crawl direction, air steering, landing approach), providing structured exploration. As epsilon decays, learned Q-values increasingly drive decisions. Strategic stores learn throughout, receiving retrospective updates from every episode outcome.
-
-Each mesh is trained independently from scratch — no transfer between objects.
-
-### Evaluation Results
-
-All models evaluated with eval_epsilon=0.02 on 500 episodes per mesh, distance range [10–120mm]:
-
-| Mesh | Success | Collision | Timeout | Steps/Success | Detach Success |
-|------|---------|-----------|---------|---------------|----------------|
-| **Cube** | **100%** | 0% | 0% | 15 | — |
-| **Cylinder** | **87.0%** | 8.0% | 5.0% | 125 | 72.1% |
-| **Mug** | **70.4%** | 16.0% | 13.6% | 200 | 54.8% |
-| **Cup** | **65.8%** | 25.0% | 9.2% | 177 | 55.6% |
-| **Vase** | **64.2%** | 8.0% | 27.8% | 326 | 49.1% |
-
-### Analysis by Object Geometry
-
-**Cube (100%)** — trivially solved by pure surface crawling. All goals reachable via edge transitions (perpendicular faces, dot=0.0). No detach or flight needed. Confirms fundamental crawling mechanics work perfectly.
-
-**Cylinder (87%)** — best hollow object. Simple symmetric geometry enables effective detach-and-fly strategy (90% of steps in air). Detach success rate 72.1% — highest across all objects. Zero collisions from detach or crawling; all 40 collisions from flight (free_forward/small).
-
-**Mug (70.4%)** — handle creates navigation complexity. Agent must avoid handle while crawling to rim. Detach collision rate 4.6% (handle geometry). Direction store learned clear differentiation: blocked→bypass 77%, clear→goal 77%.
-
-**Cup (65.8%)** — thin walls cause highest collision rate (25%). Detach collision 9.4% — thin walls don't survive standard detach distance. Direction store achieved best clear→goal discrimination (94.5%). Fastest steps/success among hollow objects (177).
-
-**Vase (64.2%)** — safest (8% collision) but slowest (326 steps/success). Elongated shape makes landing difficult (27.8% timeout). Agent spends 76% of time in air. Direction store blocked zone at 49.8% — store uncertain about bypass on smooth geometry.
-
-### Strategic Store Effectiveness
-
-**Direction Store** — consistently effective across all objects:
-- Blocked path → bypass: 73–81% (correct)
-- Clear path → fly to goal: 77–95% (correct)
-- 2400–3400 points per mesh, well-distributed
-
-**Detach Store** — functional but with persistent pattern:
-- Q-value spread remains small (~0.1), indicating weak differentiation
-- "Same" zone often shows higher switch preference than "opposite" zone
-- This is partially correct for hollow objects (same-side + path_blocked = need to go around)
-- 300–800 points per mesh
-
-### Key Findings
-
-1. **Geometry determines failure mode**: thin walls → collisions (cup), elongated shape → timeouts (vase), handles → navigation complexity (mug)
-
-2. **Strategic direction store provides significant value**: without it (1 point, pre-fix), agent always bypassed. With it (2400+ points), agent correctly switches between bypass and direct flight based on path_blocked state
-
-3. **Single-level training [10-120mm] works**: no curriculum needed. Heuristic-guided exploration provides sufficient structure for learning across all distance ranges
-
-4. **Detach is high-risk, high-reward**: +18–28mm distance improvement when successful, but 0.9–9.4% collision rate depending on wall thickness. Success rate 49–72% depending on geometry
-
-5. **Landing remains the bottleneck**: agents can fly to vicinity of goal but struggle to land on surface. Vase shows this most clearly (LAND phase only 9.9% of steps, 27.8% timeout)
-
-
-### Potential Improvements (Priority Order)
-
-#### 1. 🔴 Detach Collision Reduction
-**Problem:** Detach collision rate 0.9–9.4% depending on wall thickness. `_detach_simple` moves agent along surface normal by fixed distance, passing through thin walls (cup: 9.4%).
-
-**Solution:** Add depth check before detach — if sensor depth in normal direction < detach_distance × 1.5, reduce detach distance or abort. Alternatively, use sub-stepped detach with collision check at each increment.
-
-**Expected impact:** -5–8% collision rate on cup/mug, minimal code change.
-
-#### 2. 🔴 Landing Improvement
-**Problem:** Agent flies to goal vicinity but can't land on surface. Vase: 27.8% timeout, LAND phase only 9.9% of steps. Agent flies `free_forward_small` toward goal with depth=100 (no surface visible), passing alongside the object without touching it.
-
-**Solution:** When in LAND phase with depth=100 and distance < landing_threshold, agent should rotate toward nearest surface (look_down/turn toward object center) rather than continue flying forward. Add "blind landing" heuristic using object_center direction when depth sensor sees nothing.
-
-**Expected impact:** -10–15% timeout on vase, -5% on mug/cylinder.
-
-#### 3. 🟡 Detach Store Differentiation
-**Problem:** Q-value spread ~0.1, store can't clearly distinguish when detach helps vs hurts. "Same" zone shows higher switch preference than "opposite" zone across most objects.
-
-**Solution:** Add `same_side` as explicit feature in detach state (currently inferred indirectly via normal_agreement). This gives store direct signal about the most important factor for detach decisions. Alternatively, increase `strategic_alpha_switch_multiplier` for stronger learning signal.
-
-**Expected impact:** Better detach timing, +2–5% success rate on hollow objects.
-
-#### 4. 🟡 Surface Contact Transition Classification
-**Problem:** When agent crawls via `move_tangentially` and transitions between surfaces (wall→handle, wall→bottom), the normal changes sharply. Current `_detect_collision` treats any normal flip as `surface_violation`, but `move_tangentially` uses `snap_to_surface` which guarantees the agent stays on the surface. These are **contact transitions**, not penetrations.
-
-This affects all objects with sharp geometry — mug (wall→handle: 31 false collisions), cup (wall→rim: 68 false collisions). On mug eval, all 76 collisions in `CRAWL_TO_GOAL` phase; a significant portion are false positives from surface crawling.
-
-**Solution:** In `_detect_collision`, skip normal flip check when the previous action was `move_tangentially` (actions 0–7). These actions use `snap_to_surface` which projects the agent onto the nearest surface — normal changes are legitimate surface transitions, not penetrations. Flight actions (`free_forward`, `free_forward_small`, `free_backward`) still trigger normal flip detection since they can actually penetrate surfaces.
-
-**Expected impact:** -5–14% collision rate (mug: ~15%→~9%, cup: ~25%→~11%). Significant success rate improvement from correct event classification, no physics changes needed. Risk mitigated by existing `depth < min_valid_depth` check which catches actual penetrations on the next step.
-
-#### 5. 🟡 Air Step Budget After Detach
-**Problem:** 47–53% of detaches don't result in landing. Mean air steps after detach: 81–133. Some episodes spend 499 steps in air after a single detach.
-
-**Solution:** Implement air step budget — after N steps in air without landing (e.g., 80), force phase switch to aggressive landing mode: suppress all turn/look actions, only allow `free_forward_small` toward nearest surface point. Or penalize long air time more strongly in detach store retrospective updates.
-
-**Expected impact:** -5–10% timeout, faster episode resolution.
-
-#### 6. 🟡 Direction Store: Blocked Zone on Smooth Objects
-**Problem:** On vase and cup, blocked zone switch_preferred ≈ 49–50% (random). `path_blocked` flickers on smooth curved surfaces — ray barely grazes surface, alternating blocked/clear each step. Store receives contradictory signals.
-
-**Solution:** Smooth `path_blocked` signal — use rolling average over 3–5 steps instead of instantaneous ray cast. Or add margin to path_blocked check (blocked if ray hits within `dist_to_goal - margin` instead of `dist_to_goal - 2.0`).
-
-**Expected impact:** More stable direction decisions on smooth objects, -3–5% timeout on vase.
-
-#### 7. 🟢 Move Tangentially Collision on Cup
-**Problem:** `move_tangentially` collision rate 0.37% on cup (9× worse than mug). Thin walls and sharp curvature transitions cause normal flip detection during crawling.
-
-**Solution:** Reduce `surface_step` for thin-walled objects, or add adaptive step size based on local curvature (smaller steps near high-curvature regions). Alternatively, increase `normal_flip_threshold` tolerance for cup-like geometry.
-
-**Expected impact:** -2–3% collision on cup.
-
-#### 8. 🟢 Training Duration
-**Problem:** 3000 episodes may not be sufficient for complex objects. Vase direction store blocked zone still at 50% (not converged). Learning curve shows continued improvement at 3000 episodes (54% → 65% between 1K and 3K).
-
-**Solution:** Train 5000–6000 episodes with epsilon 1.0 → 0.1 (lower final epsilon). Or add second training stage with `load_mode: auto`, epsilon 0.3 → 0.1, for fine-tuning.
-
-**Expected impact:** +3–5% success rate across all objects, better store convergence.
-
-#### 9. 🟢 Orbit Direction Stability
-**Problem:** On mug, orbit_age median=2.0 (direction recalculated every 2 steps). `path_blocked` flickering causes `_cached_orbit_direction` to reset frequently, leading to zigzag flight paths.
-
-**Solution:** Increase orbit direction cache lifetime — don't recalculate if current orbit is making progress (distance decreasing or lateral movement). Add hysteresis: only recalculate orbit when `path_blocked` has been stable for 3+ steps.
-
-**Expected impact:** More efficient bypass flights, -5–10 steps per bypass maneuver.
-
-#### 10. 🟢 Cross-Object Transfer Learning
-**Problem:** Each mesh trained from scratch. Strategic stores learn similar patterns (blocked→bypass, clear→goal) independently on each object.
-
-**Solution:** Train on one object (e.g., cylinder), then fine-tune on others with `load_mode: auto`. Strategic stores should transfer well since their 5D state space is geometry-agnostic. Q-stores may need unfreezing normalization for transfer.
-
-**Expected impact:** Faster training convergence, potentially better initial performance on new objects.
-
-
-## Baseline System — Technical Summary
-
-### 1. Heuristics (`_compute_heuristic_bias`)
-
-The heuristic system provides structured exploration bias across 7 components, each producing a bias vector over all actions. Components are additive — final heuristic is the sum of all components.
-
-#### Phase Determination (`_determine_phase`)
-
-Before computing heuristics, the system determines the current navigation phase based on sensor state:
-
-| Phase | Condition | Description |
-|-------|-----------|-------------|
-| `CRAWL_TO_GOAL` | On surface, same_side, path clear | Direct surface crawl toward goal |
-| `CRAWL_TO_EDGE` | On surface, opposite side OR path blocked | Crawl toward nearest edge/rim |
-| `DETACH_NEEDED` | On surface, stuck crawling (30+ steps no progress) | Should detach and fly |
-| `FLY_TO_GOAL` | In air, path clear (3+ steps) | Direct flight toward goal |
-| `FLY_TO_EDGE` | In air, path blocked | Bypass flight around object |
-| `LAND` | In air, near goal, path clear | Approach and land on surface |
-
-#### Heuristic Components
-
-**0. Suppress** — always-on penalties:
-- Rotation actions (`rotate_sensor_+/-`): -2.0
-- Orientation actions when far from goal: -2.0
-- Detach action: -5.0 base (strategic level decides detach, not tactical)
-- Additional -5.0 if last action was detach or recent detach in last 3 steps
-- Additional -8.0 if in `CRAWL_TO_GOAL` and close to goal (< 5× surface_step)
-
-**1. Surface Move** — phase-aware crawl direction:
-- `CRAWL_TO_EDGE` (strength 8.0): scores 8 tangential directions against subgoal direction (edge/rim). Uses surface-projected up_direction for walls, away-from-center for horizontal surfaces.
-- `CRAWL_TO_GOAL` (strength 4.0): scores directions against goal projection on tangent plane. Uses geodesic direction when goal_normal available (great circle path), falls back to Euclidean projection. When path_blocked, redirects toward edge using fly direction. Includes direction hysteresis (HYST_ABS) to prevent oscillation.
-
-**2. Stagnation** — anti-oscillation for surface crawling:
-- Activates in `CRAWL_TO_GOAL` or `CRAWL_TO_EDGE` when < 0.5× surface_step progress over 10 steps
-- Penalizes current direction (-2.0), boosts perpendicular directions (+2.0) and opposite (+1.0)
-
-**3. Steer in Air** — flight direction control:
-- Computes improvement for each rotation (pitch up/down, yaw left/right) toward effective goal
-- Effective goal = subgoal_direction in `FLY_TO_EDGE`, goal_position otherwise
-- Three regimes based on angle_to_goal:
-  - \> 45° (TURN_ONLY): suppress forward flight, boost big rotations toward goal
-  - 20–45°: small forward + moderate rotation corrections
-  - < 20°: full forward flight + minor corrections
-- Trapped boost: when `FLY_TO_EDGE` + path_blocked + depth < 20%, boost look_up to escape
-- Suppresses all surface/utility actions in air (-8.0)
-
-**4. Damp Free on Surface** — prevents flight actions while crawling:
-- `free_forward/small/backward`: -8.0
-- Big rotations, orientation, roll: -4.0
-
-**5. Flyby Correction** — detects and corrects overshooting goal in air:
-- Triggers when distance increases for 2-3 consecutive steps while flying
-- Escalates with flyby count (strength 4.0 + 2.0 per repeat)
-- Suppresses forward flight, boosts rotation toward goal
-- Uses 5-step distance minimum to detect overshoot
-
-**6. Orientation Cooldown** — prevents repeated ineffective orientation actions:
-- Tracks consecutive no-effect orientation actions (distance change < 0.1mm while on surface)
-- After 3+ repeats: penalty up to -12.0 on that action
-
-**7. Landing** — approach and touchdown control:
-- Emergency landing (depth < 5mm): suppress big forward, boost small forward, suppress all rotations
-- `LAND` phase near goal: boost `free_forward_small`, suppress `free_forward` and rotations
-- Landing urgency scales with proximity to goal
-- Overshoot protection: if distance > min_recent + free_step while near goal, suppress all forward
-
-### 2. Action Selection (`_choose_action`)
-
-Three-tier decision process:
-
-```
-┌─────────────────────────────────┐
-│     Strategic Level             │
-│  Detach Store: stay vs switch   │──→ If switch: action = DETACH (override)
-│  Direction Store: goal vs bypass│──→ Sets phase (FLY_TO_GOAL / FLY_TO_EDGE)
-└──────────────┬──────────────────┘
-               │ (if no override)
-┌──────────────▼──────────────────┐
-│     Tactical Level              │
-│  combined = (1-ε)·Q + ε·H      │
-│  Action mask applied            │
-│  Softmax sampling (temperature) │──→ action
-│                                 │
-│  Random exploration:            │
-│  p = 0.02 × ε chance           │──→ random valid action
-└─────────────────────────────────┘
-```
-
-**Strategic Level:**
-- On surface: detach store decides stay (continue crawling) vs switch (detach). Uses 5D compact state. If switch + `_can_detach()` + (not same_side or path_blocked) → action = DETACH, bypasses softmax.
-- In air: direction store decides fly_to_goal vs bypass. Uses 5D compact state. Sets `_current_phase` which affects heuristic computation. Does NOT override action — only influences phase/heuristic.
-
-**Tactical Level:**
-- Blends Q-values and heuristic bias: `combined = (1-ε)·Q_norm + ε·H_norm`
-- Temperature: `clip(0.5 × ε, 0.01, 0.5)` — higher epsilon = more exploration
-- Warmup mode: pure heuristic with temperature 0.001 (near-greedy)
-- Action mask: surface actions blocked in air, flight actions blocked on surface, detach blocked after 3 consecutive
-
-**Random Exploration:**
-- Probability: `0.02 × ε` per step
-- Selects uniformly from valid (unmasked) actions
-- Provides exploration even when Q+heuristic are confident
-
-### 3. Reward (`_compute_reward`)
-
-Dense reward with 7 components, phase-aware shaping:
-
-#### Core Rewards
-
-**1. Progress toward goal:**
-```
-reward += (prev_distance - distance) / surface_step × reward_progress
-```
-- Scaled by surface_step for consistent magnitude across step sizes
-- Phase modifiers:
-  - `FLY_TO_EDGE` + negative progress: ×0.2 (don't penalize bypass detours)
-  - `CRAWL_TO_EDGE` / `DETACH_NEEDED`: ×0.1 (suppress misleading goal-progress signal)
-- Detour mode: when alignment < threshold on surface, clips negative progress
-- Stagnation penalty: -0.3 when movement_efficiency < 0.1 on surface (oscillation detection)
-
-**2. Subgoal potential shaping** (Ng et al. 1999):
-```
-reward += γ · φ(current) - φ(previous)
-```
-- φ = 0 when alignment ≥ 0 (goal visible from surface)
-- φ = (1 + alignment) × SCALE when alignment < 0 (goal behind object)
-- On surface: SCALE = 2.0 (strong push toward edge)
-- In air: SCALE = 0.6 (weaker, avoid interfering with flight)
-- Preserves optimal policy while accelerating edge-seeking behavior
-
-**3. Goal reached:** `+reward_goal_reached` (configurable, default 30.0), episode done
-
-**4. Step penalty:** `reward_step_penalty` per step (small negative, encourages efficiency)
-
-#### Safety Penalties
-
-**5. Risky actions on surface:**
-- `free_forward` on surface: -2.0 (can fly off)
-- `free_forward_small` on surface: -2.0
-- `free_backward` on surface: -2.0
-
-**6. Flying too far:** -2.0 when distance > 1.5 × max_object_extent (prevents drifting away)
-
-**7. Collisions:**
-- `surface_violation`: large negative (configurable), episode done
-- `detach_collision`: same as surface_violation
-- `lost_object` (fell off surface without detach): `reward_drifted_away`
-
-**8. Detach in air:** -5.0 (detach only makes sense on surface)
-
-#### Phase Bonuses
-
-**9. Successful landing:**
-```
-landing_quality = max(0, 1 - distance / landing_radius)
-reward += 8.0 × landing_quality
-```
-- Triggers when: was in air → now on surface, no collision, same_side
-- Rewards landing near goal (quality 1.0 = at goal, 0.0 = at landing_radius edge)
-
-**10. Correct crawl:** +0.2 when `CRAWL_TO_GOAL` with positive progress > 0.1mm
-
-**11. Flight alignment shaping:**
-- `FLY_TO_EDGE`: tracks alignment with subgoal_direction, rewards improvement: `+2.0 × Δalignment`
-- `FLY_TO_GOAL` / `LAND`: tracks alignment with goal_direction, rewards improvement: `+2.0 × Δalignment`
-- Encourages agent to turn toward correct direction before flying forward
-
-**12. Timeout:** `reward_timeout` when steps ≥ max_steps_per_goal, episode done
-
-#### Success Backup (`_apply_success_backup_updates`)
-
-Applied only on goal_reached episodes, two mechanisms:
-
-**Lambda-return backup:** propagates discounted return backward through trajectory
-```
-G = r_t + γ·G_{t+1}
-Q(s,a) ← Q(s,a) + α·λ^depth · (G - Q(s,a))
-```
-- Depth-weighted: recent transitions get full learning rate, early ones decay by λ
-
-**Critical Action Bonus:** directly boosts Q-values for detach actions in successful episodes
-```
-Q(s, detach) ← Q(s, detach) + α·0.2 · (reward_goal_reached × 0.3 - Q(s, detach))
-```
-- Solves credit assignment: detach at step 5 gets direct credit from goal at step 100
-- Without this, lambda-return gives near-zero credit to early detach decisions
-
-## Резюме улучшений SAC пайплайна
-
-### State representation
-
-| Было | Стало | Зачем |
-|---|---|---|
-| 18D state | **22D state** | Больше информации для принятия решений |
-| Нет path_blocked | **path_blocked [18]** | SAC знает когда путь заблокирован |
-| Нет movement_efficiency | **movement_efficiency [19]** | SAC знает когда застрял |
-| Нет projected direction | **projected_goal_2d [20:22]** | SAC знает куда ползти на любом объекте |
-
-### Action representation
-
-| Было | Стало | Зачем |
-|---|---|---|
-| Angle в градусах (0-360) | **Sin/cos representation** | Нет разрыва при 0°/360°, лучше аппроксимация нейросетью |
-| MoveTangentially params: [angle, dist] | **[sin, cos, dist]** | Непрерывное представление направления |
-| Turn/Look params: [angle] | **[sin, cos]** | Консистентное представление углов |
-
-### Подготовка данных (BC)
-
-| Было | Стало | Зачем |
-|---|---|---|
-| Q-store eval + heuristic 50/50 | **Только heuristic** | Чистые данные без Q-store bias |
-| Без air start | **Air start каждый 3-й эпизод** | SAC видит примеры полёта и приземления |
-| Без фильтров по уровням | **Curriculum filters** (same_side, path_blocked) | Разделение по сложности |
-| Баланс только по (mesh, level) | **+ баланс по action type** (min 1%) | Редкие действия (detach) представлены |
-| Фиксированный target_per_group | **bc_total_target (опционально)** | Гибкое управление объёмом данных |
-
-### Тренировка SAC
-
-| Было | Стало | Зачем |
-|---|---|---|
-| Стандартный SAC critic | **CQL (Conservative Q-Learning)** | Предотвращает переоценку незнакомых действий |
-| Нет actor warmup | **Warmup per level (100 эпизодов)** | Critic учится до обновления actor |
-| bc_lambda decay без floor | **bc_lambda min=2.0** | BC regularization не исчезает |
-| bc_lambda decay по total steps | **Decay по actor updates** | Правильный темп decay |
-| Нет action masks | **Masks: no detach in air, no crawl in air, no fly on surface, no detach 3x** | Физические ограничения |
-| Mask заменяет на фиксированное действие | **Resample из actor с маской** | SAC сам выбирает альтернативу |
-| Curriculum по расстоянию | **Curriculum с фильтрами** (same_side, path_blocked) | От простого к сложному |
-| Promote во время warmup | **Promote только после warmup** | Actor обучен перед усложнением |
-| Best model глобальный | **Best model per level** | Лучшая модель для текущей сложности |
-| Reward только progress + goal | **Общая reward function** (subgoal shaping, landing bonus, fly alignment, stagnation penalty) | Те же сигналы что у Q-store |
-| Subgoal shaping без clamp | **Clamp [-3, 3]** | Предотвращает аномальные rewards |
-
-### Adaptive mode
-
-| Было | Стало | Зачем |
-|---|---|---|
-| Стандартный critic update | **CQL critic update** | Безопасное обучение на новом объекте |
-| Нет actor warmup | **Warmup 200 эпизодов** | Critic адаптируется до actor |
-| Все transitions в один поток | **Все → buffer, успешные → BC data** | Critic видит негативный опыт, actor якорится к позитивному |
-| Offline SAC = полная тренировка с env | **CQL retrain на buffer без env** | Безопасное offline обучение |
-| Нет curriculum filters | **Те же filters из конфига** | Консистентность с offline тренировкой |
-
-### Результаты
-
-| Метрика | Первый SAC | Финальный SAC |
-|---|---|---|
-| Eval rate (mug) | 12% | **94%** |
-| Rolling rate | 20% (деградация) | **72%** (стабильный) |
-| Steps/success L0 | ~960 | **16.7** |ы
-| Steps/success L1 | - | **46.6** |
-| Steps/success L2 | - | **102.9** |
-| Catastrophic forgetting | Да | **Нет** |
-| Detach accuracy (BC) | 0% | **55.6%** |
-
-
-## Q-Store Training & Generalization — Summary
-
-### Approach
-
-We train a non-parametric Q-store (HNSW-based) using curriculum learning across multiple 3D objects, progressing from simple primitives to complex hollow shapes. The Q-store learns geometric navigation patterns — surface crawling, edge traversal, rim transitions, and obstacle avoidance — that generalize across object geometries.
-
-**Architecture:**
-- **Tactical Q-stores** (`q_store_surface`, `q_store_free`): ~880K points total, storing Q-values for 24 discrete actions indexed by 22D state vectors (local normals, curvature, alignment, distance, depth, path_blocked, movement_efficiency, projected goal direction)
-- **Strategic Q-stores** (`strategic_detach`, `strategic_direction`): ~10K points, making macro-decisions (detach vs stay, fly-to-goal vs bypass)
-- **Heuristic bias**: hand-crafted navigation heuristics blended with Q-values via softmax sampling, with epsilon-greedy exploration during training
-
-**Training pipeline:**
-- **Phase 1 — Primitives**: cube → sphere → cylinder → flat_square (from scratch, epsilon 1.0→0.15)
-- **Phase 2 — Hollow objects**: vase → mug (loaded from Phase 1, epsilon 0.5→0.10)
-- **Phase 3 — Reinforcement**: vase and mug on new surface points (pool_seed override, epsilon 0.3→0.08)
-
-Each stage uses 3-level curriculum with filters:
-- L0: `same_side=true, path_blocked=false` (simple crawling)
-- L1: `same_side=true, path_blocked=true` (edge traversal required)
-- L2: `same_side=false` (rim transitions, inside↔outside for hollow objects)
-
-Per-stage configurable parameters: `epsilon_start/min`, `warmup_episodes`, `promote_threshold/window`, `curriculum_filters`, `pool_seed`.
-
-### Key Heuristic Fixes for Hollow Objects
-
-During development, we identified and fixed several issues with rim/edge traversal on hollow objects (vase, mug, cup):
-
-1. **Horizontal surface detection** (`_determine_phase`): When agent is on a horizontal rim with `path_blocked=true`, phase stays `CRAWL_TO_GOAL` instead of switching to `CRAWL_TO_EDGE`, allowing natural edge traversal
-2. **Away-from-center push** (`_compute_heuristic_bias`): On horizontal rims where goal is significantly below/above, blend goal direction with radial push toward rim edge, scaled by `horiz_ratio`
-3. **Wrong-side wall correction** (`_move_tangentially`): Cache `_wrong_side_outward` while `same_side=false`; on rim-to-wall transition, if `nearest.on_surface` returns same wall type as cached, search for opposite wall via `closest - hit_n * 5.0`
-4. **Rim transition override** (`_move_tangentially`): When `is_from_horizontal=true` and normals conflict, trust mesh normals instead of flipping (watertight mesh guarantee)
-
-### Validation Results
-
-**Train objects** (seen during training):
-
-| Object | L0 | L1 | L2 | vs Heuristics |
-|--------|----|----|----|----|
-| Cube | 100% | 100% | 91% | ≥ heuristics |
-| Sphere | 100% | 100% | 100% | ≥ heuristics |
-| Cylinder | 100% | 97% | 95% | ≥ heuristics |
-| Vase | 99% | 100% | 98% | +8% on L2 |
-| Mug | 98% | 87% | 79% | +17% L1, −9% L2 |
-
-**Held-out objects** (never seen during training):
-
-| Object | L0 | L1 | L2 | vs Heuristics |
-|--------|----|----|----|----|
-| Thin cylinder | 100% | 95% | 94% | ≥ heuristics |
-| Cup (hollow) | 99% | 89% | 91% | +3–5% |
-| Cone | 100% | 56% | 61% | geometry limitation |
-
-**Key findings:**
-- Q-store **does not degrade** performance on any train object compared to pure heuristics
-- **Generalization to held-out primitives** works well: thin_cylinder achieves 94–100%, matching the trained cylinder
-- **Generalization to held-out hollow object** (cup) works: 89–91% success, **better than pure heuristics** (+3–5%)
-- Cone performance (56–61% on L1/L2) is limited by apex geometry (surface_step ≈ apex radius), not Q-store quality
-- Mug L2 regression (−9%) is caused by handle geometry artifacts (mesh concatenation, not boolean union)
-
-### Known Limitations
-
-1. **Handle collision**: Objects with handles (mug, cup) suffer 5–9% collision rate from `move_tangentially` near handle attachment points. Root cause: `trimesh.util.concatenate` creates non-watertight geometry at handle-body junction. Fix: use boolean union or improve collision detection near handles.
-
-2. **Epsilon warmup bug**: During curriculum level transitions, warmup sets epsilon=1.0 but does not reset to `epsilon_start` afterward — epsilon decays from 1.0 instead of the configured start value. Fix identified: reset epsilon to `epsilon_start` and recalculate decay for remaining episodes after warmup ends.
-
-3. **Flat square edge case**: Objects where `thickness ≈ surface_step` (3mm) cannot traverse edges reliably — agent overshoots the thin side face. Not a Q-store issue; inherent discretization limitation.
-
-4. **Air navigation**: After detach, agent spends many steps in `FLY_TO_EDGE` orbit (mean 50–270 air steps). Orbit direction heuristic works but is slow. Future work: improve orbit escape and landing approach.
-
-5. **Strategic Q-store conservatism**: Detach store strongly prefers "stay" over "switch" (Q_switch negative in all zones). This is correct for current rim-traversal fixes but may under-utilize detach for genuinely blocked scenarios.
-
-### What to Improve
-
-**Short-term:**
-- Fix epsilon warmup reset bug (reset to `epsilon_start` after warmup, recalculate decay)
-- Fix flat_square curriculum filters (use only L0, or single level with `{}` filter)
-- Add per-stage `epsilon_on_promote` for controlled exploration on new curriculum levels
-
-**Medium-term:**
-- Improve handle geometry (boolean union instead of concatenate)
-- Improve air navigation: faster orbit escape, better landing approach heuristics
-- Train on more diverse objects to improve cone-like geometry handling
-
-**Long-term:**
-- Add SAC for continuous action parameters, with Q-store providing discrete action type selection
-- Implement replay buffer with balanced object sampling for SAC training
-- Periodic distillation from Q-store to SAC via environment interaction
-- Extend to YCB objects with mesh preprocessing (fix normals, fill holes)

@@ -349,7 +349,7 @@ experiment:
       #cone: 500
       #thin_cylinder: 500
       #vase: 1000
-      #mug: 3000
+      #mug: 1000
     
     sac_episodes_per_mesh:
       mug:

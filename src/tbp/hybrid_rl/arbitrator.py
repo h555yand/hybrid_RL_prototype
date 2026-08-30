@@ -72,15 +72,14 @@ def sac_to_discrete(action_type: int, action_params: np.ndarray) -> int:
 class Arbitrator:
     """Decides which action source to use per step.
 
-    Logic (no calibration):
-      1. Q-confident override: high confidence + spread > 3.0
-         - types agree: Q type + 50/50 blend params
-         - types differ: Q type + Q params
+    Logic:
+      1. Q-confident override (high confidence + spread > 3.0):
+         - Q type == SAC type → SAC params (Q confirms SAC)
+         - Q type != SAC type → heuristic (conflict resolution)
       2. Track record scoring:
-         - h_track = max(real_track, 0.8)
-         - ML trend falling AND best_ml < h_track → heuristic
+         - ML below heuristic and not improving → heuristic
+         - Heuristic budget = gap between heuristic and ML track
          - Otherwise → SAC (default)
-      3. Heuristic budget: max 20% of decisions per level
     """
 
     def __init__(
@@ -148,7 +147,7 @@ class Arbitrator:
         self._param_dims = ExperienceExtractor.get_param_dims()
         self._type_names = ExperienceExtractor.get_type_names()
 
-        # Running Q statistics for v2-style confidence
+        # Running Q statistics
         self._running_q_stats_free = RunningQStats(warmup=200)
         self._running_q_stats_surface = RunningQStats(warmup=200)
         self._warmup_running_stats()
@@ -157,7 +156,7 @@ class Arbitrator:
         self._sac_strategic_detach: Optional[Any] = None
         self._sac_strategic_direction: Optional[Any] = None
 
-        # Arbitrage-only stats (excluding calibration)
+        # Arbitrage-only stats
         self._arbitrage_stats = {
             "q_store_chosen": 0,
             "sac_chosen": 0,
@@ -169,7 +168,7 @@ class Arbitrator:
         # Heuristic budget tracking per level
         self._level_total_decisions: Dict[int, int] = defaultdict(int)
         self._level_heuristic_decisions: Dict[int, int] = defaultdict(int)
-        self._heuristic_budget = 0.20  # max 20%
+        self._heuristic_eps_min = 0.1
 
     def _warmup_running_stats(self):
         """Warm up RunningQStats from existing Q-store points."""
@@ -198,6 +197,51 @@ class Arbitrator:
                 f"points_total={len(store.points)}"
             )
 
+    def _get_heuristic_eps(self, ml_track: float, h_track: float) -> float:
+        """Dynamic heuristic epsilon = gap between heuristic and ML.
+
+        h_track=0.8, best_ml=0.6 → eps=0.2 (20% heuristic)
+        h_track=0.8, best_ml=0.85 → eps=0.05 (ML better, minimum)
+        """
+        gap = h_track - ml_track
+        return max(gap, self._heuristic_eps_min)
+
+    def _get_level_tracks(self, level: int):
+        """Compute ML and heuristic tracks for a level."""
+        q_track = self._get_track(self._level_q_results[level])
+        sac_track = self._get_track(self._level_sac_results[level])
+        b_track = self._get_track(self._level_blend_results[level])
+        h_track = max(self._get_track(self._level_heuristic_results[level]), 0.8)
+
+        ml_tracks = []
+        if len(self._level_q_results[level]) >= self._min_eval_per_source:
+            ml_tracks.append(q_track)
+        if len(self._level_sac_results[level]) >= self._min_eval_per_source:
+            ml_tracks.append(sac_track)
+        if len(self._level_blend_results[level]) >= self._min_eval_per_source:
+            ml_tracks.append(b_track)
+        best_ml_track = max(ml_tracks) if ml_tracks else 0.5
+        worst_ml_track = min(ml_tracks) if ml_tracks else 0.5
+
+        return q_track, sac_track, b_track, h_track, best_ml_track, worst_ml_track, len(ml_tracks) > 0
+    
+    def _is_ml_trend_increasing(self, level: int) -> bool:
+        """Detect if any ML source is trending upward."""
+        for results in [
+            self._level_q_results[level],
+            self._level_sac_results[level],
+            self._level_blend_results[level],
+        ]:
+            if len(results) < 10:
+                continue
+            mid = len(results) // 2
+            results_list = list(results)
+            first_half = sum(results_list[:mid]) / max(mid, 1)
+            second_half = sum(results_list[mid:]) / max(len(results_list) - mid, 1)
+            if second_half > first_half + 0.05:
+                return True
+        return False
+
     def start_episode(self, level: int):
         if level != self._current_level:
             self._current_level = level
@@ -215,7 +259,6 @@ class Arbitrator:
         level = self._current_level
         has_sac = self.sac_actor is not None
 
-        # Track per-level decisions for heuristic budget
         self._level_total_decisions[level] += 1
 
         # === Get proposals ===
@@ -246,76 +289,21 @@ class Arbitrator:
             if self.q_confidence_history
             else 0.0
         )
-        q_conf_threshold = min(max(q_conf_mean * 1.1, 0.5), 1.0)
+        q_conf_threshold = min(max(q_conf_mean * 0.9, 0.5), 1.0)
 
         if q_confidence >= q_conf_threshold and q_spread > 3.0:
-            if q_type == sac_type and has_sac:
-                # Blend 50/50: Q type + mixed params
-                dim = self._param_dims.get(q_type, 0)
-                if dim > 0:
-                    blended = 0.5 * q_params[:dim] + 0.5 * sac_params[:dim]
-                    blend_padded = np.zeros(3, dtype=np.float32)
-                    blend_padded[:dim] = blended
-                else:
-                    blend_padded = sac_params.copy()
+            if q_type == sac_type:
+                # 1.1 Types agree: Q confirms SAC → use SAC params
                 self._record_decision("blend")
                 self.blend_chosen_actions[q_name] += 1
                 self._current_episode_sources.append("blend")
-                return q_type, blend_padded, (
-                    f"q_confident_blend("
+                return sac_type, sac_params, (
+                    f"q_confirms_sac("
                     f"conf={q_confidence:.2f},"
                     f"spread={q_spread:.1f})"
                 )
             else:
-                # Types differ: Q type + Q params
-                self._record_decision("q_store")
-                self.q_chosen_actions[q_name] += 1
-                self._current_episode_sources.append("q_store")
-                return q_type, q_params, (
-                    f"q_confident("
-                    f"conf={q_confidence:.2f},"
-                    f"spread={q_spread:.1f})"
-                )
-
-        # === 2. Track record scoring ===
-        q_track = self._get_track(self._level_q_results[level])
-        sac_track = self._get_track(self._level_sac_results[level])
-        b_track = self._get_track(self._level_blend_results[level])
-        h_track_raw = self._get_track(self._level_heuristic_results[level])
-        h_track = max(h_track_raw, 0.8)
-
-        best_ml_track = max(q_track, sac_track, b_track)
-
-        # Check if we have enough data to evaluate trends
-        has_enough_data = (
-            len(self._level_q_results[level])
-            + len(self._level_sac_results[level])
-            + len(self._level_blend_results[level])
-            >= self._min_eval_per_source
-        )
-
-        # Detect ML trend falling
-        # Heuristic fallback: ML trend falling AND best ML < heuristic
-        # ML significantly below heuristic AND not improving
-        ml_trend_increasing = True
-        if has_enough_data:
-            ml_trend_increasing = not self._is_ml_trend_increasing(level)
-
-        ml_below_heuristic = best_ml_track < h_track * 1.0
-
-        use_heuristic = (
-            has_enough_data
-            and ml_below_heuristic
-            and not ml_trend_increasing
-        )
-
-        if use_heuristic:
-            # Check heuristic budget: max 20% of decisions on this level
-            total_on_level = max(self._level_total_decisions[level], 1)
-            heuristic_on_level = self._level_heuristic_decisions[level]
-            heuristic_ratio = heuristic_on_level / total_on_level
-
-            if heuristic_ratio < self._heuristic_budget:
+                # 1.2 Types differ: conflict → heuristic decides
                 h_action = self._get_heuristic_action(
                     state, current_pose, sensor_data
                 )
@@ -327,12 +315,53 @@ class Arbitrator:
                 self.heuristic_chosen_actions[h_name] += 1
                 self._current_episode_sources.append("heuristic")
                 return h_type, h_params, (
-                    f"heuristic(ml_falling,"
+                    f"q_sac_conflict("
+                    f"q={q_name},sac={sac_name},"
+                    f"conf={q_confidence:.2f},"
+                    f"spread={q_spread:.1f})"
+                )
+
+        # === 2. Track record scoring ===
+        q_track, sac_track, b_track, h_track, best_ml_track, worst_ml_track, has_enough_data = (
+            self._get_level_tracks(level)
+        )
+
+        ml_trend_not_increasing = True
+        if has_enough_data:
+            ml_trend_not_increasing = not self._is_ml_trend_increasing(level)
+
+        ml_below_heuristic = worst_ml_track < h_track
+
+        use_heuristic = (
+            has_enough_data
+            and ml_below_heuristic
+            # and ml_trend_not_increasing
+        )
+
+        if use_heuristic:
+            total_on_level = max(self._level_total_decisions[level], 1)
+            heuristic_on_level = self._level_heuristic_decisions[level]
+            heuristic_ratio = heuristic_on_level / total_on_level
+            current_eps = self._get_heuristic_eps(worst_ml_track, h_track)
+
+            if heuristic_ratio < current_eps:
+                h_action = self._get_heuristic_action(
+                    state, current_pose, sensor_data
+                )
+                h_type = ExperienceExtractor.DISCRETE_TO_PSAC[h_action][0]
+                h_params = self._discrete_to_params(h_action)
+                self._record_decision("heuristic")
+                self._level_heuristic_decisions[level] += 1
+                h_name = self._type_names.get(h_type, f"type_{h_type}")
+                self.heuristic_chosen_actions[h_name] += 1
+                self._current_episode_sources.append("heuristic")
+                return h_type, h_params, (
+                    f"heuristic(ml_low,"
                     f"best_ml={best_ml_track:.2f},"
                     f"ht={h_track:.2f},"
-                    f"budget={heuristic_ratio:.2f})"
+                    f"eps={current_eps:.3f},"
+                    f"used={heuristic_ratio:.3f})"
                 )
-            # Budget exhausted — fall through to SAC
 
         # === 3. SAC default ===
         if has_sac:
@@ -341,10 +370,11 @@ class Arbitrator:
             self.sac_chosen_actions[sac_n] += 1
             self._current_episode_sources.append("sac")
             return sac_type, sac_params, (
-                f"sac(qs={q_track:.2f},"
-                f"ss={sac_track:.2f},"
+                f"sac(qt={q_track:.2f},"
+                f"st={sac_track:.2f},"
                 f"bt={b_track:.2f},"
-                f"ht={h_track:.2f})"
+                f"ht={h_track:.2f},"
+                f"h_eps={self._get_heuristic_eps(worst_ml_track, h_track):.3f})"
             )
 
         # Fallback Q (no SAC)
@@ -353,29 +383,7 @@ class Arbitrator:
         self._current_episode_sources.append("q_store")
         return q_type, q_params, "q_fallback"
 
-    def _is_ml_trend_increasing(self, level: int) -> bool:
-        """Detect if any ML source is trending upward.
-
-        Compares first half vs second half of track record.
-        Returns True if ANY ML source shows improvement.
-        """
-        for results in [
-            self._level_q_results[level],
-            self._level_sac_results[level],
-            self._level_blend_results[level],
-        ]:
-            if len(results) < 10:
-                continue
-            mid = len(results) // 2
-            results_list = list(results)
-            first_half = sum(results_list[:mid]) / max(mid, 1)
-            second_half = sum(results_list[mid:]) / max(len(results_list) - mid, 1)
-            if second_half > first_half + 0.05:
-                return True
-        return False
-
     def _record_decision(self, source: str):
-        """Record decision in both total and arbitrage-only stats."""
         self.stats[f"{source}_chosen"] += 1
         self._arbitrage_stats[f"{source}_chosen"] += 1
         self._arbitrage_stats["total_decisions"] += 1
@@ -443,9 +451,7 @@ class Arbitrator:
                     raw_sample = normal.rsample()
                     squashed = torch.tanh(raw_sample)
 
-                    scale, center = self.sac_actor._get_scale_center(
-                        action_type
-                    )
+                    scale, center = self.sac_actor._get_scale_center(action_type)
                     if scale is not None:
                         scaled = squashed * scale[:dim] + center[:dim]
                     else:
@@ -606,7 +612,6 @@ class Arbitrator:
 
     def on_episode_end(self, success: bool):
         level = self._current_level
-
         counts = Counter(self._current_episode_sources)
         if counts:
             dominant = counts.most_common(1)[0][0]
@@ -618,7 +623,6 @@ class Arbitrator:
                 self._level_sac_results[level].append(success)
             elif dominant == "heuristic":
                 self._level_heuristic_results[level].append(success)
-
         self._current_episode_sources = []
 
     @property
@@ -696,12 +700,9 @@ class Arbitrator:
                 + list(self._level_heuristic_results.keys())
             )
         ):
-            q_r = self._get_track(self._level_q_results[level])
-            s_r = self._get_track(self._level_sac_results[level])
-            h_r = self._get_track(self._level_heuristic_results[level])
-            b_r = self._get_track(self._level_blend_results[level])
             total_lvl = max(self._level_total_decisions.get(level, 0), 1)
             h_lvl = self._level_heuristic_decisions.get(level, 0)
+            q_r, s_r, b_r, h_r, best_ml, worst_ml, _ = self._get_level_tracks(level)
             level_stats[f"level_{level}"] = {
                 "q_rate": round(q_r, 3),
                 "sac_rate": round(s_r, 3),
@@ -712,6 +713,7 @@ class Arbitrator:
                 "blend_evals": len(self._level_blend_results[level]),
                 "heuristic_evals": len(self._level_heuristic_results[level]),
                 "heuristic_budget_used": round(h_lvl / total_lvl, 3),
+                "heuristic_eps": round(self._get_heuristic_eps(worst_ml, h_r), 4),
                 "ml_trend_increasing": self._is_ml_trend_increasing(level),
             }
 
