@@ -793,6 +793,8 @@ The adaptive mode combines Q-store, SAC, and heuristics with online learning on 
 | Online SAC updates | 20 |
 | Offline retrains triggered | 0 |
 
+[Details are here](results_publish/adaptive_logs_cup-4)
+
 ##### Source Distribution
 
 | Source | Step Rate | Success Rate | Role |
