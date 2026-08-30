@@ -205,7 +205,7 @@ class Arbitrator:
         """
         gap = h_track - ml_track
         eps_max = max(gap, self._heuristic_eps_min)
-        eps_max_min = min(eps_max, 0.3)
+        eps_max_min = min(eps_max, 0.25)
         return eps_max_min
 
     def _get_level_tracks(self, level: int):
