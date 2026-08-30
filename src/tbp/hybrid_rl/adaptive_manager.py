@@ -51,8 +51,8 @@ class AdaptiveTrainingManager:
         mastered_threshold: float = 0.95,
         offline_threshold: float = 0.40,
         monitor_window: int = 100,
-        online_sac_update_every: int = 200,
-        online_sac_update_steps: int = 20,
+        online_sac_update_every: int = 100,
+        online_sac_update_steps: int = 40,
         offline_q_episodes: int = 500,
         offline_sac_episodes: int = 300,
         post_offline_cooldown: int = 200,
@@ -125,6 +125,8 @@ class AdaptiveTrainingManager:
         self.mode_changes: List[Dict[str, Any]] = []
         self._level_success_history: Dict[int, deque] = {}
         self._offline_just_completed = False
+        self._online_critic_warmup_updates = 0
+        self._critic_warmup_threshold = 3
 
     @property
     def success_rate(self) -> float:
@@ -307,15 +309,19 @@ class AdaptiveTrainingManager:
                     -self.max_bc_transitions :
                 ]
         else:
-            if np.random.random() < 0.3:
+            # Adaptive failure collection: less when success rate is low
+            failure_prob = min(0.3, self.success_rate * 0.5)
+            if np.random.random() < failure_prob:
                 self.online_transitions_raw.extend(psac_transitions)
 
     def _maybe_online_sac_update(self) -> None:
         """Periodic online SAC update.
 
-        Critic: CQL every step.
-        Actor: every 10th step with strong BC lambda (like training).
-        No interaction with environment — gradient steps on buffer.
+        Mirrors PSACTrainer.train() logic:
+        - Critic warmup: first N updates critic-only
+        - BC lambda decay: gradually free actor from BC
+        - Reduced actor lr: prevent catastrophic forgetting
+        - CQL critic: prevent overestimation on new object
         """
         if self.sac_trainer is None:
             return
@@ -361,9 +367,17 @@ class AdaptiveTrainingManager:
             self.online_episodes_since_sac_update = 0
             return
 
-        # Strong BC for online (prevent forgetting, like training init)
-        old_bc_lambda = self.sac_trainer.bc_lambda
-        self.sac_trainer.bc_lambda = self.sac_trainer.bc_lambda_init
+        # ═══ BC lambda decay (like training) ═══
+        self.sac_trainer.bc_lambda = max(
+            self.sac_trainer.bc_lambda * 0.95,
+            self.sac_trainer.bc_lambda_min,
+        )
+
+        # ═══ Determine if actor should update ═══
+        actor_ready = (
+            self._online_critic_warmup_updates
+            >= self._critic_warmup_threshold
+        )
 
         mesh_name = Path(self.mesh_path).stem
         for step_i in range(self.online_sac_update_steps):
@@ -376,26 +390,45 @@ class AdaptiveTrainingManager:
             )
 
             # CQL critic every step
+            old_cql_alpha = self.sac_trainer.cql_alpha
+            self.sac_trainer.cql_alpha = 1.0
             self.sac_trainer.update_critic_cql(batch)
+            self.sac_trainer.cql_alpha = old_cql_alpha
 
-            # Actor every 10th step (same as training)
-            if step_i % 10 == 0 and self.bc_transitions:
+            # Actor: after warmup, every 10th step, reduced lr
+            if (
+                actor_ready
+                and step_i % 10 == 0
+                and self.bc_transitions
+            ):
+                old_lr = (
+                    self.sac_trainer.actor_optimizer
+                    .param_groups[0]['lr']
+                )
+                self.sac_trainer.actor_optimizer \
+                    .param_groups[0]['lr'] = old_lr * 0.1
                 self.sac_trainer.update_actor(batch)
+                self.sac_trainer.actor_optimizer \
+                    .param_groups[0]['lr'] = old_lr
 
             self.sac_trainer.soft_update_target()
 
-        self.sac_trainer.bc_lambda = old_bc_lambda
+        self._online_critic_warmup_updates += 1
         self.total_sac_updates += 1
         self.online_episodes_since_sac_update = 0
 
         logger.info(
-            "Online SAC update: added=%d, bc=%d, "
-            "steps=%d, bc_lambda=%.1f, total=%d",
+            "Online SAC update #%d: added=%d, bc=%d, "
+            "steps=%d, bc_lambda=%.3f, "
+            "actor=%s, warmup=%d/%d",
+            self.total_sac_updates,
             added,
             len(self.bc_transitions),
             self.online_sac_update_steps,
-            self.sac_trainer.bc_lambda_init,
-            self.total_sac_updates,
+            self.sac_trainer.bc_lambda,
+            "active" if actor_ready else "warmup",
+            self._online_critic_warmup_updates,
+            self._critic_warmup_threshold,
         )
 
     def _trigger_offline(self):
@@ -582,7 +615,26 @@ class AdaptiveTrainingManager:
                 current_level,
             )
 
-            self.sac_trainer.bc_data = all_bc
+            # Combine original BC with new success trails
+            # (don't lose knowledge about other objects)
+            if self.sac_trainer.bc_data is not None:
+                combined_bc = self.sac_trainer.bc_data + all_bc
+                # Keep manageable size
+                if len(combined_bc) > self.max_bc_transitions * 2:
+                    # Keep all new + sample from old
+                    old_count = len(self.sac_trainer.bc_data)
+                    keep_old = min(old_count, self.max_bc_transitions)
+                    old_indices = np.random.choice(
+                        old_count, keep_old, replace=False
+                    )
+                    combined_bc = (
+                        [self.sac_trainer.bc_data[i] for i in old_indices]
+                        + all_bc
+                    )
+                self.sac_trainer.bc_data = combined_bc
+            else:
+                self.sac_trainer.bc_data = all_bc
+
             self.sac_trainer.bc_lambda = self.sac_trainer.bc_lambda_init
 
             old_use_cql = self.sac_trainer.use_cql

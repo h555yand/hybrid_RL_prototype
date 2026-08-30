@@ -18,6 +18,7 @@ import logging
 import os
 import pathlib
 from typing import Any, Dict, List, Optional, Tuple
+from collections import deque
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R
@@ -32,23 +33,38 @@ logger = logging.getLogger(__name__)
 
 
 class RunningQStats:
-    """Welford's online algorithm for tracking Q-value distribution.
+    """Running Q-value statistics with optional sliding window.
 
-    Tracks running mean and variance of Q-values returned by
-    get_q_values across all queries. Used to:
-    - Normalize advantage (Q - V) to a common scale
-    - Compute V_normalized to determine state quality
-    - Decide trust level in Q-values vs heuristic
+    When window is None: classic Welford (accumulates all history).
+    When window is set: sliding window mean/std that adapts to
+    distribution shifts (e.g. new object in adaptive mode).
 
     The warmup period ensures statistics are stable before use.
     Before warmup completes, all normalization is identity.
-    """
 
-    def __init__(self, warmup: int = 200):
-        self.mean = 0.0
-        self.var = 1.0
-        self.count = 0
+    Args:
+        warmup: Minimum samples before normalization is active.
+        window: Sliding window size. None = unlimited (Welford).
+    """
+    def __init__(self, warmup: int = 200, window: Optional[int] = None):
         self.warmup = warmup
+        self.window = window
+
+        # Sliding window storage
+        if window is not None:
+            self._buffer: Optional[deque] = deque(maxlen=window)
+            self._cached_mean: float = 0.0
+            self._cached_std: float = 1.0
+            self._cache_interval: int = max(window // 20, 100)
+            self._updates_since_cache: int = 0
+        else:
+            self._buffer = None
+
+        # Welford state (used when window is None,
+        # also as public attributes for compatibility)
+        self.mean: float = 0.0
+        self.var: float = 1.0
+        self.count: int = 0
 
     def update(self, q_values: np.ndarray):
         """Update running statistics with a new Q-value vector.
@@ -56,15 +72,38 @@ class RunningQStats:
         Args:
             q_values: Q-values array [num_actions] from one query.
         """
-        for q in q_values:
-            self.count += 1
-            delta = q - self.mean
-            self.mean += delta / self.count
-            delta2 = q - self.mean
-            self.var += (delta * delta2 - self.var) / self.count
+        if self._buffer is not None:
+            for q in q_values:
+                self._buffer.append(float(q))
+            self.count = len(self._buffer)
+            self._updates_since_cache += len(q_values)
+
+            if (
+                self._updates_since_cache >= self._cache_interval
+                and self.count >= self.warmup
+            ):
+                self._recompute_cache()
+        else:
+            for q in q_values:
+                self.count += 1
+                delta = q - self.mean
+                self.mean += delta / self.count
+                delta2 = q - self.mean
+                self.var += (delta * delta2 - self.var) / self.count
+
+    def _recompute_cache(self):
+        """Recompute mean/std from sliding window buffer."""
+        arr = np.array(self._buffer)
+        self._cached_mean = float(arr.mean())
+        self._cached_std = float(max(arr.std(), 1e-4))
+        self.mean = self._cached_mean
+        self.var = self._cached_std ** 2
+        self._updates_since_cache = 0
 
     @property
     def std(self) -> float:
+        if self._buffer is not None:
+            return self._cached_std
         return max(np.sqrt(max(self.var, 0.0)), 1e-4)
 
     @property
@@ -72,27 +111,28 @@ class RunningQStats:
         return self.count >= self.warmup
 
     def normalize_value(self, v: float) -> float:
-        """Normalize a single value relative to global Q distribution.
+        """Normalize a single value relative to Q distribution.
 
         Args:
             v: Raw value (typically V = mean of Q-values for a state).
 
         Returns:
-            Z-score of v relative to global Q distribution.
-            Returns 0.0 if not warmed up.
+            Z-score of v. Returns 0.0 if not warmed up.
         """
         if not self.is_warmed_up:
             return 0.0
+        if self._buffer is not None:
+            return (v - self._cached_mean) / self._cached_std
         return (v - self.mean) / self.std
 
     def normalize_advantage(self, advantage: np.ndarray) -> np.ndarray:
-        """Normalize advantage vector by global Q std.
+        """Normalize advantage vector by Q std.
 
         Args:
             advantage: Raw advantage array (Q - V).
 
         Returns:
-            Advantage divided by global std. Identity if not warmed up.
+            Advantage divided by std. Identity if not warmed up.
         """
         if not self.is_warmed_up:
             return advantage

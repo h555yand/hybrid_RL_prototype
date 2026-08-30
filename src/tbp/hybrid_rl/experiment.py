@@ -45,6 +45,7 @@ from tbp.hybrid_rl.lightweight_env import LightweightEnv
 from tbp.hybrid_rl.mesh_factory import prepare_demo_meshes
 from tbp.hybrid_rl.rl_goal_approach_controller import (
     RLGoalApproachController,
+    RunningQStats
 )
 from tbp.hybrid_rl.sac_trainer import PSACTrainer
 from tbp.hybrid_rl.ablation_runner import _maybe_save_visualization, visualize_agent_goal
@@ -1906,16 +1907,26 @@ class RLGoalApproachExperiment:
                 ),
             )
 
-        for mesh_name, num_episodes in self.sac_episodes_per_mesh.items():
+        for mesh_name, mesh_cfg in self.sac_episodes_per_mesh.items():
+            # Support both formats:
+            #   mug: 3000
+            #   mug: {episodes: 3000, pool_seed: 301}
+            if isinstance(mesh_cfg, dict):
+                num_episodes = mesh_cfg["episodes"]
+                pool_seed = mesh_cfg.get("pool_seed", self.sac_seed)
+            else:
+                num_episodes = mesh_cfg
+                pool_seed = self.sac_seed
+
             mesh_path = str(
                 self.data_dir / f"{mesh_name}.stl"
             )
             logger.info(
-                "SAC Training: %s, %d episodes",
+                "SAC Training: %s, %d episodes, pool_seed=%d",
                 mesh_name,
                 num_episodes,
+                pool_seed,
             )
-
             env = LightweightEnv(mesh_path)
             controller = RLGoalApproachController(
                 agent_id=f"sac_{mesh_name}",
@@ -1924,12 +1935,12 @@ class RLGoalApproachExperiment:
 
             sac_pools = get_or_generate_pools(
                 mesh_path=mesh_path,
-                seeds=[self.sac_seed],
+                seeds=[pool_seed],
                 episodes_per_level=num_episodes,
                 scripts_dir=self.scripts_dir,
                 curriculum_levels=self.curriculum_levels,
                 regenerate=self.regenerate_scripts,
-                prefix=f"sac_train_{mesh_name}",
+                prefix=f"sac_train_{mesh_name}_ps{pool_seed}",
                 curriculum_filters=self.curriculum_filters,
             )
 
@@ -1949,7 +1960,7 @@ class RLGoalApproachExperiment:
                 curriculum_levels=self.curriculum_levels,
                 promote_threshold=self.promote_threshold,
                 promote_window=self.promote_window,
-                episode_pools=sac_pools[self.sac_seed],
+                episode_pools=sac_pools[pool_seed],
                 visualise=self.visualise,
                 mesh_name=mesh_name,
             )
@@ -2547,6 +2558,19 @@ class RLGoalApproachExperiment:
         )
         manager.sac_trainer = sac_trainer
 
+        # ═══ Sliding window RunningQStats for adaptive ═══
+        # Welford's accumulates all history and stops adapting
+        # on new objects. Sliding window forgets old distribution
+        # and adapts to cup within ~55 episodes.
+        _ADAPTIVE_Q_STATS_WINDOW = 200_000
+        manager.arbitrator._running_q_stats_free = RunningQStats(
+            warmup=200, window=_ADAPTIVE_Q_STATS_WINDOW
+        )
+        manager.arbitrator._running_q_stats_surface = RunningQStats(
+            warmup=200, window=_ADAPTIVE_Q_STATS_WINDOW
+        )
+        manager.arbitrator._warmup_running_stats()
+
         if sac_trainer.strategic_detach_sac is not None:
             manager.arbitrator._sac_strategic_detach = (
                 sac_trainer.strategic_detach_sac
@@ -2792,13 +2816,18 @@ class RLGoalApproachExperiment:
                 surface_debug = getattr(controller, "_last_surface_debug", None)
                 surface_str = ""
                 if surface_debug is not None:
-                    surface_str = (
-                        f", e_t=[{surface_debug['e_t'][0]:.1f},"
-                        f"{surface_debug['e_t'][1]:.1f},"
-                        f"{surface_debug['e_t'][2]:.1f}]"
-                        f", best_dir={surface_debug['best_dir']}"
-                        f", scores={surface_debug['scores']}"
-                    )
+                    if 'best_dir' in surface_debug:
+                        surface_str = (
+                            f", e_t=[{surface_debug['e_t'][0]:.1f},"
+                            f"{surface_debug['e_t'][1]:.1f},"
+                            f"{surface_debug['e_t'][2]:.1f}]"
+                            f", best_dir={surface_debug['best_dir']}"
+                            f", scores={surface_debug['scores']}"
+                        )
+                    else:
+                        surface_str = (
+                            f", note={surface_debug.get('note', 'unknown')}"
+                        )
                     if "e_t_direct" in surface_debug:
                         d = surface_debug["e_t_direct"]
                         surface_str += (
@@ -3040,12 +3069,12 @@ class RLGoalApproachExperiment:
                 src_stats["success_steps"].append(ep_steps)
 
             # Snapshot every N episodes
-            if self.visualise and (episode + 1) % 42 <= 5 and (episode + 1) >= 0:
+            if self.visualise and ((episode + 1) % 100 <= 0 or (episode + 1) == 1) and (episode + 1) >= 0:
                 vis_dir = (
                     Path(adaptive_log_dir)
                     / "visualizations"
                 )
-                if termination != "success":
+                if termination in ("success", "collision", "timeout"):
                     _maybe_save_visualization(
                         controller=controller,
                         env=env,

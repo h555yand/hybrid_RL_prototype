@@ -9,15 +9,15 @@ experiment:
   config:
     seed: 42
     # Visualization: null | text | pictures | video
-    visualise: text
+    visualise: video
     regenerate_scripts: false
     do_train: false
     do_eval: false
     do_heur_eval: false
     do_bc_train: false
     do_sac_train: false
-    do_sac_eval: true
-    do_adaptive: false
+    do_sac_eval: false
+    do_adaptive: true
 
     train_seeds: [11]
     eval_seeds: [44]
@@ -166,44 +166,44 @@ experiment:
     # ═══════════════════════════════════════════
     eval_meshes:
       # Train set — primitives
-      - mesh: cube
-        curriculum_filters:
-          - {same_side: true, path_blocked: false}
-          - {same_side: true, path_blocked: true}
-          - {}
-      - mesh: sphere
-        curriculum_filters:
-          - {same_side: true, path_blocked: false}
-          - {same_side: true, path_blocked: true}
-          - {}
-      - mesh: cylinder
-        curriculum_filters:
-          - {same_side: true, path_blocked: false}
-          - {same_side: true, path_blocked: true}
-          - {}
-      - mesh: flat_square
-        curriculum_filters:
-          - {same_side: true, path_blocked: false}
-          - {same_side: true, path_blocked: true}
-          - {}
-      - mesh: cone
-        curriculum_filters:
-          - {same_side: true, path_blocked: false}
-          - {same_side: true, path_blocked: true}
-          - {}
-      - mesh: thin_cylinder
-        curriculum_filters:
-          - {same_side: true, path_blocked: false}
-          - {same_side: true, path_blocked: true}
-          - {}
+      #- mesh: cube
+      #  curriculum_filters:
+      #    - {same_side: true, path_blocked: false}
+      #    - {same_side: true, path_blocked: true}
+      #    - {}
+      #- mesh: sphere
+      #  curriculum_filters:
+      #    - {same_side: true, path_blocked: false}
+      #    - {same_side: true, path_blocked: true}
+      #    - {}
+      #- mesh: cylinder
+      #  curriculum_filters:
+      #    - {same_side: true, path_blocked: false}
+      #    - {same_side: true, path_blocked: true}
+      #    - {}
+      #- mesh: flat_square
+      #  curriculum_filters:
+      #    - {same_side: true, path_blocked: false}
+      #    - {same_side: true, path_blocked: true}
+      #    - {}
+      #- mesh: cone
+      #  curriculum_filters:
+      #    - {same_side: true, path_blocked: false}
+      #    - {same_side: true, path_blocked: true}
+      #    - {}
+      #- mesh: thin_cylinder
+      #  curriculum_filters:
+      #    - {same_side: true, path_blocked: false}
+      #    - {same_side: true, path_blocked: true}
+      #    - {}
       # Train set — hollow
-      - vase
+      #- vase
       - mug
       # Held-out — hollow
       - mesh: cup
         pool_seed: 57
 
-    eval_episodes_per_level: 100
+    eval_episodes_per_level: 200
 
     # BC config (not used in Q-only pipeline)
     # ═══ BC data collection ═══
@@ -322,14 +322,13 @@ experiment:
 
     # SAC (not used in Q-only pipeline)
     sac_config:
-      load_mode: null
+      load_mode: auto
       goal_threshold: 4.0
       gamma: 0.99
       tau: 0.005
       lr_actor: 0.00003
       lr_critic: 0.0003
       batch_size: 256
-      bc_lambda_init: 5.0
       bc_lambda_init: 5.0
       bc_lambda_min: 0.5
       actor_warmup_per_level: 50
@@ -342,24 +341,29 @@ experiment:
       use_cql: true
       cql_alpha: 1.0
 
+    #sac_episodes_per_mesh:
+      #cube: 500
+      #sphere: 500
+      #cylinder: 500
+      #flat_square: 500
+      #cone: 500
+      #thin_cylinder: 500
+      #vase: 1000
+      #mug: 3000
+    
     sac_episodes_per_mesh:
-      cube: 500
-      sphere: 500
-      cylinder: 500
-      flat_square: 500
-      cone: 500
-      thin_cylinder: 500
-      vase: 1000
-      mug: 1000
+      mug:
+        episodes: 3000
+        pool_seed: 301
 
-    sac_eval_episodes_per_level: 50
+    sac_eval_episodes_per_level: 200
 
     adaptive_mesh: cup
-    adaptive_episodes: 3000
+    adaptive_episodes: 2000
 
     offline_check_window: 100
 
 
     logging:
-      run_name: Q_generalization-v2-sac
+      run_name: adapt-baseline
       output_dir: ${oc.env:MONTY_LOGS}
