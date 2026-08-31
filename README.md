@@ -706,6 +706,24 @@ All methods trained on: cube, sphere, cylinder, flat_square, cone, thin_cylinder
 | **cup** ★ | 98% | 69% | 69% | **79%** |
 | **mug** | 99% | 72% | 65% | **78%** |
 
+####  ═══ BC balancing ═══
+    bc_mesh_weights:
+    # simple, but provides basic flat surface skills and edge traversal
+      cube: 0.8         
+      sphere: 0.8       
+      cylinder: 1.5      
+      flat_square: 0.5   
+      cone: 0.5
+      thin_cylinder: 0.5
+      # hollow navigation
+      vase: 2.0    
+      # handle+rim   
+      mug: 2.5           
+
+    bc_level_weights:
+      0: 1.0
+      1: 1.5
+      2: 2.0    
 
 #### SAC Training
     sac_episodes_per_mesh:
