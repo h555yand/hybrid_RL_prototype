@@ -708,7 +708,7 @@ All methods trained on: cube, sphere, cylinder, flat_square, cone, thin_cylinder
 
 ####  ═══ BC balancing ═══
     bc_mesh_weights:
-    # simple, but provides basic flat surface skills and edge traversal
+      # simple, but provides basic flat surface skills and edge traversal
       cube: 0.8         
       sphere: 0.8       
       cylinder: 1.5      
