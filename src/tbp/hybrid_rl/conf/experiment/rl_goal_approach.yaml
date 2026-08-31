@@ -9,7 +9,7 @@ experiment:
   config:
     seed: 42
     # Visualization: null | text | pictures | video
-    visualise: video
+    visualise: text
     regenerate_scripts: false
     do_train: false
     do_eval: false

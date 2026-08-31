@@ -327,6 +327,7 @@ class Arbitrator:
         q_track, sac_track, b_track, h_track, best_ml_track, worst_ml_track, has_enough_data = (
             self._get_level_tracks(level)
         )
+        ml_track = (best_ml_track + worst_ml_track) * 0.5
 
         ml_trend_not_increasing = True
         if has_enough_data:
@@ -344,7 +345,7 @@ class Arbitrator:
             total_on_level = max(self._level_total_decisions[level], 1)
             heuristic_on_level = self._level_heuristic_decisions[level]
             heuristic_ratio = heuristic_on_level / total_on_level
-            current_eps = self._get_heuristic_eps(worst_ml_track, h_track)
+            current_eps = self._get_heuristic_eps(ml_track, h_track)
 
             if heuristic_ratio < current_eps:
                 h_action = self._get_heuristic_action(
@@ -376,7 +377,7 @@ class Arbitrator:
                 f"st={sac_track:.2f},"
                 f"bt={b_track:.2f},"
                 f"ht={h_track:.2f},"
-                f"h_eps={self._get_heuristic_eps(worst_ml_track, h_track):.3f})"
+                f"h_eps={self._get_heuristic_eps(ml_track, h_track):.3f})"
             )
 
         # Fallback Q (no SAC)
@@ -705,6 +706,7 @@ class Arbitrator:
             total_lvl = max(self._level_total_decisions.get(level, 0), 1)
             h_lvl = self._level_heuristic_decisions.get(level, 0)
             q_r, s_r, b_r, h_r, best_ml, worst_ml, _ = self._get_level_tracks(level)
+            ml_track = (best_ml + worst_ml) * 0.5
             level_stats[f"level_{level}"] = {
                 "q_rate": round(q_r, 3),
                 "sac_rate": round(s_r, 3),
@@ -715,7 +717,7 @@ class Arbitrator:
                 "blend_evals": len(self._level_blend_results[level]),
                 "heuristic_evals": len(self._level_heuristic_results[level]),
                 "heuristic_budget_used": round(h_lvl / total_lvl, 3),
-                "heuristic_eps": round(self._get_heuristic_eps(worst_ml, h_r), 4),
+                "heuristic_eps": round(self._get_heuristic_eps(ml_track, h_r), 4),
                 "ml_trend_increasing": self._is_ml_trend_increasing(level),
             }
 
