@@ -16,7 +16,7 @@
 # Finally, activate the environment with:
 #     $ conda activate project # TODO: Update to your project's name
 #
-name: hybrid_RL_prototype # TODO: Update to your project's name
+name: hybrid_RL_mujoco # TODO: Update to your project's name
 channels:
   - pytorch
   - pyg
@@ -26,8 +26,8 @@ channels:
   - defaults
 
 dependencies:
-  - python=3.8
-  - thousandbrainsproject::tbp.monty==0.33.0 # TODO: Pin to desired tbp.monty version for reproducibility
+  - python=3.9
+  # - thousandbrainsproject::tbp.monty==0.47.0 # TODO: Pin to desired tbp.monty version for reproducibility
   - pip
   - pip:
     - -e .[dev]
@@ -38,3 +38,4 @@ dependencies:
     - pyglet<2
     - manifold3d
     - pyrender
+    - mujoco==3.3.3

@@ -53,6 +53,7 @@ from tbp.hybrid_rl.strategic_sac import StrategicSAC, StrategicBCTrainer
 from tbp.hybrid_rl.episode_pools import _is_reachable_by_surface
 from .arbitrator import sac_to_discrete
 from .action_interpreter import ActionInterpreter
+from tbp.hybrid_rl.ycb_utils import convert_ycb_objects
 
 logger = logging.getLogger(__name__)
 
@@ -225,6 +226,12 @@ class RLGoalApproachExperiment:
                 [],  # empty = use all eval_meshes
             )
         )
+        # YCB eval config
+        self.do_ycb_eval = self.config.get("do_ycb_eval", False)
+        self.ycb_config = self.config.get("ycb_config", {})
+        self.do_ycb_mujoco_eval = self.config.get("do_ycb_mujoco_eval", False)
+        self.ycb_mujoco_config = self.config.get("ycb_mujoco_config", {})
+
     # ══════════════════════════════════════════════════════
     # Model path helpers
     # ══════════════════════════════════════════════════════
@@ -720,6 +727,10 @@ class RLGoalApproachExperiment:
             self._run_sac_eval()
         if self.do_adaptive:
             self._run_adaptive()
+        if self.do_ycb_eval:
+            self._run_ycb_eval()
+        if self.do_ycb_mujoco_eval:
+            self._run_ycb_mujoco_eval()
 
         elapsed = time.time() - start_time
         logger.info("Experiment complete in %.1fs", elapsed)
@@ -3511,7 +3522,600 @@ class RLGoalApproachExperiment:
             final_results["collision_rate"],
             final_results["timeout_rate"],
         )
-    
+
+    # ══════════════════════════════════════════════════════
+    # YCB Evaluation
+    # ══════════════════════════════════════════════════════
+
+    def _run_ycb_eval(self) -> None:
+        """Evaluate trained agent on YCB objects.
+
+        Converts YCB .glb → .stl (mm), then runs eval using
+        LightweightEnv (same as standard eval).
+        """
+        logger.info("=" * 60)
+        logger.info("YCB Evaluation")
+        logger.info("=" * 60)
+
+        ycb_src_dir = self.ycb_config.get("ycb_src_dir")
+        if not ycb_src_dir:
+            logger.error(
+                "ycb_config.ycb_src_dir not set. "
+                "Set path to YCB meshes directory."
+            )
+            return
+
+        ycb_src_dir = Path(ycb_src_dir).expanduser()
+        if not ycb_src_dir.exists():
+            logger.error("YCB source dir not found: %s", ycb_src_dir)
+            return
+
+        # Parse which objects to evaluate
+        ycb_objects = self.ycb_config.get("objects", None)
+        # Format: {local_name: ycb_folder_name}
+        # e.g. {"ycb_mug": "025_mug", "ycb_bowl": "024_bowl"}
+
+        ycb_episodes_per_level = self.ycb_config.get(
+            "episodes_per_level", 100
+        )
+        ycb_curriculum_levels = [
+            tuple(level)
+            for level in self.ycb_config.get(
+                "curriculum_levels", self.curriculum_levels
+            )
+        ]
+        ycb_curriculum_filters = self.ycb_config.get(
+            "curriculum_filters", self.curriculum_filters
+        )
+
+        # Convert YCB objects
+        ycb_data_dir = self.data_dir / "ycb"
+        logger.info("Converting YCB objects from %s", ycb_src_dir)
+        converted = convert_ycb_objects(
+            ycb_src_dir=str(ycb_src_dir),
+            output_dir=str(ycb_data_dir),
+            objects=ycb_objects,
+        )
+
+        if not converted:
+            logger.error("No YCB objects converted, aborting")
+            return
+
+        logger.info("Converted %d YCB objects", len(converted))
+
+        # Eval config
+        eval_cfg = {
+            **self.rl_config,
+            "mode": "eval",
+        }
+
+        all_ycb_results = {}
+
+        for mesh_name, stl_path in converted.items():
+            mesh_path = str(stl_path)
+            logger.info(
+                "YCB Eval: %s (%s)", mesh_name, stl_path
+            )
+
+            # Generate episode pools
+            eval_pools = get_or_generate_pools(
+                mesh_path=mesh_path,
+                seeds=self.eval_seeds,
+                episodes_per_level=ycb_episodes_per_level,
+                scripts_dir=self.scripts_dir,
+                curriculum_levels=ycb_curriculum_levels,
+                regenerate=self.regenerate_scripts,
+                prefix=f"ycb_eval_{mesh_name}",
+                curriculum_filters=ycb_curriculum_filters,
+            )
+
+            # Run eval
+            eval_results, _ = run_eval_per_seed(
+                data_dir=self.data_dir,
+                runs_dir=self.runs_dir,
+                mesh_path=mesh_path,
+                train_seeds=self.train_seeds,
+                eval_seeds=self.eval_seeds,
+                variant="q_store",
+                eval_cfg=eval_cfg,
+                eval_pools=eval_pools,
+                collect_bc=False,
+                episodes_per_level=ycb_episodes_per_level,
+                mesh_name=mesh_name,
+                visualise=self.visualise,
+            )
+
+            all_ycb_results[mesh_name] = eval_results
+
+            # Log per-level results
+            for level_key, level_data in eval_results.items():
+                if level_key == "overall":
+                    continue
+                logger.info(
+                    "  %s %s: success=%.3f, timeout=%.3f, collision=%.3f",
+                    mesh_name,
+                    level_key,
+                    level_data.get("mean_success_rate", 0),
+                    level_data.get("mean_timeout_rate", 0),
+                    level_data.get("mean_collision_rate", 0),
+                )
+
+            if "overall" in eval_results:
+                logger.info(
+                    "  %s OVERALL: success=%.3f",
+                    mesh_name,
+                    eval_results["overall"].get("mean_success_rate", 0),
+                )
+
+            # Save per-mesh result
+            mesh_result_path = (
+                self.data_dir / f"ycb_eval_result_{mesh_name}.json"
+            )
+            with mesh_result_path.open("w") as f:
+                json.dump(eval_results, f, indent=2)
+
+        # Save combined results
+        ycb_result_path = self.data_dir / "ycb_eval_result_all.json"
+        with ycb_result_path.open("w") as f:
+            json.dump(all_ycb_results, f, indent=2)
+
+        # Summary table
+        logger.info("\n" + "=" * 60)
+        logger.info("YCB EVALUATION SUMMARY")
+        logger.info("=" * 60)
+        logger.info("%-20s %10s %10s %10s", "Object", "Success", "Timeout", "Collision")
+        logger.info("-" * 60)
+        for mesh_name, results in all_ycb_results.items():
+            overall = results.get("overall", {})
+            logger.info(
+                "%-20s %10.3f %10.3f %10.3f",
+                mesh_name,
+                overall.get("mean_success_rate", 0),
+                overall.get("mean_timeout_rate", 0),
+                overall.get("mean_collision_rate", 0),
+            )
+        logger.info("=" * 60)
+
+        logger.info("YCB eval results saved to %s", ycb_result_path)
+
+    # ══════════════════════════════════════════════════════
+    # YCB MuJoCo Evaluation
+    # ══════════════════════════════════════════════════════
+
+    def _run_ycb_mujoco_eval(self) -> None:
+        """Evaluate trained agent on YCB objects using MuJoCo rendering."""
+        logger.info("=" * 60)
+        logger.info("YCB MuJoCo Evaluation")
+        logger.info("=" * 60)
+
+        ycb_src_dir = self.ycb_mujoco_config.get("ycb_src_dir")
+        if not ycb_src_dir:
+            logger.error("ycb_mujoco_config.ycb_src_dir not set")
+            return
+
+        ycb_src_dir = Path(ycb_src_dir).expanduser()
+        if not ycb_src_dir.exists():
+            logger.error("YCB source dir not found: %s", ycb_src_dir)
+            return
+
+        ycb_objects = self.ycb_mujoco_config.get("objects", {})
+        episodes_per_level = self.ycb_mujoco_config.get(
+            "episodes_per_level", 10
+        )
+        max_steps = self.ycb_mujoco_config.get("max_steps", 500)
+
+        mujoco_data_path_raw = self.ycb_mujoco_config.get(
+            "mujoco_data_path"
+        )
+        if mujoco_data_path_raw:
+            mujoco_data_path = str(
+                Path(mujoco_data_path_raw).expanduser()
+            )
+        else:
+            mujoco_data_path = str(ycb_src_dir)
+
+        ycb_data_dir = self.data_dir / "ycb"
+        ycb_data_dir.mkdir(parents=True, exist_ok=True)
+
+        seed = self.train_seeds[0]
+        q_dir = self._q_model_dir(seed)
+        if not (Path(q_dir) / "config.json").exists():
+            logger.error("Q-store not found at %s", q_dir)
+            return
+
+        eval_cfg = {**self.rl_config, "mode": "eval"}
+
+        curriculum_levels = [
+            tuple(level)
+            for level in self.ycb_mujoco_config.get(
+                "curriculum_levels", self.curriculum_levels
+            )
+        ]
+
+        all_results = {}
+
+        for local_name, obj_config in ycb_objects.items():
+            # ═══ Parse object config ═══
+            if isinstance(obj_config, dict):
+                mujoco_name = obj_config["mujoco_name"]
+                glb_name = obj_config.get("glb_name", mujoco_name)
+            else:
+                mujoco_name = obj_config
+                glb_name = obj_config
+
+            logger.info("-" * 40)
+            logger.info(
+                "YCB MuJoCo Eval: %s (mujoco=%s, glb=%s)",
+                local_name, mujoco_name, glb_name,
+            )
+
+            # ═══ Verify MuJoCo object data ═══
+            obj_path = (
+                Path(mujoco_data_path) / mujoco_name / "textured.obj"
+            )
+            if not obj_path.exists():
+                logger.warning(
+                    "  SKIP %s: %s not found", mujoco_name, obj_path,
+                )
+                continue
+
+            # ═══ Convert to mm STL ═══
+            stl_path = ycb_data_dir / f"{local_name}.stl"
+            if not stl_path.exists():
+                glb_path = (
+                    ycb_src_dir / glb_name
+                    / "google_16k" / "textured.glb"
+                )
+                src_mesh_path = (
+                    str(glb_path) if glb_path.exists()
+                    else str(obj_path)
+                )
+                import trimesh as _trimesh
+                mesh = _trimesh.load(src_mesh_path, force="mesh")
+                mesh_mm = mesh.copy()
+                mesh_mm.vertices *= 1000.0
+                mesh_mm.export(str(stl_path))
+                logger.info(
+                    "  Converted: extents_m=%s, extents_mm=%s",
+                    mesh.extents.round(4).tolist(),
+                    mesh_mm.extents.round(1).tolist(),
+                )
+
+            # ═══ Create MuJoCo adapter ═══
+            from tbp.hybrid_rl.mujoco_env_adapter import MuJoCoEnvAdapter
+
+            try:
+                env = MuJoCoEnvAdapter(
+                    mesh_path_mm=str(stl_path),
+                    mujoco_object_name=mujoco_name,
+                    mujoco_data_path=mujoco_data_path,
+                    seed=self.eval_seeds[0],
+                )
+            except Exception as e:
+                logger.error(
+                    "  SKIP %s: init failed: %s",
+                    local_name, e, exc_info=True,
+                )
+                continue
+
+            # ═══ Debug: scene info ═══
+            logger.info(
+                "  Scene: ngeom=%d, nbody=%d, CAD_center=%s, "
+                "CAD_extents=%s",
+                env._sim.model.ngeom,
+                env._sim.model.nbody,
+                env._cad_center_mm.round(1).tolist(),
+                env._cad_extents_mm.round(1).tolist(),
+            )
+            for gi in range(env._sim.model.ngeom):
+                gname = env._sim.model.geom(gi).name
+                gpos = env._sim.data.geom_xpos[gi]
+                logger.info(
+                    "    geom %d: '%s' pos_m=%s", gi, gname,
+                    [round(float(x), 4) for x in gpos],
+                )
+
+            # ═══ Load controller ═══
+            controller = RLGoalApproachController.load(
+                q_dir,
+                agent_id=f"ycb_mujoco_{local_name}",
+                config=eval_cfg,
+            )
+            action_space = controller.action_space
+            np.random.seed(self.eval_seeds[0])
+
+            level_results = {}
+
+            for level_idx, (min_dist, max_dist) in enumerate(
+                curriculum_levels
+            ):
+                successes = 0
+                timeouts = 0
+                collisions = 0
+                episode_steps_list = []
+                success_steps_list = []
+
+                for ep in range(episodes_per_level):
+                    env.reset()
+                    start_pos = env.get_pose()[:3]
+
+                    goal_pose = env.get_random_surface_point(
+                        reference_pos=start_pos,
+                        min_dist=min_dist,
+                        max_dist=max_dist,
+                        max_attempts=2000,
+                    )
+                    env.set_goal(goal_pose)
+                    controller.set_new_goal(goal_pose, start_pos)
+
+                    goals_before = controller._total_goals_reached
+                    ep_steps = 0
+
+                    # ═══ Collect trajectory ═══
+                    current_poses = [env.get_pose().copy()]
+                    action_explanations = []
+                    debug_lines = []
+
+                    # ═══ Debug: initial state ═══
+                    init_pos_mm = env.get_pose()[:3]
+                    init_pos_m = list(env._embodiment.position)
+                    init_rot = list(env._embodiment.rotation)
+                    debug_lines.append(
+                        f"INIT: pos_mm={[round(x,1) for x in init_pos_mm]}, "
+                        f"pos_m={[round(x,4) for x in init_pos_m]}, "
+                        f"rot_wxyz={[round(x,4) for x in init_rot]}"
+                    )
+
+                    # ═══ Debug: first render ═══
+                    init_sensor = env.get_sensor_data()
+                    debug_lines.append(
+                        f"INIT_SENSOR: depth={init_sensor['depth']:.1f}, "
+                        f"on_object={init_sensor['on_object']}, "
+                        f"normal={init_sensor['point_normal']}, "
+                        f"k1={init_sensor['k1']:.4f}, "
+                        f"k2={init_sensor['k2']:.4f}, "
+                        f"same_side={init_sensor['same_side']}, "
+                        f"path_blocked={init_sensor['path_blocked']}"
+                    )
+
+                    for step in range(max_steps):
+                        pose = env.get_pose()
+                        sensor_data = env.get_sensor_data()
+
+                        _, explanation = controller.step(
+                            pose, sensor_data
+                        )
+
+                        if controller._current_goal is None:
+                            break
+
+                        env.step(
+                            controller._last_action, action_space
+                        )
+                        ep_steps += 1
+
+                        # ═══ Collect debug info ═══
+                        new_pose = env.get_pose()
+                        current_poses.append(new_pose.copy())
+
+                        mj_pos = list(env._embodiment.position)
+                        new_sensor = env.get_sensor_data()
+
+                        if explanation is not None:
+                            interp = explanation["interpretation"]
+                        else:
+                            interp = "done"
+
+                        interp += (
+                            f" |mj=[{mj_pos[0]:.4f},"
+                            f"{mj_pos[1]:.4f},"
+                            f"{mj_pos[2]:.4f}]"
+                            f"|depth={new_sensor['depth']:.1f}"
+                            f"|on={int(new_sensor['on_object'])}"
+                        )
+                        action_explanations.append(interp)
+
+                        # ═══ Save MuJoCo POV ═══
+                        if (
+                            self.visualise
+                            and ep < 2
+                            and (ep_steps <= 5
+                                 or ep_steps % 50 == 0)
+                        ):
+                            try:
+                                mj_frame_dir = (
+                                    ycb_data_dir / "mujoco_frames"
+                                    / local_name
+                                    / f"ep_{ep:03d}_L{level_idx}"
+                                )
+                                env.save_mujoco_frame(
+                                    str(
+                                        mj_frame_dir
+                                        / f"step_{ep_steps:03d}.png"
+                                    ),
+                                    save_depth=(ep_steps <= 3),
+                                )
+                            except Exception as frame_err:
+                                logger.debug(
+                                    "Frame save failed: %s", frame_err
+                                )
+
+                    # ═══ Determine result ═══
+                    success = (
+                        controller._total_goals_reached
+                        > goals_before
+                    )
+                    episode_steps_list.append(ep_steps)
+
+                    if success:
+                        successes += 1
+                        success_steps_list.append(ep_steps)
+                        ep_result = "success"
+                    elif ep_steps >= max_steps - 1:
+                        timeouts += 1
+                        ep_result = "timeout"
+                    else:
+                        collisions += 1
+                        ep_result = "collision"
+
+                    # ═══ Save episode log ═══
+                    ep_log_dir = (
+                        ycb_data_dir / "episode_logs" / local_name
+                    )
+                    ep_log_dir.mkdir(parents=True, exist_ok=True)
+                    ep_log_path = (
+                        ep_log_dir
+                        / f"ep_{ep:03d}_L{level_idx}_{ep_result}.txt"
+                    )
+                    with ep_log_path.open("w") as f:
+                        final_pose = env.get_pose()
+                        start_dist = float(np.linalg.norm(
+                            goal_pose[:3] - current_poses[0][:3]
+                        ))
+                        final_dist = float(np.linalg.norm(
+                            goal_pose[:3] - final_pose[:3]
+                        ))
+
+                        f.write(f"Result: {ep_result}\n")
+                        f.write(f"Object: {local_name} ({mujoco_name})\n")
+                        f.write(f"Level: {level_idx} [{min_dist}-{max_dist}mm]\n")
+                        f.write(f"Goal: {goal_pose.tolist()}\n")
+                        f.write(f"Steps: {ep_steps}\n")
+                        f.write(f"Start pos (mm): {current_poses[0][:3].tolist()}\n")
+                        f.write(f"End pos (mm): {final_pose[:3].tolist()}\n")
+                        f.write(f"Start distance: {start_dist:.1f}mm\n")
+                        f.write(f"End distance: {final_dist:.1f}mm\n")
+                        f.write(f"CAD center (mm): {env._cad_center_mm.tolist()}\n")
+                        f.write(f"CAD extents (mm): {env._cad_extents_mm.tolist()}\n")
+                        f.write(f"Up direction: {env.up_direction.tolist()}\n")
+                        f.write(f"Embodiment pos (m): {list(env._embodiment.position)}\n")
+                        f.write(f"Embodiment rot (wxyz): {list(env._embodiment.rotation)}\n")
+                        f.write("\n")
+
+                        for dbg in debug_lines:
+                            f.write(f"{dbg}\n")
+                        f.write("\n")
+
+                        for i, action_text in enumerate(action_explanations):
+                            if i < len(current_poses) - 1:
+                                p = current_poses[i + 1]
+                                dist = float(np.linalg.norm(
+                                    goal_pose[:3] - p[:3]
+                                ))
+                                f.write(
+                                    f"Step {i+1:03d} (dist={dist:.1f}mm): "
+                                    f"{action_text}\n"
+                                )
+                            else:
+                                f.write(
+                                    f"Step {i+1:03d}: {action_text}\n"
+                                )
+
+                    # ═══ Trimesh visualization ═══
+                    if self.visualise and ep < 2:
+                        try:
+                            env._sim._close_renderers()
+                            vis_dir = (
+                                ycb_data_dir / "visualizations"
+                                / local_name
+                            )
+                            _maybe_save_visualization(
+                                controller=controller,
+                                env=env,
+                                episode=ep,
+                                ep_result=ep_result,
+                                goal_pose=goal_pose,
+                                current_poses=current_poses,
+                                action_explanations=action_explanations,
+                                vis_dir=vis_dir,
+                                visualize_mode="text",
+                            )
+                        except Exception as vis_err:
+                            logger.warning(
+                                "Visualization failed: %s", vis_err
+                            )
+
+                    # ═══ Log episode ═══
+                    final_dist = float(np.linalg.norm(
+                        goal_pose[:3] - env.get_pose()[:3]
+                    ))
+                    logger.info(
+                        "    ep %d: %s, steps=%d, "
+                        "start_dist=%.1f, final_dist=%.1f",
+                        ep, ep_result, ep_steps,
+                        float(np.linalg.norm(
+                            goal_pose[:3] - start_pos
+                        )),
+                        final_dist,
+                    )
+
+                total = max(episodes_per_level, 1)
+                level_results[f"level_{level_idx}"] = {
+                    "bounds_mm": list(curriculum_levels[level_idx]),
+                    "episodes": episodes_per_level,
+                    "success_rate": round(successes / total, 4),
+                    "timeout_rate": round(timeouts / total, 4),
+                    "collision_rate": round(collisions / total, 4),
+                    "mean_episode_steps": round(
+                        float(np.mean(episode_steps_list))
+                        if episode_steps_list else 0, 1,
+                    ),
+                    "mean_success_steps": round(
+                        float(np.mean(success_steps_list))
+                        if success_steps_list else 0, 1,
+                    ),
+                }
+
+                logger.info(
+                    "  L%d [%.0f-%.0f mm]: success=%.3f, "
+                    "timeout=%.3f, collision=%.3f",
+                    level_idx, min_dist, max_dist,
+                    level_results[f"level_{level_idx}"]["success_rate"],
+                    level_results[f"level_{level_idx}"]["timeout_rate"],
+                    level_results[f"level_{level_idx}"]["collision_rate"],
+                )
+
+            all_success = [
+                v["success_rate"]
+                for k, v in level_results.items()
+                if k.startswith("level_")
+            ]
+            level_results["overall"] = {
+                "mean_success_rate": round(
+                    float(np.mean(all_success))
+                    if all_success else 0, 4,
+                ),
+            }
+
+            all_results[local_name] = level_results
+            logger.info(
+                "  %s OVERALL: success=%.3f",
+                local_name,
+                level_results["overall"]["mean_success_rate"],
+            )
+
+            env.close()
+
+        # ═══ Save results ═══
+        result_path = self.data_dir / "ycb_mujoco_eval_result.json"
+        with result_path.open("w") as f:
+            json.dump(all_results, f, indent=2)
+
+        # ═══ Summary ═══
+        logger.info("\n" + "=" * 60)
+        logger.info("YCB MUJOCO EVALUATION SUMMARY")
+        logger.info("=" * 60)
+        logger.info("%-20s %10s", "Object", "Success")
+        logger.info("-" * 35)
+        for name, results in all_results.items():
+            overall = results.get("overall", {})
+            logger.info(
+                "%-20s %10.3f", name,
+                overall.get("mean_success_rate", 0),
+            )
+        logger.info("=" * 60)
+        logger.info("Results saved to %s", result_path)
+        
     # ═════════════════════════════════════════════════════
     # Utilities
     # ═════════════════════════════════════════════════════

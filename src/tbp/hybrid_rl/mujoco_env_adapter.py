@@ -1,32 +1,12 @@
 """MuJoCo Environment Adapter for RL Goal Approach Controller.
 
-Wraps Monty's MuJoCoSimulator to expose the LightweightEnv interface,
-enabling the RL agent trained on trimesh to operate in MuJoCo with
-YCB objects.
-
-All sensory observations are extracted from MuJoCo depth rendering
-using Monty's own feature extraction pipeline (DepthTo3DLocations,
-surface_normal_total_least_squares, principal_curvatures).
-
-Object metadata (up_direction, centroid, extents) is loaded once
-from the mesh file — analogous to having a CAD model on a real robot.
+MuJoCo-first environment: all movement and sensing through MuJoCo.
+trimesh (CAD model) used only at load time for static metadata.
 
 Architecture:
-    MuJoCo Renderer → depth map → DepthTo3DLocations → point cloud
-    → surface_normal_TLS → normal
-    → principal_curvatures → k1, k2
-    → center pixel depth → depth (scalar)
-    → semantic map → on_object
-
-Usage:
-    adapter = MuJoCoEnvAdapter(
-        mesh_path="path/to/textured.obj",
-        data_path="path/to/ycb_objects",
-        object_name="mug",
-    )
-    sensor_data = adapter.reset()
-    adapter.set_goal(goal_pose_mm)
-    sensor_data = adapter.step(action_index, action_space)
+    Movement: MuJoCo Actions (MoveForward, MoveTangentially, OrientH/V, SetAgentPose)
+    Sensing:  MuJoCo Rendering → Monty transforms → normal, curvature, depth
+    Metadata: trimesh CAD (up_direction, extents, goal_normal — loaded once)
 """
 
 from __future__ import annotations
@@ -34,44 +14,12 @@ from __future__ import annotations
 import logging
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-import quaternion as qt
 import trimesh
-from scipy.spatial.transform import Rotation as R
-
-from tbp.monty.frameworks.actions.actions import (
-    LookDown,
-    LookUp,
-    MoveForward,
-    MoveTangentially,
-    OrientHorizontal,
-    OrientVertical,
-    SetAgentPose,
-    TurnLeft,
-    TurnRight,
-)
-from tbp.monty.frameworks.agents import AgentID
-from tbp.monty.frameworks.environment_utils.transforms import (
-    DepthTo3DLocations,
-    MissingToMaxDepth,
-    TransformContext,
-)
-from tbp.monty.frameworks.models.motor_system_state import (
-    AgentState,
-    ProprioceptiveState,
-)
-from tbp.monty.frameworks.sensors import Resolution2D, SensorConfig, SensorID
-from tbp.monty.simulators.mujoco.agents import SurfaceAgent
-from tbp.monty.simulators.mujoco.simulator import MuJoCoSimulator
-
-# Surface geometry functions from Monty
-from tbp.monty.frameworks.utils.spatial_arithmetics import normalize
-from tbp.monty.frameworks.environment_utils.graph_utils import (
-    surface_normal_total_least_squares,
-    principal_curvatures,
-)
+from scipy.spatial.transform import Rotation as Rot
+from tbp.hybrid_rl.ablation_runner import _maybe_save_visualization
 
 logger = logging.getLogger(__name__)
 
@@ -79,81 +27,121 @@ logger = logging.getLogger(__name__)
 # Constants
 # ═══════════════════════════════════════════════════
 MM_PER_M = 1000.0
-AGENT_ID = AgentID("rl_agent")
-SENSOR_ID = SensorID("depth_camera")
-DEFAULT_HFOV = 90.0
-DEFAULT_ZOOM = 10.0  # Monty surface agent uses zoom=10
 NO_SURFACE_DEPTH_MM = 100.0
-ON_OBJECT_THRESHOLD_MM = 3.0
-ZFAR_THRESHOLD_M = 10.0  # Beyond this, consider "no surface"
+ON_OBJECT_DEPTH_MM = 3.0
+SNAP_TARGET_DEPTH_MM = 2.0  # target distance from surface after snap
+
+# ═══════════════════════════════════════════════════
+# Monty imports
+# ═══════════════════════════════════════════════════
+from tbp.monty.frameworks.actions.actions import (
+    MoveForward,
+    MoveTangentially,
+    OrientHorizontal,
+    OrientVertical,
+    SetAgentPose,
+)
+from tbp.monty.frameworks.agents import AgentID
+from tbp.monty.frameworks.environment_utils.transforms import (
+    DepthTo3DLocations,
+    MissingToMaxDepth,
+    TransformContext,
+)
+from tbp.monty.frameworks.models.motor_system_state import ProprioceptiveState
+from tbp.monty.frameworks.sensors import Resolution2D, SensorConfig, SensorID
+from tbp.monty.frameworks.utils.sensor_processing import (
+    principal_curvatures,
+    surface_normal_total_least_squares,
+)
+from tbp.monty.simulators.mujoco.agents import SurfaceAgent
+from tbp.monty.simulators.mujoco.simulator import MuJoCoSimulator
+
+_AGENT_ID = AgentID("rl_agent")
+_SENSOR_ID = SensorID("depth_camera")
+_DEFAULT_ZOOM = 10.0
+_DEFAULT_HFOV = 90.0
 
 
 class MuJoCoEnvAdapter:
-    """Wraps MuJoCoSimulator to expose the LightweightEnv interface.
+    """MuJoCo environment with LightweightEnv-compatible interface.
 
-    Sensory data pipeline:
-        MuJoCo depth map → DepthTo3DLocations (Monty) → point cloud
-        → surface_normal_total_least_squares (Monty) → point_normal
-        → principal_curvatures (Monty) → k1, k2
-
-    Object metadata (static, loaded once):
-        trimesh.load(mesh) → up_direction, centroid, extents, goal_normal, same_side
+    All movement through MuJoCo Actions.
+    All sensing through MuJoCo rendering + Monty feature extraction.
+    CAD model (trimesh) used only for static metadata at load time.
     """
 
     def __init__(
         self,
-        mesh_path: str,
-        data_path: str | None = None,
-        object_name: str = "mug",
-        sensor_resolution: Resolution2D | None = None,
-        zoom: float = DEFAULT_ZOOM,
-        hfov: float = DEFAULT_HFOV,
-        seed: int | None = None,
+        mesh_path_mm: str,
+        mujoco_object_name: str,
+        mujoco_data_path: str,
+        sensor_resolution: Tuple[int, int] = (64, 64),
+        zoom: float = _DEFAULT_ZOOM,
+        hfov: float = _DEFAULT_HFOV,
+        seed: Optional[int] = None,
     ):
-        if sensor_resolution is None:
-            sensor_resolution = Resolution2D(width=64, height=64)
+        """Initialize MuJoCo environment adapter.
 
-        self._sensor_resolution = sensor_resolution
+        Args:
+            mesh_path_mm: Path to mesh in mm units (for CAD metadata only).
+            mujoco_object_name: Object name matching directory in mujoco_data_path.
+                Directory must contain textured.obj + texture_map.png.
+            mujoco_data_path: Path to directory containing object folders.
+            sensor_resolution: (width, height) for MuJoCo camera.
+            zoom: Camera zoom factor.
+            hfov: Horizontal field of view in degrees.
+            seed: Random seed.
+        """
+        self._sensor_w, self._sensor_h = sensor_resolution
         self._zoom = zoom
         self._hfov = hfov
-        self._object_name = object_name
 
-        # ═══ Object metadata (trimesh — loaded once, like CAD model) ═══
-        self._object_mesh = trimesh.load(mesh_path)
-        self._mesh_centroid = np.array(self._object_mesh.centroid, dtype=float)
+        if seed is not None:
+            np.random.seed(seed)
+
+        # ═══ CAD model (trimesh, mm) — loaded once ═══
+        self.mesh = trimesh.load(mesh_path_mm, force="mesh")
+        if isinstance(self.mesh, trimesh.Scene):
+            self.mesh = trimesh.util.concatenate(
+                list(self.mesh.geometry.values())
+            )
+        self._cad_center_mm = np.array(self.mesh.centroid, dtype=float)
+        self._cad_extents_mm = (
+            self.mesh.bounds[1] - self.mesh.bounds[0]
+        ).astype(float)
         self._compute_up_direction()
 
         # ═══ MuJoCo simulator ═══
+        res = Resolution2D(width=self._sensor_w, height=self._sensor_h)
         sensor_configs = {
-            SENSOR_ID: SensorConfig(
-                resolution=sensor_resolution,
+            _SENSOR_ID: SensorConfig(
+                resolution=res,
                 zoom=zoom,
                 semantic=True,
             )
         }
-
         agent_factory = partial(
             SurfaceAgent,
-            agent_id=AGENT_ID,
+            agent_id=_AGENT_ID,
             sensor_configs=sensor_configs,
         )
-
         self._sim = MuJoCoSimulator(
             agents=[agent_factory],
-            data_path=data_path,
+            data_path=mujoco_data_path,
         )
-        self._sim.add_object(object_name)
+        self._sim.add_object(mujoco_object_name)
+        logger.info("MuJoCo initialized: object='%s'", mujoco_object_name)
 
-        # ═══ Monty transforms (reused without modification) ═══
+        # ═══ Monty transforms ═══
         self._missing_to_max = MissingToMaxDepth(
-            agent_id=AGENT_ID,
+            agent_id=_AGENT_ID,
             max_depth=1.0,
             threshold=0.0,
         )
         self._depth_to_3d = DepthTo3DLocations(
-            agent_id=AGENT_ID,
-            sensor_ids=[SENSOR_ID],
-            resolutions=[(sensor_resolution.height, sensor_resolution.width)],
+            agent_id=_AGENT_ID,
+            sensor_ids=[_SENSOR_ID],
+            resolutions=[(self._sensor_h, self._sensor_w)],
             zooms=[zoom],
             hfov=[hfov],
             world_coord=True,
@@ -161,544 +149,357 @@ class MuJoCoEnvAdapter:
             use_semantic_sensor=False,
         )
 
-        # ═══ Agent state (mm / euler degrees — LightweightEnv convention) ═══
-        self.agent_pos = np.zeros(3)
-        self.agent_rot = np.zeros(3)
-
         # ═══ Episode state ═══
-        self._current_goal = None
+        self._current_goal: Optional[np.ndarray] = None
+        self._goal_normal_mm: Optional[List[float]] = None
         self._passed_through = False
         self._detach_had_collision = False
         self._edge_traversed = False
         self._last_detach_sub_steps = 1
-        self._wrong_side_outward = None
-
-        # ═══ Cache for curvature (avoid recomputing every call) ═══
-        self._last_point_cloud = None
-        self._last_cam_to_world = None
-
-        if seed is not None:
-            np.random.seed(seed)
+        self._prev_normal: Optional[List[float]] = None
 
     # ═══════════════════════════════════════════════════
     # Unit conversion
     # ═══════════════════════════════════════════════════
 
     @staticmethod
-    def _mm_to_m(pos_mm: np.ndarray) -> tuple:
-        arr = np.asarray(pos_mm, dtype=float) / MM_PER_M
-        return tuple(arr)
-
-    @staticmethod
-    def _m_to_mm(pos_m) -> np.ndarray:
-        return np.asarray(pos_m, dtype=float) * MM_PER_M
-
-    @staticmethod
-    def _euler_to_quat_wxyz(euler_xyz_deg: np.ndarray) -> tuple:
-        """Euler XYZ degrees → quaternion (W, X, Y, Z)."""
-        rot = R.from_euler("xyz", euler_xyz_deg, degrees=True)
-        q_xyzw = rot.as_quat()  # scipy: [x, y, z, w]
-        return (float(q_xyzw[3]), float(q_xyzw[0]),
-                float(q_xyzw[1]), float(q_xyzw[2]))
-
-    @staticmethod
-    def _quat_wxyz_to_euler(quat_wxyz) -> np.ndarray:
-        """Quaternion (W, X, Y, Z) → Euler XYZ degrees."""
-        w, x, y, z = quat_wxyz
-        rot = R.from_quat([x, y, z, w])  # scipy expects [x, y, z, w]
-        return rot.as_euler("xyz", degrees=True)
-
-    @staticmethod
     def _normalize_euler(angles):
         return (np.array(angles, dtype=float) + 180.0) % 360.0 - 180.0
 
+    @staticmethod
+    def _euler_to_quat_wxyz(euler_xyz_deg: np.ndarray) -> tuple:
+        """Euler XYZ degrees → (W, X, Y, Z)."""
+        r = Rot.from_euler("xyz", euler_xyz_deg, degrees=True)
+        q = r.as_quat()  # scipy: [x, y, z, w]
+        return (float(q[3]), float(q[0]), float(q[1]), float(q[2]))
+
+    @staticmethod
+    def _quat_wxyz_to_euler(qw, qx, qy, qz) -> np.ndarray:
+        """(W, X, Y, Z) → Euler XYZ degrees."""
+        r = Rot.from_quat([qx, qy, qz, qw])
+        return r.as_euler("xyz", degrees=True)
+
+    def _look_at_direction(self, direction) -> np.ndarray:
+        """Euler angles so forward (-Z) aligns with direction."""
+        d = np.asarray(direction, dtype=float)
+        d /= (np.linalg.norm(d) + 1e-12)
+        r, _ = Rot.align_vectors([d], [[0, 0, -1]])
+        return r.as_euler("xyz", degrees=True)
+
     # ═══════════════════════════════════════════════════
-    # State synchronization: adapter ↔ MuJoCo
+    # MuJoCo state access
     # ═══════════════════════════════════════════════════
 
-    def _push_state_to_mujoco(self):
-        """Push adapter agent_pos/agent_rot → MuJoCo SurfaceAgent."""
-        pos_m = self._mm_to_m(self.agent_pos)
-        quat_wxyz = self._euler_to_quat_wxyz(self.agent_rot)
+    @property
+    def _embodiment(self):
+        return self._sim._agents[_AGENT_ID]._embodiment
+
+    def _get_pos_m(self) -> np.ndarray:
+        return np.array(self._embodiment.position, dtype=float)
+
+    def _get_rot_wxyz(self) -> tuple:
+        return self._embodiment.rotation
+
+    def _get_pos_mm(self) -> np.ndarray:
+        return self._get_pos_m() * MM_PER_M
+
+    def _get_euler_deg(self) -> np.ndarray:
+        w, x, y, z = self._get_rot_wxyz()
+        return self._normalize_euler(self._quat_wxyz_to_euler(w, x, y, z))
+
+    def _set_pose_mm(self, pos_mm: np.ndarray, euler_deg: np.ndarray):
+        """Set agent pose via SetAgentPose action."""
+        pos_m = tuple(pos_mm / MM_PER_M)
+        quat = self._euler_to_quat_wxyz(euler_deg)
         action = SetAgentPose(
-            agent_id=AGENT_ID,
-            location=pos_m,
+            agent_id=_AGENT_ID, location=pos_m, rotation_quat=quat
+        )
+        self._sim.step([action])
+
+    def _apply_rotation_delta(self, axis: str, degrees: float):
+        """Apply rotation delta via SetAgentPose (for look/turn in air)."""
+        pos_m = self._get_pos_m()
+        current = Rot.from_quat([
+            self._get_rot_wxyz()[1], self._get_rot_wxyz()[2],
+            self._get_rot_wxyz()[3], self._get_rot_wxyz()[0],
+        ])
+        if axis == "x":  # pitch (look up/down)
+            delta = Rot.from_euler("x", degrees, degrees=True)
+            new_rot = current * delta  # local frame
+        elif axis == "y":  # yaw (turn left/right)
+            delta = Rot.from_euler("y", degrees, degrees=True)
+            new_rot = current * delta
+        elif axis == "z":  # roll (rotate sensor)
+            delta = Rot.from_euler("z", degrees, degrees=True)
+            new_rot = current * delta
+        else:
+            return
+
+        q = new_rot.as_quat()  # [x, y, z, w]
+        quat_wxyz = (float(q[3]), float(q[0]), float(q[1]), float(q[2]))
+        action = SetAgentPose(
+            agent_id=_AGENT_ID,
+            location=tuple(pos_m),
             rotation_quat=quat_wxyz,
         )
         self._sim.step([action])
 
-    def _pull_state_from_mujoco(self):
-        """Pull MuJoCo SurfaceAgent state → adapter agent_pos/agent_rot."""
-        agent = self._sim._agents[AGENT_ID]
-        pos_m = np.array(agent._embodiment.position)
-        quat_wxyz = agent._embodiment.rotation
-        self.agent_pos = self._m_to_mm(pos_m)
-        self.agent_rot = self._quat_wxyz_to_euler(quat_wxyz)
-        self.agent_rot = self._normalize_euler(self.agent_rot)
-
     # ═══════════════════════════════════════════════════
-    # Observation extraction from MuJoCo
+    # MuJoCo rendering → Monty pipeline
     # ═══════════════════════════════════════════════════
 
-    def _get_proprioceptive_state(self) -> ProprioceptiveState:
-        """Build ProprioceptiveState for Monty transforms."""
-        return self._sim.states
+    def _render_and_extract(self) -> dict:
+        """Render MuJoCo scene and apply Monty transforms.
 
-    def _render_observations(self) -> dict:
-        """Get raw MuJoCo observations and apply Monty transforms.
-
-        Returns:
-            Transformed observations dict containing:
-                - depth: (H, W) float
-                - rgba: (H, W, 4) uint8
-                - semantic_3d: (N, 4) [x, y, z, sem_id] world coords
-                - sensor_frame_data: (N, 4) camera coords
-                - cam_to_world: (4, 4) transform matrix
+        Returns dict with keys:
+            depth_mm, point_normal, k1_mm, k2_mm, on_object,
+            semantic_3d, cam_to_world
         """
-        # Get raw observations from MuJoCo
+        from mujoco import mj_forward
+        mj_forward(self._sim.model, self._sim.data)
+
         obs = self._sim.observations
         state = self._sim.states
 
-        # Build transform context
-        ctx = TransformContext(
-            rng=np.random.RandomState(),
-            state=state,
-        )
-
-        # Apply Monty transforms
+        ctx = TransformContext(rng=np.random.RandomState(), state=state)
         obs = self._missing_to_max(obs, ctx)
         obs = self._depth_to_3d(obs, ctx)
 
-        return obs[AGENT_ID][SENSOR_ID]
+        sensor_obs = obs[_AGENT_ID][_SENSOR_ID]
+        depth_map = sensor_obs["depth"]  # (H, W), after MissingToMaxDepth
+        semantic_3d = sensor_obs.get("semantic_3d")  # (N, 4) or None
+        cam_to_world = sensor_obs.get("cam_to_world")  # (4, 4) or None
 
-    def _extract_normal_from_point_cloud(
-        self, sensor_obs: dict
-    ) -> tuple[list[float] | None, bool]:
-        """Extract surface normal at center pixel using Monty's TLS method.
+        # ═══ Center pixel depth → mm ═══
+        cy, cx = self._sensor_h // 2, self._sensor_w // 2
+        center_depth_raw = float(depth_map[cy, cx])
 
-        Args:
-            sensor_obs: Transformed observation dict with semantic_3d,
-                        sensor_frame_data, cam_to_world.
+        if center_depth_raw >= 1.0:
+            # Background (MissingToMaxDepth sets to 1.0)
+            depth_mm = NO_SURFACE_DEPTH_MM
+        else:
+            # DepthTo3DLocations works with these depth values directly.
+            # The raw depth from MuJoCo after MissingToMaxDepth is in
+            # normalized units. Convert to meters using the z-buffer formula.
+            # But actually, Monty's pipeline already handles this in
+            # DepthTo3DLocations via inv_k projection. The depth values
+            # after MissingToMaxDepth are the actual metric depths from
+            # MuJoCo's renderer (not z-buffer — MuJoCo returns linear depth).
+            depth_mm = center_depth_raw * MM_PER_M
 
-        Returns:
-            (point_normal, valid): normal as [nx, ny, nz] or None, validity flag.
+        on_object = depth_mm < ON_OBJECT_DEPTH_MM
+
+        # ═══ Normal and curvature from Monty pipeline ═══
+        point_normal = None
+        k1_mm, k2_mm = 0.0, 0.0
+
+        if semantic_3d is not None and cam_to_world is not None:
+            center_id = cy * self._sensor_w + cx
+
+            if (center_id < len(semantic_3d)
+                    and semantic_3d[center_id, 3] > 0):
+                view_dir = cam_to_world[:3, 2]
+
+                try:
+                    normal, valid_sn = surface_normal_total_least_squares(
+                        semantic_3d, center_id, view_dir
+                    )
+                    if valid_sn:
+                        point_normal = normal.tolist()
+
+                        try:
+                            k1, k2, _, _, valid_pc = principal_curvatures(
+                                semantic_3d, center_id, normal
+                            )
+                            if valid_pc:
+                                # Monty returns curvature in 1/m (world coords)
+                                # Controller expects 1/mm
+                                k1_mm = float(k1) / MM_PER_M
+                                k2_mm = float(k2) / MM_PER_M
+                                # Convention: |k1| >= |k2|
+                                if abs(k1_mm) < abs(k2_mm):
+                                    k1_mm, k2_mm = k2_mm, k1_mm
+                        except Exception:
+                            logger.debug("Curvature extraction failed",
+                                         exc_info=True)
+                except Exception:
+                    logger.debug("Normal extraction failed", exc_info=True)
+
+        return {
+            "depth_mm": depth_mm,
+            "point_normal": point_normal,
+            "k1_mm": k1_mm,
+            "k2_mm": k2_mm,
+            "on_object": on_object,
+            "semantic_3d": semantic_3d,
+            "cam_to_world": cam_to_world,
+        }
+
+    def _render_depth_in_direction(
+        self, pos_mm: np.ndarray, direction: np.ndarray
+    ) -> float:
+        """Temporarily orient agent, render depth, return depth_mm.
+
+        Used for path_blocked and collision checks.
+        Does NOT restore pose — caller must handle that.
         """
-        semantic_3d = sensor_obs.get("semantic_3d")
-        cam_to_world = sensor_obs.get("cam_to_world")
+        euler = self._look_at_direction(direction)
+        self._set_pose_mm(pos_mm, euler)
 
-        if semantic_3d is None or cam_to_world is None:
-            return None, False
+        from mujoco import mj_forward
+        mj_forward(self._sim.model, self._sim.data)
 
-        h = self._sensor_resolution.height
-        w = self._sensor_resolution.width
-        center_id = (h // 2) * w + (w // 2)
+        agent = self._sim._agents[_AGENT_ID]
+        sensor_obs = agent.observations[_SENSOR_ID]
+        depth_map = sensor_obs["depth"]
 
-        # Check if center pixel is on object
-        if center_id >= len(semantic_3d) or semantic_3d[center_id, 3] <= 0:
-            return None, False
+        cy, cx = self._sensor_h // 2, self._sensor_w // 2
+        center_raw = float(depth_map[cy, cx])
 
-        # View direction = 3rd column of cam_to_world rotation
-        view_dir = cam_to_world[:3, 2]
-
-        try:
-            normal, valid = surface_normal_total_least_squares(
-                semantic_3d, center_id, view_dir
-            )
-        except Exception:
-            logger.debug("Surface normal extraction failed", exc_info=True)
-            return None, False
-
-        if not valid:
-            return None, False
-
-        return normal.tolist(), True
-
-    def _extract_curvature_from_point_cloud(
-        self, sensor_obs: dict, normal: np.ndarray
-    ) -> dict[str, float]:
-        """Extract principal curvatures using Monty's quadratic regression.
-
-        Args:
-            sensor_obs: Transformed observation dict with semantic_3d.
-            normal: Surface normal at center pixel.
-
-        Returns:
-            dict with 'k1' and 'k2' in 1/mm.
-        """
-        semantic_3d = sensor_obs.get("semantic_3d")
-        if semantic_3d is None:
-            return {"k1": 0.0, "k2": 0.0}
-
-        h = self._sensor_resolution.height
-        w = self._sensor_resolution.width
-        center_id = (h // 2) * w + (w // 2)
-
-        if center_id >= len(semantic_3d) or semantic_3d[center_id, 3] <= 0:
-            return {"k1": 0.0, "k2": 0.0}
-
-        try:
-            k1, k2, _, _, valid = principal_curvatures(
-                semantic_3d, center_id, np.array(normal)
-            )
-        except Exception:
-            logger.debug("Curvature extraction failed", exc_info=True)
-            return {"k1": 0.0, "k2": 0.0}
-
-        if not valid:
-            return {"k1": 0.0, "k2": 0.0}
-
-        # Convert from 1/m to 1/mm
-        k1_mm = float(k1) / MM_PER_M
-        k2_mm = float(k2) / MM_PER_M
-
-        # Convention: |k1| >= |k2|
-        if abs(k1_mm) < abs(k2_mm):
-            k1_mm, k2_mm = k2_mm, k1_mm
-
-        return {"k1": k1_mm, "k2": k2_mm}
-
-    def _extract_depth_scalar(self, depth_map: np.ndarray) -> float:
-        """Extract scalar depth at center pixel in mm.
-
-        Args:
-            depth_map: (H, W) depth in meters.
-
-        Returns:
-            Depth in mm, or NO_SURFACE_DEPTH_MM if no surface.
-        """
-        h, w = depth_map.shape
-        center_depth_m = float(depth_map[h // 2, w // 2])
-
-        if center_depth_m >= 1.0:  # MissingToMaxDepth sets background to 1.0
+        if center_raw >= 1.0 - 1e-6:
             return NO_SURFACE_DEPTH_MM
 
-        return center_depth_m * MM_PER_M
+        # MuJoCo renderer returns linear depth after enable_depth_rendering
+        return center_raw * MM_PER_M
 
-    def _check_on_object_from_sensor(
-        self, depth_mm: float, sensor_obs: dict
-    ) -> bool:
-        """Determine if agent is on object surface.
+    # ═══════════════════════════════════════════════════
+    # Snap-to-surface via MuJoCo depth
+    # ═══════════════════════════════════════════════════
 
-        Uses both depth threshold and semantic segmentation.
+    def _snap_to_surface(self):
+        """After tangential move: check depth, approach if needed, re-orient.
 
-        Args:
-            depth_mm: Scalar depth in mm.
-            sensor_obs: Observation dict (may contain semantic info).
-
-        Returns:
-            True if agent is on object surface.
+        Like a robot finger sliding on surface: move, check distance,
+        correct position, re-orient along normal.
         """
-        # Primary: depth threshold (same as LightweightEnv)
-        if depth_mm < ON_OBJECT_THRESHOLD_MM:
+        rendered = self._render_and_extract()
+        depth_mm = rendered["depth_mm"]
+        normal = rendered["point_normal"]
+
+        if depth_mm >= NO_SURFACE_DEPTH_MM or normal is None:
+            # Lost surface — don't snap
+            return
+
+        if depth_mm > ON_OBJECT_DEPTH_MM:
+            # Too far from surface — approach
+            approach_dist_m = (depth_mm - SNAP_TARGET_DEPTH_MM) / MM_PER_M
+            if approach_dist_m > 0.0001:
+                action = MoveForward(
+                    agent_id=_AGENT_ID, distance=approach_dist_m
+                )
+                self._sim.step([action])
+
+        # Re-orient to face surface (look along -normal)
+        normal_arr = np.array(normal, dtype=float)
+        n_len = np.linalg.norm(normal_arr)
+        if n_len > 1e-8:
+            normal_arr /= n_len
+            new_euler = self._look_at_direction(-normal_arr)
+            pos_mm = self._get_pos_mm()
+            self._set_pose_mm(pos_mm, new_euler)
+
+    # ═══════════════════════════════════════════════════
+    # same_side via MuJoCo normal + CAD goal_normal
+    # ═══════════════════════════════════════════════════
+
+    def _compute_same_side(
+        self, agent_normal: Optional[List[float]]
+    ) -> bool:
+        """Check if agent and goal are on same side of object.
+
+        Uses current agent normal (from MuJoCo render) and
+        goal normal (from CAD, computed once at set_goal).
+        """
+        if self._goal_normal_mm is None or agent_normal is None:
             return True
 
-        # Fallback: check semantic at center pixel
-        semantic_3d = sensor_obs.get("semantic_3d")
-        if semantic_3d is not None:
-            h = self._sensor_resolution.height
-            w = self._sensor_resolution.width
-            center_id = (h // 2) * w + (w // 2)
-            if center_id < len(semantic_3d) and semantic_3d[center_id, 3] > 0:
-                # On object but depth > threshold — close but not touching
-                return depth_mm < ON_OBJECT_THRESHOLD_MM
+        center_mm = self._cad_center_mm
+        agent_pos_mm = self._get_pos_mm()
+        goal_pos_mm = self._current_goal[:3]
 
-        return False
+        height_axis = self.height_axis
+        up = self.up_direction
 
-    def _check_path_blocked_via_render(self, goal_pos_mm: np.ndarray) -> bool:
-        """Check if direct path to goal is blocked by rendering toward goal.
+        # Agent side
+        an = np.array(agent_normal, dtype=float)
+        an_h = an.copy()
+        an_h[height_axis] = 0.0
+        agent_from_center = agent_pos_mm - center_mm
+        agent_from_center[height_axis] = 0.0
 
-        Temporarily orients agent toward goal, renders depth, checks if
-        surface is closer than goal distance.
+        if np.linalg.norm(an_h) >= 0.3:
+            agent_outward = np.dot(an_h, agent_from_center) > 0
+        else:
+            agent_outward = np.dot(an, up) < 0
 
-        Args:
-            goal_pos_mm: Goal position in mm.
+        # Goal side
+        gn = np.array(self._goal_normal_mm, dtype=float)
+        gn_h = gn.copy()
+        gn_h[height_axis] = 0.0
+        goal_from_center = goal_pos_mm - center_mm
+        goal_from_center[height_axis] = 0.0
 
-        Returns:
-            True if path is blocked.
-        """
-        direction = goal_pos_mm - self.agent_pos
+        if np.linalg.norm(gn_h) >= 0.3:
+            goal_outward = np.dot(gn_h, goal_from_center) > 0
+        else:
+            goal_outward = np.dot(gn, up) < 0
+
+        return agent_outward == goal_outward
+
+    # ═══════════════════════════════════════════════════
+    # path_blocked via MuJoCo depth render
+    # ═══════════════════════════════════════════════════
+
+    def _check_path_blocked(self, goal_pos_mm: np.ndarray) -> bool:
+        """Check if direct path to goal is blocked by rendering toward goal."""
+        agent_pos_mm = self._get_pos_mm()
+        direction = goal_pos_mm - agent_pos_mm
         dist_to_goal = float(np.linalg.norm(direction))
         if dist_to_goal < 1e-8:
             return False
 
-        # Save current state
-        saved_rot = self.agent_rot.copy()
+        direction_norm = direction / dist_to_goal
 
-        # Look toward goal
-        self.agent_rot = self._look_at_direction(direction / dist_to_goal)
-        self._push_state_to_mujoco()
+        # Save current pose
+        saved_pos = agent_pos_mm.copy()
+        saved_euler = self._get_euler_deg().copy()
 
-        # Render and get center depth
-        obs = self._sim.observations
-        depth_map = obs[AGENT_ID][SENSOR_ID].depth
-        h, w = depth_map.shape
-        center_depth_m = float(depth_map[h // 2, w // 2])
-        center_depth_mm = center_depth_m * MM_PER_M
+        # Render toward goal
+        depth_mm = self._render_depth_in_direction(agent_pos_mm, direction_norm)
 
-        # Restore orientation
-        self.agent_rot = saved_rot
-        self._push_state_to_mujoco()
+        # Restore pose
+        self._set_pose_mm(saved_pos, saved_euler)
 
-        # Blocked if surface is closer than goal (with margin)
-        if center_depth_m >= 1.0:  # No surface in view
+        if depth_mm >= NO_SURFACE_DEPTH_MM:
             return False
 
-        return center_depth_mm < (dist_to_goal - 2.0)
-
-    def _check_passed_through_via_render(
-        self, old_pos_mm: np.ndarray, direction: np.ndarray, step_size_mm: float
-    ) -> bool:
-        """Check if agent passed through object during a move.
-
-        Renders depth from old position in movement direction.
-
-        Args:
-            old_pos_mm: Position before move.
-            direction: Normalized movement direction.
-            step_size_mm: Step size in mm.
-
-        Returns:
-            True if agent passed through object.
-        """
-        # Save current state
-        saved_pos = self.agent_pos.copy()
-        saved_rot = self.agent_rot.copy()
-
-        # Move to old position, look in movement direction
-        self.agent_pos = old_pos_mm.copy()
-        self.agent_rot = self._look_at_direction(direction)
-        self._push_state_to_mujoco()
-
-        # Render depth
-        obs = self._sim.observations
-        depth_map = obs[AGENT_ID][SENSOR_ID].depth
-        h, w = depth_map.shape
-        center_depth_m = float(depth_map[h // 2, w // 2])
-        center_depth_mm = center_depth_m * MM_PER_M
-
-        # Restore state
-        self.agent_pos = saved_pos
-        self.agent_rot = saved_rot
-        self._push_state_to_mujoco()
-
-        if center_depth_m >= 1.0:
-            return False
-
-        return center_depth_mm < step_size_mm
-
-    def _detect_edge_traversal(
-        self, normal_before: list[float] | None, normal_after: list[float] | None
-    ) -> bool:
-        """Detect if agent traversed an edge by comparing normals.
-
-        Args:
-            normal_before: Surface normal before step.
-            normal_after: Surface normal after step.
-
-        Returns:
-            True if normals differ by > 45 degrees.
-        """
-        if normal_before is None or normal_after is None:
-            return False
-
-        n1 = np.array(normal_before)
-        n2 = np.array(normal_after)
-        dot = float(np.dot(n1, n2))
-        # cos(45°) ≈ 0.707
-        return dot < 0.707
+        return depth_mm < (dist_to_goal - 2.0)
 
     # ═══════════════════════════════════════════════════
-    # Object metadata (from mesh, loaded once)
+    # CAD metadata (trimesh, loaded once)
     # ═══════════════════════════════════════════════════
-
-    def _get_goal_normal(self, goal_pos_mm: np.ndarray) -> list[float] | None:
-        """Get surface normal at goal position from object mesh."""
-        _, _, face_id = self._object_mesh.nearest.on_surface([goal_pos_mm])
-        return self._object_mesh.face_normals[face_id[0]].tolist()
-
-    def _is_reachable_by_surface(
-        self, start_pos: np.ndarray, goal_pos: np.ndarray
-    ) -> bool:
-        """Check if start and goal are on the same side of the object."""
-        from tbp.hybrid_rl.lightweight_env import _is_reachable_by_surface
-
-        return _is_reachable_by_surface(self, start_pos, goal_pos)
 
     def _compute_up_direction(self):
-        """Compute up direction from object mesh (same as LightweightEnv)."""
+        """Compute up direction from CAD mesh."""
         from tbp.hybrid_rl.lightweight_env import LightweightEnv
-
         temp = object.__new__(LightweightEnv)
-        temp.mesh = self._object_mesh
+        temp.mesh = self.mesh
         temp._compute_up_direction()
         self.height_axis = temp.height_axis
         self.up_sign = temp.up_sign
         self.up_direction = temp.up_direction
         self.open_edge_height = temp.open_edge_height
 
-    @property
-    def mesh(self):
-        """Expose mesh for _is_reachable_by_surface compatibility."""
-        return self._object_mesh
-
-    # ═══════════════════════════════════════════════════
-    # Core interface (matches LightweightEnv)
-    # ═══════════════════════════════════════════════════
-
-    def reset(self, position=None, rotation=None):
-        """Place the agent. Same interface as LightweightEnv.reset()."""
-        self._passed_through = False
-        self._detach_had_collision = False
-        self._current_goal = None
-        self._wrong_side_outward = None
-        self._edge_traversed = False
-
-        if position is not None:
-            self.agent_pos = np.array(position, dtype=float)
-        else:
-            points, face_ids = self._object_mesh.sample(1, return_index=True)
-            normal = self._object_mesh.face_normals[face_ids[0]]
-            self.agent_pos = points[0] + normal * 2.0
-
-            if rotation is None:
-                self.agent_rot = self._look_at_direction(-normal)
-
-        if rotation is not None:
-            self.agent_rot = np.array(rotation, dtype=float)
-        elif position is not None:
-            self.agent_rot = np.zeros(3)
-
-        self.agent_rot = self._normalize_euler(self.agent_rot)
-        self._push_state_to_mujoco()
-
-        return self.get_sensor_data()
-
-    def set_goal(self, goal_pose):
-        """Set goal pose [x,y,z,rx,ry,rz] in mm/degrees."""
-        self._current_goal = np.array(goal_pose, dtype=float)
-
-    def step(self, action_index, action_space):
-        """Execute a discrete action. Same interface as LightweightEnv.step()."""
-        self._detach_had_collision = False
-        self._edge_traversed = False
-
-        action_info = action_space.get_info(action_index)
-
-        # Get normal before step (for edge detection)
-        sensor_before = self.get_sensor_data()
-        normal_before = sensor_before.get("point_normal")
-
-        # Save position before step
-        old_pos = self.agent_pos.copy()
-        old_rot = self.agent_rot.copy()
-
-        # Translate and execute action
-        monty_actions = self._translate_action(action_info, action_space)
-
-        for monty_action in monty_actions:
-            self._sim.step([monty_action])
-
-        # Pull updated state from MuJoCo
-        self._pull_state_from_mujoco()
-
-        # Post-step checks
-        if action_info.name in ("free_forward", "free_backward", "free_forward_small"):
-            rot = R.from_euler("xyz", old_rot, degrees=True)
-            forward = rot.apply([0, 0, -1])
-            step_size = self._get_step_size(action_info.name, action_space)
-            self._passed_through = self._check_passed_through_via_render(
-                old_pos, forward * np.sign(step_size), abs(step_size)
-            )
-
-            # Additional proximity check
-            sensor_after = self._render_observations()
-            depth_after = self._extract_depth_scalar(sensor_after["depth"])
-            proximity_threshold = min(1.0, abs(step_size) * 0.25)
-            if depth_after < proximity_threshold:
-                self._passed_through = True
-        else:
-            self._passed_through = False
-
-        # Edge traversal detection
-        sensor_after_data = self.get_sensor_data()
-        normal_after = sensor_after_data.get("point_normal")
-        self._edge_traversed = self._detect_edge_traversal(normal_before, normal_after)
-
-        # Update sensor_data with edge_traversed
-        sensor_after_data["edge_traversed"] = self._edge_traversed
-        sensor_after_data["passed_through"] = self._passed_through
-
-        return sensor_after_data
-
-    def get_pose(self):
-        """Return [x, y, z, rx, ry, rz] in mm/degrees."""
-        return np.concatenate([self.agent_pos, self.agent_rot])
-
-    def get_sensor_data(self):
-        """Extract sensor_data dict compatible with RLGoalApproachController.
-
-        All sensory data from MuJoCo rendering + Monty feature extraction.
-        Object metadata from mesh (loaded once).
-        """
-        # ═══ Render and extract features from MuJoCo ═══
-        sensor_obs = self._render_observations()
-        depth_map = sensor_obs["depth"]
-
-        # Depth (scalar, mm)
-        depth_mm = self._extract_depth_scalar(depth_map)
-
-        # On object
-        on_object = self._check_on_object_from_sensor(depth_mm, sensor_obs)
-
-        # Surface normal (from Monty TLS)
-        point_normal, normal_valid = self._extract_normal_from_point_cloud(sensor_obs)
-
-        # Curvature (from Monty quadratic regression)
-        if normal_valid and point_normal is not None:
-            curvature = self._extract_curvature_from_point_cloud(
-                sensor_obs, point_normal
-            )
-        else:
-            curvature = {"k1": 0.0, "k2": 0.0}
-
-        # ═══ Goal-dependent computations ═══
-        goal_normal = None
-        path_blocked = False
-        same_side = True
-
-        if self._current_goal is not None:
-            goal_pos = self._current_goal[:3]
-            goal_normal = self._get_goal_normal(goal_pos)
-            path_blocked = self._check_path_blocked_via_render(goal_pos)
-            same_side = self._is_reachable_by_surface(self.agent_pos, goal_pos)
-
-        return {
-            "point_normal": point_normal,
-            "k1": curvature["k1"],
-            "k2": curvature["k2"],
-            "principal_curvatures": [curvature["k1"], curvature["k2"]],
-            "on_object": on_object,
-            "depth": depth_mm,
-            "passed_through": getattr(self, "_passed_through", False),
-            "goal_normal": goal_normal,
-            "detach_had_collision": getattr(self, "_detach_had_collision", False),
-            "detach_sub_steps": getattr(self, "_last_detach_sub_steps", 1),
-            "path_blocked": path_blocked,
-            "up_direction": self.up_direction.tolist(),
-            "object_center": self._object_mesh.centroid.tolist(),
-            "same_side": same_side,
-            "object_extents": (
-                self._object_mesh.bounds[1] - self._object_mesh.bounds[0]
-            ).tolist(),
-            "edge_traversed": getattr(self, "_edge_traversed", False),
-        }
+    def _get_goal_normal_from_cad(self, goal_pos_mm: np.ndarray) -> List[float]:
+        """Get surface normal at goal from CAD model."""
+        _, _, face_id = self.mesh.nearest.on_surface([goal_pos_mm])
+        return self.mesh.face_normals[face_id[0]].tolist()
 
     def get_random_surface_point(self, **kwargs) -> np.ndarray:
-        """Random point on surface. Same as LightweightEnv."""
+        """Random surface point from CAD model (for episode planning)."""
         from tbp.hybrid_rl.lightweight_env import LightweightEnv
-
         temp = object.__new__(LightweightEnv)
-        temp.mesh = self._object_mesh
+        temp.mesh = self.mesh
         temp.up_direction = self.up_direction
         temp.height_axis = self.height_axis
         temp.up_sign = self.up_sign
@@ -707,236 +508,369 @@ class MuJoCoEnvAdapter:
         return temp.get_random_surface_point(**kwargs)
 
     # ═══════════════════════════════════════════════════
-    # Action translation
+    # Core interface (LightweightEnv compatible)
     # ═══════════════════════════════════════════════════
 
-    def _get_step_size(self, action_name: str, action_space) -> float:
-        """Get step size in mm for a given action name."""
-        if action_name == "free_forward":
-            return action_space.free_step
-        elif action_name == "free_backward":
-            return -action_space.free_step_backward
-        elif action_name == "free_forward_small":
-            return action_space.free_step_small
-        return 0.0
+    def reset(self, position=None, rotation=None):
+        """Place agent. Returns sensor_data."""
+        self._passed_through = False
+        self._detach_had_collision = False
+        self._edge_traversed = False
+        self._current_goal = None
+        self._goal_normal_mm = None
+        self._prev_normal = None
+        self._last_detach_sub_steps = 1
 
-    def _translate_action(self, action_info, action_space) -> list:
-        """Convert discrete action → list of Monty Action objects."""
+        if position is not None:
+            pos_mm = np.array(position, dtype=float)
+            if rotation is not None:
+                euler = np.array(rotation, dtype=float)
+            else:
+                euler = np.zeros(3)
+        else:
+            # Random point on CAD surface
+            points, face_ids = self.mesh.sample(1, return_index=True)
+            normal = self.mesh.face_normals[face_ids[0]]
+            pos_mm = points[0] + normal * 2.0
+            euler = self._look_at_direction(-normal)
+            if rotation is not None:
+                euler = np.array(rotation, dtype=float)
+
+        euler = self._normalize_euler(euler)
+        self._set_pose_mm(pos_mm, euler)
+        return self.get_sensor_data()
+
+    def set_goal(self, goal_pose):
+        """Set goal [x,y,z,rx,ry,rz] in mm/degrees."""
+        self._current_goal = np.array(goal_pose, dtype=float)
+        self._goal_normal_mm = self._get_goal_normal_from_cad(
+            self._current_goal[:3]
+        )
+
+    def get_pose(self) -> np.ndarray:
+        """Return [x,y,z,rx,ry,rz] in mm/degrees."""
+        pos_mm = self._get_pos_mm()
+        euler = self._get_euler_deg()
+        return np.concatenate([pos_mm, euler])
+
+    def get_sensor_data(self) -> dict:
+        """Build sensor_data dict for RLGoalApproachController."""
+        rendered = self._render_and_extract()
+
+        goal_normal = self._goal_normal_mm
+        path_blocked = False
+        same_side = True
+
+        if self._current_goal is not None:
+            goal_pos = self._current_goal[:3]
+            path_blocked = self._check_path_blocked(goal_pos)
+            same_side = self._compute_same_side(rendered["point_normal"])
+
+        return {
+            "point_normal": rendered["point_normal"],
+            "k1": rendered["k1_mm"],
+            "k2": rendered["k2_mm"],
+            "principal_curvatures": [rendered["k1_mm"], rendered["k2_mm"]],
+            "on_object": rendered["on_object"],
+            "depth": rendered["depth_mm"],
+            "passed_through": self._passed_through,
+            "goal_normal": goal_normal,
+            "detach_had_collision": self._detach_had_collision,
+            "detach_sub_steps": self._last_detach_sub_steps,
+            "path_blocked": path_blocked,
+            "up_direction": self.up_direction.tolist(),
+            "object_center": self._cad_center_mm.tolist(),
+            "same_side": same_side,
+            "object_extents": self._cad_extents_mm.tolist(),
+            "edge_traversed": self._edge_traversed,
+        }
+
+    # ═══════════════════════════════════════════════════
+    # Action execution
+    # ═══════════════════════════════════════════════════
+
+    def step(self, action_index, action_space):
+        """Execute discrete action via MuJoCo. Returns sensor_data."""
+        self._detach_had_collision = False
+        self._edge_traversed = False
+        self._passed_through = False
+
+        # Save normal before step (for edge detection)
+        self._prev_normal = None
+        pre_render = self._render_and_extract()
+        self._prev_normal = pre_render["point_normal"]
+
+        action_info = action_space.get_info(action_index)
         name = action_info.name
 
+        # ═══ Dispatch to MuJoCo actions ═══
         if name == "move_tangentially":
-            angle_rad = np.radians(action_info.direction_degrees)
-            local_dir = np.array([
-                np.sin(angle_rad), 0.0, -np.cos(angle_rad)
-            ])
-            local_dir /= (np.linalg.norm(local_dir) + 1e-12)
-            distance_m = action_space.surface_step / MM_PER_M
-            return [MoveTangentially(
-                agent_id=AGENT_ID,
-                distance=distance_m,
-                direction=tuple(local_dir),
-            )]
-
+            self._do_move_tangentially(
+                action_info.direction_degrees,
+                action_space.surface_step,
+            )
         elif name == "free_forward":
-            return [MoveForward(
-                agent_id=AGENT_ID,
-                distance=action_space.free_step / MM_PER_M,
-            )]
-
+            self._do_move_forward(action_space.free_step)
         elif name == "free_backward":
-            return [MoveForward(
-                agent_id=AGENT_ID,
-                distance=-action_space.free_step_backward / MM_PER_M,
-            )]
-
+            self._do_move_forward(-action_space.free_step_backward)
         elif name == "free_forward_small":
-            return [MoveForward(
-                agent_id=AGENT_ID,
-                distance=action_space.free_step_small / MM_PER_M,
-            )]
-
+            self._do_move_forward(action_space.free_step_small)
         elif name == "look_up":
-            return [LookUp(
-                agent_id=AGENT_ID,
-                rotation_degrees=action_space.rotation_step,
-            )]
-
+            self._apply_rotation_delta("x", action_space.rotation_step)
         elif name == "look_down":
-            return [LookDown(
-                agent_id=AGENT_ID,
-                rotation_degrees=action_space.rotation_step,
-            )]
-
+            self._apply_rotation_delta("x", -action_space.rotation_step)
         elif name == "look_up_big":
-            return [LookUp(
-                agent_id=AGENT_ID,
-                rotation_degrees=action_space.rotation_step_big,
-            )]
-
+            self._apply_rotation_delta("x", action_space.rotation_step_big)
         elif name == "look_down_big":
-            return [LookDown(
-                agent_id=AGENT_ID,
-                rotation_degrees=action_space.rotation_step_big,
-            )]
-
+            self._apply_rotation_delta("x", -action_space.rotation_step_big)
         elif name == "turn_left":
-            return [TurnLeft(
-                agent_id=AGENT_ID,
-                rotation_degrees=action_space.rotation_step,
-            )]
-
+            self._apply_rotation_delta("y", action_space.rotation_step)
         elif name == "turn_right":
-            return [TurnRight(
-                agent_id=AGENT_ID,
-                rotation_degrees=action_space.rotation_step,
-            )]
-
+            self._apply_rotation_delta("y", -action_space.rotation_step)
         elif name == "turn_left_big":
-            return [TurnLeft(
-                agent_id=AGENT_ID,
-                rotation_degrees=action_space.rotation_step_big,
-            )]
-
+            self._apply_rotation_delta("y", action_space.rotation_step_big)
         elif name == "turn_right_big":
-            return [TurnRight(
-                agent_id=AGENT_ID,
-                rotation_degrees=action_space.rotation_step_big,
-            )]
-
+            self._apply_rotation_delta("y", -action_space.rotation_step_big)
+        elif name == "rotate_sensor_+":
+            self._apply_rotation_delta("z", action_space.rotation_step)
+        elif name == "rotate_sensor_-":
+            self._apply_rotation_delta("z", -action_space.rotation_step)
         elif name == "orient_horizontal":
-            return [OrientHorizontal(
-                agent_id=AGENT_ID,
-                rotation_degrees=action_info.rotation_degrees,
-                forward_distance=action_info.forward_distance / MM_PER_M,
-                left_distance=action_info.left_distance / MM_PER_M,
-            )]
-
+            self._do_orient_horizontal(
+                action_info.rotation_degrees,
+                action_info.forward_distance,
+                action_info.left_distance,
+            )
         elif name == "orient_vertical":
-            return [OrientVertical(
-                agent_id=AGENT_ID,
-                rotation_degrees=action_info.rotation_degrees,
-                forward_distance=action_info.forward_distance / MM_PER_M,
-                down_distance=action_info.down_distance / MM_PER_M,
-            )]
-
-        elif name in ("rotate_sensor_+", "rotate_sensor_-"):
-            sign = 1.0 if name == "rotate_sensor_+" else -1.0
-            self.agent_rot[2] += sign * action_space.rotation_step
-            self.agent_rot = self._normalize_euler(self.agent_rot)
-            self._push_state_to_mujoco()
-            return []
-
+            self._do_orient_vertical(
+                action_info.rotation_degrees,
+                action_info.forward_distance,
+                action_info.down_distance,
+            )
         elif name == "detach":
-            return self._handle_detach(action_space)
-
+            if self._current_goal is not None:
+                self._do_detach(
+                    self._current_goal,
+                    action_space.free_step * 3,
+                )
         else:
-            logger.warning(f"Unknown action: {name}, skipping")
-            return []
+            logger.warning("Unknown action: %s", name)
 
-    def _handle_detach(self, action_space) -> list:
-        """Handle detach macro-action via direct state manipulation.
+        # ═══ Edge traversal detection ═══
+        post_render = self._render_and_extract()
+        post_normal = post_render["point_normal"]
+        if self._prev_normal is not None and post_normal is not None:
+            dot = float(np.dot(
+                np.array(self._prev_normal),
+                np.array(post_normal),
+            ))
+            if dot < 0.707:  # > 45°
+                self._edge_traversed = True
 
-        Detach: move along surface normal, then orient toward goal.
-        Collision detection via MuJoCo depth rendering.
-        """
+        return self.get_sensor_data()
+
+    # ═══════════════════════════════════════════════════
+    # Movement implementations
+    # ═══════════════════════════════════════════════════
+
+    def _do_move_tangentially(self, direction_degrees: float, step_mm: float):
+        """Move tangentially via MuJoCo + snap to surface."""
+        angle_rad = np.radians(direction_degrees)
+        local_dir = (
+            float(np.sin(angle_rad)),
+            0.0,
+            float(-np.cos(angle_rad)),
+        )
+        distance_m = step_mm / MM_PER_M
+
+        action = MoveTangentially(
+            agent_id=_AGENT_ID,
+            distance=distance_m,
+            direction=local_dir,
+        )
+        self._sim.step([action])
+
+        # Snap to surface (robot finger sliding)
+        self._snap_to_surface()
+
+    def _do_move_forward(self, step_mm: float):
+        """Move forward via MuJoCo + collision check."""
+        # Save position before move
+        old_pos_mm = self._get_pos_mm().copy()
+
+        distance_m = step_mm / MM_PER_M
+        action = MoveForward(agent_id=_AGENT_ID, distance=distance_m)
+        self._sim.step([action])
+
+        self._passed_through = False
+
+        if abs(step_mm) > 0.5:
+            # Check collision: render depth at new position
+            new_render = self._render_and_extract()
+            new_depth = new_render["depth_mm"]
+
+            # If very close to surface after move → likely passed through
+            proximity_threshold = min(1.0, abs(step_mm) * 0.25)
+            if new_depth < proximity_threshold:
+                self._passed_through = True
+
+            # Also check: did we cross a surface?
+            # Render from old position in movement direction
+            new_pos_mm = self._get_pos_mm()
+            move_dir = new_pos_mm - old_pos_mm
+            move_len = np.linalg.norm(move_dir)
+            if move_len > 1e-8:
+                saved_pos = new_pos_mm.copy()
+                saved_euler = self._get_euler_deg().copy()
+
+                check_depth = self._render_depth_in_direction(
+                    old_pos_mm, move_dir / move_len
+                )
+                if check_depth < abs(step_mm):
+                    self._passed_through = True
+
+                # Restore
+                self._set_pose_mm(saved_pos, saved_euler)
+
+    def _do_orient_horizontal(
+        self, rotation_deg: float, forward_mm: float, left_mm: float
+    ):
+        """OrientHorizontal via MuJoCo (natively supported)."""
+        # SurfaceAgent.actuate_orient_horizontal:
+        #   move_along_local_axis(-left_distance, X)
+        #   yaw(-rotation_degrees)  ← clockwise convention
+        #   move_along_local_axis(-forward_distance, Z)
+        #
+        # LightweightEnv._orient_horizontal:
+        #   agent_rot[1] += rotation_degrees  ← anticlockwise
+        #
+        # To match LightweightEnv: negate rotation_degrees
+        action = OrientHorizontal(
+            agent_id=_AGENT_ID,
+            rotation_degrees=-rotation_deg,  # invert for clockwise convention
+            left_distance=left_mm / MM_PER_M,
+            forward_distance=forward_mm / MM_PER_M,
+        )
+        self._sim.step([action])
+
+    def _do_orient_vertical(
+        self, rotation_deg: float, forward_mm: float, down_mm: float
+    ):
+        """OrientVertical via MuJoCo (natively supported)."""
+        # SurfaceAgent.actuate_orient_vertical:
+        #   move_along_local_axis(-down_distance, Y)
+        #   pitch(rotation_degrees)  ← same sign as LightweightEnv
+        #   move_along_local_axis(-forward_distance, Z)
+        action = OrientVertical(
+            agent_id=_AGENT_ID,
+            rotation_degrees=rotation_deg,
+            down_distance=down_mm / MM_PER_M,
+            forward_distance=forward_mm / MM_PER_M,
+        )
+        self._sim.step([action])
+
+    def _do_detach(self, goal_pose: np.ndarray, detach_distance_mm: float):
+        """Detach macro-action via SetAgentPose."""
         self._detach_had_collision = False
         self._last_detach_sub_steps = 1
 
-        if self._current_goal is None:
-            return []
+        rendered = self._render_and_extract()
+        normal = rendered["point_normal"]
+        if normal is None:
+            return
 
-        # Get current normal from MuJoCo rendering
-        sensor_obs = self._render_observations()
-        point_normal, valid = self._extract_normal_from_point_cloud(sensor_obs)
+        normal_arr = np.array(normal, dtype=float)
+        normal_arr /= (np.linalg.norm(normal_arr) + 1e-12)
 
-        if not valid or point_normal is None:
-            logger.debug("DETACH: no valid normal, aborting")
-            return []
+        old_pos_mm = self._get_pos_mm().copy()
+        old_euler = self._get_euler_deg().copy()
 
-        normal = np.array(point_normal, dtype=float)
-        normal /= (np.linalg.norm(normal) + 1e-12)
-
-        detach_distance = action_space.free_step * 3  # mm
-
-        # Check collision: render depth in normal direction from current pos
-        old_pos = self.agent_pos.copy()
-        collision = self._check_passed_through_via_render(
-            old_pos, normal, detach_distance
-        )
-
-        if collision:
+        # Collision check: render depth along normal
+        check_depth = self._render_depth_in_direction(old_pos_mm, normal_arr)
+        if check_depth < detach_distance_mm:
             self._detach_had_collision = True
-            logger.debug("DETACH: collision detected, aborting")
-            return []
+            # Restore pose
+            self._set_pose_mm(old_pos_mm, old_euler)
+            return
 
-        # Move along normal
-        new_pos_mm = old_pos + normal * detach_distance
+        # Compute new position
+        new_pos_mm = old_pos_mm + normal_arr * detach_distance_mm
 
         # Orient toward goal
-        goal_pos = self._current_goal[:3]
+        goal_pos = goal_pose[:3]
         goal_dir = goal_pos - new_pos_mm
         goal_dist = np.linalg.norm(goal_dir)
 
         if goal_dist > 1e-8:
             goal_dir /= goal_dist
-            dot_goal_normal = float(np.dot(goal_dir, normal))
+            dot_goal_normal = float(np.dot(goal_dir, normal_arr))
 
             if dot_goal_normal < -0.2:
-                # Goal behind surface — fly sideways
-                tangent = goal_dir - dot_goal_normal * normal
-                t_len = np.linalg.norm(tangent)
+                tangent = goal_dir - dot_goal_normal * normal_arr
+                t_len = float(np.linalg.norm(tangent))
                 if t_len > 1e-8:
                     tangent /= t_len
-                    fly_dir = normal * 0.7 + tangent * 0.7
+                    fly_dir = normal_arr * 0.7 + tangent * 0.7
                 else:
-                    fly_dir = normal
+                    fly_dir = normal_arr
                 fly_dir /= (np.linalg.norm(fly_dir) + 1e-12)
             else:
-                fly_dir = goal_dir + normal * 0.3
+                fly_dir = goal_dir + normal_arr * 0.3
                 fly_dir /= (np.linalg.norm(fly_dir) + 1e-12)
 
-            new_rot = self._look_at_direction(fly_dir)
+            new_euler = self._look_at_direction(fly_dir)
         else:
-            new_rot = self.agent_rot.copy()
+            new_euler = old_euler
 
-        # Apply via SetAgentPose
-        self.agent_pos = new_pos_mm
-        self.agent_rot = self._normalize_euler(new_rot)
-
-        pos_m = self._mm_to_m(self.agent_pos)
-        quat_wxyz = self._euler_to_quat_wxyz(self.agent_rot)
-
-        return [SetAgentPose(
-            agent_id=AGENT_ID,
-            location=pos_m,
-            rotation_quat=quat_wxyz,
-        )]
+        new_euler = self._normalize_euler(new_euler)
+        self._set_pose_mm(new_pos_mm, new_euler)
 
     # ═══════════════════════════════════════════════════
-    # Utility methods
+    # Debug visualization
     # ═══════════════════════════════════════════════════
 
-    def _look_at_direction(self, direction) -> np.ndarray:
-        """Return euler angles [rx, ry, rz] in degrees for looking in direction."""
-        d = np.asarray(direction, dtype=float)
-        d /= (np.linalg.norm(d) + 1e-12)
-        forward = np.array([0.0, 0.0, -1.0])
-        rot, _ = R.align_vectors([d], [forward])
-        return rot.as_euler("xyz", degrees=True)
+    def save_mujoco_frame(self, filepath: str, save_depth: bool = False):
+        """Save MuJoCo camera view (agent's POV)."""
+        from mujoco import mj_forward
+        from PIL import Image
 
-    def get_mujoco_render(self) -> dict:
-        """Get raw MuJoCo rendered observations (for debugging)."""
-        obs = self._sim.observations
-        sensor_obs = obs[AGENT_ID][SENSOR_ID]
-        return {
-            "depth": sensor_obs.depth,
-            "rgba": sensor_obs.rgba,
-            "semantic": getattr(sensor_obs, "semantic", None),
-        }
+        mj_forward(self._sim.model, self._sim.data)
 
+        cam_name = f"{_AGENT_ID}.{_SENSOR_ID}"
+        res = Resolution2D(width=self._sensor_w, height=self._sensor_h)
+        renderer = self._sim.renderer_for_res(res)
+
+        renderer.update_scene(self._sim.data, camera=cam_name)
+        rgb = renderer.render()
+        img = Image.fromarray(rgb)
+        img = img.resize((256, 256), Image.NEAREST)
+
+        Path(filepath).parent.mkdir(parents=True, exist_ok=True)
+        img.save(filepath)
+
+        if save_depth:
+            renderer.enable_depth_rendering()
+            depth = renderer.render()
+            renderer.disable_depth_rendering()
+
+            d_min, d_max = depth.min(), depth.max()
+            if d_max > d_min:
+                depth_norm = (
+                    (depth - d_min) / (d_max - d_min) * 255
+                ).astype(np.uint8)
+            else:
+                depth_norm = np.zeros_like(depth, dtype=np.uint8)
+            depth_img = Image.fromarray(depth_norm, mode="L")
+            depth_img = depth_img.resize((256, 256), Image.NEAREST)
+            depth_img.save(filepath.replace(".png", "_depth.png"))
+                        
+    # ═══════════════════════════════════════════════════
+    # Cleanup
+    # ═══════════════════════════════════════════════════
     def close(self):
-        """Clean up MuJoCo resources."""
-        self._sim.close()
+        if self._sim is not None:
+            self._sim.close()
+            self._sim = None
 
     def __enter__(self):
         return self

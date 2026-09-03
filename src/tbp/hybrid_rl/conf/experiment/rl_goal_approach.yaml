@@ -9,15 +9,17 @@ experiment:
   config:
     seed: 42
     # Visualization: null | text | pictures | video
-    visualise: text
-    regenerate_scripts: false
+    visualise: pictures
+    regenerate_scripts: true
     do_train: false
     do_eval: false
     do_heur_eval: false
     do_bc_train: false
     do_sac_train: false
     do_sac_eval: false
-    do_adaptive: true
+    do_adaptive: false
+    do_ycb_eval: false
+    do_ycb_mujoco_eval: true
 
     train_seeds: [11]
     eval_seeds: [44]
@@ -363,7 +365,51 @@ experiment:
 
     offline_check_window: 100
 
+    ycb_mujoco_config:
+      # MuJoCo data: textured.obj + texture_map.png + metadata.json
+      mujoco_data_path: ~/Downloads/tbp/data/mujoco/objects/ycb
+
+      # GLB meshes (для конвертации в mm STL)
+      ycb_src_dir: ~/Downloads/simulator_data/objects/ycb/meshes
+
+      # {local_name: [mujoco_folder, glb_folder]}
+      # mujoco_folder = имя в mujoco_data_path
+      # glb_folder = имя в ycb_src_dir (для конвертации в mm STL)
+      objects:
+        ycb_mug:
+          mujoco_name: mug
+          glb_name: 025_mug
+        ycb_bowl:
+          mujoco_name: bowl
+          glb_name: 024_bowl
+        ycb_can:
+          mujoco_name: master_chef_can
+          glb_name: 002_master_chef_can
+        ycb_banana:
+          mujoco_name: banana
+          glb_name: 011_banana
+        ycb_cracker_box:
+          mujoco_name: cracker_box
+          glb_name: 003_cracker_box
+        ycb_cups:
+          mujoco_name: a_cups
+          glb_name: 065-a_cups
+        ycb_foam_brick:
+          mujoco_name: foam_brick
+          glb_name: 061_foam_brick
+        ycb_apple:
+          mujoco_name: apple
+          glb_name: 013_apple
+        ycb_sugar_box:
+          mujoco_name: sugar_box
+          glb_name: 004_sugar_box
+        ycb_mustard:
+          mujoco_name: mustard_bottle
+          glb_name: 006_mustard_bottle
+
+      episodes_per_level: 10
+      max_steps: 500
 
     logging:
       run_name: adapt-baseline
-      output_dir: ${oc.env:MONTY_LOGS}
+      output_dir: /home/aeisaev/Downloads/github/hybrid_RL_prototype/results/adapt-baseline

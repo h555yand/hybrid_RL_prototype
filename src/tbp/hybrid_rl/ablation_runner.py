@@ -32,7 +32,7 @@ from tbp.hybrid_rl.rl_goal_approach_controller import RLGoalApproachController
 from tbp.hybrid_rl.visualize_env import save_episode_frames, visualize_agent_goal
 from tbp.hybrid_rl.episode_pools import _is_reachable_by_surface
 
-_LOG_INTERVAL = 100
+_LOG_INTERVAL = 1
 
 logger = logging.getLogger(__name__)
 
