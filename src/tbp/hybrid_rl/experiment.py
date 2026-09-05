@@ -3800,20 +3800,14 @@ class RLGoalApproachExperiment:
 
             # ═══ Debug: scene info ═══
             logger.info(
-                "  Scene: ngeom=%d, nbody=%d, CAD_center=%s, "
-                "CAD_extents=%s",
+                "  Scene: ngeom=%d, nbody=%d, MJ_center=%s, "
+                "MJ_extents=%s, up=%s",
                 env._sim.model.ngeom,
                 env._sim.model.nbody,
-                env._cad_center_mm.round(1).tolist(),
-                env._cad_extents_mm.round(1).tolist(),
+                env._mj_center_mm.round(1).tolist(),
+                env._mj_extents_mm.round(1).tolist(),
+                env.up_direction.round(3).tolist(),
             )
-            for gi in range(env._sim.model.ngeom):
-                gname = env._sim.model.geom(gi).name
-                gpos = env._sim.data.geom_xpos[gi]
-                logger.info(
-                    "    geom %d: '%s' pos_m=%s", gi, gname,
-                    [round(float(x), 4) for x in gpos],
-                )
 
             # ═══ Load controller ═══
             controller = RLGoalApproachController.load(
@@ -3839,12 +3833,56 @@ class RLGoalApproachExperiment:
                     env.reset()
                     start_pos = env.get_pose()[:3]
 
-                    goal_pose = env.get_random_surface_point(
-                        reference_pos=start_pos,
-                        min_dist=min_dist,
-                        max_dist=max_dist,
-                        max_attempts=2000,
+                    # ═══ Goal generation with filters ═══
+                    level_filter = {}
+                    curriculum_filters = self.ycb_mujoco_config.get(
+                        "curriculum_filters", self.curriculum_filters
                     )
+                    if level_idx < len(curriculum_filters):
+                        level_filter = curriculum_filters[level_idx]
+
+                    require_same_side = level_filter.get(
+                        "same_side", None
+                    )
+                    require_path_blocked = level_filter.get(
+                        "path_blocked", None
+                    )
+
+                    goal_pose = None
+                    for _attempt in range(50):
+                        candidate = env.get_random_surface_point(
+                            reference_pos=start_pos,
+                            min_dist=min_dist,
+                            max_dist=max_dist,
+                            max_attempts=2000,
+                        )
+
+                        if (
+                            require_same_side is not None
+                            or require_path_blocked is not None
+                        ):
+                            env.set_goal(candidate)
+                            sensor = env.get_sensor_data()
+
+                            if require_same_side is not None:
+                                if (
+                                    sensor["same_side"]
+                                    != require_same_side
+                                ):
+                                    continue
+                            if require_path_blocked is not None:
+                                if (
+                                    sensor["path_blocked"]
+                                    != require_path_blocked
+                                ):
+                                    continue
+
+                        goal_pose = candidate
+                        break
+
+                    if goal_pose is None:
+                        goal_pose = candidate
+
                     env.set_goal(goal_pose)
                     controller.set_new_goal(goal_pose, start_pos)
 
@@ -3857,25 +3895,43 @@ class RLGoalApproachExperiment:
                     debug_lines = []
 
                     # ═══ Debug: initial state ═══
-                    init_pos_mm = env.get_pose()[:3]
-                    init_pos_m = list(env._embodiment.position)
+                    init_pos_mj = env._get_pos_mj_mm()
                     init_rot = list(env._embodiment.rotation)
                     debug_lines.append(
-                        f"INIT: pos_mm={[round(x,1) for x in init_pos_mm]}, "
-                        f"pos_m={[round(x,4) for x in init_pos_m]}, "
-                        f"rot_wxyz={[round(x,4) for x in init_rot]}"
+                        f"INIT: pos_mm="
+                        f"{[round(x,1) for x in init_pos_mj]}, "
+                        f"pos_m="
+                        f"{[round(x,4) for x in (init_pos_mj/1000)]}, "
+                        f"rot_wxyz="
+                        f"{[round(x,4) for x in init_rot]}"
                     )
 
-                    # ═══ Debug: first render ═══
                     init_sensor = env.get_sensor_data()
                     debug_lines.append(
-                        f"INIT_SENSOR: depth={init_sensor['depth']:.1f}, "
+                        f"INIT_SENSOR: "
+                        f"depth={init_sensor['depth']:.1f}, "
                         f"on_object={init_sensor['on_object']}, "
                         f"normal={init_sensor['point_normal']}, "
                         f"k1={init_sensor['k1']:.4f}, "
                         f"k2={init_sensor['k2']:.4f}, "
                         f"same_side={init_sensor['same_side']}, "
-                        f"path_blocked={init_sensor['path_blocked']}"
+                        f"path_blocked="
+                        f"{init_sensor['path_blocked']}"
+                    )
+
+                    init_pos_cad = env._pos_mj_mm_to_cad_mm(
+                        env._get_pos_mj_mm()
+                    )
+                    goal_pos_cad = env._pos_mj_mm_to_cad_mm(
+                        goal_pose[:3]
+                    )
+                    debug_lines.append(
+                        f"INIT_CAD: pos="
+                        f"{[round(x,1) for x in init_pos_cad]}"
+                    )
+                    debug_lines.append(
+                        f"GOAL_CAD: pos="
+                        f"{[round(x,1) for x in goal_pos_cad]}"
                     )
 
                     for step in range(max_steps):
@@ -3898,7 +3954,9 @@ class RLGoalApproachExperiment:
                         new_pose = env.get_pose()
                         current_poses.append(new_pose.copy())
 
-                        mj_pos = list(env._embodiment.position)
+                        mj_pos = list(
+                            env._embodiment.position
+                        )
                         new_sensor = env.get_sensor_data()
 
                         if explanation is not None:
@@ -3915,29 +3973,41 @@ class RLGoalApproachExperiment:
                         )
                         action_explanations.append(interp)
 
-                        # ═══ Save MuJoCo POV ═══
+                        # ═══ MuJoCo scene view ═══
                         if (
                             self.visualise
                             and ep < 2
                             and (ep_steps <= 5
-                                 or ep_steps % 50 == 0)
+                                 or ep_steps % 20 == 0)
                         ):
                             try:
+                                agent_cad = (
+                                    env._pos_mj_mm_to_cad_mm(
+                                        env._get_pos_mj_mm()
+                                    )
+                                )
+                                goal_cad_pos = (
+                                    env._pos_mj_mm_to_cad_mm(
+                                        goal_pose[:3]
+                                    )
+                                )
                                 mj_frame_dir = (
-                                    ycb_data_dir / "mujoco_frames"
+                                    ycb_data_dir
+                                    / "mujoco_scene"
                                     / local_name
                                     / f"ep_{ep:03d}_L{level_idx}"
                                 )
-                                env.save_mujoco_frame(
+                                env.save_mujoco_scene(
                                     str(
                                         mj_frame_dir
                                         / f"step_{ep_steps:03d}.png"
                                     ),
-                                    save_depth=(ep_steps <= 3),
+                                    agent_pos_cad_mm=agent_cad,
+                                    goal_pos_cad_mm=goal_cad_pos,
                                 )
-                            except Exception as frame_err:
+                            except Exception as e:
                                 logger.debug(
-                                    "Frame save failed: %s", frame_err
+                                    "MuJoCo scene failed: %s", e
                                 )
 
                     # ═══ Determine result ═══
@@ -3977,46 +4047,102 @@ class RLGoalApproachExperiment:
                         ))
 
                         f.write(f"Result: {ep_result}\n")
-                        f.write(f"Object: {local_name} ({mujoco_name})\n")
-                        f.write(f"Level: {level_idx} [{min_dist}-{max_dist}mm]\n")
+                        f.write(
+                            f"Object: {local_name} "
+                            f"({mujoco_name})\n"
+                        )
+                        f.write(
+                            f"Level: {level_idx} "
+                            f"[{min_dist}-{max_dist}mm]\n"
+                        )
                         f.write(f"Goal: {goal_pose.tolist()}\n")
                         f.write(f"Steps: {ep_steps}\n")
-                        f.write(f"Start pos (mm): {current_poses[0][:3].tolist()}\n")
-                        f.write(f"End pos (mm): {final_pose[:3].tolist()}\n")
-                        f.write(f"Start distance: {start_dist:.1f}mm\n")
-                        f.write(f"End distance: {final_dist:.1f}mm\n")
-                        f.write(f"CAD center (mm): {env._cad_center_mm.tolist()}\n")
-                        f.write(f"CAD extents (mm): {env._cad_extents_mm.tolist()}\n")
-                        f.write(f"Up direction: {env.up_direction.tolist()}\n")
-                        f.write(f"Embodiment pos (m): {list(env._embodiment.position)}\n")
-                        f.write(f"Embodiment rot (wxyz): {list(env._embodiment.rotation)}\n")
+                        f.write(
+                            f"Start pos (mm): "
+                            f"{current_poses[0][:3].tolist()}\n"
+                        )
+                        f.write(
+                            f"End pos (mm): "
+                            f"{final_pose[:3].tolist()}\n"
+                        )
+                        f.write(
+                            f"Start distance: "
+                            f"{start_dist:.1f}mm\n"
+                        )
+                        f.write(
+                            f"End distance: "
+                            f"{final_dist:.1f}mm\n"
+                        )
+                        f.write(
+                            f"MJ center (mm): "
+                            f"{env._mj_center_mm.tolist()}\n"
+                        )
+                        f.write(
+                            f"MJ extents (mm): "
+                            f"{env._mj_extents_mm.tolist()}\n"
+                        )
+                        f.write(
+                            f"Up direction: "
+                            f"{env.up_direction.tolist()}\n"
+                        )
+                        f.write(
+                            f"Embodiment pos (m): "
+                            f"{list(env._embodiment.position)}\n"
+                        )
+                        f.write(
+                            f"Embodiment rot (wxyz): "
+                            f"{list(env._embodiment.rotation)}\n"
+                        )
                         f.write("\n")
 
                         for dbg in debug_lines:
                             f.write(f"{dbg}\n")
                         f.write("\n")
 
-                        for i, action_text in enumerate(action_explanations):
+                        for i, action_text in enumerate(
+                            action_explanations
+                        ):
                             if i < len(current_poses) - 1:
                                 p = current_poses[i + 1]
                                 dist = float(np.linalg.norm(
                                     goal_pose[:3] - p[:3]
                                 ))
                                 f.write(
-                                    f"Step {i+1:03d} (dist={dist:.1f}mm): "
+                                    f"Step {i+1:03d} "
+                                    f"(dist={dist:.1f}mm): "
                                     f"{action_text}\n"
                                 )
                             else:
                                 f.write(
-                                    f"Step {i+1:03d}: {action_text}\n"
+                                    f"Step {i+1:03d}: "
+                                    f"{action_text}\n"
                                 )
 
                     # ═══ Trimesh visualization ═══
                     if self.visualise and ep < 2:
                         try:
-                            env._sim._close_renderers()
+                            # Safe close: suppress _gl_context errors
+                            renderers = env._sim._renderers
+                            for key in list(renderers.keys()):
+                                r = renderers[key]
+                                try:
+                                    if hasattr(r, '_gl_context') and r._gl_context:
+                                        r.close()
+                                except Exception:
+                                    pass
+                                # Prevent __del__ from crashing
+                                r._gl_context = None
+                            renderers.clear()
+
+                            cad_poses = [
+                                env.pose_mj_to_cad(p)
+                                for p in current_poses
+                            ]
+                            goal_cad = env.pose_mj_to_cad(goal_pose)
+
                             vis_dir = (
-                                ycb_data_dir / "visualizations"
+                                ycb_data_dir
+                                / "visualizations"
                                 / local_name
                             )
                             _maybe_save_visualization(
@@ -4024,15 +4150,15 @@ class RLGoalApproachExperiment:
                                 env=env,
                                 episode=ep,
                                 ep_result=ep_result,
-                                goal_pose=goal_pose,
-                                current_poses=current_poses,
+                                goal_pose=goal_cad,
+                                current_poses=cad_poses,
                                 action_explanations=action_explanations,
                                 vis_dir=vis_dir,
-                                visualize_mode="text",
+                                visualize_mode=self.visualise,
                             )
                         except Exception as vis_err:
                             logger.warning(
-                                "Visualization failed: %s", vis_err
+                                "Viz failed: %s", vis_err
                             )
 
                     # ═══ Log episode ═══
@@ -4051,11 +4177,19 @@ class RLGoalApproachExperiment:
 
                 total = max(episodes_per_level, 1)
                 level_results[f"level_{level_idx}"] = {
-                    "bounds_mm": list(curriculum_levels[level_idx]),
+                    "bounds_mm": list(
+                        curriculum_levels[level_idx]
+                    ),
                     "episodes": episodes_per_level,
-                    "success_rate": round(successes / total, 4),
-                    "timeout_rate": round(timeouts / total, 4),
-                    "collision_rate": round(collisions / total, 4),
+                    "success_rate": round(
+                        successes / total, 4
+                    ),
+                    "timeout_rate": round(
+                        timeouts / total, 4
+                    ),
+                    "collision_rate": round(
+                        collisions / total, 4
+                    ),
                     "mean_episode_steps": round(
                         float(np.mean(episode_steps_list))
                         if episode_steps_list else 0, 1,
@@ -4070,9 +4204,15 @@ class RLGoalApproachExperiment:
                     "  L%d [%.0f-%.0f mm]: success=%.3f, "
                     "timeout=%.3f, collision=%.3f",
                     level_idx, min_dist, max_dist,
-                    level_results[f"level_{level_idx}"]["success_rate"],
-                    level_results[f"level_{level_idx}"]["timeout_rate"],
-                    level_results[f"level_{level_idx}"]["collision_rate"],
+                    level_results[f"level_{level_idx}"][
+                        "success_rate"
+                    ],
+                    level_results[f"level_{level_idx}"][
+                        "timeout_rate"
+                    ],
+                    level_results[f"level_{level_idx}"][
+                        "collision_rate"
+                    ],
                 )
 
             all_success = [
@@ -4091,13 +4231,17 @@ class RLGoalApproachExperiment:
             logger.info(
                 "  %s OVERALL: success=%.3f",
                 local_name,
-                level_results["overall"]["mean_success_rate"],
+                level_results["overall"][
+                    "mean_success_rate"
+                ],
             )
 
             env.close()
 
         # ═══ Save results ═══
-        result_path = self.data_dir / "ycb_mujoco_eval_result.json"
+        result_path = (
+            self.data_dir / "ycb_mujoco_eval_result.json"
+        )
         with result_path.open("w") as f:
             json.dump(all_results, f, indent=2)
 
@@ -4115,7 +4259,7 @@ class RLGoalApproachExperiment:
             )
         logger.info("=" * 60)
         logger.info("Results saved to %s", result_path)
-        
+
     # ═════════════════════════════════════════════════════
     # Utilities
     # ═════════════════════════════════════════════════════
