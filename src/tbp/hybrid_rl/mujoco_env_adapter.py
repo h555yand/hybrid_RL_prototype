@@ -621,58 +621,192 @@ class MuJoCoEnvAdapter:
 
         return self.get_sensor_data()
 
-    def _do_move_tangentially(self, direction_degrees: float, step_mm: float):
+    def _do_move_tangentially(self, direction_degrees, step_mm):
+        """Tangential surface move with snap and rollback.
+        
+        Mirrors LightweightEnv._move_tangentially:
+        1. Build tangent basis from current normal
+        2. Compute world direction from direction_degrees
+        3. Project onto tangent plane
+        4. Move agent
+        5. Snap to surface with normal consistency
+        6. Rollback if snap fails or surface lost
+        7. If rollback, try half-step for edge traversal
+        """
         pos = self._get_pos_mj_mm()
         euler = self._get_euler_deg()
         rot = Rot.from_euler("xyz", euler, degrees=True)
 
-        angle_rad = np.radians(direction_degrees)
-        local_dir = np.array([np.sin(angle_rad), 0.0, -np.cos(angle_rad)])
-        world_dir = rot.apply(local_dir)
-
-        # Project onto tangent plane using current normal
+        # Get current normal BEFORE move
         rendered = self._render_and_extract()
         normal = rendered["point_normal"]
-        if normal is not None:
-            n = np.array(normal, dtype=float)
-            n_len = np.linalg.norm(n)
-            if n_len > 1e-8:
-                n = n / n_len
-                # Remove normal component
-                world_dir = world_dir - np.dot(world_dir, n) * n
-                w_len = np.linalg.norm(world_dir)
-                if w_len > 1e-8:
-                    world_dir = world_dir / w_len
 
+        if normal is None:
+            # No surface — move in local direction (like LightweightEnv)
+            angle_rad = np.radians(direction_degrees)
+            local_dir = np.array([np.sin(angle_rad), 0.0, -np.cos(angle_rad)])
+            local_dir /= (np.linalg.norm(local_dir) + 1e-12)
+            world_dir = rot.apply(local_dir)
+            new_pos = pos + world_dir * step_mm
+            self._set_pose_mj_mm(new_pos, euler)
+            return
+
+        n = np.array(normal, dtype=float)
+        n /= (np.linalg.norm(n) + 1e-12)
+
+        # ═══ Build tangent basis (same as LightweightEnv) ═══
+        right_world = rot.apply([1.0, 0.0, 0.0])
+        t1 = right_world - np.dot(right_world, n) * n
+        t1_norm = np.linalg.norm(t1)
+
+        if t1_norm < 1e-8:
+            up_world = rot.apply([0.0, 1.0, 0.0])
+            t1 = up_world - np.dot(up_world, n) * n
+            t1_norm = np.linalg.norm(t1)
+
+        if t1_norm < 1e-8:
+            tmp = np.array([0.0, 1.0, 0.0])
+            if abs(np.dot(tmp, n)) > 0.9:
+                tmp = np.array([0.0, 0.0, 1.0])
+            t1 = np.cross(n, tmp)
+            t1_norm = np.linalg.norm(t1)
+
+        t1 /= (t1_norm + 1e-12)
+        t2 = np.cross(n, t1)
+        t2 /= (np.linalg.norm(t2) + 1e-12)
+
+        # ═══ Compute tangent direction ═══
+        a = np.radians(direction_degrees)
+        world_dir = np.cos(a) * t1 + np.sin(a) * t2
+        world_dir /= (np.linalg.norm(world_dir) + 1e-12)
+
+        # ═══ Save old state for rollback ═══
+        old_pos = pos.copy()
+        old_euler = euler.copy()
+
+        # ═══ Move ═══
         new_pos = pos + world_dir * step_mm
         self._set_pose_mj_mm(new_pos, euler)
-        self._snap_to_surface()
 
-    def _snap_to_surface(self):
-        """After tangential move: approach to 2mm + re-orient along normal."""
+        # ═══ Snap with normal consistency ═══
+        snap_ok = self._snap_to_surface(prev_normal=normal)
+
+        if snap_ok:
+            # Check we're still on surface
+            post = self._render_and_extract()
+            if post["depth_mm"] < ON_OBJECT_DEPTH_MM:
+                return  # Success!
+
+        # ═══ Snap failed — try half-step (edge traversal) ═══
+        # Like LightweightEnv: intermediate step for edge crossing
+        half_pos = old_pos + world_dir * step_mm * 0.5
+        self._set_pose_mj_mm(half_pos, old_euler)
+
+        snap_half = self._snap_to_surface(prev_normal=normal)
+
+        if snap_half:
+            post_half = self._render_and_extract()
+            if post_half["depth_mm"] < ON_OBJECT_DEPTH_MM:
+                # Half-step landed — try second half
+                half_normal = post_half["point_normal"]
+                pos_after_half = self._get_pos_mj_mm()
+                euler_after_half = self._get_euler_deg()
+
+                full_pos = pos_after_half + world_dir * step_mm * 0.5
+                self._set_pose_mj_mm(full_pos, euler_after_half)
+
+                snap_full = self._snap_to_surface(prev_normal=half_normal)
+
+                if snap_full:
+                    post_full = self._render_and_extract()
+                    if post_full["depth_mm"] < ON_OBJECT_DEPTH_MM:
+                        self._edge_traversed = True
+                        return  # Edge traversal success!
+
+        # ═══ All attempts failed — rollback ═══
+        self._set_pose_mj_mm(old_pos, old_euler)
+        
+    def _snap_to_surface(self, prev_normal=None):
+        """After tangential move: snap to surface with normal consistency.
+        
+        Mirrors LightweightEnv logic:
+        1. Ray cast forward to find surface
+        2. Approach to SNAP_TARGET_DEPTH_MM
+        3. Get normal from render
+        4. Check normal consistency with prev_normal
+        5. If normal flipped → reject snap (caller handles rollback)
+        
+        Args:
+            prev_normal: Surface normal before the move (list or None).
+                Used for consistency check and fallback ray direction.
+        
+        Returns:
+            True if snap succeeded, False if rejected/failed.
+        """
+        pos = self._get_pos_mj_mm()
+        euler = self._get_euler_deg()
+        rot = Rot.from_euler("xyz", euler, degrees=True)
+        forward = rot.apply([0, 0, -1])
+
+        # ═══ Step 1: Find surface via ray cast ═══
+        hit_dist = self._mj_ray_cast(pos, forward)
+
+        if hit_dist < 0 or hit_dist >= 10.0:
+            # Surface not found forward — try previous normal direction
+            if prev_normal is not None:
+                prev_n = np.array(prev_normal, dtype=float)
+                hit_dist = self._mj_ray_cast(pos, -prev_n)
+                if hit_dist > 0 and hit_dist < 10.0:
+                    approach = hit_dist - SNAP_TARGET_DEPTH_MM
+                    new_pos = pos - prev_n * approach
+                    new_euler = self._look_at_direction(-prev_n)
+                    self._set_pose_mj_mm(new_pos, new_euler)
+                    return True
+            return False
+
+        # ═══ Step 2: Approach to target depth ═══
+        if abs(hit_dist - SNAP_TARGET_DEPTH_MM) > 0.3:
+            approach = hit_dist - SNAP_TARGET_DEPTH_MM
+            pos = pos + forward * approach
+            self._set_pose_mj_mm(pos, euler)
+
+        # ═══ Step 3: Get normal from render ═══
         rendered = self._render_and_extract()
-        depth_mm = rendered["depth_mm"]
-        normal = rendered["point_normal"]
+        new_normal = rendered["point_normal"]
 
-        if depth_mm >= 10.0 or normal is None:
-            return
+        if new_normal is None:
+            # No normal from render — keep position, use prev orientation
+            if prev_normal is not None:
+                new_euler = self._look_at_direction(-np.array(prev_normal))
+                self._set_pose_mj_mm(pos, new_euler)
+                return True
+            return False
 
-        normal_arr = np.array(normal, dtype=float)
+        normal_arr = np.array(new_normal, dtype=float)
         n_len = np.linalg.norm(normal_arr)
         if n_len < 1e-8:
-            return
+            return False
         normal_arr /= n_len
 
-        pos = self._get_pos_mj_mm()
+        # ═══ Step 4: Normal consistency check ═══
+        if prev_normal is not None:
+            prev_n = np.array(prev_normal, dtype=float)
+            prev_n /= (np.linalg.norm(prev_n) + 1e-12)
+            dot = float(np.dot(normal_arr, prev_n))
 
-        # Approach to SNAP_TARGET_DEPTH_MM
-        if abs(depth_mm - SNAP_TARGET_DEPTH_MM) > 0.3:
-            approach = depth_mm - SNAP_TARGET_DEPTH_MM
-            pos = pos - normal_arr * approach
+            if dot < -0.1:
+                # Normal flipped > ~96° — invalid transition
+                # Like LightweightEnv: can_transition = np.dot(hit_n, n) > -0.1
+                return False
 
-        # Re-orient to face surface (like LightweightEnv)
+            # If normal reversed but not flipped, align it
+            if dot < 0:
+                normal_arr = -normal_arr
+
+        # ═══ Step 5: Apply snap ═══
         new_euler = self._look_at_direction(-normal_arr)
         self._set_pose_mj_mm(pos, new_euler)
+        return True
 
     def pose_mj_to_cad(self, pose_mj: np.ndarray) -> np.ndarray:
         """Convert 6D pose from MuJoCo frame to CAD frame for visualization."""

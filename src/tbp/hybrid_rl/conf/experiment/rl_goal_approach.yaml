@@ -376,21 +376,21 @@ experiment:
       # mujoco_folder = имя в mujoco_data_path
       # glb_folder = имя в ycb_src_dir (для конвертации в mm STL)
       objects:
-        #ycb_mug:
-        #  mujoco_name: mug
-        #  glb_name: 025_mug
-        #ycb_bowl:
-        #  mujoco_name: bowl
-        #  glb_name: 024_bowl
-        #ycb_can:
-        #  mujoco_name: master_chef_can
-        #  glb_name: 002_master_chef_can
+        ycb_mug:
+          mujoco_name: mug
+          glb_name: 025_mug
+        ycb_bowl:
+          mujoco_name: bowl
+          glb_name: 024_bowl
+        ycb_can:
+          mujoco_name: master_chef_can
+          glb_name: 002_master_chef_can
         ycb_banana:
           mujoco_name: banana
           glb_name: 011_banana
-        #ycb_cracker_box:
-        #  mujoco_name: cracker_box
-        #  glb_name: 003_cracker_box
+        ycb_cracker_box:
+          mujoco_name: cracker_box
+          glb_name: 003_cracker_box
         #ycb_cups:
         #  mujoco_name: a_cups
         #  glb_name: 065-a_cups
@@ -407,7 +407,7 @@ experiment:
         #  mujoco_name: mustard_bottle
         #  glb_name: 006_mustard_bottle
 
-      episodes_per_level: 10
+      episodes_per_level: 50
       max_steps: 500
 
     logging:
