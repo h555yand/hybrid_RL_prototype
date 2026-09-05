@@ -136,6 +136,10 @@ class MuJoCoEnvAdapter:
             agents=[agent_factory], data_path=mujoco_data_path,
         )
         self._sim.add_object(mujoco_object_name)
+        # ═══ Increase offscreen framebuffer for scene rendering ═══
+        self._sim.model.vis.global_.offwidth = 256
+        self._sim.model.vis.global_.offheight = 256
+
         logger.info("MuJoCo initialized: object='%s'", mujoco_object_name)
 
         # ═══ Monty transforms ═══
@@ -158,6 +162,10 @@ class MuJoCoEnvAdapter:
         self._edge_traversed = False
         self._last_detach_sub_steps = 1
         self._prev_normal: Optional[List[float]] = None
+
+        # ═══ Scene renderer (for visualization, separate from sensor) ═══
+        self._scene_renderer = None
+        self._scene_res = (256, 256)
 
     # ═══════════════════════════════════════════════════
     # Coordinate conversion (computed once, used everywhere)
@@ -209,6 +217,34 @@ class MuJoCoEnvAdapter:
     # ═══════════════════════════════════════════════════
     # Helpers
     # ═══════════════════════════════════════════════════
+    def _mj_ray_cast(
+        self, origin_mj_mm: np.ndarray, direction: np.ndarray
+    ) -> float:
+        """MuJoCo ray cast. Returns hit distance in mm, or -1 if no hit."""
+        import mujoco
+
+        origin_m = origin_mj_mm / MM_PER_M
+        direction = np.array(direction, dtype=np.float64)
+        d_len = np.linalg.norm(direction)
+        if d_len < 1e-12:
+            return -1.0
+        direction = direction / d_len
+
+        geomid = np.array([-1], dtype=np.int32)
+        hit_dist = mujoco.mj_ray(
+            self._sim.model,
+            self._sim.data,
+            origin_m,
+            direction,
+            None,       # geomgroup
+            1,          # flg_static
+            -1,         # bodyexclude
+            geomid,
+        )
+
+        if hit_dist < 0:
+            return -1.0
+        return float(hit_dist) * MM_PER_M
 
     @staticmethod
     def _normalize_euler(angles):
@@ -364,31 +400,18 @@ class MuJoCoEnvAdapter:
     # ═══════════════════════════════════════════════════
 
     def _check_path_blocked(self, goal_pos_mj_mm: np.ndarray) -> bool:
+        """Check path blocked via MuJoCo ray cast."""
         agent_pos = self._get_pos_mj_mm()
         direction = goal_pos_mj_mm - agent_pos
-        dist = float(np.linalg.norm(direction))
-        if dist < 1e-8:
+        dist_to_goal = float(np.linalg.norm(direction))
+        if dist_to_goal < 1e-8:
             return False
-        direction /= dist
 
-        saved_pos = agent_pos.copy()
-        saved_euler = self._get_euler_deg().copy()
-
-        euler = self._look_at_direction(direction)
-        self._set_pose_mj_mm(agent_pos, euler)
-
-        from mujoco import mj_forward
-        mj_forward(self._sim.model, self._sim.data)
-        agent = self._sim._agents[_AGENT_ID]
-        depth_map = agent.observations[_SENSOR_ID]["depth"]
-        cy, cx = self._sensor_h // 2, self._sensor_w // 2
-        d = float(depth_map[cy, cx])
-        depth_mm = NO_SURFACE_DEPTH_MM if d >= 1.0 else d * MM_PER_M
-
-        self._set_pose_mj_mm(saved_pos, saved_euler)
-
-        return depth_mm < (dist - 2.0) if depth_mm < NO_SURFACE_DEPTH_MM else False
-
+        hit_dist = self._mj_ray_cast(agent_pos, direction)
+        if hit_dist < 0:
+            return False
+        return hit_dist < (dist_to_goal - 2.0)
+        
     # ═══════════════════════════════════════════════════
     # Surface point generation (CAD → MuJoCo)
     # ═══════════════════════════════════════════════════
@@ -508,7 +531,6 @@ class MuJoCoEnvAdapter:
         return np.concatenate([self._get_pos_mj_mm(), self._get_euler_deg()])
 
     def get_sensor_data(self) -> dict:
-        """All data in MuJoCo frame."""
         rendered = self._render_and_extract()
 
         goal_normal = self._goal_normal_mj
@@ -516,8 +538,9 @@ class MuJoCoEnvAdapter:
         same_side = True
 
         if self._current_goal is not None:
-            path_blocked = self._check_path_blocked(self._current_goal[:3])
+            goal_pos = self._current_goal[:3]
             same_side = self._compute_same_side(rendered["point_normal"])
+            path_blocked = self._check_path_blocked(goal_pos)
 
         return {
             "point_normal": rendered["point_normal"],
@@ -626,6 +649,7 @@ class MuJoCoEnvAdapter:
         self._snap_to_surface()
 
     def _snap_to_surface(self):
+        """After tangential move: approach to 2mm + re-orient along normal."""
         rendered = self._render_and_extract()
         depth_mm = rendered["depth_mm"]
         normal = rendered["point_normal"]
@@ -640,41 +664,13 @@ class MuJoCoEnvAdapter:
         normal_arr /= n_len
 
         pos = self._get_pos_mj_mm()
-        euler = self._get_euler_deg()  # keep current orientation!
 
-        # Only adjust position toward surface
+        # Approach to SNAP_TARGET_DEPTH_MM
         if abs(depth_mm - SNAP_TARGET_DEPTH_MM) > 0.3:
             approach = depth_mm - SNAP_TARGET_DEPTH_MM
             pos = pos - normal_arr * approach
 
-        # Keep same orientation, only update position
-        self._set_pose_mj_mm(pos, euler)
-
-    def _snap_to_surface_old(self):
-        rendered = self._render_and_extract()
-        depth_mm = rendered["depth_mm"]
-        normal = rendered["point_normal"]
-
-        if depth_mm >= NO_SURFACE_DEPTH_MM or normal is None:
-            pos = self._get_pos_mj_mm()
-            to_center = self._mj_center_mm - pos
-            tc_len = np.linalg.norm(to_center)
-            if tc_len > 1e-8:
-                euler = self._look_at_direction(to_center / tc_len)
-                self._set_pose_mj_mm(pos, euler)
-            return
-
-        normal_arr = np.array(normal, dtype=float)
-        n_len = np.linalg.norm(normal_arr)
-        if n_len < 1e-8:
-            return
-        normal_arr /= n_len
-
-        pos = self._get_pos_mj_mm()
-        if depth_mm > ON_OBJECT_DEPTH_MM:
-            approach = depth_mm - SNAP_TARGET_DEPTH_MM
-            pos = pos - normal_arr * approach
-
+        # Re-orient to face surface (like LightweightEnv)
         new_euler = self._look_at_direction(-normal_arr)
         self._set_pose_mj_mm(pos, new_euler)
 
@@ -692,15 +688,24 @@ class MuJoCoEnvAdapter:
         return np.concatenate([pos_cad, euler_cad])
 
     def _do_move_forward(self, step_mm: float):
+        """Move forward via MuJoCo + collision check via ray cast."""
         old_pos = self._get_pos_mj_mm().copy()
+
+        # Get forward direction before move
+        w, x, y, z = self._embodiment.rotation
+        rot = Rot.from_quat([x, y, z, w])
+        forward = rot.apply([0, 0, -1])
+
         distance_m = step_mm / MM_PER_M
         action = MoveForward(agent_id=_AGENT_ID, distance=distance_m)
         self._sim.step([action])
+
         self._passed_through = False
 
         if abs(step_mm) > 0.5:
-            r = self._render_and_extract()
-            if r["depth_mm"] < min(1.0, abs(step_mm) * 0.25):
+            move_dir = forward * np.sign(step_mm)
+            hit_dist = self._mj_ray_cast(old_pos, move_dir)
+            if hit_dist > 0 and hit_dist < abs(step_mm):
                 self._passed_through = True
 
     def _do_orient_horizontal(self, rotation_deg, forward_mm, left_mm):
@@ -718,6 +723,7 @@ class MuJoCoEnvAdapter:
         self._sim.step([action])
 
     def _do_detach(self, goal_pose, detach_distance_mm):
+        """Detach macro-action via SetAgentPose + ray cast collision."""
         self._detach_had_collision = False
         self._last_detach_sub_steps = 1
 
@@ -730,28 +736,25 @@ class MuJoCoEnvAdapter:
         normal_arr /= (np.linalg.norm(normal_arr) + 1e-12)
 
         old_pos = self._get_pos_mj_mm().copy()
-        old_euler = self._get_euler_deg().copy()
 
-        # Collision check
-        euler_check = self._look_at_direction(normal_arr)
-        self._set_pose_mj_mm(old_pos, euler_check)
-        from mujoco import mj_forward
-        mj_forward(self._sim.model, self._sim.data)
-        d = float(self._sim._agents[_AGENT_ID].observations[_SENSOR_ID]["depth"][self._sensor_h//2, self._sensor_w//2])
-        check_depth = NO_SURFACE_DEPTH_MM if d >= 1.0 else d * MM_PER_M
-
-        if check_depth < detach_distance_mm:
+        # Collision check via ray cast along normal
+        hit_dist = self._mj_ray_cast(old_pos, normal_arr)
+        if hit_dist > 0 and hit_dist < detach_distance_mm:
             self._detach_had_collision = True
-            self._set_pose_mj_mm(old_pos, old_euler)
             return
 
+        # Compute new position
         new_pos = old_pos + normal_arr * detach_distance_mm
 
-        goal_dir = goal_pose[:3] - new_pos
+        # Orient toward goal
+        goal_pos = goal_pose[:3]
+        goal_dir = goal_pos - new_pos
         goal_dist = np.linalg.norm(goal_dir)
+
         if goal_dist > 1e-8:
             goal_dir /= goal_dist
             dot = float(np.dot(goal_dir, normal_arr))
+
             if dot < -0.2:
                 tangent = goal_dir - dot * normal_arr
                 t_len = float(np.linalg.norm(tangent))
@@ -764,9 +767,10 @@ class MuJoCoEnvAdapter:
             else:
                 fly_dir = goal_dir + normal_arr * 0.3
                 fly_dir /= (np.linalg.norm(fly_dir) + 1e-12)
+
             new_euler = self._look_at_direction(fly_dir)
         else:
-            new_euler = old_euler
+            new_euler = self._get_euler_deg()
 
         self._set_pose_mj_mm(new_pos, self._normalize_euler(new_euler))
 
@@ -804,13 +808,22 @@ class MuJoCoEnvAdapter:
         filepath: str,
         agent_pos_cad_mm: np.ndarray,
         goal_pos_cad_mm: np.ndarray,
+        trail_positions_mj_mm: list = None,
     ):
-        """Render MuJoCo scene with 3D agent/goal spheres."""
-        from mujoco import mj_forward
+        """Render MuJoCo scene with agent/goal/trail at 256x256."""
+        from mujoco import mj_forward, Renderer
         from PIL import Image, ImageDraw
         import mujoco
 
         mj_forward(self._sim.model, self._sim.data)
+
+        # Create scene renderer once
+        if self._scene_renderer is None:
+            self._scene_renderer = Renderer(
+                self._sim.model,
+                height=self._scene_res[1],
+                width=self._scene_res[0],
+            )
 
         agent_m = np.array(self._embodiment.position, dtype=float)
         goal_m = (
@@ -820,106 +833,132 @@ class MuJoCoEnvAdapter:
         )
 
         max_ext = float(max(self._mj_extents_mm)) / MM_PER_M
-        cam_dist = max_ext * 2.5
         sphere_size = max_ext * 0.03
+        trail_size = sphere_size * 0.25
+
+        # Camera
+        if goal_m is not None:
+            midpoint = (agent_m + goal_m) / 2
+        else:
+            midpoint = agent_m
+
+        cam_dist = max_ext * 1.3
+        to_agent = agent_m.copy()
+        to_agent[2] = 0
+        ta_len = np.linalg.norm(to_agent)
+        azimuth = (
+            np.degrees(np.arctan2(to_agent[1], to_agent[0]))
+            if ta_len > 1e-5 else 135
+        )
 
         camera = mujoco.MjvCamera()
         camera.type = mujoco.mjtCamera.mjCAMERA_FREE
-        camera.lookat[:] = [0, 0, 0]
+        camera.lookat[:] = midpoint
         camera.distance = cam_dist
-        camera.azimuth = 135
-        camera.elevation = -30
+        camera.azimuth = azimuth + 90
+        camera.elevation = -25
 
-        # Build scene with extra geoms
-        scene = mujoco.MjvScene(self._sim.model, maxgeom=100)
+        # Build scene
+        max_trail = 50
+        scene = mujoco.MjvScene(
+            self._sim.model, maxgeom=max_trail + 50
+        )
         mujoco.mjv_updateScene(
             self._sim.model, self._sim.data,
             mujoco.MjvOption(), None,
             camera, mujoco.mjtCatBit.mjCAT_ALL, scene,
         )
 
-        # Agent sphere (blue)
+        # Trail (orange)
+        if trail_positions_mj_mm:
+            trail = trail_positions_mj_mm
+            if len(trail) > max_trail:
+                step = len(trail) // max_trail
+                trail = trail[::step]
+            for t_pos_mm in trail:
+                if scene.ngeom >= scene.maxgeom:
+                    break
+                t_m = np.array(t_pos_mm[:3], dtype=float) / MM_PER_M
+                mujoco.mjv_initGeom(
+                    scene.geoms[scene.ngeom],
+                    mujoco.mjtGeom.mjGEOM_SPHERE,
+                    [trail_size, 0, 0], t_m,
+                    np.eye(3).flatten(),
+                    [1.0, 0.65, 0.0, 0.8],
+                )
+                scene.ngeom += 1
+
+        # Agent (blue)
         if scene.ngeom < scene.maxgeom:
             mujoco.mjv_initGeom(
                 scene.geoms[scene.ngeom],
                 mujoco.mjtGeom.mjGEOM_SPHERE,
-                [sphere_size, 0, 0],
-                agent_m,
+                [sphere_size, 0, 0], agent_m,
                 np.eye(3).flatten(),
                 [0.2, 0.2, 1.0, 1.0],
             )
             scene.ngeom += 1
 
-        # Goal sphere (green)
+        # Goal (green)
         if goal_m is not None and scene.ngeom < scene.maxgeom:
             mujoco.mjv_initGeom(
                 scene.geoms[scene.ngeom],
                 mujoco.mjtGeom.mjGEOM_SPHERE,
-                [sphere_size * 1.2, 0, 0],
-                goal_m,
+                [sphere_size * 1.3, 0, 0], goal_m,
                 np.eye(3).flatten(),
                 [0.2, 1.0, 0.2, 1.0],
             )
             scene.ngeom += 1
 
-        # Gaze arrow (red capsule)
+        # Gaze (red)
         if scene.ngeom < scene.maxgeom:
             w, x, y, z = self._embodiment.rotation
             rot = Rot.from_quat([x, y, z, w])
             fwd = rot.apply([0, 0, -1])
             gaze_end = agent_m + fwd * sphere_size * 5
-            midpoint = (agent_m + gaze_end) / 2
-            direction = gaze_end - agent_m
-            length = float(np.linalg.norm(direction))
-
+            midpt = (agent_m + gaze_end) / 2
+            d = gaze_end - agent_m
+            length = float(np.linalg.norm(d))
             if length > 1e-8:
-                direction /= length
-                z_axis = np.array([0, 0, 1.0])
-                v = np.cross(z_axis, direction)
-                c = float(np.dot(z_axis, direction))
-
+                d /= length
+                za = np.array([0, 0, 1.0])
+                v = np.cross(za, d)
+                c = float(np.dot(za, d))
                 if abs(c + 1) < 1e-6:
-                    rot_mat = np.diag([-1.0, -1.0, 1.0])
+                    rm = np.diag([-1.0, -1.0, 1.0])
                 elif np.linalg.norm(v) < 1e-8:
-                    rot_mat = np.eye(3)
+                    rm = np.eye(3)
                 else:
                     vx = np.array([
                         [0, -v[2], v[1]],
                         [v[2], 0, -v[0]],
                         [-v[1], v[0], 0],
                     ])
-                    rot_mat = np.eye(3) + vx + vx @ vx / (1 + c)
-
+                    rm = np.eye(3) + vx + vx @ vx / (1 + c)
                 mujoco.mjv_initGeom(
                     scene.geoms[scene.ngeom],
                     mujoco.mjtGeom.mjGEOM_CAPSULE,
                     [sphere_size * 0.15, length / 2, 0],
-                    midpoint,
-                    rot_mat.flatten(),
+                    midpt, rm.flatten(),
                     [1.0, 0.0, 0.0, 1.0],
                 )
                 scene.ngeom += 1
 
-        # Render
-        res = Resolution2D(width=self._sensor_w, height=self._sensor_h)
-        renderer = self._sim.renderer_for_res(res)
+        # Render at scene resolution
+        w, h = self._scene_res
         mujoco.mjr_render(
-            mujoco.MjrRect(0, 0, self._sensor_w, self._sensor_h),
-            scene, renderer._mjr_context,
+            mujoco.MjrRect(0, 0, w, h),
+            scene, self._scene_renderer._mjr_context,
         )
-        rgb = np.empty(
-            (self._sensor_h, self._sensor_w, 3), dtype=np.uint8
-        )
+        rgb = np.empty((h, w, 3), dtype=np.uint8)
         mujoco.mjr_readPixels(
             rgb, None,
-            mujoco.MjrRect(0, 0, self._sensor_w, self._sensor_h),
-            renderer._mjr_context,
+            mujoco.MjrRect(0, 0, w, h),
+            self._scene_renderer._mjr_context,
         )
         rgb = np.flipud(rgb)
 
         img = Image.fromarray(rgb)
-        img = img.resize((512, 512), Image.LANCZOS)
-
         draw = ImageDraw.Draw(img)
         dist = float(np.linalg.norm(
             agent_pos_cad_mm - goal_pos_cad_mm
@@ -928,8 +967,14 @@ class MuJoCoEnvAdapter:
 
         Path(filepath).parent.mkdir(parents=True, exist_ok=True)
         img.save(filepath)
-        
+
     def close(self):
+        if self._scene_renderer is not None:
+            try:
+                self._scene_renderer.close()
+            except Exception:
+                pass
+            self._scene_renderer = None
         if self._sim is not None:
             self._sim.close()
             self._sim = None

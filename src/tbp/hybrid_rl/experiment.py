@@ -3684,6 +3684,17 @@ class RLGoalApproachExperiment:
 
     def _run_ycb_mujoco_eval(self) -> None:
         """Evaluate trained agent on YCB objects using MuJoCo rendering."""
+        # Suppress MuJoCo Renderer cleanup error at exit
+        import mujoco as _mj
+        if hasattr(_mj.Renderer, '__del__'):
+            _orig_del = _mj.Renderer.__del__
+            def _safe_del(self):
+                try:
+                    _orig_del(self)
+                except (AttributeError, Exception):
+                    pass
+            _mj.Renderer.__del__ = _safe_del
+
         logger.info("=" * 60)
         logger.info("YCB MuJoCo Evaluation")
         logger.info("=" * 60)
@@ -3977,8 +3988,10 @@ class RLGoalApproachExperiment:
                         if (
                             self.visualise
                             and ep < 2
-                            and (ep_steps <= 5
-                                 or ep_steps % 20 == 0)
+                            and (ep_steps <= 50
+                                 or ep_steps % 100 == 0
+                                 or ep_steps == (max_steps - 1)
+                                 )
                         ):
                             try:
                                 agent_cad = (
@@ -4004,12 +4017,14 @@ class RLGoalApproachExperiment:
                                     ),
                                     agent_pos_cad_mm=agent_cad,
                                     goal_pos_cad_mm=goal_cad_pos,
+                                    trail_positions_mj_mm=[
+                                        p[:3] for p in current_poses[:-1]
+                                    ],
                                 )
                             except Exception as e:
                                 logger.debug(
                                     "MuJoCo scene failed: %s", e
                                 )
-
                     # ═══ Determine result ═══
                     success = (
                         controller._total_goals_reached
@@ -4121,19 +4136,8 @@ class RLGoalApproachExperiment:
                     # ═══ Trimesh visualization ═══
                     if self.visualise and ep < 2:
                         try:
-                            # Safe close: suppress _gl_context errors
-                            renderers = env._sim._renderers
-                            for key in list(renderers.keys()):
-                                r = renderers[key]
-                                try:
-                                    if hasattr(r, '_gl_context') and r._gl_context:
-                                        r.close()
-                                except Exception:
-                                    pass
-                                # Prevent __del__ from crashing
-                                r._gl_context = None
-                            renderers.clear()
-
+                            # НЕТ _close_renderers здесь!
+                            
                             cad_poses = [
                                 env.pose_mj_to_cad(p)
                                 for p in current_poses
@@ -4141,8 +4145,7 @@ class RLGoalApproachExperiment:
                             goal_cad = env.pose_mj_to_cad(goal_pose)
 
                             vis_dir = (
-                                ycb_data_dir
-                                / "visualizations"
+                                ycb_data_dir / "visualizations"
                                 / local_name
                             )
                             _maybe_save_visualization(
@@ -4154,7 +4157,7 @@ class RLGoalApproachExperiment:
                                 current_poses=cad_poses,
                                 action_explanations=action_explanations,
                                 vis_dir=vis_dir,
-                                visualize_mode=self.visualise,
+                                visualize_mode="text",
                             )
                         except Exception as vis_err:
                             logger.warning(
