@@ -9,7 +9,7 @@ experiment:
   config:
     seed: 42
     # Visualization: null | text | pictures | video
-    visualise: text
+    visualise: video
     regenerate_scripts: true
     do_train: false
     do_eval: false
@@ -391,6 +391,7 @@ experiment:
         ycb_cracker_box:
           mujoco_name: cracker_box
           glb_name: 003_cracker_box
+
         #ycb_cups:
         #  mujoco_name: a_cups
         #  glb_name: 065-a_cups

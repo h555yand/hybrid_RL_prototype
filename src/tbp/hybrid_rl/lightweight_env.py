@@ -7,11 +7,14 @@
 # license that can be found in the LICENSE file or at
 # https://opensource.org/licenses/MIT.
 
+from __future__ import annotations
+
 import logging
 
 import numpy as np
 import trimesh
 from scipy.spatial.transform import Rotation as R
+from PIL import Image, ImageDraw, ImageFont
 
 logger = logging.getLogger(__name__)
 
@@ -1918,6 +1921,142 @@ class LightweightEnv:
 
         self._last_detach_sub_steps = sub_steps
         return self.get_sensor_data()
+
+    def render_episode_frame(
+        self,
+        agent_pose: np.ndarray,
+        goal_pose: np.ndarray,
+        filepath: str,
+        trail_poses: Optional[List[np.ndarray]] = None,
+        text: str = "",
+        step_num: int = 0,
+        distance: float = 0.0,
+        result: str = "",
+    ) -> None:
+        """Render split-view frame: solid + x-ray using trimesh.
+        
+        Implements RenderableEnv protocol.
+        """
+        from .visualize_env import add_text_overlay
+        
+        resolution = (1024, 768)
+        half_res = (resolution[0] // 2, resolution[1])
+        fov = 50.0
+        mesh_alpha_solid = 255
+        mesh_alpha_xray = 60
+
+        def build_scene(alpha):
+            import trimesh as _trimesh
+            scene = _trimesh.Scene()
+            mesh_copy = self.mesh.copy()
+            mesh_copy.visual.face_colors = [200, 200, 200, alpha]
+            scene.add_geometry(mesh_copy, geom_name="mesh")
+            
+            # Agent (blue)
+            agent_s = _trimesh.primitives.Sphere(radius=1.0, center=agent_pose[:3])
+            agent_s.visual.face_colors = [0, 50, 255, 255]
+            scene.add_geometry(agent_s, geom_name="agent")
+            
+            # Goal (green)
+            goal_s = _trimesh.primitives.Sphere(radius=1.4, center=goal_pose[:3])
+            goal_s.visual.face_colors = [0, 255, 0, 255]
+            scene.add_geometry(goal_s, geom_name="goal")
+            
+            # Gaze (red line)
+            rot = R.from_euler("xyz", agent_pose[3:], degrees=True)
+            fwd = rot.apply([0, 0, -1])
+            line_verts = np.array([agent_pose[:3], agent_pose[:3] + fwd * 3])
+            arrow = _trimesh.load_path(line_verts, colors=[[255, 0, 0, 255]])
+            scene.add_geometry(arrow, geom_name="gaze")
+            
+            # Trail (orange)
+            if trail_poses:
+                for i, tp in enumerate(trail_poses):
+                    ts = _trimesh.primitives.Sphere(radius=0.6, center=tp[:3])
+                    ts.visual.face_colors = [255, 165, 0, 255]
+                    scene.add_geometry(ts, geom_name=f"trail_{i}")
+            
+            return scene
+
+        def compute_camera(scene):
+            midpoint = (agent_pose[:3] + goal_pose[:3]) / 2.0
+            mesh_size = float(np.linalg.norm(scene.bounds[1] - scene.bounds[0]))
+            cam_dist = mesh_size * 1.7
+            mesh_center = scene.bounds.mean(axis=0)
+            to_agent = agent_pose[:3] - mesh_center
+            to_agent[2] = 0
+            norm = np.linalg.norm(to_agent)
+            dir_h = to_agent / norm if norm > 1e-5 else np.array([1, 0, 0])
+            
+            cam_pos = midpoint + dir_h * cam_dist * 0.7
+            cam_pos[2] = max(agent_pose[2], goal_pose[2]) + cam_dist * 0.5
+            
+            forward = midpoint - cam_pos
+            forward /= np.linalg.norm(forward) + 1e-6
+            right = np.cross(forward, [0, 0, 1])
+            if np.linalg.norm(right) < 1e-3:
+                right = np.cross(forward, [0, 1, 0])
+            right /= np.linalg.norm(right) + 1e-6
+            up = np.cross(right, forward)
+            
+            T = np.eye(4)
+            T[:3, 0] = right
+            T[:3, 1] = up
+            T[:3, 2] = -forward
+            T[:3, 3] = cam_pos
+            return T
+
+        from pathlib import Path as _Path
+        from PIL import Image as _Image
+        import io as _io
+
+        _Path(filepath).parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            scene_solid = build_scene(mesh_alpha_solid)
+            cam = compute_camera(scene_solid)
+            scene_solid.camera_transform = cam
+            scene_solid.camera.fov = (fov, fov)
+            scene_solid.camera.z_near = 1.0
+            scene_solid.camera.z_far = 100000.0
+            png_solid = scene_solid.save_image(resolution=half_res, visible=False)
+
+            scene_xray = build_scene(mesh_alpha_xray)
+            scene_xray.camera_transform = cam
+            scene_xray.camera.fov = (fov, fov)
+            scene_xray.camera.z_near = 1.0
+            scene_xray.camera.z_far = 100000.0
+            png_xray = scene_xray.save_image(resolution=half_res, visible=False)
+
+            if not png_solid or not png_xray or len(png_solid) < 100 or len(png_xray) < 100:
+                raise RuntimeError("Empty render")
+
+            img_left = _Image.open(_io.BytesIO(png_solid))
+            img_right = _Image.open(_io.BytesIO(png_xray))
+            merged = _Image.new("RGBA", resolution)
+            merged.paste(img_left, (0, 0))
+            merged.paste(img_right, (half_res[0], 0))
+
+            if text:
+                merged = add_text_overlay(merged, text, step_num, distance, result)
+                draw = ImageDraw.Draw(merged)
+                try:
+                    font = ImageFont.truetype(
+                        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 12)
+                except OSError:
+                    font = ImageFont.load_default()
+                draw.text((10, resolution[1] - 20), "SOLID", fill="white", font=font)
+                draw.text((half_res[0] + 10, resolution[1] - 20), "X-RAY", fill="white", font=font)
+
+            merged.save(filepath, format="PNG")
+
+        except Exception:
+            # Fallback: save text file
+            txt_path = _Path(filepath).with_suffix(".txt")
+            with txt_path.open("w") as f:
+                f.write(f"Step {step_num}, dist={distance:.1f}mm: {text}\n")
+            logger.debug("Trimesh render failed for %s", filepath, exc_info=True)
+
 
 def is_on_same_cube_side(pos_a, pos_b, cube_side=42.0, atol=1e-5):
     """Checks whether two points lie on the same side of a cube (e.g., both at +X when x = +42).

@@ -623,15 +623,14 @@ class MuJoCoEnvAdapter:
 
     def _do_move_tangentially(self, direction_degrees, step_mm):
         """Tangential surface move with snap and rollback.
-        
+
         Mirrors LightweightEnv._move_tangentially:
         1. Build tangent basis from current normal
         2. Compute world direction from direction_degrees
-        3. Project onto tangent plane
-        4. Move agent
-        5. Snap to surface with normal consistency
-        6. Rollback if snap fails or surface lost
-        7. If rollback, try half-step for edge traversal
+        3. Move agent along tangent plane
+        4. Snap to surface with normal consistency
+        5. If snap fails, try half-step for edge traversal
+        6. If all fails, rollback to original position
         """
         pos = self._get_pos_mj_mm()
         euler = self._get_euler_deg()
@@ -644,7 +643,9 @@ class MuJoCoEnvAdapter:
         if normal is None:
             # No surface — move in local direction (like LightweightEnv)
             angle_rad = np.radians(direction_degrees)
-            local_dir = np.array([np.sin(angle_rad), 0.0, -np.cos(angle_rad)])
+            local_dir = np.array(
+                [np.sin(angle_rad), 0.0, -np.cos(angle_rad)]
+            )
             local_dir /= (np.linalg.norm(local_dir) + 1e-12)
             world_dir = rot.apply(local_dir)
             new_pos = pos + world_dir * step_mm
@@ -692,161 +693,68 @@ class MuJoCoEnvAdapter:
         snap_ok = self._snap_to_surface(prev_normal=normal)
 
         if snap_ok:
-            # Check we're still on surface
-            post = self._render_and_extract()
-            if post["depth_mm"] < ON_OBJECT_DEPTH_MM:
-                return  # Success!
+            return  # snap_to_surface verified ray cast and normal — trust it
 
         # ═══ Snap failed — try half-step (edge traversal) ═══
-        # Like LightweightEnv: intermediate step for edge crossing
         half_pos = old_pos + world_dir * step_mm * 0.5
         self._set_pose_mj_mm(half_pos, old_euler)
 
         snap_half = self._snap_to_surface(prev_normal=normal)
 
         if snap_half:
-            post_half = self._render_and_extract()
-            if post_half["depth_mm"] < ON_OBJECT_DEPTH_MM:
-                # Half-step landed — try second half
-                half_normal = post_half["point_normal"]
-                pos_after_half = self._get_pos_mj_mm()
-                euler_after_half = self._get_euler_deg()
+            half_rendered = self._render_and_extract()
+            half_normal = half_rendered["point_normal"]
+            pos_after_half = self._get_pos_mj_mm()
+            euler_after_half = self._get_euler_deg()
 
-                full_pos = pos_after_half + world_dir * step_mm * 0.5
-                self._set_pose_mj_mm(full_pos, euler_after_half)
+            full_pos = pos_after_half + world_dir * step_mm * 0.5
+            self._set_pose_mj_mm(full_pos, euler_after_half)
 
-                snap_full = self._snap_to_surface(prev_normal=half_normal)
+            snap_full = self._snap_to_surface(prev_normal=half_normal)
 
-                if snap_full:
-                    post_full = self._render_and_extract()
-                    if post_full["depth_mm"] < ON_OBJECT_DEPTH_MM:
-                        self._edge_traversed = True
-                        return  # Edge traversal success!
+            if snap_full:
+                self._edge_traversed = True
+                return
 
         # ═══ All attempts failed — rollback ═══
         self._set_pose_mj_mm(old_pos, old_euler)
-
+        
     def _snap_to_surface(self, prev_normal=None):
-        pos = self._get_pos_mj_mm()
+        pos = self._get_pos_mj_mm()  # позиция после tangential move
         euler = self._get_euler_deg()
         rot = Rot.from_euler("xyz", euler, degrees=True)
         forward = rot.apply([0, 0, -1])
 
-        # ═══ Strategy: try multiple ray directions to find surface ═══
-        # Priority 1: forward (current gaze direction)
-        # Priority 2: -prev_normal (toward surface we came from)
-        
-        snap_pos = None
-        snap_normal = None
-        
-        # Try forward
-        hit_dist = self._mj_ray_cast(pos, forward)
-        if hit_dist > 0 and hit_dist < 10.0:
-            snap_pos = pos + forward * (hit_dist - SNAP_TARGET_DEPTH_MM)
-        
-        # Try prev_normal direction (always, not just as fallback)
-        if prev_normal is not None:
-            prev_n = np.array(prev_normal, dtype=float)
-            prev_n /= (np.linalg.norm(prev_n) + 1e-12)
-            prev_hit = self._mj_ray_cast(pos, -prev_n)
-            
-            if prev_hit > 0 and prev_hit < 10.0:
-                # If forward also found surface, prefer the CLOSER one
-                # (closer = same side of wall, farther = through wall)
-                if snap_pos is None:
-                    snap_pos = pos - prev_n * (prev_hit - SNAP_TARGET_DEPTH_MM)
-                    snap_normal = prev_n  # use prev normal for orientation
-                elif prev_hit < hit_dist:
-                    # prev_normal direction is closer — use it
-                    snap_pos = pos - prev_n * (prev_hit - SNAP_TARGET_DEPTH_MM)
-                    snap_normal = prev_n
-        
-        if snap_pos is None:
-            return False
-        
-        # Move to snap position
-        self._set_pose_mj_mm(snap_pos, euler)
-        
-        # Get normal from render at new position
-        rendered = self._render_and_extract()
-        new_normal = rendered["point_normal"]
-        
-        if new_normal is not None:
-            normal_arr = np.array(new_normal, dtype=float)
-            n_len = np.linalg.norm(normal_arr)
-            if n_len > 1e-8:
-                normal_arr /= n_len
-                
-                # ═══ Like trimesh: flip normal to match prev direction ═══
-                if prev_normal is not None:
-                    prev_n = np.array(prev_normal, dtype=float)
-                    prev_n /= (np.linalg.norm(prev_n) + 1e-12)
-                    if float(np.dot(normal_arr, prev_n)) < 0:
-                        normal_arr = -normal_arr  # flip to match prev side
-                
-                snap_normal = normal_arr
-        
-        if snap_normal is None:
-            if prev_normal is not None:
-                snap_normal = np.array(prev_normal, dtype=float)
-                snap_normal /= (np.linalg.norm(snap_normal) + 1e-12)
-            else:
-                return False
-        
-        new_euler = self._look_at_direction(-snap_normal)
-        self._set_pose_mj_mm(snap_pos, new_euler)
-        return True
+        # Save position before any approach
+        pos_after_move = pos.copy()
 
-    def _snap_to_surface_old(self, prev_normal=None):
-        """After tangential move: snap to surface with normal consistency.
-        
-        Mirrors LightweightEnv logic:
-        1. Ray cast forward to find surface
-        2. Approach to SNAP_TARGET_DEPTH_MM
-        3. Get normal from render
-        4. Check normal consistency with prev_normal
-        5. If normal flipped → reject snap (caller handles rollback)
-        
-        Args:
-            prev_normal: Surface normal before the move (list or None).
-                Used for consistency check and fallback ray direction.
-        
-        Returns:
-            True if snap succeeded, False if rejected/failed.
-        """
-        pos = self._get_pos_mj_mm()
-        euler = self._get_euler_deg()
-        rot = Rot.from_euler("xyz", euler, degrees=True)
-        forward = rot.apply([0, 0, -1])
-
-        # ═══ Step 1: Find surface via ray cast ═══
         hit_dist = self._mj_ray_cast(pos, forward)
 
         if hit_dist < 0 or hit_dist >= 10.0:
-            # Surface not found forward — try previous normal direction
+            # Surface not found forward — fallback
             if prev_normal is not None:
                 prev_n = np.array(prev_normal, dtype=float)
-                hit_dist = self._mj_ray_cast(pos, -prev_n)
-                if hit_dist > 0 and hit_dist < 10.0:
-                    approach = hit_dist - SNAP_TARGET_DEPTH_MM
+                prev_n /= (np.linalg.norm(prev_n) + 1e-12)
+                prev_hit = self._mj_ray_cast(pos, -prev_n)
+                if prev_hit > 0 and prev_hit < 10.0:
+                    approach = prev_hit - SNAP_TARGET_DEPTH_MM
                     new_pos = pos - prev_n * approach
                     new_euler = self._look_at_direction(-prev_n)
                     self._set_pose_mj_mm(new_pos, new_euler)
                     return True
             return False
 
-        # ═══ Step 2: Approach to target depth ═══
+        # Approach to target depth
         if abs(hit_dist - SNAP_TARGET_DEPTH_MM) > 0.3:
             approach = hit_dist - SNAP_TARGET_DEPTH_MM
             pos = pos + forward * approach
             self._set_pose_mj_mm(pos, euler)
 
-        # ═══ Step 3: Get normal from render ═══
+        # Get normal from render
         rendered = self._render_and_extract()
         new_normal = rendered["point_normal"]
 
         if new_normal is None:
-            # No normal from render — keep position, use prev orientation
             if prev_normal is not None:
                 new_euler = self._look_at_direction(-np.array(prev_normal))
                 self._set_pose_mj_mm(pos, new_euler)
@@ -859,22 +767,29 @@ class MuJoCoEnvAdapter:
             return False
         normal_arr /= n_len
 
-        # ═══ Step 4: Normal consistency check ═══
         if prev_normal is not None:
             prev_n = np.array(prev_normal, dtype=float)
             prev_n /= (np.linalg.norm(prev_n) + 1e-12)
             dot = float(np.dot(normal_arr, prev_n))
 
             if dot < -0.1:
-                # Normal flipped > ~96° — invalid transition
-                # Like LightweightEnv: can_transition = np.dot(hit_n, n) > -0.1
-                return False
+                # Normal flipped — use pos_after_move (NOT pos after approach)
+                # Ray cast from MOVED position in prev_normal direction
+                prev_hit = self._mj_ray_cast(pos_after_move, -prev_n)
+                if prev_hit > 0 and prev_hit < 5.0:
+                    approach = prev_hit - SNAP_TARGET_DEPTH_MM
+                    new_pos = pos_after_move - prev_n * approach
+                    new_euler = self._look_at_direction(-prev_n)
+                    self._set_pose_mj_mm(new_pos, new_euler)
+                    return True
+                else:
+                    # Can't find surface — accept flipped normal
+                    # (legitimate edge transition)
+                    normal_arr = -normal_arr
 
-            # If normal reversed but not flipped, align it
-            if dot < 0:
+            elif dot < 0:
                 normal_arr = -normal_arr
 
-        # ═══ Step 5: Apply snap ═══
         new_euler = self._look_at_direction(-normal_arr)
         self._set_pose_mj_mm(pos, new_euler)
         return True
@@ -982,6 +897,189 @@ class MuJoCoEnvAdapter:
     # ═══════════════════════════════════════════════════
     # Debug
     # ═══════════════════════════════════════════════════
+    def render_episode_frame(
+        self,
+        agent_pose: np.ndarray,
+        goal_pose: np.ndarray,
+        filepath: str,
+        trail_poses: list[np.ndarray] | None = None,
+        text: str = "",
+        step_num: int = 0,
+        distance: float = 0.0,
+        result: str = "",
+    ) -> None:
+        """Render split-view frame: MuJoCo solid + MuJoCo x-ray.
+        
+        Implements RenderableEnv protocol.
+        Left: colored MuJoCo scene with agent/goal/trail markers.
+        Right: same scene with transparent mesh (alpha=0.15).
+        """
+        import mujoco
+        from mujoco import mj_forward
+        from PIL import Image as _Image, ImageDraw as _ImageDraw, ImageFont as _ImageFont
+        from pathlib import Path as _Path
+        from .visualize_env import add_text_overlay
+
+        mj_forward(self._sim.model, self._sim.data)
+
+        _Path(filepath).parent.mkdir(parents=True, exist_ok=True)
+
+        # Scene resolution
+        w, h = 512, 256
+        half_w = w // 2  # = 256
+
+        # Renderer
+        if self._scene_renderer is None:
+            self._scene_renderer = mujoco.Renderer(self._sim.model, height=h, width=half_w)
+
+        # Camera setup
+        agent_m = np.array(self._embodiment.position, dtype=float)
+        goal_m = goal_pose[:3] / MM_PER_M
+
+        max_ext = float(max(self._mj_extents_mm)) / MM_PER_M
+        sphere_size = max_ext * 0.03
+        trail_size = sphere_size * 0.25
+
+        midpoint = (agent_m + goal_m) / 2
+        cam_dist = max_ext * 1.3
+        to_agent = agent_m.copy()
+        to_agent[2] = 0
+        ta_len = np.linalg.norm(to_agent)
+        azimuth = np.degrees(np.arctan2(to_agent[1], to_agent[0])) if ta_len > 1e-5 else 135
+
+        camera = mujoco.MjvCamera()
+        camera.type = mujoco.mjtCamera.mjCAMERA_FREE
+        camera.lookat[:] = midpoint
+        camera.distance = cam_dist
+        camera.azimuth = azimuth + 90
+        camera.elevation = -25
+
+        def _build_scene_geoms(scene):
+            # Agent position from argument, not embodiment
+            agent_m_local = agent_pose[:3] / MM_PER_M
+            
+            # Trail
+            if trail_poses:
+                trail = trail_poses[-50:]
+                for t_pos in trail:
+                    if scene.ngeom >= scene.maxgeom:
+                        break
+                    t_m = np.array(t_pos[:3], dtype=float) / MM_PER_M
+                    mujoco.mjv_initGeom(
+                        scene.geoms[scene.ngeom], mujoco.mjtGeom.mjGEOM_SPHERE,
+                        [trail_size, 0, 0], t_m, np.eye(3).flatten(),
+                        [1.0, 0.65, 0.0, 0.8],
+                    )
+                    scene.ngeom += 1
+
+            # Agent (blue) — from agent_pose argument
+            if scene.ngeom < scene.maxgeom:
+                mujoco.mjv_initGeom(
+                    scene.geoms[scene.ngeom], mujoco.mjtGeom.mjGEOM_SPHERE,
+                    [sphere_size, 0, 0], agent_m_local, np.eye(3).flatten(),
+                    [0.2, 0.2, 1.0, 1.0],
+                )
+                scene.ngeom += 1
+
+            # Goal (green)
+            if scene.ngeom < scene.maxgeom:
+                mujoco.mjv_initGeom(
+                    scene.geoms[scene.ngeom], mujoco.mjtGeom.mjGEOM_SPHERE,
+                    [sphere_size * 1.3, 0, 0], goal_m, np.eye(3).flatten(),
+                    [0.2, 1.0, 0.2, 1.0],
+                )
+                scene.ngeom += 1
+
+            # Gaze (red) — from agent_pose rotation
+            if scene.ngeom < scene.maxgeom:
+                rot = Rot.from_euler("xyz", agent_pose[3:], degrees=True)
+                fwd = rot.apply([0, 0, -1])
+                gaze_end = agent_m_local + fwd * sphere_size * 2.5
+                midpt = (agent_m_local + gaze_end) / 2
+                d = gaze_end - agent_m_local
+                length = float(np.linalg.norm(d))
+                if length > 1e-8:
+                    d /= length
+                    za = np.array([0, 0, 1.0])
+                    v = np.cross(za, d)
+                    c = float(np.dot(za, d))
+                    if abs(c + 1) < 1e-6:
+                        rm = np.diag([-1.0, -1.0, 1.0])
+                    elif np.linalg.norm(v) < 1e-8:
+                        rm = np.eye(3)
+                    else:
+                        vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+                        rm = np.eye(3) + vx + vx @ vx / (1 + c)
+                    mujoco.mjv_initGeom(
+                        scene.geoms[scene.ngeom], mujoco.mjtGeom.mjGEOM_CAPSULE,
+                        [sphere_size * 0.15, length / 2, 0], midpt, rm.flatten(),
+                        [1.0, 0.0, 0.0, 1.0],
+                    )
+                    scene.ngeom += 1
+
+        def _render_view(transparent=False):
+            """Render one view (solid or wireframe x-ray)."""
+            import mujoco
+            model = self._sim.model
+
+            max_geom = 100
+            scene = mujoco.MjvScene(model, maxgeom=max_geom)
+            
+            opt = mujoco.MjvOption()
+            if transparent:
+                opt.flags[mujoco.mjtVisFlag.mjVIS_TEXTURE] = False
+                scene_flags_wireframe = True
+            else:
+                scene_flags_wireframe = False
+            
+            mujoco.mjv_updateScene(
+                model, self._sim.data, opt, None,
+                camera, mujoco.mjtCatBit.mjCAT_ALL, scene,
+            )
+            
+            if scene_flags_wireframe:
+                scene.flags[mujoco.mjtRndFlag.mjRND_WIREFRAME] = True
+            
+            _build_scene_geoms(scene)
+
+            mujoco.mjr_render(
+                mujoco.MjrRect(0, 0, half_w, h),
+                scene, self._scene_renderer._mjr_context,
+            )
+            rgb = np.empty((h, half_w, 3), dtype=np.uint8)
+            mujoco.mjr_readPixels(
+                rgb, None, mujoco.MjrRect(0, 0, half_w, h),
+                self._scene_renderer._mjr_context,
+            )
+            return np.flipud(rgb)
+        
+        try:
+            rgb_solid = _render_view(transparent=False)
+            rgb_xray = _render_view(transparent=True)
+
+            img_left = _Image.fromarray(rgb_solid)
+            img_right = _Image.fromarray(rgb_xray)
+            merged = _Image.new("RGB", (w, h))
+            merged.paste(img_left, (0, 0))
+            merged.paste(img_right, (half_w, 0))
+
+            if text:
+                merged = add_text_overlay(merged, text, step_num, distance, result)
+
+            # Labels
+            draw = _ImageDraw.Draw(merged)
+            try:
+                font = _ImageFont.truetype(
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 12)
+            except OSError:
+                font = _ImageFont.load_default()
+            draw.text((10, h - 20), "SOLID", fill="white", font=font)
+            draw.text((half_w + 10, h - 20), "X-RAY", fill="white", font=font)
+
+            merged.save(filepath, format="PNG")
+
+        except Exception:
+            logger.debug("MuJoCo render failed for %s", filepath, exc_info=True)
 
     def save_mujoco_frame(self, filepath: str, save_depth: bool = False):
         from mujoco import mj_forward

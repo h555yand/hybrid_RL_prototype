@@ -3829,6 +3829,19 @@ class RLGoalApproachExperiment:
             action_space = controller.action_space
             np.random.seed(self.eval_seeds[0])
 
+            # ═══ Create visualizer ═══
+            viz = None
+            if self.visualise:
+                from tbp.hybrid_rl.visualize_env import EpisodeVisualizer
+                viz = EpisodeVisualizer(
+                    output_dir=ycb_data_dir,
+                    mesh_name=local_name,
+                    stage="ycb_mujoco_eval",
+                    max_per_type_per_level=5,
+                    num_levels=len(curriculum_levels),
+                    visualize_mode=self.visualise,
+                )
+
             level_results = {}
 
             for level_idx, (min_dist, max_dist) in enumerate(
@@ -3903,47 +3916,6 @@ class RLGoalApproachExperiment:
                     # ═══ Collect trajectory ═══
                     current_poses = [env.get_pose().copy()]
                     action_explanations = []
-                    debug_lines = []
-
-                    # ═══ Debug: initial state ═══
-                    init_pos_mj = env._get_pos_mj_mm()
-                    init_rot = list(env._embodiment.rotation)
-                    debug_lines.append(
-                        f"INIT: pos_mm="
-                        f"{[round(x,1) for x in init_pos_mj]}, "
-                        f"pos_m="
-                        f"{[round(x,4) for x in (init_pos_mj/1000)]}, "
-                        f"rot_wxyz="
-                        f"{[round(x,4) for x in init_rot]}"
-                    )
-
-                    init_sensor = env.get_sensor_data()
-                    debug_lines.append(
-                        f"INIT_SENSOR: "
-                        f"depth={init_sensor['depth']:.1f}, "
-                        f"on_object={init_sensor['on_object']}, "
-                        f"normal={init_sensor['point_normal']}, "
-                        f"k1={init_sensor['k1']:.4f}, "
-                        f"k2={init_sensor['k2']:.4f}, "
-                        f"same_side={init_sensor['same_side']}, "
-                        f"path_blocked="
-                        f"{init_sensor['path_blocked']}"
-                    )
-
-                    init_pos_cad = env._pos_mj_mm_to_cad_mm(
-                        env._get_pos_mj_mm()
-                    )
-                    goal_pos_cad = env._pos_mj_mm_to_cad_mm(
-                        goal_pose[:3]
-                    )
-                    debug_lines.append(
-                        f"INIT_CAD: pos="
-                        f"{[round(x,1) for x in init_pos_cad]}"
-                    )
-                    debug_lines.append(
-                        f"GOAL_CAD: pos="
-                        f"{[round(x,1) for x in goal_pos_cad]}"
-                    )
 
                     for step in range(max_steps):
                         pose = env.get_pose()
@@ -3961,20 +3933,17 @@ class RLGoalApproachExperiment:
                         )
                         ep_steps += 1
 
-                        # ═══ Collect debug info ═══
+                        # ═══ Collect action info ═══
                         new_pose = env.get_pose()
                         current_poses.append(new_pose.copy())
-
-                        mj_pos = list(
-                            env._embodiment.position
-                        )
-                        new_sensor = env.get_sensor_data()
 
                         if explanation is not None:
                             interp = explanation["interpretation"]
                         else:
                             interp = "done"
 
+                        new_sensor = env.get_sensor_data()
+                        mj_pos = list(env._embodiment.position)
                         interp += (
                             f" |mj=[{mj_pos[0]:.4f},"
                             f"{mj_pos[1]:.4f},"
@@ -3984,47 +3953,6 @@ class RLGoalApproachExperiment:
                         )
                         action_explanations.append(interp)
 
-                        # ═══ MuJoCo scene view ═══
-                        if (
-                            self.visualise
-                            and ep < 5
-                            and (ep_steps <= 50
-                                 or ep_steps % 100 == 0
-                                 or ep_steps == (max_steps - 1)
-                                 )
-                        ):
-                            try:
-                                agent_cad = (
-                                    env._pos_mj_mm_to_cad_mm(
-                                        env._get_pos_mj_mm()
-                                    )
-                                )
-                                goal_cad_pos = (
-                                    env._pos_mj_mm_to_cad_mm(
-                                        goal_pose[:3]
-                                    )
-                                )
-                                mj_frame_dir = (
-                                    ycb_data_dir
-                                    / "mujoco_scene"
-                                    / local_name
-                                    / f"ep_{ep:03d}_L{level_idx}"
-                                )
-                                env.save_mujoco_scene(
-                                    str(
-                                        mj_frame_dir
-                                        / f"step_{ep_steps:03d}.png"
-                                    ),
-                                    agent_pos_cad_mm=agent_cad,
-                                    goal_pos_cad_mm=goal_cad_pos,
-                                    trail_positions_mj_mm=[
-                                        p[:3] for p in current_poses[:-1]
-                                    ],
-                                )
-                            except Exception as e:
-                                logger.debug(
-                                    "MuJoCo scene failed: %s", e
-                                )
                     # ═══ Determine result ═══
                     success = (
                         controller._total_goals_reached
@@ -4043,126 +3971,30 @@ class RLGoalApproachExperiment:
                         collisions += 1
                         ep_result = "collision"
 
-                    # ═══ Save episode log ═══
-                    ep_log_dir = (
-                        ycb_data_dir / "episode_logs" / local_name
-                    )
-                    ep_log_dir.mkdir(parents=True, exist_ok=True)
-                    ep_log_path = (
-                        ep_log_dir
-                        / f"ep_{ep:03d}_L{level_idx}_{ep_result}.txt"
-                    )
-                    with ep_log_path.open("w") as f:
-                        final_pose = env.get_pose()
-                        start_dist = float(np.linalg.norm(
-                            goal_pose[:3] - current_poses[0][:3]
-                        ))
-                        final_dist = float(np.linalg.norm(
-                            goal_pose[:3] - final_pose[:3]
-                        ))
-
-                        f.write(f"Result: {ep_result}\n")
-                        f.write(
-                            f"Object: {local_name} "
-                            f"({mujoco_name})\n"
+                    # ═══ Unified visualization ═══
+                    if viz:
+                        viz.save_episode(
+                            env=env,
+                            episode=ep,
+                            level=level_idx,
+                            result=ep_result,
+                            goal_pose=goal_pose,
+                            poses=current_poses,
+                            actions=action_explanations,
+                            extra_info={
+                                "object": f"{local_name} ({mujoco_name})",
+                                "level_bounds": f"[{min_dist}-{max_dist}mm]",
+                                "mj_center": env._mj_center_mm.tolist(),
+                                "mj_extents": env._mj_extents_mm.tolist(),
+                                "up_direction": env.up_direction.tolist(),
+                                "embodiment_pos": list(
+                                    env._embodiment.position
+                                ),
+                                "embodiment_rot": list(
+                                    env._embodiment.rotation
+                                ),
+                            },
                         )
-                        f.write(
-                            f"Level: {level_idx} "
-                            f"[{min_dist}-{max_dist}mm]\n"
-                        )
-                        f.write(f"Goal: {goal_pose.tolist()}\n")
-                        f.write(f"Steps: {ep_steps}\n")
-                        f.write(
-                            f"Start pos (mm): "
-                            f"{current_poses[0][:3].tolist()}\n"
-                        )
-                        f.write(
-                            f"End pos (mm): "
-                            f"{final_pose[:3].tolist()}\n"
-                        )
-                        f.write(
-                            f"Start distance: "
-                            f"{start_dist:.1f}mm\n"
-                        )
-                        f.write(
-                            f"End distance: "
-                            f"{final_dist:.1f}mm\n"
-                        )
-                        f.write(
-                            f"MJ center (mm): "
-                            f"{env._mj_center_mm.tolist()}\n"
-                        )
-                        f.write(
-                            f"MJ extents (mm): "
-                            f"{env._mj_extents_mm.tolist()}\n"
-                        )
-                        f.write(
-                            f"Up direction: "
-                            f"{env.up_direction.tolist()}\n"
-                        )
-                        f.write(
-                            f"Embodiment pos (m): "
-                            f"{list(env._embodiment.position)}\n"
-                        )
-                        f.write(
-                            f"Embodiment rot (wxyz): "
-                            f"{list(env._embodiment.rotation)}\n"
-                        )
-                        f.write("\n")
-
-                        for dbg in debug_lines:
-                            f.write(f"{dbg}\n")
-                        f.write("\n")
-
-                        for i, action_text in enumerate(
-                            action_explanations
-                        ):
-                            if i < len(current_poses) - 1:
-                                p = current_poses[i + 1]
-                                dist = float(np.linalg.norm(
-                                    goal_pose[:3] - p[:3]
-                                ))
-                                f.write(
-                                    f"Step {i+1:03d} "
-                                    f"(dist={dist:.1f}mm): "
-                                    f"{action_text}\n"
-                                )
-                            else:
-                                f.write(
-                                    f"Step {i+1:03d}: "
-                                    f"{action_text}\n"
-                                )
-
-                    # ═══ Trimesh visualization ═══
-                    if self.visualise and ep < 2:
-                        try:
-                            # НЕТ _close_renderers здесь!
-                            
-                            cad_poses = [
-                                env.pose_mj_to_cad(p)
-                                for p in current_poses
-                            ]
-                            goal_cad = env.pose_mj_to_cad(goal_pose)
-
-                            vis_dir = (
-                                ycb_data_dir / "visualizations"
-                                / local_name
-                            )
-                            _maybe_save_visualization(
-                                controller=controller,
-                                env=env,
-                                episode=ep,
-                                ep_result=ep_result,
-                                goal_pose=goal_cad,
-                                current_poses=cad_poses,
-                                action_explanations=action_explanations,
-                                vis_dir=vis_dir,
-                                visualize_mode="text",
-                            )
-                        except Exception as vis_err:
-                            logger.warning(
-                                "Viz failed: %s", vis_err
-                            )
 
                     # ═══ Log episode ═══
                     final_dist = float(np.linalg.norm(
