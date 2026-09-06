@@ -3987,7 +3987,7 @@ class RLGoalApproachExperiment:
                         # ═══ MuJoCo scene view ═══
                         if (
                             self.visualise
-                            and ep < 2
+                            and ep < 5
                             and (ep_steps <= 50
                                  or ep_steps % 100 == 0
                                  or ep_steps == (max_steps - 1)

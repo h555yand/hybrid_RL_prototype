@@ -407,7 +407,7 @@ experiment:
         #  mujoco_name: mustard_bottle
         #  glb_name: 006_mustard_bottle
 
-      episodes_per_level: 50
+      episodes_per_level: 30
       max_steps: 500
 
     logging:

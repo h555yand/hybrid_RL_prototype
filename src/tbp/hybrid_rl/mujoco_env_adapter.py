@@ -725,8 +725,79 @@ class MuJoCoEnvAdapter:
 
         # ═══ All attempts failed — rollback ═══
         self._set_pose_mj_mm(old_pos, old_euler)
-        
+
     def _snap_to_surface(self, prev_normal=None):
+        pos = self._get_pos_mj_mm()
+        euler = self._get_euler_deg()
+        rot = Rot.from_euler("xyz", euler, degrees=True)
+        forward = rot.apply([0, 0, -1])
+
+        # ═══ Strategy: try multiple ray directions to find surface ═══
+        # Priority 1: forward (current gaze direction)
+        # Priority 2: -prev_normal (toward surface we came from)
+        
+        snap_pos = None
+        snap_normal = None
+        
+        # Try forward
+        hit_dist = self._mj_ray_cast(pos, forward)
+        if hit_dist > 0 and hit_dist < 10.0:
+            snap_pos = pos + forward * (hit_dist - SNAP_TARGET_DEPTH_MM)
+        
+        # Try prev_normal direction (always, not just as fallback)
+        if prev_normal is not None:
+            prev_n = np.array(prev_normal, dtype=float)
+            prev_n /= (np.linalg.norm(prev_n) + 1e-12)
+            prev_hit = self._mj_ray_cast(pos, -prev_n)
+            
+            if prev_hit > 0 and prev_hit < 10.0:
+                # If forward also found surface, prefer the CLOSER one
+                # (closer = same side of wall, farther = through wall)
+                if snap_pos is None:
+                    snap_pos = pos - prev_n * (prev_hit - SNAP_TARGET_DEPTH_MM)
+                    snap_normal = prev_n  # use prev normal for orientation
+                elif prev_hit < hit_dist:
+                    # prev_normal direction is closer — use it
+                    snap_pos = pos - prev_n * (prev_hit - SNAP_TARGET_DEPTH_MM)
+                    snap_normal = prev_n
+        
+        if snap_pos is None:
+            return False
+        
+        # Move to snap position
+        self._set_pose_mj_mm(snap_pos, euler)
+        
+        # Get normal from render at new position
+        rendered = self._render_and_extract()
+        new_normal = rendered["point_normal"]
+        
+        if new_normal is not None:
+            normal_arr = np.array(new_normal, dtype=float)
+            n_len = np.linalg.norm(normal_arr)
+            if n_len > 1e-8:
+                normal_arr /= n_len
+                
+                # ═══ Like trimesh: flip normal to match prev direction ═══
+                if prev_normal is not None:
+                    prev_n = np.array(prev_normal, dtype=float)
+                    prev_n /= (np.linalg.norm(prev_n) + 1e-12)
+                    if float(np.dot(normal_arr, prev_n)) < 0:
+                        normal_arr = -normal_arr  # flip to match prev side
+                
+                snap_normal = normal_arr
+        
+        if snap_normal is None:
+            if prev_normal is not None:
+                snap_normal = np.array(prev_normal, dtype=float)
+                snap_normal /= (np.linalg.norm(snap_normal) + 1e-12)
+            else:
+                return False
+        
+        new_euler = self._look_at_direction(-snap_normal)
+        self._set_pose_mj_mm(snap_pos, new_euler)
+        return True
+
+    def _snap_to_surface_old(self, prev_normal=None):
         """After tangential move: snap to surface with normal consistency.
         
         Mirrors LightweightEnv logic:
