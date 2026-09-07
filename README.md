@@ -453,17 +453,6 @@ The progress reward adapts to the current navigation phase:
 - **Detour mode**: When alignment < threshold and on surface, negative progress is clipped to prevent large penalties for necessary detours
 
 ### Subgoal potential shaping
-
-Based on Ng et al. (1999) potential-based reward shaping, which provably preserves the optimal policy:
-
-```
-φ(s) = (1 + alignment) × SCALE    when alignment < 0 and on_object
-φ(s) = (1 + alignment) × SCALE × 0.3   when alignment < 0 and in air
-φ(s) = 0                           when alignment ≥ 0
-
-shaping_reward = γ × φ(s') - φ(s)
-```
-
 This encourages the agent to move toward the object edge (where alignment → 0) when the goal is behind the surface, without distorting the optimal policy.
 
 Details of logic here: `def compute_common_reward` and `def _compute_reward`
@@ -882,6 +871,7 @@ Potential solutions: larger online update batches, adaptive BC lambda decay base
 
 **3. Heuristic-ML gap at L2.** On the hardest level, heuristics (72%) slightly outperform blend (63%). This suggests the learned policies haven't fully captured the geometric reasoning needed for opposite-side navigation. More training episodes on complex objects, or explicit curriculum for detach scenarios, could close this gap.
 
+
 ## YCB Results on MuJoCo Environment
 
 To validate that learned policies transfer beyond the training simulator, we evaluated on **real YCB objects** rendered in **MuJoCo** — a physics-based environment with realistic depth sensing, surface normals from mesh rendering, and physically-grounded agent movement. The agent was trained entirely on simple geometric primitives (cube, sphere, cylinder, etc.) in the lightweight trimesh environment and had **never seen any YCB object during training**.
@@ -1203,12 +1193,12 @@ with consistent thresholds.
 
 ## Known Limitations
 
-This is a prototype. The goal is to demonstrate that the approach works, while being transparent about current limitations. The core claims are validated:
+This is a prototype. The goal is to demonstrate that the approach works:
 - **Q-learning, SAC, and adaptive arbitrage generalize to unseen objects** (cup: 83% adaptive, never seen during training)
 - **Sim-to-real transfer works** — policies trained on trimesh primitives navigate YCB objects in MuJoCo without retraining (banana 99%, can 81%, box 83%)
 - **The solution is ready for integration testing** with Monty's Learning Module and Sensor Module
 
-The limitations below are known, understood, and have clear paths to improvement.
+The limitations below are known, understood, and have clear paths to improvement:
 
 ### 1. Surface Movement Mechanics
 
@@ -1267,6 +1257,14 @@ This gap is expected for any sim-to-sim transfer and represents the baseline cos
 
 ## Roadmap
 
+### Short-term: Monty Integration
+
+**RLGoalPolicy as JumpToGoal replacement.** Create `RLGoalPolicy` implementing the `MotorPolicy` protocol. Receives goals from GSG (`goal.location` + `goal.morphological_features['pose_vectors']`), navigates incrementally instead of teleporting. All existing Monty behavior preserved — the RL module only activates for GSG goals.
+
+**Intermediate observation mode.** During navigation to goal, every intermediate surface contact provides pose + features that the LM could use for evidence accumulation. Configurable: default mode (motor-only, same contract as JumpToGoal) or directed exploration mode (LM processes observations during navigation).
+
+**Validation on YCB in Monty.** Key metric: does replacing JumpToGoal with RLGoalPolicy maintain classification accuracy and pose estimation quality while using only incremental actions?
+
 ### Near-term: Improve Core Navigation
 
 **Robust edge traversal.** The highest-impact improvement. Options under consideration:
@@ -1290,15 +1288,8 @@ This gap is expected for any sim-to-sim transfer and represents the baseline cos
 
 **Strategic crawl-to-edge store.** Add a third strategic Q-store (alongside detach and direction) that learns when to crawl toward the rim vs toward the goal. State: [alignment, normal_agreement, distance_to_edge_estimate, on_object, path_blocked]. This would give the strategic level explicit control over the crawl-to-edge decision, rather than relying on heuristic phase detection.
 
-### Medium-term: Monty Integration
 
-**RLGoalPolicy as JumpToGoal replacement.** Create `RLGoalPolicy` implementing the `MotorPolicy` protocol. Receives goals from GSG (`goal.location` + `goal.morphological_features['pose_vectors']`), navigates incrementally instead of teleporting. All existing Monty behavior preserved — the RL module only activates for GSG goals.
-
-**Intermediate observation mode.** During navigation to goal, every intermediate surface contact provides pose + features that the LM could use for evidence accumulation. Configurable: default mode (motor-only, same contract as JumpToGoal) or directed exploration mode (LM processes observations during navigation).
-
-**Validation on YCB in Monty.** Key metric: does replacing JumpToGoal with RLGoalPolicy maintain classification accuracy and pose estimation quality while using only incremental actions?
-
-### Medium-term: Real Robot Deployment
+### Long-term: Real Robot Deployment
 
 **RobotEnvAdapter.** Implement `RLEnvironment` protocol for a physical robot:
 - `get_pose()` from robot kinematics / SLAM
