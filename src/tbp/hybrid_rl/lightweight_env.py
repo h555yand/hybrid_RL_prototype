@@ -2057,6 +2057,113 @@ class LightweightEnv:
                 f.write(f"Step {step_num}, dist={distance:.1f}mm: {text}\n")
             logger.debug("Trimesh render failed for %s", filepath, exc_info=True)
 
+    # ═══════════════════════════════════════════════════
+    # RLEnvironment protocol implementation
+    # ═══════════════════════════════════════════════════
+
+    def step_discrete(self, action_idx: int, action_space) -> dict:
+        """Execute discrete action. Delegates to existing step().
+
+        Args:
+            action_idx: Discrete action index (0-23).
+            action_space: ActionSpace instance.
+
+        Returns:
+            Sensor data after action.
+        """
+        return self.step(action_idx, action_space)
+
+    def step_continuous(
+        self, action_type: int, action_params: np.ndarray
+    ) -> dict:
+        """Execute continuous SAC action via direct env manipulation.
+
+        Same semantics as ActionInterpreter.execute() but without
+        requiring a separate interpreter instance. This makes
+        LightweightEnv self-contained as an RLEnvironment.
+
+        Args:
+            action_type: PSAC action type (0-7).
+            action_params: Continuous parameters array [3].
+
+        Returns:
+            Sensor data after action.
+        """
+        self._detach_had_collision = False
+        self._edge_traversed = False
+        self._passed_through = False
+
+        if action_type == 0:
+            # Tangential surface move: [sin_angle, cos_angle, distance]
+            sin_a = float(action_params[0])
+            cos_a = float(action_params[1])
+            angle_deg = float(np.degrees(np.arctan2(sin_a, cos_a)))
+            distance = float(np.clip(action_params[2], 0.5, 15.0))
+            self._move_tangentially(angle_deg, distance)
+
+        elif action_type == 1:
+            # Linear move: [distance, -, -]
+            distance = float(np.clip(action_params[0], -25.0, 25.0))
+            self._move_forward(distance)
+
+        elif action_type == 2:
+            # Yaw (turn left/right): [sin_angle, cos_angle, -]
+            sin_a = float(action_params[0])
+            cos_a = float(action_params[1])
+            rotation = float(np.degrees(np.arctan2(sin_a, cos_a)))
+            rotation = float(np.clip(rotation, -45.0, 45.0))
+            self.agent_rot[1] += rotation
+
+        elif action_type == 3:
+            # Pitch (look up/down): [sin_angle, cos_angle, -]
+            sin_a = float(action_params[0])
+            cos_a = float(action_params[1])
+            rotation = float(np.degrees(np.arctan2(sin_a, cos_a)))
+            rotation = float(np.clip(rotation, -45.0, 45.0))
+            self.agent_rot[0] += rotation
+
+        elif action_type == 4:
+            # Roll (tilt): [sin_angle, cos_angle, -]
+            sin_a = float(action_params[0])
+            cos_a = float(action_params[1])
+            rotation = float(np.degrees(np.arctan2(sin_a, cos_a)))
+            rotation = float(np.clip(rotation, -45.0, 45.0))
+            self.agent_rot[2] += rotation
+
+        elif action_type == 5:
+            # Orient horizontal: [rotation_deg, left_dist, fwd_dist]
+            rotation = float(action_params[0])
+            left_dist = float(action_params[1])
+            fwd_dist = float(action_params[2])
+            self._orient_horizontal(rotation, fwd_dist, left_dist)
+
+        elif action_type == 6:
+            # Orient vertical: [rotation_deg, down_dist, fwd_dist]
+            rotation = float(action_params[0])
+            down_dist = float(action_params[1])
+            fwd_dist = float(action_params[2])
+            self._orient_vertical(rotation, fwd_dist, down_dist)
+
+        elif action_type == 7:
+            # Detach: params ignored, uses current goal
+            if (
+                hasattr(self, "_current_goal")
+                and self._current_goal is not None
+            ):
+                self._detach_simple(goal_pose=self._current_goal)
+
+        self.agent_rot = self._normalize_euler(self.agent_rot)
+        return self.get_sensor_data()
+
+    @property
+    def supports_continuous(self) -> bool:
+        """LightweightEnv supports continuous actions."""
+        return True
+
+    @property
+    def supports_offline_retrain(self) -> bool:
+        """Trimesh is fast enough for offline retrain."""
+        return True
 
 def is_on_same_cube_side(pos_a, pos_b, cube_side=42.0, atol=1e-5):
     """Checks whether two points lie on the same side of a cube (e.g., both at +X when x = +42).

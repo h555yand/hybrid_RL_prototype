@@ -231,6 +231,8 @@ class RLGoalApproachExperiment:
         self.ycb_config = self.config.get("ycb_config", {})
         self.do_ycb_mujoco_eval = self.config.get("do_ycb_mujoco_eval", False)
         self.ycb_mujoco_config = self.config.get("ycb_mujoco_config", {})
+        self.do_ycb_mujoco_adaptive = self.config.get("do_ycb_mujoco_adaptive", False)
+        self.ycb_mujoco_adaptive_config = self.config.get("ycb_mujoco_adaptive_config", {})
 
     # ══════════════════════════════════════════════════════
     # Model path helpers
@@ -731,6 +733,8 @@ class RLGoalApproachExperiment:
             self._run_ycb_eval()
         if self.do_ycb_mujoco_eval:
             self._run_ycb_mujoco_eval()
+        if self.do_ycb_mujoco_adaptive:
+            self._run_ycb_mujoco_adaptive()
 
         elapsed = time.time() - start_time
         logger.info("Experiment complete in %.1fs", elapsed)
@@ -2449,121 +2453,112 @@ class RLGoalApproachExperiment:
         return results
 
     # ══════════════════════════════════════════════════════
-    # Adaptive
+    # Adaptive (generic, environment-agnostic)
     # ══════════════════════════════════════════════════════
-    def _run_adaptive(self) -> None:
-        """Run adaptive mode with Q-store + SAC arbitration.
-        
-        Synergy: Q-store chooses action type (familiar states),
-        SAC provides continuous params. When Q is not confident,
-        SAC decides both type and params.
+
+    def _run_adaptive_generic(
+        self,
+        online_env,
+        offline_env,
+        object_name: str,
+        num_episodes: int,
+        curriculum_levels: list,
+        curriculum_filters: list,
+        adapt_q_dir: str,
+        adapt_sac_dir: str,
+        adapt_seed: int,
+        log_dir: Path,
+        mesh_path: str,
+        visualizer=None,
+    ) -> dict:
+        """Unified adaptive loop for any environment.
+
+        Online interaction uses online_env (MuJoCo, robot, trimesh).
+        Offline retrain uses offline_env (always trimesh — fast).
+        State is frame-invariant: relative features in agent's local frame.
+
+        Args:
+            online_env: Environment for online interaction.
+                Must implement RLEnvironment protocol.
+            offline_env: Fast environment for offline retrain.
+                Must have supports_offline_retrain=True.
+            object_name: Name for logging and file paths.
+            num_episodes: Total adaptive episodes.
+            curriculum_levels: Distance ranges per level.
+            curriculum_filters: Per-level filters.
+            adapt_q_dir: Save path for adaptive Q-store.
+            adapt_sac_dir: Save path for adaptive SAC.
+            adapt_seed: Random seed.
+            log_dir: Directory for logs/snapshots.
+            mesh_path: Path to mesh STL (for offline retrain).
+            visualizer: Optional EpisodeVisualizer instance.
+
+        Returns:
+            Final results dict.
         """
+        from collections import Counter
+
         logger.info("=" * 60)
-        logger.info("Adaptive: %s", self.adaptive_mesh)
+        logger.info(
+            "Adaptive Generic: %s (%d episodes)",
+            object_name, num_episodes,
+        )
         logger.info("=" * 60)
 
-        mesh_path = str(
-            self.data_dir / f"{self.adaptive_mesh}.stl"
+        np.random.seed(adapt_seed)
+        random.seed(adapt_seed)
+
+        num_types = len(ExperienceExtractor.get_type_names())
+        type_names = ExperienceExtractor.get_type_names()
+
+        adaptive_cfg = {**self.rl_config, "mode": "adaptive"}
+        adaptive_max_steps = self.rl_config.get(
+            "max_steps_per_goal", 400
         )
 
-        adapt_seed = self.train_seeds[0]
-        np.random.seed(self.adapt_seed)
-        random.seed(self.adapt_seed)
-        env = LightweightEnv(mesh_path, seed=adapt_seed)
-
-        num_types = len(
-            ExperienceExtractor.get_type_names()
+        # ═══ Load controller ═══
+        q_load_dir = (
+            adapt_q_dir
+            if (Path(adapt_q_dir) / "config.json").exists()
+            else self._q_model_dir(adapt_seed)
         )
+        logger.info("Loading Q-store from: %s", q_load_dir)
 
-        # Load Q-store: adaptive if exists, otherwise training
-        adaptive_q_dir = str(
-            self.runs_dir
-            / f"adaptive_q_seed_{adapt_seed}"
-        )
-        if (
-            Path(adaptive_q_dir) / "config.json"
-        ).exists():
-            q_load_dir = adaptive_q_dir
-            logger.info(
-                "Loading Q-store from adaptive: %s",
-                q_load_dir,
-            )
-        else:
-            q_load_dir = self._q_model_dir(adapt_seed)
-            logger.info(
-                "Loading Q-store from training: %s",
-                q_load_dir,
-            )
-
-        adaptive_cfg = {
-            **self.rl_config,
-            "mode": "adaptive",
-        }
         controller = RLGoalApproachController.load(
             q_load_dir,
-            agent_id=f"{self.adaptive_mesh}_adaptive",
+            agent_id=f"{object_name}_adaptive",
             config=adaptive_cfg,
-        )
-        # Normalization stays frozen from training.
-        # Unfreezing happens only during offline retrain
-        # (via unfreeze_normalization in run_episodes config).
-        logger.info(
-            "Adaptive mode: normalization frozen from training, "
-            "will unfreeze only during offline retrain"
         )
         controller._collision_stats = {}
 
-        # Load SAC: adaptive if exists, otherwise training
-        adaptive_sac_dir = str(
-            self.runs_dir
-            / f"adaptive_sac_seed_{self.sac_seed}"
-        )
-        sac_trainer = PSACTrainer(
-            state_dim=self.rl_config.get("state_dim", 20),
-            num_types=num_types,
-        )
-        if (
-            Path(adaptive_sac_dir) / "sac_actor.pt"
-        ).exists():
-            sac_trainer.load(adaptive_sac_dir)
-            logger.info(
-                "Loading SAC from adaptive: %s",
-                adaptive_sac_dir,
+        # ═══ Load SAC ═══
+        sac_trainer = None
+        sac_model_dir = self._sac_model_dir(self.sac_seed)
+        if (Path(sac_model_dir) / "sac_actor.pt").exists():
+            sac_trainer = PSACTrainer(
+                state_dim=self.rl_config.get("state_dim", 20),
+                num_types=num_types,
             )
-        else:
-            sac_trainer.load(
-                self._sac_model_dir(self.sac_seed)
-            )
-            logger.info(
-                "Loading SAC from training: %s",
-                self._sac_model_dir(self.sac_seed),
-            )
+            if (Path(adapt_sac_dir) / "sac_actor.pt").exists():
+                sac_trainer.load(adapt_sac_dir)
+                logger.info("SAC loaded from adaptive: %s", adapt_sac_dir)
+            else:
+                sac_trainer.load(sac_model_dir)
+                logger.info("SAC loaded from training: %s", sac_model_dir)
+            sac_trainer.buffer.set_current_mesh(object_name)
 
-        if sac_trainer is not None:
-            sac_trainer.buffer.set_current_mesh(
-                self.adaptive_mesh
-            )
-
-        # Strategic SAC
-        controller.strategic_sac = None
-
-        adapt_q_dir = str(
-            self.runs_dir
-            / f"adaptive_q_seed_{adapt_seed}"
-        )
-        adapt_sac_dir = str(
-            self.runs_dir
-            / f"adaptive_sac_seed_{self.sac_seed}"
-        )
+        # ═══ Manager (uses offline_env for retrain) ═══
         manager = AdaptiveTrainingManager(
             controller=controller,
-            env=env,
+            env=offline_env,
             config=adaptive_cfg,
             runs_dir=str(self.runs_dir),
             mesh_path=mesh_path,
             q_save_dir=adapt_q_dir,
             sac_save_dir=adapt_sac_dir,
-            offline_check_window=self.config.get("offline_check_window", 50),
+            offline_check_window=self.config.get(
+                "offline_check_window", 50
+            ),
             promote_threshold=self.promote_threshold,
             promote_window=self.promote_window,
             online_sac_update_every=100,
@@ -2571,10 +2566,7 @@ class RLGoalApproachExperiment:
         )
         manager.sac_trainer = sac_trainer
 
-        # ═══ Sliding window RunningQStats for adaptive ═══
-        # Welford's accumulates all history and stops adapting
-        # on new objects. Sliding window forgets old distribution
-        # and adapts to cup within ~55 episodes.
+        # ═══ Sliding window RunningQStats ═══
         _ADAPTIVE_Q_STATS_WINDOW = 200_000
         manager.arbitrator._running_q_stats_free = RunningQStats(
             warmup=200, window=_ADAPTIVE_Q_STATS_WINDOW
@@ -2584,112 +2576,66 @@ class RLGoalApproachExperiment:
         )
         manager.arbitrator._warmup_running_stats()
 
-        if sac_trainer.strategic_detach_sac is not None:
-            manager.arbitrator._sac_strategic_detach = (
-                sac_trainer.strategic_detach_sac
-            )
-        if (
-            sac_trainer.strategic_direction_sac
-            is not None
-        ):
-            manager.arbitrator._sac_strategic_direction = (
-                sac_trainer.strategic_direction_sac
-            )
+        # ═══ Strategic SAC ═══
+        if sac_trainer is not None:
+            if sac_trainer.strategic_detach_sac is not None:
+                manager.arbitrator._sac_strategic_detach = (
+                    sac_trainer.strategic_detach_sac
+                )
+            if sac_trainer.strategic_direction_sac is not None:
+                manager.arbitrator._sac_strategic_direction = (
+                    sac_trainer.strategic_direction_sac
+                )
 
-        # Metrics tracking
+        # ═══ Tracking state ═══
         episode_log: list[dict[str, Any]] = []
         snapshot_log: list[dict[str, Any]] = []
         action_counts: dict[str, int] = {}
         collision_counts: dict[str, int] = {}
         source_counts: dict[str, int] = {
-            "q_store": 0,
-            "sac": 0,
-            "blend": 0,
-            "heuristic": 0,
+            "q_store": 0, "sac": 0, "blend": 0, "heuristic": 0,
         }
         total_steps_adaptive = 0
         rolling_successes: list[bool] = []
-        # ═══ Episode length tracking ═══
         all_episode_steps: list[int] = []
         all_success_steps: list[int] = []
-        # Per-level
         level_episode_steps: dict[int, list[int]] = {}
         level_success_steps: dict[int, list[int]] = {}
-
-        adaptive_log_dir = (
-            self.data_dir
-            / f"adaptive_logs_{self.adaptive_mesh}"
-        )
-        adaptive_log_dir.mkdir(parents=True, exist_ok=True)
-
-        # Per-level per-source tracking
         per_level_source_stats: dict[int, dict[str, dict]] = {}
+        ep_successes: list[bool] = []
 
-        def _get_level_source(lvl, src):
-                if lvl not in per_level_source_stats:
-                    per_level_source_stats[lvl] = {}
-                if src not in per_level_source_stats[lvl]:
-                    per_level_source_stats[lvl][src] = {
-                        "success": 0,
-                        "collision": 0,
-                        "timeout": 0,
-                        "final_distances": [],
-                        "episode_steps": [],
-                        "success_steps": [],
-                    }
-                return per_level_source_stats[lvl][src]
-        
-        blend_final_distances: list[float] = []
-        blend_episode_steps: list[int] = []
-        heuristic_final_distances: list[float] = []
-        heuristic_episode_steps: list[int] = []
-        q_final_distances: list[float] = []
-        sac_final_distances: list[float] = []
-        q_episode_steps: list[int] = []
-        sac_episode_steps: list[int] = []
-        adaptive_max_steps = self.rl_config.get(
-            "max_steps_per_goal", 400
-        )
-
-        collision_stats_before = dict(
-            controller._collision_stats
-        )
-
-        # Curriculum for adaptive
-        adaptive_curriculum = list(self.curriculum_levels)
+        # Curriculum state
         adaptive_level = 0
         adaptive_promote_window: list[bool] = []
-        adaptive_promote_threshold = self.promote_threshold
-        adaptive_promote_window_size = self.promote_window
+        collision_stats_before: dict = dict(controller._collision_stats)
 
-        ep_successes = []
+        log_dir.mkdir(parents=True, exist_ok=True)
 
-        # Create interpreter for continuous action execution
-        interpreter = ActionInterpreter(env)
-        type_names = ExperienceExtractor.get_type_names()
+        def _get_level_source(lvl, src):
+            if lvl not in per_level_source_stats:
+                per_level_source_stats[lvl] = {}
+            if src not in per_level_source_stats[lvl]:
+                per_level_source_stats[lvl][src] = {
+                    "success": 0, "collision": 0, "timeout": 0,
+                    "final_distances": [], "episode_steps": [],
+                    "success_steps": [],
+                }
+            return per_level_source_stats[lvl][src]
 
-        for episode in range(self.adaptive_episodes):
-            env.reset()
-            start_pos = env.get_pose()[:3]
+        # ═══ Main loop ═══
+        for episode in range(num_episodes):
+            online_env.reset()
+            start_pos = online_env.get_pose()[:3]
 
-            # Curriculum goal generation with filters
-            min_dist, max_dist = adaptive_curriculum[
-                adaptive_level
-            ]
-
+            # ═══ Goal generation with filters ═══
+            min_dist, max_dist = curriculum_levels[adaptive_level]
             level_filter = (
-                self.curriculum_filters[adaptive_level]
-                if adaptive_level
-                < len(self.curriculum_filters)
+                curriculum_filters[adaptive_level]
+                if adaptive_level < len(curriculum_filters)
                 else {}
             )
-            require_same_side = level_filter.get(
-                "same_side", None
-            )
-            require_path_blocked = level_filter.get(
-                "path_blocked", None
-            )
-
+            require_same_side = level_filter.get("same_side", None)
+            require_path_blocked = level_filter.get("path_blocked", None)
             max_goal_attempts = (
                 50
                 if (
@@ -2703,10 +2649,10 @@ class RLGoalApproachExperiment:
             is_fallback_episode = False
 
             for _attempt in range(max_goal_attempts):
-                env.reset()  # ← новый start каждую попытку
-                start_pos = env.get_pose()[:3]
+                online_env.reset()
+                start_pos = online_env.get_pose()[:3]
 
-                candidate = env.get_random_surface_point(
+                candidate = online_env.get_random_surface_point(
                     reference_pos=start_pos,
                     min_dist=min_dist,
                     max_dist=max_dist,
@@ -2714,20 +2660,21 @@ class RLGoalApproachExperiment:
                     mesh_sample=True,
                 )
 
-                if require_same_side is not None:
-                    same_side = _is_reachable_by_surface(
-                        env, start_pos, candidate[:3],
-                    )
-                    if same_side != require_same_side:
-                        continue
+                if require_same_side is not None or require_path_blocked is not None:
+                    online_env.set_goal(candidate)
+                    sensor_check = online_env.get_sensor_data()
 
-                if require_path_blocked is not None:
-                    env._current_goal = np.concatenate([
-                        candidate[:3], candidate[3:],
-                    ])
-                    sensor = env.get_sensor_data()
-                    pb = sensor.get("path_blocked", False)
-                    if pb != require_path_blocked:
+                    if (
+                        require_same_side is not None
+                        and sensor_check.get("same_side", True)
+                        != require_same_side
+                    ):
+                        continue
+                    if (
+                        require_path_blocked is not None
+                        and sensor_check.get("path_blocked", False)
+                        != require_path_blocked
+                    ):
                         continue
 
                 goal_pose = candidate
@@ -2735,14 +2682,13 @@ class RLGoalApproachExperiment:
 
             if goal_pose is None:
                 logger.warning(
-                    "Adaptive ep %d: L%d filter %s not satisfied "
-                    "in %d attempts, using unfiltered goal",
-                    episode, adaptive_level, level_filter,
-                    max_goal_attempts,
+                    "Adaptive ep %d: L%d filter not satisfied, "
+                    "using unfiltered goal",
+                    episode, adaptive_level,
                 )
-                env.reset()
-                start_pos = env.get_pose()[:3]
-                goal_pose = env.get_random_surface_point(
+                online_env.reset()
+                start_pos = online_env.get_pose()[:3]
+                goal_pose = online_env.get_random_surface_point(
                     reference_pos=start_pos,
                     min_dist=min_dist,
                     max_dist=max_dist,
@@ -2751,61 +2697,55 @@ class RLGoalApproachExperiment:
                 )
                 is_fallback_episode = True
 
-
             controller.set_new_goal(goal_pose, start_pos)
-            env.set_goal(goal_pose)
-
-            # Tell arbitrator about new episode and level
+            online_env.set_goal(goal_pose)
             manager.arbitrator.start_episode(level=adaptive_level)
 
             goals_before = controller._total_goals_reached
             ep_steps = 0
             ep_sources: list[str] = []
-            ep_actions: list[int] = []
-            current_poses = []
-            action_explanations = []
+            current_poses: list[np.ndarray] = [online_env.get_pose().copy()]
+            action_explanations: list[str] = []
+            last_transitions: list = []
+            collision_stats_before = dict(controller._collision_stats)
 
-            # Save transitions before episode
-            collision_stats_before = dict(
-                controller._collision_stats
-            )
-
+            # ═══ Step loop ═══
             for step in range(adaptive_max_steps):
-                pose = env.get_pose()
-                current_poses.append(pose.copy())
-                sensor = env.get_sensor_data()
+                pose = online_env.get_pose()
+                sensor = online_env.get_sensor_data()
                 state = controller._compute_state(pose, sensor)
 
-                # Arbitrator returns (type, params, source)
+                # Arbitrator decides action
                 action_type, action_params, source = (
                     manager.get_action(state, pose, sensor)
                 )
                 controller._current_source = source
 
-                # Convert to discrete for Q-store learning
-                discrete_idx = sac_to_discrete(
-                    action_type, action_params
-                )
+                # Discrete index for Q-store learning
+                discrete_idx = sac_to_discrete(action_type, action_params)
 
                 # Save transitions before update_only clears them
-                last_transitions = (
-                    controller._episode_transitions.copy()
-                )
+                last_transitions = controller._episode_transitions.copy()
 
-                # Execute continuous action in environment
-                sensor_after = interpreter.execute(
-                    action_type, action_params
-                )
+                # ═══ KEY: use continuous params when available ═══
+                if online_env.supports_continuous:
+                    sensor_after = online_env.step_continuous(
+                        action_type, action_params
+                    )
+                else:
+                    sensor_after = online_env.step_discrete(
+                        discrete_idx, controller.action_space
+                    )
 
                 # Q-store learns from discrete action
-                pose_after = env.get_pose()
-                _st, done = controller.update_only(
+                pose_after = online_env.get_pose()
+                _, done = controller.update_only(
                     pose_after, sensor_after, discrete_idx
                 )
 
                 ep_steps += 1
                 total_steps_adaptive += 1
-                ep_actions.append(discrete_idx)
+                current_poses.append(online_env.get_pose().copy())
 
                 # Track action type
                 act_name = type_names.get(
@@ -2813,80 +2753,6 @@ class RLGoalApproachExperiment:
                 )
                 action_counts[act_name] = (
                     action_counts.get(act_name, 0) + 1
-                )
-                dist_to_goal = float(np.linalg.norm(goal_pose[:3] - pose[:3]))
-                sensor_normal = sensor.get("point_normal", None)
-                normal_str = ""
-                if sensor_normal is not None:
-                    normal_str = (
-                        f", n=[{sensor_normal[0]:.2f},"
-                        f"{sensor_normal[1]:.2f},"
-                        f"{sensor_normal[2]:.2f}]"
-                    )
-                phase_str = getattr(controller, "_current_phase", "")
-                same_side = sensor.get("same_side", True)
-                path_blocked = sensor.get("path_blocked", False)
-                surface_debug = getattr(controller, "_last_surface_debug", None)
-                surface_str = ""
-                if surface_debug is not None:
-                    if 'best_dir' in surface_debug:
-                        surface_str = (
-                            f", e_t=[{surface_debug['e_t'][0]:.1f},"
-                            f"{surface_debug['e_t'][1]:.1f},"
-                            f"{surface_debug['e_t'][2]:.1f}]"
-                            f", best_dir={surface_debug['best_dir']}"
-                            f", scores={surface_debug['scores']}"
-                        )
-                    else:
-                        surface_str = (
-                            f", note={surface_debug.get('note', 'unknown')}"
-                        )
-                    if "e_t_direct" in surface_debug:
-                        d = surface_debug["e_t_direct"]
-                        surface_str += (
-                            f", e_t_direct=[{d[0]:.1f},{d[1]:.1f},{d[2]:.1f}]"
-                        )
-                    if "use_geodesic" in surface_debug:
-                        surface_str += f", geo={surface_debug['use_geodesic']}"
-                    if "goal_dir_world" in surface_debug:
-                        g = surface_debug["goal_dir_world"]
-                        surface_str += (
-                            f", goal_w=[{g[0]:.1f},{g[1]:.1f},{g[2]:.1f}]"
-                        )
-                    # ═══ ADD THIS BLOCK ═══
-                    rim_debug = getattr(controller, "_rim_debug", None)
-                    if rim_debug is not None:
-                        surface_str += (
-                            f", is_horiz={rim_debug.get('is_horizontal')}"
-                        )
-                        if rim_debug.get("is_horizontal"):
-                            eh = rim_debug.get("e_t_horiz", [0, 0, 0])
-                            surface_str += (
-                                f", up={rim_debug.get('up_dir')}"
-                                f", h_len={rim_debug.get('horiz_len')}"
-                                f", v_comp={rim_debug.get('vert_comp')}"
-                                f", h_ratio={rim_debug.get('horiz_ratio')}"
-                                f", aw={rim_debug.get('away_weight')}"
-                                f", e_t_h=[{eh[0]:.1f},{eh[1]:.1f},{eh[2]:.1f}]"
-                            )
-                        else:
-                            surface_str += (
-                                f", n_dot_up={rim_debug.get('n_dot_up')}"
-                            )
-                        controller._rim_debug = None
-                    # ═══ END OF NEW BLOCK ═══
-                    controller._last_surface_debug = None
-
-                action_explanations.append(
-                    f"source: {source}, type: {act_name}, "
-                    f"params: [{action_params[0]:.2f}, "
-                    f"{action_params[1]:.2f}, "
-                    f"{action_params[2]:.2f}], "
-                    f"dist={dist_to_goal:.1f}, "
-                    f"phase={phase_str}, "
-                    f"ss={int(same_side)}, pb={int(path_blocked)}"
-                    f"{normal_str}"
-                    f"{surface_str}"
                 )
 
                 # Track source
@@ -2910,19 +2776,24 @@ class RLGoalApproachExperiment:
                 )
                 ep_sources.append(source_key)
 
+                # Action explanation for logging
+                dist_to_goal = float(
+                    np.linalg.norm(goal_pose[:3] - pose[:3])
+                )
+                action_explanations.append(
+                    f"src={source} | {act_name} | "
+                    f"dist={dist_to_goal:.1f}"
+                )
+
                 if done:
                     break
 
+            # ═══ Episode result ═══
             success = (
-                controller._total_goals_reached
-                > goals_before
+                controller._total_goals_reached > goals_before
             )
-
             ep_successes.append(success)
-            total_episodes_rate = (
-                sum(ep_successes) / len(ep_successes)
-            )
-            # ═══ Track episode length ═══
+
             all_episode_steps.append(ep_steps)
             if success:
                 all_success_steps.append(ep_steps)
@@ -2934,7 +2805,7 @@ class RLGoalApproachExperiment:
             if success:
                 level_success_steps[adaptive_level].append(ep_steps)
 
-            # Determine termination
+            # Termination type
             if success:
                 termination = "success"
             elif step == (adaptive_max_steps - 1):
@@ -2942,99 +2813,19 @@ class RLGoalApproachExperiment:
             else:
                 termination = "collision"
 
+            # Collision tracking
             if termination == "collision":
-                for act_name, count in (
+                for act_name_c, count in (
                     controller._collision_stats.items()
                 ):
-                    prev = collision_stats_before.get(
-                        act_name, 0
-                    )
+                    prev = collision_stats_before.get(act_name_c, 0)
                     if count > prev:
-                        collision_counts[act_name] = (
-                            collision_counts.get(act_name, 0)
+                        collision_counts[act_name_c] = (
+                            collision_counts.get(act_name_c, 0)
                             + (count - prev)
                         )
 
-            collision_stats_before = dict(
-                controller._collision_stats
-            )
-
-            transitions = last_transitions
-
-            manager.on_episode_complete(
-                success=success,
-                transitions=transitions,
-            )
-            if manager._offline_just_completed:
-                rolling_successes.clear()
-                manager._offline_just_completed = False
-
-            # Write mode changes to JSON
-            while manager.mode_changes:
-                change = manager.mode_changes.pop(0)
-                change["recent_episodes"] = episode_log[-10:]
-                change_idx = len([
-                    f for f in adaptive_log_dir.iterdir()
-                    if f.name.startswith("mode_change_")
-                ])
-                change_path = (
-                    adaptive_log_dir
-                    / f"mode_change_{change_idx:04d}_ep_{change['episode']:05d}.json"
-                )
-                with change_path.open("w") as f:
-                    json.dump(change, f, indent=2)
-                logger.info(
-                    "Mode change saved: %s → %s at ep %d to %s",
-                    change["from_mode"],
-                    change["to_mode"],
-                    change["episode"],
-                    change_path,
-                )
-
-            manager.arbitrator.on_episode_end(success)
-
-            # Curriculum promote
-            if not is_fallback_episode:
-                adaptive_promote_window.append(success)
-            if (
-                len(adaptive_promote_window)
-                > adaptive_promote_window_size
-            ):
-                adaptive_promote_window.pop(0)
-            if (
-                len(adaptive_promote_window)
-                == adaptive_promote_window_size
-                and adaptive_level
-                < len(adaptive_curriculum) - 1
-            ):
-                promote_rate = (
-                    sum(adaptive_promote_window)
-                    / adaptive_promote_window_size
-                )
-                if promote_rate >= adaptive_promote_threshold:
-                    adaptive_level += 1
-                    adaptive_promote_window = []
-                    logger.info(
-                        "Adaptive curriculum: promoted to "
-                        "level %d (%s mm) at ep %d "
-                        "(rate=%.3f)",
-                        adaptive_level,
-                        adaptive_curriculum[adaptive_level],
-                        episode + 1,
-                        promote_rate,
-                    )
-
-            rolling_successes.append(success)
-            if len(rolling_successes) > 100:
-                rolling_successes.pop(0)
-            rolling_rate = (
-                sum(rolling_successes)
-                / len(rolling_successes)
-            )
-
-            # Dominant source for this episode
-            from collections import Counter
-
+            # Per-source per-level tracking
             source_counter = Counter(ep_sources)
             dominant_source_key = (
                 source_counter.most_common(1)[0][0]
@@ -3042,17 +2833,81 @@ class RLGoalApproachExperiment:
                 else "heuristic"
             )
 
-            # Per-episode log
+            src_stats = _get_level_source(
+                adaptive_level, dominant_source_key
+            )
+            src_stats[termination] = (
+                src_stats.get(termination, 0) + 1
+            )
+            final_pose = online_env.get_pose()
+            final_dist = float(
+                np.linalg.norm(goal_pose[:3] - final_pose[:3])
+            )
+            src_stats["final_distances"].append(round(final_dist, 1))
+            src_stats["episode_steps"].append(ep_steps)
+            if success:
+                src_stats["success_steps"].append(ep_steps)
+
+            # Manager update (offline retrain uses offline_env)
+            manager.on_episode_complete(
+                success=success, transitions=last_transitions,
+            )
+            if manager._offline_just_completed:
+                rolling_successes.clear()
+                manager._offline_just_completed = False
+
+            # Mode change logging
+            while manager.mode_changes:
+                change = manager.mode_changes.pop(0)
+                change["recent_episodes"] = episode_log[-10:]
+                change_idx = len([
+                    f for f in log_dir.iterdir()
+                    if f.name.startswith("mode_change_")
+                ])
+                change_path = (
+                    log_dir
+                    / f"mode_change_{change_idx:04d}"
+                    f"_ep_{change['episode']:05d}.json"
+                )
+                with change_path.open("w") as f:
+                    json.dump(change, f, indent=2)
+
+            manager.arbitrator.on_episode_end(success)
+
+            # Curriculum promote
+            if not is_fallback_episode:
+                adaptive_promote_window.append(success)
+            if len(adaptive_promote_window) > self.promote_window:
+                adaptive_promote_window.pop(0)
+            if (
+                len(adaptive_promote_window) == self.promote_window
+                and adaptive_level < len(curriculum_levels) - 1
+            ):
+                promote_rate = (
+                    sum(adaptive_promote_window)
+                    / self.promote_window
+                )
+                if promote_rate >= self.promote_threshold:
+                    adaptive_level += 1
+                    adaptive_promote_window = []
+                    logger.info(
+                        "Promoted to level %d at ep %d (rate=%.3f)",
+                        adaptive_level, episode + 1, promote_rate,
+                    )
+
+            # Rolling success rate
+            rolling_successes.append(success)
+            if len(rolling_successes) > 100:
+                rolling_successes.pop(0)
+            rolling_rate = (
+                sum(rolling_successes) / len(rolling_successes)
+            )
+            total_rate = sum(ep_successes) / len(ep_successes)
+
+            # Episode log entry
             start_dist = float(
                 np.linalg.norm(goal_pose[:3] - start_pos)
             )
-            final_pose = env.get_pose()
-            final_dist = float(
-                np.linalg.norm(
-                    goal_pose[:3] - final_pose[:3]
-                )
-            )
-
             episode_log.append({
                 "episode": episode,
                 "success": success,
@@ -3062,307 +2917,104 @@ class RLGoalApproachExperiment:
                 "final_distance": round(final_dist, 1),
                 "dominant_source": dominant_source_key,
                 "last_source_detail": source,
-                "rolling_success_rate": round(
-                    rolling_rate, 3
-                ),
+                "rolling_success_rate": round(rolling_rate, 3),
                 "mode": manager.mode,
                 "curriculum_level": adaptive_level,
             })
 
-            # Per-source per-level tracking
-            src_stats = _get_level_source(
-                adaptive_level, dominant_source_key
-            )
-            src_stats[termination] = (
-                src_stats.get(termination, 0) + 1
-            )
-            src_stats["final_distances"].append(
-                round(final_dist, 1)
-            )
-            src_stats["episode_steps"].append(ep_steps)
-            if success:
-                src_stats["success_steps"].append(ep_steps)
-
-            # Snapshot every N episodes
-            if self.visualise and ((episode + 1) % 100 <= 0 or (episode + 1) == 1) and (episode + 1) >= 0:
-                vis_dir = (
-                    Path(adaptive_log_dir)
-                    / "visualizations"
+            # Visualization
+            if visualizer is not None:
+                visualizer.save_episode(
+                    env=online_env,
+                    episode=episode,
+                    level=adaptive_level,
+                    result=termination,
+                    goal_pose=goal_pose,
+                    poses=current_poses,
+                    actions=action_explanations,
+                    extra_info={
+                        "object": object_name,
+                        "mode": manager.mode,
+                        "source": dominant_source_key,
+                        "rolling_rate": round(rolling_rate, 3),
+                    },
                 )
-                if termination in ("success", "collision", "timeout"):
-                    _maybe_save_visualization(
-                        controller=controller,
-                        env=env,
-                        episode=episode,
-                        ep_result=termination,
-                        goal_pose=goal_pose,
-                        current_poses=current_poses,
-                        action_explanations=action_explanations,
-                        vis_dir=vis_dir,
-                        vis_filter=None,
-                        vis_counts=None,
-                        timeout_frame_interval=50,
-                        visualize_mode=self.visualise
-                    )
 
+            # ═══ Periodic snapshot ═══
             if (episode + 1) % _ADAPTIVE_LOG_INTERVAL == 0:
                 stats = manager.get_stats()
                 arb_stats = manager.arbitrator.get_stats()
-
-                total_src = max(
-                    sum(source_counts.values()), 1
-                )
-                total_act = max(
-                    sum(action_counts.values()), 1
-                )
+                total_src = max(sum(source_counts.values()), 1)
+                total_act = max(sum(action_counts.values()), 1)
                 successes_count = sum(
                     1 for e in episode_log if e["success"]
                 )
-                snapshot = {
-                    "episode": episode + 1,
-                    "rolling_success_rate": round(
-                        rolling_rate, 3
-                    ),
-                    "total_episodes_success_rate": round(
-                        total_episodes_rate, 3
-                    ),
-                    "curriculum_level": adaptive_level,
-                    "mode": stats["mode"],
-                    "total_episodes": episode + 1,
-                    "total_steps": total_steps_adaptive,
-                    "success_count": sum(
-                        1
-                        for e in episode_log
-                        if e["success"]
-                    ),
-                    "collision_count": sum(
-                        1
-                        for e in episode_log
-                        if e["termination"] == "collision"
-                    ),
-                    "timeout_count": sum(
-                        1
-                        for e in episode_log
-                        if e["termination"] == "timeout"
-                    ),
-                    "mean_episode_steps": round(
-                        float(np.mean(all_episode_steps))
-                        if all_episode_steps else 0, 1,
-                    ),
-                    "mean_success_steps": round(
-                        float(np.mean(all_success_steps))
-                        if all_success_steps else 0, 1,
-                    ),
-                    "total_steps_per_goal": round(
-                        total_steps_adaptive
-                        / max(successes_count, 1), 1,
-                    ),
-                    "source_distribution": {
-                        k: round(v / total_src, 3)
-                        for k, v in source_counts.items()
-                    },
-                    "action_distribution": {
-                        k: {
-                            "count": v,
-                            "rate": round(
-                                v / total_act, 4
-                            ),
-                        }
-                        for k, v in sorted(
-                            action_counts.items(),
-                            key=lambda x: -x[1],
-                        )
-                    },
-                    "collision_stats": dict(
-                        collision_counts
-                    ),
-                    "arbitrator": {
-                        "q_store_rate": arb_stats.get(
-                            "q_store_rate", 0
-                        ),
-                        "sac_rate": arb_stats.get(
-                            "sac_rate", 0
-                        ),
-                        "blend_rate": arb_stats.get(
-                            "blend_rate", 0
-                        ),
-                        "heuristic_rate": arb_stats.get(
-                            "heuristic_rate", 0
-                        ),
-                        "agreement_rate": arb_stats.get(
-                            "agreement_rate", 0
-                        ),
-                        "q_spread_mean": arb_stats.get(
-                            "q_spread_mean", 0
-                        ),
-                        "q_confidence_mean": arb_stats.get(
-                            "q_confidence_mean", 0
-                        ),
-                        "q_success_rate": arb_stats.get(
-                            "q_success_rate", 0
-                        ),
-                        "sac_success_rate": arb_stats.get(
-                            "sac_success_rate", 0
-                        ),
-                        "heuristic_success_rate": arb_stats.get(
-                            "heuristic_success_rate", 0
-                        ),
-                        "blend_success_rate": arb_stats.get(
-                            "blend_success_rate", 0
-                        ),
-                        "arbitrage_only": arb_stats.get(
-                            "arbitrage_only", {}
-                        ),
-                        "per_level_track_record": arb_stats.get(
-                            "per_level_track_record", {}
-                        ),
-                        "is_calibrating": arb_stats.get(
-                            "is_calibrating", False
-                        ),
-                    },
-                    "manager": {
-                        "sac_updates": stats.get(
-                            "total_sac_updates", 0
-                        ),
-                        "offline_iterations": stats.get(
-                            "total_offline_iterations",
-                            0,
-                        ),
-                    },
-                    "per_source_analysis": {
-                        lvl_key: {
-                            src_name: {
-                                "terminations": {
-                                    k: v
-                                    for k, v in src_data.items()
-                                    if k in (
-                                        "success",
-                                        "collision",
-                                        "timeout",
-                                    )
-                                },
-                                "total_episodes": (
-                                    src_data.get("success", 0)
-                                    + src_data.get("collision", 0)
-                                    + src_data.get("timeout", 0)
-                                ),
-                                "success_rate": round(
-                                    src_data.get("success", 0)
-                                    / max(
-                                        src_data.get("success", 0)
-                                        + src_data.get("collision", 0)
-                                        + src_data.get("timeout", 0),
-                                        1,
-                                    ),
-                                    3,
-                                ),
-                                "mean_final_distance": round(
-                                    float(
-                                        np.mean(
-                                            src_data[
-                                                "final_distances"
-                                            ]
-                                        )
-                                    )
-                                    if src_data[
-                                        "final_distances"
-                                    ]
-                                    else 0,
-                                    1,
-                                ),
-                                "near_miss_count": sum(
-                                    1
-                                    for d in src_data[
-                                        "final_distances"
-                                    ]
-                                    if 2.0 < d <= 5.0
-                                ),
-                                "mean_success_steps": round(
-                                    float(
-                                        np.mean(
-                                            src_data.get(
-                                                "success_steps",
-                                                [],
-                                            )
-                                        )
-                                    )
-                                    if src_data.get(
-                                        "success_steps"
-                                    )
-                                    else 0,
-                                    1,
-                                ),
-                            }
-                            for src_name, src_data in level_data.items()
-                        }
-                        for lvl_key, level_data in {
-                            f"level_{lvl}": sources
-                            for lvl, sources in sorted(
-                                per_level_source_stats.items()
-                            )
-                        }.items()
-                    },
-                }
+
+                snapshot = self._build_adaptive_snapshot(
+                    episode=episode + 1,
+                    rolling_rate=rolling_rate,
+                    total_rate=total_rate,
+                    adaptive_level=adaptive_level,
+                    stats=stats,
+                    arb_stats=arb_stats,
+                    total_steps_adaptive=total_steps_adaptive,
+                    episode_log=episode_log,
+                    source_counts=source_counts,
+                    action_counts=action_counts,
+                    collision_counts=collision_counts,
+                    all_episode_steps=all_episode_steps,
+                    all_success_steps=all_success_steps,
+                    per_level_source_stats=per_level_source_stats,
+                )
                 snapshot_log.append(snapshot)
 
                 snap_path = (
-                    adaptive_log_dir
-                    / f"snapshot_ep_{episode + 1:05d}.json"
+                    log_dir / f"snapshot_ep_{episode + 1:05d}.json"
                 )
                 with snap_path.open("w") as f:
                     json.dump(snapshot, f, indent=2)
 
                 logger.info(
-                    "Adaptive ep %d: rate=%.3f, "
-                    "mode=%s, saved to %s",
-                    episode + 1,
-                    rolling_rate,
-                    stats["mode"],
-                    snap_path,
+                    "Adaptive ep %d: rate=%.3f, mode=%s",
+                    episode + 1, rolling_rate, stats["mode"],
                 )
 
-        # Save adaptive models
+        # ═══ Save models ═══
         controller.save(adapt_q_dir)
-        logger.info(
-            "Adaptive Q-store saved to %s", adapt_q_dir
-        )
+        logger.info("Adaptive Q-store saved to %s", adapt_q_dir)
 
         if manager.sac_trainer:
             manager.sac_trainer.save(adapt_sac_dir)
-            logger.info(
-                "Adaptive SAC saved to %s", adapt_sac_dir
-            )
+            logger.info("Adaptive SAC saved to %s", adapt_sac_dir)
 
-        # Save comprehensive results
+        # ═══ Build final results ═══
+        total_ep = len(episode_log)
         total_src = max(sum(source_counts.values()), 1)
         total_act = max(sum(action_counts.values()), 1)
-        successes = sum(
+        successes_total = sum(
             1 for e in episode_log if e["success"]
         )
-        collisions = sum(
-            1
-            for e in episode_log
+        collisions_total = sum(
+            1 for e in episode_log
             if e["termination"] == "collision"
         )
-        timeouts = sum(
-            1
-            for e in episode_log
+        timeouts_total = sum(
+            1 for e in episode_log
             if e["termination"] == "timeout"
         )
-        total_ep = len(episode_log)
 
         final_results = {
-            "mesh": self.adaptive_mesh,
+            "object": object_name,
             "total_episodes": total_ep,
             "total_steps": total_steps_adaptive,
             "success_rate": round(
-                successes / max(total_ep, 1), 4
+                successes_total / max(total_ep, 1), 4
             ),
             "collision_rate": round(
-                collisions / max(total_ep, 1), 4
+                collisions_total / max(total_ep, 1), 4
             ),
             "timeout_rate": round(
-                timeouts / max(total_ep, 1), 4
+                timeouts_total / max(total_ep, 1), 4
             ),
             "mean_episode_steps": round(
                 float(np.mean(all_episode_steps))
@@ -3373,11 +3025,9 @@ class RLGoalApproachExperiment:
                 if all_success_steps else 0, 1,
             ),
             "total_steps_per_goal": round(
-                total_steps_adaptive
-                / max(successes, 1),
-                1,
+                total_steps_adaptive / max(successes_total, 1), 1,
             ),
-            # Per-level breakdown
+            "final_level": adaptive_level,
             "per_level_steps": {
                 f"level_{lvl}": {
                     "mean_episode_steps": round(
@@ -3403,125 +3053,475 @@ class RLGoalApproachExperiment:
                 for k, v in source_counts.items()
             },
             "action_distribution": {
-                k: {
-                    "count": v,
-                    "rate": round(v / total_act, 4),
-                }
+                k: {"count": v, "rate": round(v / total_act, 4)}
                 for k, v in sorted(
-                    action_counts.items(),
-                    key=lambda x: -x[1],
+                    action_counts.items(), key=lambda x: -x[1]
                 )
             },
             "collision_stats": dict(collision_counts),
             "snapshots": snapshot_log,
             "episode_log": episode_log,
-            "per_source_analysis": {
-                lvl_key: {
-                    src_name: {
-                        "terminations": {
-                            k: v
-                            for k, v in src_data.items()
-                            if k in (
-                                "success",
-                                "collision",
-                                "timeout",
-                            )
-                        },
-                        "total_episodes": (
-                            src_data.get("success", 0)
-                            + src_data.get("collision", 0)
-                            + src_data.get("timeout", 0)
-                        ),
-                        "success_rate": round(
-                            src_data.get("success", 0)
-                            / max(
-                                src_data.get("success", 0)
-                                + src_data.get("collision", 0)
-                                + src_data.get("timeout", 0),
-                                1,
-                            ),
-                            3,
-                        ),
-                        "mean_final_distance": round(
-                            float(
-                                np.mean(
-                                    src_data[
-                                        "final_distances"
-                                    ]
-                                )
-                            )
-                            if src_data[
-                                "final_distances"
-                            ]
-                            else 0,
-                            1,
-                        ),
-                        "near_miss_count": sum(
-                            1
-                            for d in src_data[
-                                "final_distances"
-                            ]
-                            if 2.0 < d <= 5.0
-                        ),
-                        "mean_success_steps": round(
-                            float(
-                                np.mean(
-                                    src_data.get(
-                                        "success_steps",
-                                        [],
-                                    )
-                                )
-                            )
-                            if src_data.get(
-                                "success_steps"
-                            )
-                            else 0,
-                            1,
-                        ),
-                    }
-                    for src_name, src_data in level_data.items()
-                }
-                for lvl_key, level_data in {
-                    f"level_{lvl}": sources
-                    for lvl, sources in sorted(
-                        per_level_source_stats.items()
-                    )
-                }.items()
-            },
+            "per_source_analysis": self._build_per_source_analysis(
+                per_level_source_stats
+            ),
         }
 
-        results_path = (
-            self.data_dir
-            / f"adaptive_result_{self.adaptive_mesh}.json"
+        # Save results
+        result_path = (
+            self.data_dir / f"adaptive_result_{object_name}.json"
         )
-        with results_path.open("w") as f:
+        with result_path.open("w") as f:
             json.dump(final_results, f, indent=2)
-        logger.info(
-            "Adaptive results saved to %s", results_path
-        )
 
         self._save_meta(
-            f"adaptive_{self.adaptive_mesh}",
+            f"adaptive_{object_name}",
             adapt_seed,
             {
-                "success_rate": final_results[
-                    "success_rate"
-                ],
+                "success_rate": final_results["success_rate"],
                 "total_episodes": total_ep,
                 "source_distribution": final_results[
                     "source_distribution"
                 ],
             },
-            [self.adaptive_mesh],
+            [object_name],
         )
 
         logger.info(
-            "Adaptive complete: success=%.3f, "
+            "Adaptive %s complete: success=%.3f, "
             "collision=%.3f, timeout=%.3f",
+            object_name,
             final_results["success_rate"],
             final_results["collision_rate"],
             final_results["timeout_rate"],
         )
+
+        return final_results
+
+    # ══════════════════════════════════════════════════════
+    # Adaptive helpers (extracted from inline code)
+    # ══════════════════════════════════════════════════════
+
+    @staticmethod
+    def _build_per_source_analysis(
+        per_level_source_stats: dict,
+    ) -> dict:
+        """Build per-source analysis dict for results JSON."""
+        result = {}
+        for lvl, level_data in sorted(
+            per_level_source_stats.items()
+        ):
+            level_key = f"level_{lvl}"
+            result[level_key] = {}
+            for src_name, src_data in level_data.items():
+                total = (
+                    src_data.get("success", 0)
+                    + src_data.get("collision", 0)
+                    + src_data.get("timeout", 0)
+                )
+                result[level_key][src_name] = {
+                    "terminations": {
+                        k: v
+                        for k, v in src_data.items()
+                        if k in ("success", "collision", "timeout")
+                    },
+                    "total_episodes": total,
+                    "success_rate": round(
+                        src_data.get("success", 0)
+                        / max(total, 1), 3,
+                    ),
+                    "mean_final_distance": round(
+                        float(np.mean(src_data["final_distances"]))
+                        if src_data["final_distances"] else 0, 1,
+                    ),
+                    "near_miss_count": sum(
+                        1 for d in src_data["final_distances"]
+                        if 2.0 < d <= 5.0
+                    ),
+                    "mean_success_steps": round(
+                        float(np.mean(
+                            src_data.get("success_steps", [])
+                        ))
+                        if src_data.get("success_steps") else 0, 1,
+                    ),
+                }
+        return result
+
+    @staticmethod
+    def _build_adaptive_snapshot(
+        episode: int,
+        rolling_rate: float,
+        total_rate: float,
+        adaptive_level: int,
+        stats: dict,
+        arb_stats: dict,
+        total_steps_adaptive: int,
+        episode_log: list,
+        source_counts: dict,
+        action_counts: dict,
+        collision_counts: dict,
+        all_episode_steps: list,
+        all_success_steps: list,
+        per_level_source_stats: dict,
+    ) -> dict:
+        """Build periodic snapshot dict."""
+        total_src = max(sum(source_counts.values()), 1)
+        total_act = max(sum(action_counts.values()), 1)
+        successes_count = sum(
+            1 for e in episode_log if e["success"]
+        )
+
+        return {
+            "episode": episode,
+            "rolling_success_rate": round(rolling_rate, 3),
+            "total_episodes_success_rate": round(total_rate, 3),
+            "curriculum_level": adaptive_level,
+            "mode": stats["mode"],
+            "total_episodes": episode,
+            "total_steps": total_steps_adaptive,
+            "success_count": successes_count,
+            "collision_count": sum(
+                1 for e in episode_log
+                if e["termination"] == "collision"
+            ),
+            "timeout_count": sum(
+                1 for e in episode_log
+                if e["termination"] == "timeout"
+            ),
+            "mean_episode_steps": round(
+                float(np.mean(all_episode_steps))
+                if all_episode_steps else 0, 1,
+            ),
+            "mean_success_steps": round(
+                float(np.mean(all_success_steps))
+                if all_success_steps else 0, 1,
+            ),
+            "total_steps_per_goal": round(
+                total_steps_adaptive
+                / max(successes_count, 1), 1,
+            ),
+            "source_distribution": {
+                k: round(v / total_src, 3)
+                for k, v in source_counts.items()
+            },
+            "action_distribution": {
+                k: {"count": v, "rate": round(v / total_act, 4)}
+                for k, v in sorted(
+                    action_counts.items(), key=lambda x: -x[1]
+                )
+            },
+            "collision_stats": dict(collision_counts),
+            "arbitrator": {
+                "q_store_rate": arb_stats.get("q_store_rate", 0),
+                "sac_rate": arb_stats.get("sac_rate", 0),
+                "blend_rate": arb_stats.get("blend_rate", 0),
+                "heuristic_rate": arb_stats.get("heuristic_rate", 0),
+                "agreement_rate": arb_stats.get("agreement_rate", 0),
+                "q_spread_mean": arb_stats.get("q_spread_mean", 0),
+                "q_confidence_mean": arb_stats.get(
+                    "q_confidence_mean", 0
+                ),
+                "q_success_rate": arb_stats.get("q_success_rate", 0),
+                "sac_success_rate": arb_stats.get(
+                    "sac_success_rate", 0
+                ),
+                "heuristic_success_rate": arb_stats.get(
+                    "heuristic_success_rate", 0
+                ),
+                "blend_success_rate": arb_stats.get(
+                    "blend_success_rate", 0
+                ),
+                "arbitrage_only": arb_stats.get(
+                    "arbitrage_only", {}
+                ),
+                "per_level_track_record": arb_stats.get(
+                    "per_level_track_record", {}
+                ),
+                "is_calibrating": arb_stats.get(
+                    "is_calibrating", False
+                ),
+            },
+            "manager": {
+                "sac_updates": stats.get("total_sac_updates", 0),
+                "offline_iterations": stats.get(
+                    "total_offline_iterations", 0
+                ),
+            },
+            "per_source_analysis": (
+                RLGoalApproachExperiment._build_per_source_analysis(
+                    per_level_source_stats
+                )
+            ),
+        }
+
+    # ══════════════════════════════════════════════════════
+    # Adaptive wrappers (delegate to _run_adaptive_generic)
+    # ══════════════════════════════════════════════════════
+
+    def _run_adaptive(self) -> None:
+        """Run adaptive mode on trimesh (LightweightEnv).
+
+        Both online and offline use the same trimesh env
+        since it's fast enough for both.
+        """
+        logger.info("=" * 60)
+        logger.info("Adaptive (trimesh): %s", self.adaptive_mesh)
+        logger.info("=" * 60)
+
+        mesh_path = str(
+            self.data_dir / f"{self.adaptive_mesh}.stl"
+        )
+        adapt_seed = self.train_seeds[0]
+
+        np.random.seed(self.adapt_seed)
+        random.seed(self.adapt_seed)
+
+        env = LightweightEnv(mesh_path, seed=adapt_seed)
+
+        adapt_q_dir = str(
+            self.runs_dir
+            / f"adaptive_q_seed_{adapt_seed}"
+        )
+        adapt_sac_dir = str(
+            self.runs_dir
+            / f"adaptive_sac_seed_{self.sac_seed}"
+        )
+        log_dir = (
+            self.data_dir
+            / f"adaptive_logs_{self.adaptive_mesh}"
+        )
+
+        # Visualizer
+        visualizer = None
+        if self.visualise:
+            from tbp.hybrid_rl.visualize_env import EpisodeVisualizer
+            visualizer = EpisodeVisualizer(
+                output_dir=self.data_dir,
+                mesh_name=self.adaptive_mesh,
+                stage="adaptive",
+                max_per_type_per_level=5,
+                num_levels=len(self.curriculum_levels),
+                visualize_mode=self.visualise,
+            )
+
+        self._run_adaptive_generic(
+            online_env=env,
+            offline_env=env,  # trimesh is fast — same env for both
+            object_name=self.adaptive_mesh,
+            num_episodes=self.adaptive_episodes,
+            curriculum_levels=self.curriculum_levels,
+            curriculum_filters=self.curriculum_filters,
+            adapt_q_dir=adapt_q_dir,
+            adapt_sac_dir=adapt_sac_dir,
+            adapt_seed=adapt_seed,
+            log_dir=log_dir,
+            mesh_path=mesh_path,
+            visualizer=visualizer,
+        )
+
+    def _run_ycb_mujoco_adaptive(self) -> None:
+        """Run adaptive mode on YCB objects using MuJoCo environment.
+
+        Online loop runs in MuJoCo (realistic sensor data).
+        Offline retrain runs in trimesh (fast, already works).
+        """
+        # Suppress MuJoCo Renderer cleanup error at exit
+        import mujoco as _mj
+        if hasattr(_mj.Renderer, '__del__'):
+            _orig_del = _mj.Renderer.__del__
+
+            def _safe_del(self):
+                try:
+                    _orig_del(self)
+                except (AttributeError, Exception):
+                    pass
+
+            _mj.Renderer.__del__ = _safe_del
+
+        logger.info("=" * 60)
+        logger.info("YCB MuJoCo Adaptive")
+        logger.info("=" * 60)
+
+        adapt_cfg = self.ycb_mujoco_adaptive_config
+        if not adapt_cfg:
+            adapt_cfg = self.ycb_mujoco_config
+
+        ycb_src_dir = adapt_cfg.get("ycb_src_dir")
+        if not ycb_src_dir:
+            logger.error(
+                "ycb_mujoco_adaptive_config.ycb_src_dir not set"
+            )
+            return
+        ycb_src_dir = Path(ycb_src_dir).expanduser()
+        if not ycb_src_dir.exists():
+            logger.error(
+                "YCB source dir not found: %s", ycb_src_dir
+            )
+            return
+
+        mujoco_data_path_raw = adapt_cfg.get("mujoco_data_path")
+        mujoco_data_path = (
+            str(Path(mujoco_data_path_raw).expanduser())
+            if mujoco_data_path_raw
+            else str(ycb_src_dir)
+        )
+
+        ycb_objects = adapt_cfg.get("objects", {})
+        adaptive_episodes = adapt_cfg.get(
+            "adaptive_episodes", 2000
+        )
+
+        ycb_data_dir = self.data_dir / "ycb"
+        ycb_data_dir.mkdir(parents=True, exist_ok=True)
+
+        curriculum_levels = [
+            tuple(level)
+            for level in adapt_cfg.get(
+                "curriculum_levels", self.curriculum_levels
+            )
+        ]
+        curriculum_filters = adapt_cfg.get(
+            "curriculum_filters", self.curriculum_filters
+        )
+
+        adapt_seed = self.train_seeds[0]
+        np.random.seed(adapt_seed)
+        random.seed(adapt_seed)
+
+        q_dir = self._q_model_dir(adapt_seed)
+        if not (Path(q_dir) / "config.json").exists():
+            logger.error("Q-store not found at %s", q_dir)
+            return
+
+        for local_name, obj_config in ycb_objects.items():
+            # ═══ Parse object config ═══
+            if isinstance(obj_config, dict):
+                mujoco_name = obj_config["mujoco_name"]
+                glb_name = obj_config.get(
+                    "glb_name", mujoco_name
+                )
+            else:
+                mujoco_name = obj_config
+                glb_name = obj_config
+
+            logger.info("-" * 40)
+            logger.info(
+                "YCB MuJoCo Adaptive: %s", local_name
+            )
+
+            # ═══ Verify MuJoCo object data ═══
+            obj_path = (
+                Path(mujoco_data_path)
+                / mujoco_name
+                / "textured.obj"
+            )
+            if not obj_path.exists():
+                logger.warning(
+                    "SKIP %s: %s not found",
+                    mujoco_name, obj_path,
+                )
+                continue
+
+            # ═══ Convert to mm STL ═══
+            stl_path = ycb_data_dir / f"{local_name}.stl"
+            if not stl_path.exists():
+                glb_path = (
+                    ycb_src_dir
+                    / glb_name
+                    / "google_16k"
+                    / "textured.glb"
+                )
+                src_mesh_path = (
+                    str(glb_path)
+                    if glb_path.exists()
+                    else str(obj_path)
+                )
+                import trimesh as _trimesh
+                mesh = _trimesh.load(
+                    src_mesh_path, force="mesh"
+                )
+                mesh_mm = mesh.copy()
+                mesh_mm.vertices *= 1000.0
+                mesh_mm.export(str(stl_path))
+                logger.info(
+                    "Converted: extents_m=%s, extents_mm=%s",
+                    mesh.extents.round(4).tolist(),
+                    mesh_mm.extents.round(1).tolist(),
+                )
+
+            # ═══ Create environments ═══
+            from tbp.hybrid_rl.mujoco_env_adapter import (
+                MuJoCoEnvAdapter,
+            )
+
+            try:
+                mj_env = MuJoCoEnvAdapter(
+                    mesh_path_mm=str(stl_path),
+                    mujoco_object_name=mujoco_name,
+                    mujoco_data_path=mujoco_data_path,
+                    seed=adapt_seed,
+                )
+            except Exception as e:
+                logger.error(
+                    "SKIP %s: init failed: %s",
+                    local_name, e, exc_info=True,
+                )
+                continue
+
+            trimesh_env = LightweightEnv(
+                str(stl_path), seed=adapt_seed
+            )
+
+            # ═══ Paths ═══
+            adapt_q_dir = str(
+                self.runs_dir
+                / f"adaptive_q_ycb_{local_name}"
+                f"_seed_{adapt_seed}"
+            )
+            adapt_sac_dir = str(
+                self.runs_dir
+                / f"adaptive_sac_ycb_{local_name}"
+                f"_seed_{self.sac_seed}"
+            )
+            log_dir = (
+                ycb_data_dir
+                / f"adaptive_logs_{local_name}"
+            )
+
+            # ═══ Visualizer ═══
+            visualizer = None
+            if self.visualise:
+                from tbp.hybrid_rl.visualize_env import (
+                    EpisodeVisualizer,
+                )
+                visualizer = EpisodeVisualizer(
+                    output_dir=ycb_data_dir,
+                    mesh_name=local_name,
+                    stage="ycb_mujoco_adaptive",
+                    max_per_type_per_level=5,
+                    num_levels=len(curriculum_levels),
+                    visualize_mode=self.visualise,
+                )
+
+            # ═══ Run unified adaptive loop ═══
+            try:
+                self._run_adaptive_generic(
+                    online_env=mj_env,
+                    offline_env=trimesh_env,
+                    object_name=local_name,
+                    num_episodes=adaptive_episodes,
+                    curriculum_levels=curriculum_levels,
+                    curriculum_filters=curriculum_filters,
+                    adapt_q_dir=adapt_q_dir,
+                    adapt_sac_dir=adapt_sac_dir,
+                    adapt_seed=adapt_seed,
+                    log_dir=log_dir,
+                    mesh_path=str(stl_path),
+                    visualizer=visualizer,
+                )
+            finally:
+                mj_env.close()
+
+        logger.info("YCB MuJoCo Adaptive complete")
 
     # ══════════════════════════════════════════════════════
     # YCB Evaluation
@@ -4072,6 +4072,11 @@ class RLGoalApproachExperiment:
             )
 
             env.close()
+            # ═══ Save intermediate results ═══
+            intermediate_path = ycb_data_dir / f"ycb_mujoco_result_{local_name}.json"
+            with intermediate_path.open("w") as f:
+                json.dump(level_results, f, indent=2)
+            logger.info("  Intermediate results saved to %s", intermediate_path)
 
         # ═══ Save results ═══
         result_path = (

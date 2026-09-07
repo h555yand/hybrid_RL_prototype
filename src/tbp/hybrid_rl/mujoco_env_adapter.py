@@ -621,6 +621,135 @@ class MuJoCoEnvAdapter:
 
         return self.get_sensor_data()
 
+    # ═══════════════════════════════════════════════════
+    # RLEnvironment protocol implementation
+    # ═══════════════════════════════════════════════════
+
+    def step_discrete(self, action_idx: int, action_space) -> dict:
+        """Execute discrete action. Delegates to existing step().
+
+        Args:
+            action_idx: Discrete action index (0-23).
+            action_space: ActionSpace instance.
+
+        Returns:
+            Sensor data after action.
+        """
+        return self.step(action_idx, action_space)
+
+    def step_continuous(
+        self, action_type: int, action_params: np.ndarray
+    ) -> dict:
+        """Execute continuous SAC action in MuJoCo.
+
+        Maps (type, params) to MuJoCo primitives with the same
+        semantics as ActionInterpreter.execute() for trimesh.
+        This is the key method that enables SAC continuous params
+        to work in MuJoCo (previously lost via sac_to_discrete).
+
+        Args:
+            action_type: PSAC action type (0-7).
+            action_params: Continuous parameters array [3].
+
+        Returns:
+            Sensor data after action.
+        """
+        self._detach_had_collision = False
+        self._edge_traversed = False
+        self._passed_through = False
+
+        pre = self._render_and_extract()
+        self._prev_normal = pre["point_normal"]
+
+        if action_type == 0:
+            # Tangential surface move: [sin_angle, cos_angle, distance]
+            sin_a = float(action_params[0])
+            cos_a = float(action_params[1])
+            angle_deg = float(np.degrees(np.arctan2(sin_a, cos_a)))
+            distance = float(np.clip(action_params[2], 0.5, 15.0))
+            self._do_move_tangentially(angle_deg, distance)
+
+        elif action_type == 1:
+            # Linear move: [distance, -, -]
+            distance = float(np.clip(action_params[0], -25.0, 25.0))
+            self._do_move_forward(distance)
+
+        elif action_type == 2:
+            # Yaw (turn left/right): [sin_angle, cos_angle, -]
+            sin_a = float(action_params[0])
+            cos_a = float(action_params[1])
+            rotation = float(np.degrees(np.arctan2(sin_a, cos_a)))
+            rotation = float(np.clip(rotation, -45.0, 45.0))
+            self._apply_rotation_delta("y", rotation)
+
+        elif action_type == 3:
+            # Pitch (look up/down): [sin_angle, cos_angle, -]
+            sin_a = float(action_params[0])
+            cos_a = float(action_params[1])
+            rotation = float(np.degrees(np.arctan2(sin_a, cos_a)))
+            rotation = float(np.clip(rotation, -45.0, 45.0))
+            self._apply_rotation_delta("x", rotation)
+
+        elif action_type == 4:
+            # Roll (tilt): [sin_angle, cos_angle, -]
+            sin_a = float(action_params[0])
+            cos_a = float(action_params[1])
+            rotation = float(np.degrees(np.arctan2(sin_a, cos_a)))
+            rotation = float(np.clip(rotation, -45.0, 45.0))
+            self._apply_rotation_delta("z", rotation)
+
+        elif action_type == 5:
+            # Orient horizontal: [rotation_deg, left_dist, fwd_dist]
+            rotation = float(action_params[0])
+            left_dist = float(action_params[1])
+            fwd_dist = float(action_params[2])
+            self._do_orient_horizontal(rotation, fwd_dist, left_dist)
+
+        elif action_type == 6:
+            # Orient vertical: [rotation_deg, down_dist, fwd_dist]
+            rotation = float(action_params[0])
+            down_dist = float(action_params[1])
+            fwd_dist = float(action_params[2])
+            self._do_orient_vertical(rotation, fwd_dist, down_dist)
+
+        elif action_type == 7:
+            # Detach: params ignored, uses current goal
+            if self._current_goal is not None:
+                # Detach distance matches discrete version:
+                # action_space.free_step * 3 = 8.0 * 3 = 24.0
+                self._do_detach(self._current_goal, 24.0)
+
+        # Edge detection (same logic as step())
+        post = self._render_and_extract()
+        if (
+            self._prev_normal is not None
+            and post["point_normal"] is not None
+        ):
+            dot = float(
+                np.dot(
+                    np.array(self._prev_normal),
+                    np.array(post["point_normal"]),
+                )
+            )
+            if dot < 0.707:
+                self._edge_traversed = True
+
+        return self.get_sensor_data()
+
+    @property
+    def supports_continuous(self) -> bool:
+        """MuJoCo supports continuous actions."""
+        return True
+
+    @property
+    def supports_offline_retrain(self) -> bool:
+        """MuJoCo is too slow for offline retrain.
+
+        Adaptive manager should use trimesh (LightweightEnv)
+        for offline Q-store and SAC retraining.
+        """
+        return False
+    
     def _do_move_tangentially(self, direction_degrees, step_mm):
         """Tangential surface move with snap and rollback.
 

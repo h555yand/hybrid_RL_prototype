@@ -19,7 +19,8 @@ experiment:
     do_sac_eval: false
     do_adaptive: false
     do_ycb_eval: false
-    do_ycb_mujoco_eval: true
+    do_ycb_mujoco_eval: false
+    do_ycb_mujoco_adaptive: true
 
     train_seeds: [11]
     eval_seeds: [44]
@@ -410,6 +411,31 @@ experiment:
 
       episodes_per_level: 30
       max_steps: 500
+
+    ycb_mujoco_adaptive_config:
+      mujoco_data_path: ~/Downloads/tbp/data/mujoco/objects/ycb
+      ycb_src_dir: ~/Downloads/simulator_data/objects/ycb/meshes
+      
+      objects:
+        ycb_mug:
+          mujoco_name: mug
+          glb_name: 025_mug
+        #ycb_cups_a:
+        #  mujoco_name: a_cups
+        #  glb_name: 065-a_cups
+      
+      adaptive_episodes: 1000
+      max_steps: 500
+      
+      curriculum_levels:
+        - [10.0, 60.0]
+        - [10.0, 80.0]
+        - [10.0, 120.0]
+      
+      curriculum_filters:
+        - {same_side: true, path_blocked: false}
+        - {same_side: true, path_blocked: true}
+        - {same_side: false}
 
     logging:
       run_name: adapt-baseline

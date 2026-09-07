@@ -168,7 +168,7 @@ class Arbitrator:
         # Heuristic budget tracking per level
         self._level_total_decisions: Dict[int, int] = defaultdict(int)
         self._level_heuristic_decisions: Dict[int, int] = defaultdict(int)
-        self._heuristic_eps_min = 0.1
+        self._heuristic_eps_min = 0.05
 
     def _warmup_running_stats(self):
         """Warm up RunningQStats from existing Q-store points."""
@@ -205,7 +205,7 @@ class Arbitrator:
         """
         gap = h_track - ml_track
         eps_max = max(gap, self._heuristic_eps_min)
-        eps_max_min = min(eps_max, 0.25)
+        eps_max_min = min(eps_max, 0.2)
         return eps_max_min
 
     def _get_level_tracks(self, level: int):
@@ -213,7 +213,7 @@ class Arbitrator:
         q_track = self._get_track(self._level_q_results[level])
         sac_track = self._get_track(self._level_sac_results[level])
         b_track = self._get_track(self._level_blend_results[level])
-        h_track = max(self._get_track(self._level_heuristic_results[level]), 0.8)
+        h_track = self._get_track(self._level_heuristic_results[level])
 
         ml_tracks = []
         if len(self._level_q_results[level]) >= self._min_eval_per_source:
@@ -222,6 +222,9 @@ class Arbitrator:
             ml_tracks.append(sac_track)
         if len(self._level_blend_results[level]) >= self._min_eval_per_source:
             ml_tracks.append(b_track)
+
+        if len(self._level_heuristic_results[level]) < self._min_eval_per_source:
+            h_track = 0.5
         best_ml_track = max(ml_tracks) if ml_tracks else 0.5
         worst_ml_track = min(ml_tracks) if ml_tracks else 0.5
 
@@ -292,14 +295,18 @@ class Arbitrator:
             else 0.0
         )
         q_conf_threshold = min(max(q_conf_mean * 0.9, 0.5), 1.0)
+        # q_conf_threshold = 0.1
+        q_spread_threshold = 3.0
 
-        if q_confidence >= q_conf_threshold and q_spread > 3.0:
+        if q_confidence >= q_conf_threshold and q_spread > q_spread_threshold:
             if q_type == sac_type:
                 # 1.1 Types agree: Q confirms SAC → use SAC params
                 self._record_decision("blend")
                 self.blend_chosen_actions[q_name] += 1
                 self._current_episode_sources.append("blend")
-                return sac_type, sac_params, (
+                blend_type = q_type
+                blend_params = sac_params
+                return blend_type, blend_params, (
                     f"q_confirms_sac("
                     f"conf={q_confidence:.2f},"
                     f"spread={q_spread:.1f})"
