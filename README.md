@@ -1024,13 +1024,182 @@ The YCB evaluation provides concrete evidence for sim-to-real viability:
 | 14-24% gap trimesh→MuJoCo | Quantifies the sim-to-sim transfer cost — primarily at hard levels |
 | Hollow objects 54-56% | Identifies where adaptation is most needed — complex maneuvers |
 
-The 14-24% transfer gap is the "sim-to-sim" cost. For sim-to-real (trimesh → physical robot), we expect a similar or larger gap, which the adaptive mode is designed to close through online learning. The architecture ensures that:
+### State Computation: One Function, Three Data Sources
 
-1. **Day 1**: Robot uses trimesh-trained policy — works for basic navigation (L0: ~80%+)
-2. **Day 1-N**: Online Q-learning and SAC updates adapt to real sensor noise and physics
-3. **When stuck**: Offline retrain in trimesh incorporates new experience, deploys improved policy
-4. **Convergence**: Track records stabilize, arbitrator learns which source to trust per situation
+The 22D state vector is computed by a single function regardless of environment:
 
+```python
+# Same function for ALL environments
+state = controller._compute_state(pose, sensor_data)
+```
+
+Everything is in the agent's local coordinate frame. The function doesn't know or care whether the data came from trimesh geometry, MuJoCo rendering, or a physical camera.
+
+#### Trimesh (LightweightEnv) — Exact Geometry
+
+```
+pose         ← direct numpy arrays (agent_pos, agent_rot)
+point_normal ← mesh.ray.intersects_location → face_normals[face_id]
+depth        ← np.linalg.norm(hit_point - agent_pos)
+k1, k2       ← trimesh.curvature.discrete_mean/gaussian_curvature_measure
+on_object    ← depth < 3.0mm
+path_blocked ← ray cast agent→goal, check if hit < dist_to_goal
+goal_normal  ← mesh.nearest.on_surface → face_normals
+object_center← mesh.centroid
+up_direction ← ray-based asymmetry detection
+```
+
+Perfect geometry. Normals are exact face normals. Curvatures are discrete mesh curvatures. No noise. Fast — thousands of episodes per minute.
+
+#### MuJoCo (MuJoCoEnvAdapter) — Through Monty Sensor Pipeline
+
+```
+pose         ← embodiment.position × 1000, quat_to_euler(embodiment.rotation)
+point_normal ← Monty: surface_normal_total_least_squares(semantic_3d, center_id, view_dir)
+depth        ← Monty: depth_map[cy, cx] × 1000
+k1, k2       ← Monty: principal_curvatures(semantic_3d, center_id, normal)
+on_object    ← depth < 5.0mm
+path_blocked ← mujoco.mj_ray (physics-based ray cast)
+goal_normal  ← CAD mesh face normal → _dir_cad_to_mj (frame conversion)
+object_center← CAD centroid → _pos_cad_to_mj_mm
+up_direction ← CAD ray analysis → _dir_cad_to_mj
+```
+
+The MuJoCo adapter uses **the same Monty sensor processing functions** (`surface_normal_total_least_squares`, `principal_curvatures`, `DepthTo3DLocations`) that Monty's Learning Modules use. Normals are estimated from rendered depth point clouds — not exact, but realistic. This is the same noise profile a real camera would produce.
+
+#### Robot (Future RobotEnvAdapter) — Through Monty + Physical Sensors
+
+```
+pose         ← robot kinematics (end-effector position/orientation) or SLAM
+point_normal ← Monty: surface_normal_total_least_squares(camera_point_cloud)
+depth        ← depth_camera.center_pixel × 1000
+k1, k2       ← Monty: principal_curvatures(camera_point_cloud)
+on_object    ← depth < threshold (calibrated per camera)
+path_blocked ← depth-based occlusion check or point cloud ray cast
+goal_normal  ← from Monty's learned reference frame (LM knows 3D object structure)
+object_center← from Monty's learned reference frame
+up_direction ← gravity vector (IMU) or from reference frame
+```
+
+The robot uses **the same Monty functions** for sensor processing. The data format is identical to MuJoCo — because MuJoCo already emulates a real camera through the Monty pipeline. The transition from MuJoCo to robot is replacing the renderer with a physical camera.
+
+#### Data Source Summary
+
+| State Field | Trimesh | MuJoCo | Robot |
+|-------------|---------|--------|-------|
+| **pose** | direct variables | `embodiment.position/rotation` | kinematics / SLAM |
+| **point_normal** | `mesh.face_normals` (exact) | Monty `surface_normal_TLS` | Monty `surface_normal_TLS` |
+| **depth** | ray cast distance | Monty depth render | depth camera |
+| **k1, k2** | `trimesh.curvature` (exact) | Monty `principal_curvatures` | Monty `principal_curvatures` |
+| **on_object** | depth < 3mm | depth < 5mm | depth < threshold |
+| **same_side** | normal direction analysis | normal direction analysis | normal direction analysis |
+| **path_blocked** | trimesh ray cast | `mujoco.mj_ray` | point cloud occlusion |
+| **goal_normal** | `mesh.nearest` (exact) | CAD → MuJoCo frame | Monty LM reference frame |
+| **object_center** | `mesh.centroid` | CAD → MuJoCo frame | Monty LM reference frame |
+| **up_direction** | ray asymmetry | CAD → MuJoCo frame | IMU / gravity |
+
+The key insight: MuJoCo already uses the Monty sensor pipeline. Transitioning to a robot means replacing MuJoCo's renderer with a physical camera — the sensor processing, state computation, and policy remain unchanged.
+
+### Action Execution: One Interface, Three Implementations
+
+Actions are executed through a unified interface with environment-specific implementations:
+
+```python
+# Continuous actions (SAC — precise parameters)
+sensor_after = env.step_continuous(action_type, action_params)
+
+# Discrete actions (Q-store / heuristic — fixed step sizes)
+sensor_after = env.step_discrete(action_idx, action_space)
+```
+
+#### Trimesh — Direct Manipulation
+
+```
+Tangential move → agent_pos += tangent_dir × distance; snap via mesh.nearest.on_surface
+Forward move    → agent_pos += forward × distance; collision via mesh.ray.intersects
+Rotation        → agent_rot[axis] += degrees
+Detach          → agent_pos += normal × distance; orient toward goal
+```
+
+No physics, no inertia. Position and orientation are numpy arrays manipulated directly. Fast and deterministic.
+
+#### MuJoCo — Through Monty Actions
+
+```
+Tangential move → SetAgentPose(new_position); snap via mj_ray; SetAgentPose(snapped)
+Forward move    → MoveForward(agent_id, distance)
+Rotation        → SetAgentPose(same_pos, new_rotation)
+Orient H/V      → OrientHorizontal/OrientVertical(agent_id, rotation, distances)
+Detach          → mj_ray collision check; SetAgentPose(lifted_position, fly_orientation)
+```
+
+Uses standard Monty action classes: `MoveForward`, `OrientHorizontal`, `OrientVertical`, `SetAgentPose`. MuJoCo physics handles collisions. The RL policy produces the same Action objects that `JumpToGoalState` would — just sequentially instead of teleporting.
+
+#### Robot — Through Inverse Kinematics
+
+```
+Tangential move → compute tangent from normal; robot.move_cartesian(target); wait_for_contact
+Forward move    → robot.move_cartesian(current + forward × distance)
+Rotation        → robot.orient_end_effector(target_quaternion)
+Detach          → robot.move_cartesian(current + normal × distance); orient toward goal
+Collision       → force/torque sensor threshold
+Surface contact → depth camera or force sensor
+```
+
+Each `step_continuous` translates to a Cartesian target → IK solver → joint commands. Force/torque sensors replace depth-based collision detection.
+
+#### Action Execution Summary
+
+| Action | Trimesh | MuJoCo (Monty) | Robot |
+|--------|---------|-----------------|-------|
+| **Tangential** | position += dir × step, `nearest.on_surface` | `SetAgentPose` + `mj_ray` snap | `move_cartesian` + force contact |
+| **Forward** | position += fwd × step | `MoveForward(distance)` | `move_cartesian(target)` |
+| **Yaw/Pitch** | rotation[axis] += deg | `SetAgentPose(new_quat)` | `orient_end_effector` |
+| **Orient H/V** | `_orient_horizontal/vertical` | `OrientHorizontal/Vertical` | `move_cartesian` + orient |
+| **Detach** | position += normal × dist | `SetAgentPose(lifted)` + `mj_ray` | `move_cartesian(lifted)` + force |
+| **Collision detect** | `mesh.ray.intersects` | `mujoco.mj_ray` | force/torque sensor |
+| **Surface snap** | `mesh.nearest.on_surface` | multi-ray `mj_ray` | depth camera + approach |
+
+### Why This Enables Monty Integration
+
+The MuJoCo adapter already uses Monty's action classes and sensor processing functions. This means:
+
+1. **State computation** will use the same sensor data that Monty's Learning Modules already receive — no separate sensor pipeline needed. When the RL controller calls `_compute_state(pose, sensor_data)`, the `sensor_data` comes from the same `surface_normal_total_least_squares` and `principal_curvatures` that the LM uses for feature extraction.
+
+2. **Actions** are already expressed as Monty primitives. The future `RLGoalPolicy` will return the same `MoveForward`, `MoveTangentially`, `OrientHorizontal` Action objects that the existing motor system uses — just selected by the RL policy instead of hard-coded in `JumpToGoalState`.
+
+3. **Robot transition** = replacing `MuJoCoSimulator` with a `RobotInterface` that provides the same action/sensor API. The RL controller, Q-store, SAC, arbitrator, and adaptive manager all remain unchanged.
+
+```
+Training (trimesh)          Validation (MuJoCo)         Deployment (robot)
+┌──────────────┐           ┌──────────────┐           ┌──────────────┐
+│ exact normals │           │ Monty sensor │           │ Monty sensor │
+│ exact depth   │  ──────► │ processing   │  ──────► │ processing   │
+│ exact k1,k2   │  train   │ (same code)  │  same    │ (same code)  │
+│               │  once    │              │  policy  │              │
+│ direct pos    │           │ Monty actions│           │ IK + motors  │
+│ manipulation  │           │ (same API)   │           │ (same API)   │
+└──────────────┘           └──────────────┘           └──────────────┘
+     ▲                           ▲                          ▲
+     │                           │                          │
+     └───── _compute_state() ────┴──── same function ───────┘
+     └───── step_continuous() ───┴──── same interface ──────┘
+```
+### Environment-Specific Configuration
+
+The controller uses several thresholds that may need tuning per environment:
+
+| Parameter | Default | Trimesh | MuJoCo | Robot |
+|-----------|:-------:|:-------:|:------:|:-----:|
+| `on_object` depth | 3.0mm | 3.0mm ✓ | 3.0mm ✓ | calibrate per camera |
+| `min_valid_depth` | 0.5mm | 0.5mm ✓ | may need 0.3mm | calibrate |
+| `normal_flip_threshold` | -0.5 | -0.5 ✓ | -0.5 ✓ (monitor) | may need -0.7 |
+| `goal_threshold` | 4.0mm | 4.0mm ✓ | 4.0mm ✓ | may need 6-8mm |
+
+These thresholds are in the RL config and can be overridden per experiment. 
+The key principle: **the environment handles sensor noise internally** 
+(e.g., normal smoothing in MuJoCo), and the controller sees clean data 
+with consistent thresholds.
 
 ## Known Limitations
 

@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════
 MM_PER_M = 1000.0
 NO_SURFACE_DEPTH_MM = 100.0
-ON_OBJECT_DEPTH_MM = 5.0
+ON_OBJECT_DEPTH_MM = 3.0
 SNAP_TARGET_DEPTH_MM = 2.0
 
 # ═══════════════════════════════════════════════════
