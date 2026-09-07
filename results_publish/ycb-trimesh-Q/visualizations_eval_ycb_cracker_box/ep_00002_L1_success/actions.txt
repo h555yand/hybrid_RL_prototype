@@ -1,0 +1,14 @@
+Result: success
+Goal: [-48.44637979889285, 8.979921612578375, 192.48618094488995, 88.60657442930639, 46.32911073472595, -89.91491272192592]
+Steps: 6
+Start: [-40.70281021613752, 5.371424481855906, 211.6720400420607, -0.2863568392000104, 2.5828752562845807, -0.012904609415897994]
+End: [-48.38304838765277, 10.804075754342964, 195.4814784416873, 84.33229756569756, -61.45796245677754, -83.55439077471652]
+Start distance: 21.0mm
+End distance: 3.5mm
+
+Step 001 (dist=21.0mm): [phase=CRAWL_TO_EDGE|ss=1|pb=1|d=2.0|al=-0.93|sd=[-0.88,0.47,0.04]|n=[0.05,0.00,1.00]|pos=[-40.7,5.4,211.7]][strat=detach_stay(q=[0.19,-0.10],eps=0.02)] [strategic=detach_stay(q=[0.19,-0.10],eps=0.02)] [phase=CRAWL_TO_EDGE] ##### Softmax; move_tangentially, confidence 100%). blend: 98% Q + 2% heuristic. Q recommends: move_tangentially - 1; Heuristics: move_tangentially - 3. 
+Step 002 (dist=17.3mm): [phase=CRAWL_TO_GOAL|ss=1|pb=1|d=2.0|al=0.15|n=[-0.98,0.00,0.18]|pos=[-42.8,7.5,208.8]][strat=detach_stay(q=[0.75,-0.02],eps=0.02)] [strategic=detach_stay(q=[0.75,-0.02],eps=0.02)] [phase=CRAWL_TO_GOAL] ##### Softmax; move_tangentially, confidence 100%). blend: 98% Q + 2% heuristic. Q recommends: move_tangentially - 0; Heuristics: move_tangentially - 0. 
+Step 003 (dist=14.2mm): [phase=CRAWL_TO_GOAL|ss=1|pb=0|d=2.0|al=-0.10|n=[-0.98,0.00,0.18]|pos=[-47.3,7.4,206.6]] [phase=CRAWL_TO_GOAL] ##### Softmax; move_tangentially, confidence 100%). blend: 98% Q + 2% heuristic. Q recommends: move_tangentially - 0; Heuristics: move_tangentially - 0. 
+Step 004 (dist=11.3mm): [phase=CRAWL_TO_GOAL|ss=1|pb=0|d=2.0|al=-0.09|n=[-0.99,-0.03,0.14]|pos=[-47.8,7.4,203.6]] [phase=CRAWL_TO_GOAL] ##### Softmax; move_tangentially, confidence 100%). blend: 98% Q + 2% heuristic. Q recommends: move_tangentially - 6; Heuristics: move_tangentially - 6. 
+Step 005 (dist=8.3mm): [phase=CRAWL_TO_GOAL|ss=1|pb=0|d=2.0|al=-0.01|n=[-1.00,-0.03,0.05]|pos=[-48.0,7.8,200.7]] [phase=CRAWL_TO_GOAL] ##### Softmax; move_tangentially, confidence 100%). blend: 98% Q + 2% heuristic. Q recommends: move_tangentially - 4; Heuristics: move_tangentially - 4. 
+Step 006 (dist=5.6mm): [phase=CRAWL_TO_GOAL|ss=1|pb=0|d=2.0|al=-0.01|n=[-1.00,-0.03,0.05]|pos=[-48.2,9.4,198.1]] [phase=CRAWL_TO_GOAL] ##### Softmax; move_tangentially, confidence 100%). blend: 98% Q + 2% heuristic. Q recommends: move_tangentially - 5; Heuristics: move_tangentially - 4. 

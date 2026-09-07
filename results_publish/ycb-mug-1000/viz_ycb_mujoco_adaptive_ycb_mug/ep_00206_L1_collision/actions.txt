@@ -1,0 +1,116 @@
+Result: collision
+Goal: [16.995529976335845, -37.283711417036066, -16.909420114919122, -90.95656905405464, -0.27204023226413654, 0.2766203419752131]
+Steps: 103
+Start: [-4.089387178739843, -0.04372629191932987, -27.691654610455757, -69.3593759021395, -11.621447033744971, 8.055364357656458]
+End: [12.788955013172172, -35.44470575285569, -32.33483651870907, 91.2033486914977, -34.1985842804786, -70.79872942458117]
+Start distance: 44.1mm
+End distance: 16.1mm
+
+object: ycb_mug
+mode: online
+source: sac
+rolling_rate: 0.8
+
+Step 001 (dist=41.7mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=44.1
+Step 002 (dist=38.7mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=41.7
+Step 003 (dist=35.3mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=38.7
+Step 004 (dist=31.7mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=35.3
+Step 005 (dist=36.6mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=31.7
+Step 006 (dist=35.1mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=36.6
+Step 007 (dist=34.0mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=35.1
+Step 008 (dist=38.1mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=34.0
+Step 009 (dist=38.3mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=38.1
+Step 010 (dist=41.4mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=38.3
+Step 011 (dist=39.1mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=41.4
+Step 012 (dist=38.3mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=39.1
+Step 013 (dist=36.2mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=38.3
+Step 014 (dist=36.3mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=36.2
+Step 015 (dist=41.4mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=36.3
+Step 016 (dist=38.1mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=41.4
+Step 017 (dist=34.7mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=38.1
+Step 018 (dist=39.0mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=34.7
+Step 019 (dist=37.0mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=39.0
+Step 020 (dist=33.7mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=37.0
+Step 021 (dist=38.4mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=33.7
+Step 022 (dist=38.5mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=38.4
+Step 023 (dist=37.0mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=38.5
+Step 024 (dist=33.0mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=37.0
+Step 025 (dist=33.7mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=33.0
+Step 026 (dist=40.9mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=33.7
+Step 027 (dist=36.0mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=40.9
+Step 028 (dist=40.8mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=36.0
+Step 029 (dist=37.5mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=40.8
+Step 030 (dist=32.2mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=37.5
+Step 031 (dist=34.7mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=32.2
+Step 032 (dist=41.4mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=34.7
+Step 033 (dist=36.9mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=41.4
+Step 034 (dist=37.3mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=36.9
+Step 035 (dist=36.5mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=37.3
+Step 036 (dist=32.6mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=36.5
+Step 037 (dist=28.9mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=32.6
+Step 038 (dist=35.6mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=28.9
+Step 039 (dist=42.1mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=35.6
+Step 040 (dist=48.7mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=42.1
+Step 041 (dist=46.0mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=48.7
+Step 042 (dist=44.5mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=46.0
+Step 043 (dist=39.7mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=44.5
+Step 044 (dist=36.3mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=39.7
+Step 045 (dist=39.3mm): src=q_confirms_sac(conf=0.60,spread=5.6) | MoveTangentially | dist=36.3
+Step 046 (dist=41.4mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=39.3
+Step 047 (dist=38.6mm): src=q_confirms_sac(conf=0.50,spread=5.5) | MoveTangentially | dist=41.4
+Step 048 (dist=36.8mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=38.6
+Step 049 (dist=36.9mm): src=q_confirms_sac(conf=0.79,spread=5.4) | MoveTangentially | dist=36.8
+Step 050 (dist=38.5mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=36.9
+Step 051 (dist=35.8mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=38.5
+Step 052 (dist=35.2mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=35.8
+Step 053 (dist=39.6mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=35.2
+Step 054 (dist=36.4mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=39.6
+Step 055 (dist=31.7mm): src=q_confirms_sac(conf=0.89,spread=5.4) | MoveTangentially | dist=36.4
+Step 056 (dist=36.0mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=31.7
+Step 057 (dist=39.9mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=36.0
+Step 058 (dist=36.6mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=39.9
+Step 059 (dist=33.9mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=36.6
+Step 060 (dist=37.3mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=33.9
+Step 061 (dist=36.9mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=37.3
+Step 062 (dist=34.0mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=36.9
+Step 063 (dist=39.3mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=34.0
+Step 064 (dist=33.9mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=39.3
+Step 065 (dist=39.2mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=33.9
+Step 066 (dist=34.2mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=39.2
+Step 067 (dist=28.6mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=34.2
+Step 068 (dist=32.7mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=28.6
+Step 069 (dist=29.7mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=32.7
+Step 070 (dist=33.9mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=29.7
+Step 071 (dist=31.4mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=33.9
+Step 072 (dist=26.0mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=31.4
+Step 073 (dist=22.7mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=26.0
+Step 074 (dist=20.7mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=22.7
+Step 075 (dist=19.3mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=20.7
+Step 076 (dist=15.7mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=19.3
+Step 077 (dist=16.4mm): src=q_confirms_sac(conf=0.52,spread=10.0) | MoveLinear | dist=15.7
+Step 078 (dist=16.4mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | Turn | dist=16.4
+Step 079 (dist=16.4mm): src=q_sac_conflict(q=MoveLinear,sac=Turn,conf=0.50,spread=9.8) | Turn | dist=16.4
+Step 080 (dist=16.4mm): src=q_sac_conflict(q=MoveLinear,sac=Look,conf=0.59,spread=10.3) | Turn | dist=16.4
+Step 081 (dist=16.4mm): src=q_sac_conflict(q=MoveLinear,sac=Look,conf=0.72,spread=10.8) | Turn | dist=16.4
+Step 082 (dist=16.4mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | Look | dist=16.4
+Step 083 (dist=16.4mm): src=q_sac_conflict(q=MoveLinear,sac=Turn,conf=0.53,spread=10.9) | Turn | dist=16.4
+Step 084 (dist=16.4mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | Turn | dist=16.4
+Step 085 (dist=16.4mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveLinear | dist=16.4
+Step 086 (dist=16.4mm): src=q_confirms_sac(conf=0.61,spread=10.3) | MoveLinear | dist=16.4
+Step 087 (dist=16.4mm): src=q_sac_conflict(q=MoveLinear,sac=Look,conf=0.51,spread=10.8) | Look | dist=16.4
+Step 088 (dist=16.4mm): src=q_sac_conflict(q=MoveLinear,sac=Look,conf=0.81,spread=10.8) | Turn | dist=16.4
+Step 089 (dist=16.4mm): src=q_sac_conflict(q=MoveLinear,sac=Look,conf=0.95,spread=10.8) | Turn | dist=16.4
+Step 090 (dist=16.4mm): src=q_sac_conflict(q=MoveLinear,sac=Look,conf=0.95,spread=10.8) | Turn | dist=16.4
+Step 091 (dist=16.4mm): src=q_sac_conflict(q=MoveLinear,sac=Look,conf=0.65,spread=10.9) | Turn | dist=16.4
+Step 092 (dist=16.4mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | Look | dist=16.4
+Step 093 (dist=16.7mm): src=q_confirms_sac(conf=0.51,spread=10.9) | MoveLinear | dist=16.4
+Step 094 (dist=16.7mm): src=q_sac_conflict(q=MoveLinear,sac=Turn,conf=0.81,spread=10.9) | Turn | dist=16.7
+Step 095 (dist=16.7mm): src=q_sac_conflict(q=MoveLinear,sac=Turn,conf=0.95,spread=10.9) | Turn | dist=16.7
+Step 096 (dist=16.7mm): src=q_sac_conflict(q=MoveLinear,sac=Turn,conf=0.95,spread=10.9) | Turn | dist=16.7
+Step 097 (dist=16.7mm): src=q_sac_conflict(q=MoveLinear,sac=Turn,conf=0.72,spread=10.9) | Look | dist=16.7
+Step 098 (dist=16.7mm): src=q_sac_conflict(q=MoveLinear,sac=Look,conf=0.95,spread=10.8) | Turn | dist=16.7
+Step 099 (dist=16.7mm): src=q_sac_conflict(q=MoveLinear,sac=Look,conf=0.51,spread=10.9) | Turn | dist=16.7
+Step 100 (dist=16.7mm): src=q_sac_conflict(q=MoveLinear,sac=Turn,conf=0.95,spread=10.9) | Look | dist=16.7
+Step 101 (dist=16.7mm): src=q_sac_conflict(q=MoveLinear,sac=Look,conf=0.81,spread=10.9) | Turn | dist=16.7
+Step 102 (dist=16.7mm): src=q_sac_conflict(q=MoveLinear,sac=Look,conf=0.95,spread=10.9) | Turn | dist=16.7
+Step 103 (dist=16.1mm): src=q_sac_conflict(q=MoveLinear,sac=Turn,conf=0.74,spread=11.0) | MoveLinear | dist=16.7

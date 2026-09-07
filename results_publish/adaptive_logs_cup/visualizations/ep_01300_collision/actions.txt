@@ -1,0 +1,156 @@
+Result: collision
+Goal: [33.64046050449713, -28.02604526991543, 29.007491231800174, 129.70935009938657, 64.77313904704029, 84.72950882276716]
+Steps: 148
+Start: [-27.598772610132922, 9.190160973371807, 0.2505033853953762, -65.747733891854, 46.41122487718263, -91.61544553324839]
+End: [30.286827050844447, -32.095997207667324, 31.094502250862533, 62.90242427632728, 68.2561164574438, -30.608323690029067]
+Start distance: 77.2mm
+End distance: 5.7mm
+
+Step 001 (dist=77.2mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: MoveTangentially, params: [-0.71, -0.71, 3.00], dist=77.2, phase=CRAWL_TO_EDGE, ss=0, pb=1, n=[0.90,-0.32,0.28], e_t=[-2.4,0.9,8.6], best_dir=5, scores=[-49.78, -62.87, -44.4, -5.19, 31.78, 44.87, 26.4, -12.81], e_t_direct=[-6.9,-12.8,7.4], goal_w=[61.2,-37.2,28.8]
+Step 002 (dist=76.9mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: MoveTangentially, params: [-0.71, 0.71, 3.00], dist=76.9, phase=CRAWL_TO_EDGE, ss=0, pb=1, n=[0.90,-0.32,0.28], e_t=[-2.4,0.9,8.6], best_dir=7, scores=[24.51, -15.24, -51.34, -62.64, -42.51, -2.76, 33.34, 44.64], e_t_direct=[-6.0,-12.9,4.5], goal_w=[62.1,-37.3,25.9]
+Step 003 (dist=76.7mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: MoveTangentially, params: [-0.71, 0.71, 3.00], dist=76.7, phase=CRAWL_TO_EDGE, ss=0, pb=1, n=[0.90,-0.32,0.28], e_t=[-2.4,0.9,8.6], best_dir=7, scores=[24.51, -15.24, -51.34, -62.64, -42.51, -2.76, 33.34, 44.64], e_t_direct=[-5.1,-12.9,1.7], goal_w=[63.0,-37.3,23.0]
+Step 004 (dist=76.7mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: MoveTangentially, params: [-0.71, 0.71, 3.00], dist=76.7, phase=CRAWL_TO_EDGE, ss=0, pb=1, n=[0.90,-0.32,0.28], e_t=[-2.4,0.9,8.6], best_dir=7, scores=[24.51, -15.24, -51.34, -62.64, -42.51, -2.76, 33.34, 44.64], e_t_direct=[-4.2,-12.8,-1.2], goal_w=[63.9,-37.2,20.2]
+Step 005 (dist=76.7mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: MoveTangentially, params: [-0.71, -0.71, 3.00], dist=76.7, phase=CRAWL_TO_EDGE, ss=0, pb=1, n=[0.93,-0.23,0.28], e_t=[-2.5,0.6,8.6], best_dir=5, scores=[-38.51, -61.85, -54.22, -20.11, 20.51, 43.85, 36.22, 2.11], e_t_direct=[-3.9,-20.0,-3.6], goal_w=[64.8,-37.2,17.3]
+Step 006 (dist=77.0mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: MoveTangentially, params: [-0.71, 0.71, 3.00], dist=77.0, phase=CRAWL_TO_EDGE, ss=0, pb=1, n=[0.90,-0.32,0.28], e_t=[-2.4,0.9,8.6], best_dir=7, scores=[24.51, -15.24, -51.34, -62.64, -42.51, -2.76, 33.34, 44.64], e_t_direct=[-2.7,-13.6,-6.9], goal_w=[65.4,-38.0,14.5]
+Step 007 (dist=77.3mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: MoveTangentially, params: [-0.71, -0.71, 3.00], dist=77.3, phase=CRAWL_TO_EDGE, ss=0, pb=1, n=[0.93,-0.23,0.28], e_t=[-2.5,0.6,8.6], best_dir=5, scores=[-38.51, -61.85, -54.22, -20.11, 20.51, 43.85, 36.22, 2.11], e_t_direct=[-2.4,-20.7,-9.3], goal_w=[66.4,-37.9,11.6]
+Step 008 (dist=77.8mm): source: q_confirms_sac(conf=0.93,spread=7.0), type: MoveTangentially, params: [-0.66, 1.00, 1.23], dist=77.8, phase=CRAWL_TO_EDGE, ss=0, pb=1, n=[0.90,-0.32,0.28]
+Step 009 (dist=78.0mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: MoveTangentially, params: [-0.71, 0.71, 3.00], dist=78.0, phase=CRAWL_TO_EDGE, ss=0, pb=1, n=[0.90,-0.32,0.28], e_t=[-2.4,0.9,8.6], best_dir=7, scores=[24.51, -15.24, -51.34, -62.64, -42.51, -2.76, 33.34, 44.64], e_t_direct=[-0.7,-14.1,-13.7], goal_w=[67.4,-38.5,7.7]
+Step 010 (dist=78.5mm): source: q_confirms_sac(conf=0.93,spread=6.9), type: MoveTangentially, params: [-0.87, 1.00, 1.32], dist=78.5, phase=CRAWL_TO_EDGE, ss=0, pb=1, n=[0.93,-0.23,0.28]
+Step 011 (dist=78.2mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: MoveTangentially, params: [-0.71, -0.71, 3.00], dist=78.2, phase=CRAWL_TO_EDGE, ss=0, pb=1, n=[0.93,-0.23,0.28], e_t=[-2.5,0.6,8.6], best_dir=5, scores=[-38.51, -61.85, -54.22, -20.11, 20.51, 43.85, 36.22, 2.11], e_t_direct=[-0.0,-19.9,-16.3], goal_w=[68.7,-37.1,4.6]
+Step 012 (dist=79.1mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: MoveTangentially, params: [-0.71, -0.71, 3.00], dist=79.1, phase=CRAWL_TO_EDGE, ss=0, pb=1, n=[0.93,-0.23,0.28], e_t=[-2.5,0.6,8.6], best_dir=5, scores=[-38.51, -61.85, -54.22, -20.11, 20.51, 43.85, 36.22, 2.11], e_t_direct=[0.6,-20.7,-19.1], goal_w=[69.3,-37.9,1.8]
+Step 013 (dist=80.0mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: MoveTangentially, params: [-0.71, -0.71, 3.00], dist=80.0, phase=CRAWL_TO_EDGE, ss=0, pb=1, n=[0.93,-0.23,0.28], e_t=[-2.5,0.6,8.6], best_dir=5, scores=[-38.51, -61.85, -54.22, -20.11, 20.51, 43.85, 36.22, 2.11], e_t_direct=[1.3,-21.5,-21.9], goal_w=[70.0,-38.7,-1.0]
+Step 014 (dist=82.2mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: MoveTangentially, params: [-0.71, 0.71, 3.00], dist=82.2, phase=CRAWL_TO_GOAL, ss=0, pb=1, n=[-0.00,0.00,1.00], e_t=[71.8,-40.0,0.0], best_dir=7, scores=[421.81, 126.08, -248.78, -483.18, -439.81, -144.08, 230.78, 465.18], e_t_direct=[71.8,-40.0,0.0], geo=False, goal_w=[71.8,-40.0,-3.0], is_horiz=True, up=[0.0, 0.0, 1.0], h_len=82.17, v_comp=2.99, h_ratio=None, aw=None, e_t_h=[71.8,-40.0,0.0]
+Step 015 (dist=85.5mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: MoveTangentially, params: [0.00, -1.00, 3.00], dist=85.5, phase=CRAWL_TO_EDGE, ss=1, pb=1, n=[-0.93,0.23,-0.27], e_t=[0.3,-6.2,-6.5], best_dir=4, scores=[-61.09, -35.77, 5.24, 37.9, 43.09, 17.77, -23.24, -55.9], e_t_direct=[1.1,-20.7,-21.7], goal_w=[75.9,-39.4,0.1]
+Step 016 (dist=84.5mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: MoveTangentially, params: [0.00, -1.00, 3.00], dist=84.5, phase=CRAWL_TO_EDGE, ss=1, pb=1, n=[-0.93,0.23,-0.27], e_t=[0.4,-6.0,-6.7], best_dir=4, scores=[-60.65, -34.39, 6.75, 38.66, 42.65, 16.39, -24.75, -56.66], e_t_direct=[1.3,-18.1,-20.1], goal_w=[76.0,-36.8,1.7]
+Step 017 (dist=83.4mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: MoveTangentially, params: [-1.00, -0.00, 3.00], dist=83.4, phase=CRAWL_TO_EDGE, ss=1, pb=1, n=[-0.95,0.14,-0.27], e_t=[0.5,-7.1,-5.5], best_dir=6, scores=[-19.16, -53.69, -62.04, -39.32, 1.16, 35.69, 44.04, 21.32], e_t_direct=[1.7,-23.3,-18.0], goal_w=[76.0,-34.3,3.3]
+Step 018 (dist=82.4mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: MoveTangentially, params: [-1.00, -0.00, 3.00], dist=82.4, phase=CRAWL_TO_EDGE, ss=1, pb=1, n=[-0.96,0.05,-0.27], e_t=[0.9,-7.8,-4.4], best_dir=6, scores=[-28.02, -58.18, -59.54, -31.29, 10.02, 40.18, 41.54, 13.29], e_t_direct=[3.2,-28.0,-16.0], goal_w=[76.0,-31.6,4.6]
+Step 019 (dist=81.3mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: MoveTangentially, params: [-0.71, -0.71, 3.00], dist=81.3, phase=CRAWL_TO_EDGE, ss=1, pb=1, n=[-0.96,0.05,-0.27], e_t=[1.0,-7.6,-4.7], best_dir=5, scores=[-29.8, -58.95, -58.83, -29.53, 11.8, 40.95, 40.83, 11.53], e_t_direct=[3.2,-25.1,-15.5], goal_w=[76.0,-28.7,5.1]
+Step 020 (dist=80.3mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: MoveTangentially, params: [0.71, 0.71, 3.00], dist=80.3, phase=CRAWL_TO_EDGE, ss=1, pb=1, n=[-0.96,-0.05,-0.27], e_t=[1.4,-8.2,-3.4], best_dir=1, scores=[20.51, 43.84, 36.23, 2.11, -38.51, -61.84, -54.23, -20.11], e_t_direct=[5.0,-30.4,-12.4], goal_w=[75.3,-26.9,7.5]
+Step 021 (dist=79.1mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: Detach, params: [0.00, 0.00, 0.00], dist=79.1, phase=DETACH_NEEDED, ss=1, pb=1, n=[-0.96,-0.05,-0.27]
+Step 022 (dist=86.6mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: Turn, params: [-0.09, 1.00, 0.00], dist=86.6, phase=FLY_TO_EDGE, ss=1, pb=1
+Step 023 (dist=86.6mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: Turn, params: [-0.09, 1.00, 0.00], dist=86.6, phase=FLY_TO_EDGE, ss=1, pb=1
+Step 024 (dist=86.6mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: Turn, params: [-0.09, 1.00, 0.00], dist=86.6, phase=FLY_TO_EDGE, ss=1, pb=1
+Step 025 (dist=86.6mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: Turn, params: [-0.09, 1.00, 0.00], dist=86.6, phase=FLY_TO_EDGE, ss=1, pb=1
+Step 026 (dist=86.6mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: Turn, params: [-0.09, 1.00, 0.00], dist=86.6, phase=FLY_TO_EDGE, ss=1, pb=1
+Step 027 (dist=86.6mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: MoveLinear, params: [8.00, 0.00, 0.00], dist=86.6, phase=FLY_TO_EDGE, ss=1, pb=1
+Step 028 (dist=88.7mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: MoveLinear, params: [8.00, 0.00, 0.00], dist=88.7, phase=FLY_TO_EDGE, ss=1, pb=1
+Step 029 (dist=91.5mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: Turn, params: [-0.26, 0.97, 0.00], dist=91.5, phase=FLY_TO_EDGE, ss=1, pb=1
+Step 030 (dist=91.5mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: Turn, params: [-0.26, 0.97, 0.00], dist=91.5, phase=FLY_TO_EDGE, ss=1, pb=1
+Step 031 (dist=91.5mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: Look, params: [0.26, 0.97, 0.00], dist=91.5, phase=FLY_TO_EDGE, ss=1, pb=1
+Step 032 (dist=91.5mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: Look, params: [0.26, 0.97, 0.00], dist=91.5, phase=FLY_TO_EDGE, ss=1, pb=1
+Step 033 (dist=91.5mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: Turn, params: [-0.26, 0.97, 0.00], dist=91.5, phase=FLY_TO_EDGE, ss=1, pb=1
+Step 034 (dist=91.5mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: Look, params: [0.26, 0.97, 0.00], dist=91.5, phase=FLY_TO_EDGE, ss=1, pb=1
+Step 035 (dist=91.5mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: Turn, params: [-0.26, 0.97, 0.00], dist=91.5, phase=FLY_TO_EDGE, ss=1, pb=1
+Step 036 (dist=91.5mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: Turn, params: [-0.09, 1.00, 0.00], dist=91.5, phase=FLY_TO_EDGE, ss=1, pb=1
+Step 037 (dist=91.5mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: Turn, params: [-0.09, 1.00, 0.00], dist=91.5, phase=FLY_TO_EDGE, ss=1, pb=1
+Step 038 (dist=91.5mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: Turn, params: [-0.09, 1.00, 0.00], dist=91.5, phase=FLY_TO_EDGE, ss=1, pb=1
+Step 039 (dist=91.5mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: Turn, params: [-0.09, 1.00, 0.00], dist=91.5, phase=FLY_TO_EDGE, ss=1, pb=1
+Step 040 (dist=91.5mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: Turn, params: [-0.09, 1.00, 0.00], dist=91.5, phase=FLY_TO_EDGE, ss=1, pb=1
+Step 041 (dist=91.5mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: Look, params: [0.09, 1.00, 0.00], dist=91.5, phase=FLY_TO_EDGE, ss=1, pb=1
+Step 042 (dist=91.5mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: Look, params: [0.09, 1.00, 0.00], dist=91.5, phase=FLY_TO_EDGE, ss=1, pb=1
+Step 043 (dist=91.5mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: MoveLinear, params: [8.00, 0.00, 0.00], dist=91.5, phase=FLY_TO_EDGE, ss=1, pb=1
+Step 044 (dist=84.8mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: MoveLinear, params: [8.00, 0.00, 0.00], dist=84.8, phase=FLY_TO_EDGE, ss=1, pb=1
+Step 045 (dist=78.3mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: MoveLinear, params: [8.00, 0.00, 0.00], dist=78.3, phase=FLY_TO_EDGE, ss=1, pb=1
+Step 046 (dist=72.2mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: MoveLinear, params: [8.00, 0.00, 0.00], dist=72.2, phase=FLY_TO_EDGE, ss=1, pb=1
+Step 047 (dist=66.4mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: MoveLinear, params: [8.00, 0.00, 0.00], dist=66.4, phase=FLY_TO_EDGE, ss=1, pb=1
+Step 048 (dist=61.2mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: MoveLinear, params: [2.00, 0.00, 0.00], dist=61.2, phase=FLY_TO_EDGE, ss=1, pb=1
+Step 049 (dist=60.0mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: MoveLinear, params: [2.00, 0.00, 0.00], dist=60.0, phase=FLY_TO_EDGE, ss=1, pb=1
+Step 050 (dist=58.8mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: MoveLinear, params: [2.00, 0.00, 0.00], dist=58.8, phase=FLY_TO_EDGE, ss=1, pb=1
+Step 051 (dist=57.7mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: MoveLinear, params: [2.00, 0.00, 0.00], dist=57.7, phase=FLY_TO_EDGE, ss=1, pb=1
+Step 052 (dist=56.6mm): source: q_confirms_sac(conf=0.75,spread=11.0), type: MoveLinear, params: [-1.39, 0.00, 0.00], dist=56.6, phase=FLY_TO_EDGE, ss=1, pb=1
+Step 053 (dist=57.3mm): source: q_confirms_sac(conf=0.94,spread=10.9), type: MoveLinear, params: [2.24, 0.00, 0.00], dist=57.3, phase=FLY_TO_EDGE, ss=1, pb=1
+Step 054 (dist=56.2mm): source: q_confirms_sac(conf=0.95,spread=10.9), type: MoveLinear, params: [2.50, 0.00, 0.00], dist=56.2, phase=FLY_TO_EDGE, ss=1, pb=1
+Step 055 (dist=54.9mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: MoveLinear, params: [2.00, 0.00, 0.00], dist=54.9, phase=FLY_TO_EDGE, ss=1, pb=1
+Step 056 (dist=54.0mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: MoveLinear, params: [2.00, 0.00, 0.00], dist=54.0, phase=FLY_TO_EDGE, ss=1, pb=1
+Step 057 (dist=53.1mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: MoveLinear, params: [2.00, 0.00, 0.00], dist=53.1, phase=FLY_TO_EDGE, ss=1, pb=1
+Step 058 (dist=52.3mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: Look, params: [0.26, 0.97, 0.00], dist=52.3, phase=LAND, ss=1, pb=0
+Step 059 (dist=52.3mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: Look, params: [0.26, 0.97, 0.00], dist=52.3, phase=LAND, ss=1, pb=0
+Step 060 (dist=52.3mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: Turn, params: [-0.09, 1.00, 0.00], dist=52.3, phase=LAND, ss=1, pb=0
+Step 061 (dist=52.3mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: Turn, params: [-0.09, 1.00, 0.00], dist=52.3, phase=LAND, ss=1, pb=0
+Step 062 (dist=52.3mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: Turn, params: [-0.09, 1.00, 0.00], dist=52.3, phase=LAND, ss=1, pb=0
+Step 063 (dist=52.3mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: Turn, params: [-0.09, 1.00, 0.00], dist=52.3, phase=LAND, ss=1, pb=0
+Step 064 (dist=52.3mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: Turn, params: [-0.09, 1.00, 0.00], dist=52.3, phase=LAND, ss=1, pb=0
+Step 065 (dist=52.3mm): source: q_sac_conflict(q=MoveLinear,sac=Look,conf=0.58,spread=11.4), type: Turn, params: [-0.09, 1.00, 0.00], dist=52.3, phase=LAND, ss=1, pb=0
+Step 066 (dist=52.3mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: Look, params: [0.09, 1.00, 0.00], dist=52.3, phase=LAND, ss=1, pb=0
+Step 067 (dist=52.3mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: Look, params: [0.09, 1.00, 0.00], dist=52.3, phase=LAND, ss=1, pb=0
+Step 068 (dist=52.3mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: Look, params: [0.09, 1.00, 0.00], dist=52.3, phase=LAND, ss=1, pb=0
+Step 069 (dist=52.3mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: MoveLinear, params: [2.00, 0.00, 0.00], dist=52.3, phase=LAND, ss=1, pb=0
+Step 070 (dist=50.4mm): source: q_confirms_sac(conf=0.63,spread=11.5), type: MoveLinear, params: [-0.12, 0.00, 0.00], dist=50.4, phase=LAND, ss=1, pb=0
+Step 071 (dist=50.5mm): source: q_confirms_sac(conf=0.63,spread=11.5), type: MoveLinear, params: [0.24, 0.00, 0.00], dist=50.5, phase=LAND, ss=1, pb=0
+Step 072 (dist=50.3mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: MoveLinear, params: [2.00, 0.00, 0.00], dist=50.3, phase=LAND, ss=1, pb=0
+Step 073 (dist=48.3mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: MoveLinear, params: [2.00, 0.00, 0.00], dist=48.3, phase=LAND, ss=1, pb=0
+Step 074 (dist=46.4mm): source: q_confirms_sac(conf=0.77,spread=11.8), type: MoveLinear, params: [-0.83, 0.00, 0.00], dist=46.4, phase=LAND, ss=1, pb=0
+Step 075 (dist=47.2mm): source: q_confirms_sac(conf=0.72,spread=11.6), type: MoveLinear, params: [1.70, 0.00, 0.00], dist=47.2, phase=LAND, ss=1, pb=0
+Step 076 (dist=45.6mm): source: q_confirms_sac(conf=0.73,spread=11.7), type: MoveLinear, params: [1.58, 0.00, 0.00], dist=45.6, phase=LAND, ss=1, pb=0
+Step 077 (dist=44.1mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: MoveLinear, params: [2.00, 0.00, 0.00], dist=44.1, phase=LAND, ss=1, pb=0
+Step 078 (dist=42.3mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: Look, params: [0.09, 1.00, 0.00], dist=42.3, phase=LAND, ss=1, pb=0
+Step 079 (dist=42.3mm): source: q_confirms_sac(conf=0.77,spread=11.8), type: MoveLinear, params: [2.39, 0.00, 0.00], dist=42.3, phase=LAND, ss=1, pb=0
+Step 080 (dist=40.0mm): source: q_confirms_sac(conf=0.97,spread=11.8), type: MoveLinear, params: [1.77, 0.00, 0.00], dist=40.0, phase=LAND, ss=1, pb=0
+Step 081 (dist=38.3mm): source: q_confirms_sac(conf=0.96,spread=11.9), type: MoveLinear, params: [2.67, 0.00, 0.00], dist=38.3, phase=LAND, ss=1, pb=0
+Step 082 (dist=35.7mm): source: q_confirms_sac(conf=0.96,spread=12.1), type: MoveLinear, params: [2.86, 0.00, 0.00], dist=35.7, phase=LAND, ss=1, pb=0
+Step 083 (dist=33.0mm): source: q_confirms_sac(conf=0.96,spread=12.3), type: MoveLinear, params: [3.16, 0.00, 0.00], dist=33.0, phase=LAND, ss=1, pb=0
+Step 084 (dist=30.1mm): source: q_confirms_sac(conf=0.95,spread=12.2), type: MoveLinear, params: [1.49, 0.00, 0.00], dist=30.1, phase=LAND, ss=1, pb=0
+Step 085 (dist=28.7mm): source: q_confirms_sac(conf=0.96,spread=12.2), type: MoveLinear, params: [1.42, 0.00, 0.00], dist=28.7, phase=LAND, ss=1, pb=0
+Step 086 (dist=27.4mm): source: q_confirms_sac(conf=0.96,spread=12.2), type: MoveLinear, params: [1.77, 0.00, 0.00], dist=27.4, phase=LAND, ss=1, pb=0
+Step 087 (dist=25.8mm): source: q_sac_conflict(q=MoveLinear,sac=Look,conf=0.96,spread=12.3), type: MoveLinear, params: [2.00, 0.00, 0.00], dist=25.8, phase=LAND, ss=1, pb=0
+Step 088 (dist=24.0mm): source: q_confirms_sac(conf=0.96,spread=12.4), type: MoveLinear, params: [1.92, 0.00, 0.00], dist=24.0, phase=LAND, ss=1, pb=0
+Step 089 (dist=22.3mm): source: q_sac_conflict(q=MoveLinear,sac=Look,conf=0.98,spread=11.8), type: Turn, params: [-0.09, 1.00, 0.00], dist=22.3, phase=LAND, ss=1, pb=0
+Step 090 (dist=22.3mm): source: q_sac_conflict(q=MoveLinear,sac=Look,conf=0.99,spread=12.1), type: MoveLinear, params: [2.00, 0.00, 0.00], dist=22.3, phase=LAND, ss=1, pb=0
+Step 091 (dist=20.6mm): source: q_sac_conflict(q=MoveLinear,sac=Look,conf=0.98,spread=11.7), type: Look, params: [0.09, 1.00, 0.00], dist=20.6, phase=LAND, ss=1, pb=0
+Step 092 (dist=20.6mm): source: q_confirms_sac(conf=0.99,spread=12.1), type: MoveLinear, params: [0.89, 0.00, 0.00], dist=20.6, phase=LAND, ss=1, pb=0
+Step 093 (dist=19.8mm): source: q_confirms_sac(conf=1.00,spread=12.1), type: MoveLinear, params: [1.75, 0.00, 0.00], dist=19.8, phase=LAND, ss=1, pb=0
+Step 094 (dist=18.3mm): source: q_sac_conflict(q=MoveLinear,sac=Look,conf=0.99,spread=11.7), type: Turn, params: [-0.09, 1.00, 0.00], dist=18.3, phase=LAND, ss=1, pb=0
+Step 095 (dist=18.3mm): source: q_sac_conflict(q=MoveLinear,sac=Look,conf=0.99,spread=11.6), type: Look, params: [0.09, 1.00, 0.00], dist=18.3, phase=LAND, ss=1, pb=0
+Step 096 (dist=18.3mm): source: q_confirms_sac(conf=0.99,spread=11.6), type: MoveLinear, params: [0.85, 0.00, 0.00], dist=18.3, phase=LAND, ss=1, pb=0
+Step 097 (dist=17.6mm): source: q_confirms_sac(conf=0.99,spread=11.6), type: MoveLinear, params: [1.08, 0.00, 0.00], dist=17.6, phase=LAND, ss=1, pb=0
+Step 098 (dist=16.6mm): source: q_confirms_sac(conf=0.99,spread=11.6), type: MoveLinear, params: [0.81, 0.00, 0.00], dist=16.6, phase=LAND, ss=1, pb=0
+Step 099 (dist=15.9mm): source: q_sac_conflict(q=MoveLinear,sac=Look,conf=0.99,spread=11.6), type: Look, params: [0.09, 1.00, 0.00], dist=15.9, phase=LAND, ss=1, pb=0
+Step 100 (dist=15.9mm): source: q_confirms_sac(conf=0.99,spread=11.5), type: MoveLinear, params: [0.68, 0.00, 0.00], dist=15.9, phase=LAND, ss=1, pb=0
+Step 101 (dist=15.3mm): source: q_confirms_sac(conf=0.99,spread=11.5), type: MoveLinear, params: [1.26, 0.00, 0.00], dist=15.3, phase=LAND, ss=1, pb=0
+Step 102 (dist=14.2mm): source: q_confirms_sac(conf=0.99,spread=11.5), type: MoveLinear, params: [1.14, 0.00, 0.00], dist=14.2, phase=LAND, ss=1, pb=0
+Step 103 (dist=13.2mm): source: q_sac_conflict(q=MoveLinear,sac=Look,conf=0.99,spread=11.5), type: Look, params: [0.09, 1.00, 0.00], dist=13.2, phase=LAND, ss=1, pb=0
+Step 104 (dist=13.2mm): source: q_confirms_sac(conf=0.99,spread=11.5), type: MoveLinear, params: [0.37, 0.00, 0.00], dist=13.2, phase=LAND, ss=1, pb=0
+Step 105 (dist=12.9mm): source: q_confirms_sac(conf=0.99,spread=11.5), type: MoveLinear, params: [0.29, 0.00, 0.00], dist=12.9, phase=LAND, ss=1, pb=0
+Step 106 (dist=12.6mm): source: q_confirms_sac(conf=0.99,spread=11.4), type: MoveLinear, params: [0.08, 0.00, 0.00], dist=12.6, phase=LAND, ss=1, pb=0
+Step 107 (dist=12.6mm): source: q_confirms_sac(conf=0.99,spread=11.3), type: MoveLinear, params: [0.16, 0.00, 0.00], dist=12.6, phase=LAND, ss=1, pb=0
+Step 108 (dist=12.4mm): source: q_confirms_sac(conf=0.99,spread=11.3), type: MoveLinear, params: [0.42, 0.00, 0.00], dist=12.4, phase=LAND, ss=1, pb=0
+Step 109 (dist=12.1mm): source: q_confirms_sac(conf=0.99,spread=11.2), type: MoveLinear, params: [0.33, 0.00, 0.00], dist=12.1, phase=LAND, ss=1, pb=0
+Step 110 (dist=11.8mm): source: q_confirms_sac(conf=0.99,spread=11.2), type: MoveLinear, params: [0.31, 0.00, 0.00], dist=11.8, phase=LAND, ss=1, pb=0
+Step 111 (dist=11.5mm): source: q_confirms_sac(conf=0.99,spread=11.1), type: MoveLinear, params: [0.96, 0.00, 0.00], dist=11.5, phase=LAND, ss=1, pb=0
+Step 112 (dist=10.7mm): source: q_sac_conflict(q=MoveLinear,sac=Look,conf=0.99,spread=11.1), type: Turn, params: [-0.09, 1.00, 0.00], dist=10.7, phase=LAND, ss=1, pb=0
+Step 113 (dist=10.7mm): source: q_sac_conflict(q=MoveLinear,sac=Look,conf=0.95,spread=13.1), type: Turn, params: [-0.09, 1.00, 0.00], dist=10.7, phase=LAND, ss=1, pb=0
+Step 114 (dist=10.7mm): source: q_sac_conflict(q=MoveLinear,sac=Look,conf=0.95,spread=13.1), type: Turn, params: [-0.09, 1.00, 0.00], dist=10.7, phase=LAND, ss=1, pb=0
+Step 115 (dist=10.7mm): source: q_sac_conflict(q=MoveLinear,sac=Look,conf=0.95,spread=13.1), type: Turn, params: [-0.09, 1.00, 0.00], dist=10.7, phase=LAND, ss=1, pb=0
+Step 116 (dist=10.7mm): source: q_sac_conflict(q=MoveLinear,sac=Look,conf=0.95,spread=13.1), type: Turn, params: [-0.09, 1.00, 0.00], dist=10.7, phase=LAND, ss=1, pb=0
+Step 117 (dist=10.7mm): source: q_sac_conflict(q=MoveLinear,sac=Look,conf=0.95,spread=13.1), type: Turn, params: [-0.09, 1.00, 0.00], dist=10.7, phase=LAND, ss=1, pb=0
+Step 118 (dist=10.7mm): source: q_sac_conflict(q=MoveLinear,sac=Look,conf=0.95,spread=13.1), type: Turn, params: [-0.09, 1.00, 0.00], dist=10.7, phase=LAND, ss=1, pb=0
+Step 119 (dist=10.7mm): source: q_sac_conflict(q=MoveLinear,sac=Look,conf=0.80,spread=12.8), type: Turn, params: [-0.09, 1.00, 0.00], dist=10.7, phase=LAND, ss=1, pb=0
+Step 120 (dist=10.7mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: Turn, params: [-0.09, 1.00, 0.00], dist=10.7, phase=LAND, ss=1, pb=0
+Step 121 (dist=10.7mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: Turn, params: [-0.09, 1.00, 0.00], dist=10.7, phase=LAND, ss=1, pb=0
+Step 122 (dist=10.7mm): source: q_sac_conflict(q=MoveLinear,sac=Turn,conf=0.70,spread=12.2), type: Turn, params: [-0.09, 1.00, 0.00], dist=10.7, phase=LAND, ss=1, pb=0
+Step 123 (dist=10.7mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: Turn, params: [-0.09, 1.00, 0.00], dist=10.7, phase=LAND, ss=1, pb=0
+Step 124 (dist=10.7mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: MoveLinear, params: [2.00, 0.00, 0.00], dist=10.7, phase=LAND, ss=1, pb=0
+Step 125 (dist=9.0mm): source: q_sac_conflict(q=MoveLinear,sac=Look,conf=0.69,spread=13.5), type: Turn, params: [-0.09, 1.00, 0.00], dist=9.0, phase=LAND, ss=0, pb=0
+Step 126 (dist=9.0mm): source: q_sac_conflict(q=MoveLinear,sac=Look,conf=0.62,spread=12.6), type: Turn, params: [-0.09, 1.00, 0.00], dist=9.0, phase=LAND, ss=0, pb=0
+Step 127 (dist=9.0mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: Turn, params: [-0.09, 1.00, 0.00], dist=9.0, phase=LAND, ss=0, pb=0
+Step 128 (dist=9.0mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: Turn, params: [-0.09, 1.00, 0.00], dist=9.0, phase=LAND, ss=0, pb=0
+Step 129 (dist=9.0mm): source: q_sac_conflict(q=MoveLinear,sac=Look,conf=0.81,spread=12.6), type: Turn, params: [-0.09, 1.00, 0.00], dist=9.0, phase=LAND, ss=0, pb=0
+Step 130 (dist=9.0mm): source: q_sac_conflict(q=MoveLinear,sac=Look,conf=0.75,spread=13.6), type: Turn, params: [-0.09, 1.00, 0.00], dist=9.0, phase=LAND, ss=0, pb=0
+Step 131 (dist=9.0mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: Turn, params: [-0.09, 1.00, 0.00], dist=9.0, phase=LAND, ss=0, pb=0
+Step 132 (dist=9.0mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: Turn, params: [-0.09, 1.00, 0.00], dist=9.0, phase=LAND, ss=0, pb=0
+Step 133 (dist=9.0mm): source: q_confirms_sac(conf=0.91,spread=12.9), type: MoveLinear, params: [1.40, 0.00, 0.00], dist=9.0, phase=LAND, ss=0, pb=0
+Step 134 (dist=7.8mm): source: q_sac_conflict(q=MoveLinear,sac=Look,conf=0.95,spread=12.9), type: Turn, params: [-0.09, 1.00, 0.00], dist=7.8, phase=LAND, ss=1, pb=0
+Step 135 (dist=7.8mm): source: q_sac_conflict(q=MoveLinear,sac=Turn,conf=0.95,spread=12.9), type: Turn, params: [-0.09, 1.00, 0.00], dist=7.8, phase=LAND, ss=1, pb=0
+Step 136 (dist=7.8mm): source: q_sac_conflict(q=MoveLinear,sac=Turn,conf=0.79,spread=13.3), type: Turn, params: [-0.09, 1.00, 0.00], dist=7.8, phase=LAND, ss=1, pb=0
+Step 137 (dist=7.8mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: Turn, params: [-0.09, 1.00, 0.00], dist=7.8, phase=LAND, ss=1, pb=0
+Step 138 (dist=7.8mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: Turn, params: [-0.09, 1.00, 0.00], dist=7.8, phase=LAND, ss=1, pb=0
+Step 139 (dist=7.8mm): source: q_confirms_sac(conf=0.71,spread=12.7), type: MoveLinear, params: [0.97, 0.00, 0.00], dist=7.8, phase=LAND, ss=1, pb=0
+Step 140 (dist=7.0mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: Turn, params: [-0.09, 1.00, 0.00], dist=7.0, phase=LAND, ss=1, pb=0
+Step 141 (dist=7.0mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: Turn, params: [-0.09, 1.00, 0.00], dist=7.0, phase=LAND, ss=1, pb=0
+Step 142 (dist=7.0mm): source: q_confirms_sac(conf=0.78,spread=12.6), type: MoveLinear, params: [1.70, 0.00, 0.00], dist=7.0, phase=LAND, ss=1, pb=0
+Step 143 (dist=5.7mm): source: q_sac_conflict(q=MoveLinear,sac=Turn,conf=0.97,spread=12.6), type: Turn, params: [-0.09, 1.00, 0.00], dist=5.7, phase=LAND, ss=1, pb=0
+Step 144 (dist=5.7mm): source: q_sac_conflict(q=MoveLinear,sac=Turn,conf=0.65,spread=11.8), type: Turn, params: [-0.09, 1.00, 0.00], dist=5.7, phase=LAND, ss=1, pb=0
+Step 145 (dist=5.7mm): source: q_sac_conflict(q=MoveLinear,sac=Turn,conf=0.70,spread=15.8), type: Turn, params: [-0.09, 1.00, 0.00], dist=5.7, phase=LAND, ss=1, pb=0, n=[-0.82,-0.49,0.28]
+Step 146 (dist=5.7mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: Turn, params: [-0.09, 1.00, 0.00], dist=5.7, phase=LAND, ss=1, pb=0, n=[-0.82,-0.49,0.28]
+Step 147 (dist=5.7mm): source: heuristic(ml_low,best_ml=0.70,ht=0.86,eps=0.380,used=0.301), type: Turn, params: [-0.09, 1.00, 0.00], dist=5.7, phase=LAND, ss=1, pb=0, n=[-0.87,-0.41,0.28]
+Step 148 (dist=5.7mm): source: q_confirms_sac(conf=0.95,spread=16.4), type: MoveLinear, params: [7.32, 0.00, 0.00], dist=5.7, phase=CRAWL_TO_GOAL, ss=1, pb=0, n=[0.00,0.00,1.00]

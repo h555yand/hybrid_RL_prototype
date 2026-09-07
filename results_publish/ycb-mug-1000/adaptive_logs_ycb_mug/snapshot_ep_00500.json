@@ -1,0 +1,188 @@
+{
+  "episode": 500,
+  "rolling_success_rate": 0.66,
+  "total_episodes_success_rate": 0.686,
+  "curriculum_level": 1,
+  "mode": "online",
+  "total_episodes": 500,
+  "total_steps": 25964,
+  "success_count": 343,
+  "collision_count": 127,
+  "timeout_count": 30,
+  "mean_episode_steps": 51.9,
+  "mean_success_steps": 15.7,
+  "total_steps_per_goal": 75.7,
+  "source_distribution": {
+    "q_store": 0.0,
+    "sac": 0.397,
+    "blend": 0.332,
+    "heuristic": 0.271
+  },
+  "action_distribution": {
+    "MoveTangentially": {
+      "count": 14302,
+      "rate": 0.5508
+    },
+    "Turn": {
+      "count": 6836,
+      "rate": 0.2633
+    },
+    "MoveLinear": {
+      "count": 2516,
+      "rate": 0.0969
+    },
+    "Look": {
+      "count": 2256,
+      "rate": 0.0869
+    },
+    "SensorRotate": {
+      "count": 32,
+      "rate": 0.0012
+    },
+    "Detach": {
+      "count": 22,
+      "rate": 0.0008
+    }
+  },
+  "collision_stats": {
+    "move_tangentially": 23,
+    "look_up": 25,
+    "free_backward": 15,
+    "look_down": 24,
+    "turn_left": 9,
+    "free_forward_small": 10,
+    "free_forward": 6,
+    "turn_right": 15
+  },
+  "arbitrator": {
+    "q_store_rate": 0.0,
+    "sac_rate": 0.397,
+    "blend_rate": 0.332,
+    "heuristic_rate": 0.271,
+    "agreement_rate": 0.638,
+    "q_spread_mean": 10.445,
+    "q_confidence_mean": 0.497,
+    "q_success_rate": 0.0,
+    "sac_success_rate": 0.72,
+    "heuristic_success_rate": 0.0,
+    "blend_success_rate": 0.84,
+    "arbitrage_only": {
+      "total_decisions": 25964,
+      "q_store_rate": 0.0,
+      "sac_rate": 0.397,
+      "blend_rate": 0.332,
+      "heuristic_rate": 0.271
+    },
+    "per_level_track_record": {
+      "level_0": {
+        "q_rate": 0.5,
+        "sac_rate": 0.86,
+        "blend_rate": 0.841,
+        "heuristic_rate": 0.0,
+        "q_evals": 0,
+        "sac_evals": 50,
+        "blend_evals": 44,
+        "heuristic_evals": 5,
+        "heuristic_budget_used": 0.201,
+        "heuristic_eps": 0.05,
+        "ml_trend_increasing": true
+      },
+      "level_1": {
+        "q_rate": 0.5,
+        "sac_rate": 0.58,
+        "blend_rate": 0.84,
+        "heuristic_rate": 0.0,
+        "q_evals": 0,
+        "sac_evals": 50,
+        "blend_evals": 50,
+        "heuristic_evals": 10,
+        "heuristic_budget_used": 0.304,
+        "heuristic_eps": 0.05,
+        "ml_trend_increasing": true
+      }
+    },
+    "is_calibrating": false
+  },
+  "manager": {
+    "sac_updates": 5,
+    "offline_iterations": 0
+  },
+  "per_source_analysis": {
+    "level_0": {
+      "sac": {
+        "terminations": {
+          "success": 114,
+          "collision": 36,
+          "timeout": 1
+        },
+        "total_episodes": 151,
+        "success_rate": 0.755,
+        "mean_final_distance": 7.7,
+        "near_miss_count": 65,
+        "mean_success_steps": 11.8
+      },
+      "blend": {
+        "terminations": {
+          "success": 37,
+          "collision": 1,
+          "timeout": 6
+        },
+        "total_episodes": 44,
+        "success_rate": 0.841,
+        "mean_final_distance": 5.1,
+        "near_miss_count": 22,
+        "mean_success_steps": 8.1
+      },
+      "heuristic": {
+        "terminations": {
+          "success": 0,
+          "collision": 2,
+          "timeout": 3
+        },
+        "total_episodes": 5,
+        "success_rate": 0.0,
+        "mean_final_distance": 30.7,
+        "near_miss_count": 0,
+        "mean_success_steps": 0
+      }
+    },
+    "level_1": {
+      "sac": {
+        "terminations": {
+          "success": 146,
+          "collision": 82,
+          "timeout": 2
+        },
+        "total_episodes": 230,
+        "success_rate": 0.635,
+        "mean_final_distance": 18.4,
+        "near_miss_count": 92,
+        "mean_success_steps": 18.0
+      },
+      "blend": {
+        "terminations": {
+          "success": 46,
+          "collision": 6,
+          "timeout": 8
+        },
+        "total_episodes": 60,
+        "success_rate": 0.767,
+        "mean_final_distance": 9.5,
+        "near_miss_count": 27,
+        "mean_success_steps": 24.0
+      },
+      "heuristic": {
+        "terminations": {
+          "success": 0,
+          "collision": 0,
+          "timeout": 10
+        },
+        "total_episodes": 10,
+        "success_rate": 0.0,
+        "mean_final_distance": 48.1,
+        "near_miss_count": 0,
+        "mean_success_steps": 0
+      }
+    }
+  }
+}

@@ -1,0 +1,30 @@
+Result: success
+Goal: [-6.724896379158265, -28.833369439648614, -42.13634804157564, -179.68201585366936, 9.105152620218949, -176.0080882396591]
+Steps: 17
+Start: [13.515485549288286, -42.579126111753, 20.028534149138643, 94.40807744612255, -5.087464420590493, -5.494137893957912]
+End: [-7.11611740329368, -31.094162412499273, -42.30718920845293, 179.36399540003595, 8.51107758183349, 171.46841578859465]
+Start distance: 66.8mm
+End distance: 2.3mm
+
+object: ycb_mug
+mode: online
+source: sac
+rolling_rate: 0.8
+
+Step 001 (dist=62.9mm): src=sac(qt=0.50,st=0.40,bt=0.50,ht=0.50,h_eps=0.100) | MoveTangentially | dist=66.8
+Step 002 (dist=57.7mm): src=sac(qt=0.50,st=0.40,bt=0.50,ht=0.50,h_eps=0.100) | MoveTangentially | dist=62.9
+Step 003 (dist=54.7mm): src=sac(qt=0.50,st=0.40,bt=0.50,ht=0.50,h_eps=0.100) | MoveTangentially | dist=57.7
+Step 004 (dist=49.1mm): src=sac(qt=0.50,st=0.40,bt=0.50,ht=0.50,h_eps=0.100) | MoveTangentially | dist=54.7
+Step 005 (dist=44.4mm): src=sac(qt=0.50,st=0.40,bt=0.50,ht=0.50,h_eps=0.100) | MoveTangentially | dist=49.1
+Step 006 (dist=39.7mm): src=sac(qt=0.50,st=0.40,bt=0.50,ht=0.50,h_eps=0.100) | MoveTangentially | dist=44.4
+Step 007 (dist=36.2mm): src=sac(qt=0.50,st=0.40,bt=0.50,ht=0.50,h_eps=0.100) | MoveTangentially | dist=39.7
+Step 008 (dist=31.4mm): src=sac(qt=0.50,st=0.40,bt=0.50,ht=0.50,h_eps=0.100) | MoveTangentially | dist=36.2
+Step 009 (dist=27.3mm): src=q_confirms_sac(conf=0.52,spread=6.3) | MoveTangentially | dist=31.4
+Step 010 (dist=22.7mm): src=sac(qt=0.50,st=0.40,bt=0.50,ht=0.50,h_eps=0.100) | MoveTangentially | dist=27.3
+Step 011 (dist=19.8mm): src=sac(qt=0.50,st=0.40,bt=0.50,ht=0.50,h_eps=0.100) | MoveTangentially | dist=22.7
+Step 012 (dist=17.4mm): src=sac(qt=0.50,st=0.40,bt=0.50,ht=0.50,h_eps=0.100) | MoveTangentially | dist=19.8
+Step 013 (dist=15.5mm): src=sac(qt=0.50,st=0.40,bt=0.50,ht=0.50,h_eps=0.100) | MoveTangentially | dist=17.4
+Step 014 (dist=12.5mm): src=sac(qt=0.50,st=0.40,bt=0.50,ht=0.50,h_eps=0.100) | MoveTangentially | dist=15.5
+Step 015 (dist=9.0mm): src=sac(qt=0.50,st=0.40,bt=0.50,ht=0.50,h_eps=0.100) | MoveTangentially | dist=12.5
+Step 016 (dist=5.8mm): src=sac(qt=0.50,st=0.40,bt=0.50,ht=0.50,h_eps=0.100) | MoveTangentially | dist=9.0
+Step 017 (dist=2.3mm): src=sac(qt=0.50,st=0.40,bt=0.50,ht=0.50,h_eps=0.100) | MoveTangentially | dist=5.8

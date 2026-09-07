@@ -1,0 +1,29 @@
+Result: success
+Goal: [22.877762649563454, 5.449483450380272, -18.595909309289045, 70.57599750333425, 31.613398333459422, -86.40995099778263]
+Steps: 21
+Start: [-4.99037005583128, -22.511081219205266, -20.17821164260002, -73.50923703213546, 3.8913435633706115, -12.911542776402428]
+End: [23.248671775778355, 0.912409793056471, -19.445304122861092, 73.38354153430419, 7.962933757306274, -89.55483311639782]
+Start distance: 39.5mm
+End distance: 4.6mm
+
+Step 001 (dist=39.5mm): source: q_confirms_sac(conf=0.60,spread=10.4), type: MoveTangentially, params: [0.10, 1.00, 2.62], dist=39.5, phase=CRAWL_TO_GOAL, ss=1, pb=0, n=[0.23,0.93,0.28]
+Step 002 (dist=38.0mm): source: q_confirms_sac(conf=0.72,spread=9.8), type: MoveTangentially, params: [0.61, 1.00, 2.70], dist=38.0, phase=CRAWL_TO_GOAL, ss=1, pb=0, n=[0.14,0.95,0.28]
+Step 003 (dist=36.4mm): source: sac(qt=0.50,st=0.50,bt=0.50,ht=0.80,h_eps=0.300), type: MoveTangentially, params: [0.58, 1.00, 1.88], dist=36.4, phase=CRAWL_TO_GOAL, ss=1, pb=0, n=[0.05,0.96,0.28]
+Step 004 (dist=35.2mm): source: sac(qt=0.50,st=0.50,bt=0.50,ht=0.80,h_eps=0.300), type: MoveTangentially, params: [-0.53, -0.87, 2.79], dist=35.2, phase=CRAWL_TO_GOAL, ss=1, pb=0, n=[-0.05,0.96,0.28]
+Step 005 (dist=33.5mm): source: sac(qt=0.50,st=0.50,bt=0.50,ht=0.80,h_eps=0.300), type: MoveTangentially, params: [0.32, -0.92, 3.00], dist=33.5, phase=CRAWL_TO_GOAL, ss=1, pb=0, n=[-0.14,0.95,0.28]
+Step 006 (dist=31.6mm): source: sac(qt=0.50,st=0.50,bt=0.50,ht=0.80,h_eps=0.300), type: MoveTangentially, params: [-0.15, -0.96, 1.99], dist=31.6, phase=CRAWL_TO_GOAL, ss=1, pb=0, n=[-0.32,0.90,0.28]
+Step 007 (dist=30.1mm): source: q_confirms_sac(conf=0.61,spread=9.2), type: MoveTangentially, params: [0.01, -0.97, 2.32], dist=30.1, phase=CRAWL_TO_GOAL, ss=1, pb=0, n=[-0.32,0.90,0.28]
+Step 008 (dist=28.3mm): source: sac(qt=0.50,st=0.50,bt=0.50,ht=0.80,h_eps=0.300), type: MoveTangentially, params: [0.93, 0.33, 2.10], dist=28.3, phase=CRAWL_TO_GOAL, ss=1, pb=0, n=[-0.49,0.82,0.28]
+Step 009 (dist=27.0mm): source: q_confirms_sac(conf=0.59,spread=10.4), type: MoveTangentially, params: [0.44, -0.90, 2.34], dist=27.0, phase=CRAWL_TO_GOAL, ss=1, pb=0, n=[-0.49,0.82,0.28]
+Step 010 (dist=25.5mm): source: sac(qt=0.50,st=0.50,bt=0.50,ht=0.80,h_eps=0.300), type: MoveTangentially, params: [0.03, -0.95, 2.88], dist=25.5, phase=CRAWL_TO_GOAL, ss=1, pb=0, n=[-0.57,0.77,0.28]
+Step 011 (dist=23.2mm): source: q_confirms_sac(conf=0.55,spread=12.3), type: MoveTangentially, params: [-0.50, -0.91, 2.94], dist=23.2, phase=CRAWL_TO_GOAL, ss=1, pb=0, n=[-0.64,0.71,0.28]
+Step 012 (dist=20.7mm): source: q_confirms_sac(conf=0.51,spread=12.9), type: MoveTangentially, params: [-0.67, -0.94, 1.78], dist=20.7, phase=CRAWL_TO_GOAL, ss=1, pb=0, n=[-0.77,0.57,0.28]
+Step 013 (dist=19.1mm): source: q_confirms_sac(conf=0.53,spread=13.4), type: MoveTangentially, params: [0.09, -0.97, 2.13], dist=19.1, phase=CRAWL_TO_GOAL, ss=1, pb=0, n=[-0.77,0.57,0.28]
+Step 014 (dist=17.3mm): source: q_confirms_sac(conf=0.85,spread=13.4), type: MoveTangentially, params: [-0.59, -0.96, 2.24], dist=17.3, phase=CRAWL_TO_GOAL, ss=1, pb=0, n=[-0.82,0.49,0.28]
+Step 015 (dist=15.2mm): source: q_confirms_sac(conf=0.58,spread=13.7), type: MoveTangentially, params: [-0.72, -0.90, 1.95], dist=15.2, phase=CRAWL_TO_GOAL, ss=1, pb=0, n=[-0.87,0.41,0.28]
+Step 016 (dist=13.4mm): source: sac(qt=0.50,st=0.50,bt=0.50,ht=0.80,h_eps=0.300), type: MoveTangentially, params: [-0.81, -0.93, 2.13], dist=13.4, phase=CRAWL_TO_GOAL, ss=1, pb=0, n=[-0.90,0.32,0.28]
+Step 017 (dist=11.4mm): source: q_confirms_sac(conf=0.53,spread=17.8), type: MoveTangentially, params: [0.75, -0.85, 1.59], dist=11.4, phase=CRAWL_TO_GOAL, ss=1, pb=0, n=[-0.93,0.23,0.28]
+Step 018 (dist=9.8mm): source: q_confirms_sac(conf=0.64,spread=15.6), type: MoveTangentially, params: [0.82, -0.88, 1.45], dist=9.8, phase=CRAWL_TO_GOAL, ss=1, pb=0, n=[-0.95,0.14,0.28]
+Step 019 (dist=8.4mm): source: q_confirms_sac(conf=0.95,spread=19.0), type: MoveTangentially, params: [-0.95, -0.11, 2.45], dist=8.4, phase=CRAWL_TO_GOAL, ss=1, pb=0, n=[-0.95,0.14,0.28]
+Step 020 (dist=6.3mm): source: q_confirms_sac(conf=0.95,spread=20.6), type: MoveTangentially, params: [0.52, -0.62, 1.79], dist=6.3, phase=CRAWL_TO_GOAL, ss=1, pb=0, n=[-0.96,0.05,0.28]
+Step 021 (dist=4.6mm): source: q_confirms_sac(conf=0.95,spread=26.3), type: MoveTangentially, params: [0.05, -0.85, 2.15], dist=4.6, phase=CRAWL_TO_GOAL, ss=1, pb=0, n=[-0.96,-0.05,0.28]

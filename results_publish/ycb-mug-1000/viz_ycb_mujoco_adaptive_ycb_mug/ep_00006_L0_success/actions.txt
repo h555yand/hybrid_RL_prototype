@@ -1,0 +1,22 @@
+Result: success
+Goal: [-49.05516203937105, 38.26868786962221, 9.751652024697572, -172.51444200807597, 65.7334341787979, -168.4372331666498]
+Steps: 9
+Start: [-41.791350510155986, 34.94937693439804, -23.268353900303993, -1.5488760936993629, 46.811390821549594, -0.6704745220798998]
+End: [-48.89815685773869, 37.983321365555454, 9.856897664706171, -132.7024225618044, 74.50812076004951, -120.1343670847488]
+Start distance: 34.0mm
+End distance: 0.3mm
+
+object: ycb_mug
+mode: online
+source: blend
+rolling_rate: 0.667
+
+Step 001 (dist=30.9mm): src=q_confirms_sac(conf=0.54,spread=9.7) | MoveTangentially | dist=34.0
+Step 002 (dist=28.1mm): src=q_confirms_sac(conf=0.52,spread=11.3) | MoveTangentially | dist=30.9
+Step 003 (dist=24.5mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=28.1
+Step 004 (dist=20.8mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=24.5
+Step 005 (dist=17.7mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=20.8
+Step 006 (dist=12.7mm): src=q_confirms_sac(conf=0.60,spread=11.9) | MoveTangentially | dist=17.7
+Step 007 (dist=8.4mm): src=q_confirms_sac(conf=0.60,spread=13.0) | MoveTangentially | dist=12.7
+Step 008 (dist=4.7mm): src=q_confirms_sac(conf=0.50,spread=11.6) | MoveTangentially | dist=8.4
+Step 009 (dist=0.3mm): src=sac(qt=0.50,st=0.50,bt=0.50,ht=0.50,h_eps=0.050) | MoveTangentially | dist=4.7

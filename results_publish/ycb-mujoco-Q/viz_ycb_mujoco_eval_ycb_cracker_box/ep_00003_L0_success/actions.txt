@@ -1,0 +1,24 @@
+Result: success
+Goal: [-21.103540013798323, -107.25071191358302, -53.30962105969192, 91.36674128022952, -3.678273717559589, -3.7670159441048514]
+Steps: 8
+Start: [-26.996053040556383, -107.20706166071548, -31.56448265850209, 88.46854045919571, -10.331786888526551, -10.060671575599002]
+End: [-20.858255291583273, -107.52621373476518, -51.28203506257033, 91.50561538399552, -3.9697812265371795, -4.075405998950288]
+Start distance: 22.5mm
+End distance: 2.1mm
+
+object: ycb_cracker_box (cracker_box)
+level_bounds: [10.0-60.0mm]
+mj_center: [-1.9280224760778926, 0.3764770854332856, -0.06409531878804645]
+mj_extents: [71.72000122070314, 213.42099237442022, 163.98600006103518]
+up_direction: [0.9999999999989999, 0.0, 0.0]
+embodiment_pos: [-0.020858255291583274, -0.10752621373476517, -0.05128203506257033]
+embodiment_rot: [0.6977779445578196, 0.7145943011278436, -0.04960770992772058, -4.5102810375396984e-17]
+
+Step 001 (dist=20.3mm): [phase=CRAWL_TO_GOAL|ss=1|pb=0|d=2.1|al=-0.03|n=[-0.12,-0.99,-0.00]|pos=[-27.0,-107.2,-31.6]] [phase=CRAWL_TO_GOAL] ##### Softmax; move_tangentially, confidence 100%). blend: 98% Q + 2% heuristic. Q recommends: move_tangentially - 6; Heuristics: move_tangentially - 7.  |mj=[-0.0245,-0.1075,-0.0333]|depth=2.1|on=1
+Step 002 (dist=18.2mm): [phase=CRAWL_TO_GOAL|ss=1|pb=0|d=2.1|al=-0.03|n=[-0.12,-0.99,-0.01]|pos=[-24.5,-107.5,-33.3]] [phase=CRAWL_TO_GOAL] ##### Softmax; move_tangentially, confidence 100%). blend: 98% Q + 2% heuristic. Q recommends: move_tangentially - 6; Heuristics: move_tangentially - 7.  |mj=[-0.0222,-0.1078,-0.0351]|depth=2.2|on=1
+Step 003 (dist=15.2mm): [phase=CRAWL_TO_GOAL|ss=1|pb=0|d=2.2|al=-0.02|n=[-0.11,-0.99,-0.02]|pos=[-22.2,-107.8,-35.1]] [phase=CRAWL_TO_GOAL] ##### Softmax; move_tangentially, confidence 100%). blend: 98% Q + 2% heuristic. Q recommends: move_tangentially - 6; Heuristics: move_tangentially - 6.  |mj=[-0.0219,-0.1078,-0.0381]|depth=2.2|on=1
+Step 004 (dist=12.2mm): [phase=CRAWL_TO_GOAL|ss=1|pb=0|d=2.2|al=-0.01|n=[-0.08,-1.00,-0.03]|pos=[-21.9,-107.8,-38.1]] [phase=CRAWL_TO_GOAL] ##### Softmax; move_tangentially, confidence 100%). blend: 98% Q + 2% heuristic. Q recommends: move_tangentially - 6; Heuristics: move_tangentially - 6.  |mj=[-0.0216,-0.1077,-0.0411]|depth=2.2|on=1
+Step 005 (dist=9.2mm): [phase=CRAWL_TO_GOAL|ss=1|pb=0|d=2.2|al=-0.01|n=[-0.08,-1.00,-0.03]|pos=[-21.6,-107.7,-41.1]] [phase=CRAWL_TO_GOAL] ##### Softmax; move_tangentially, confidence 100%). blend: 98% Q + 2% heuristic. Q recommends: move_tangentially - 6; Heuristics: move_tangentially - 6.  |mj=[-0.0214,-0.1076,-0.0441]|depth=2.1|on=1
+Step 006 (dist=7.6mm): [phase=CRAWL_TO_GOAL|ss=1|pb=0|d=2.1|al=-0.03|n=[-0.08,-1.00,-0.01]|pos=[-21.4,-107.6,-44.1]] [phase=CRAWL_TO_GOAL] ##### Softmax; move_tangentially, confidence 100%). blend: 98% Q + 2% heuristic. Q recommends: move_tangentially - 6; Heuristics: move_tangentially - 7.  |mj=[-0.0191,-0.1078,-0.0460]|depth=2.2|on=1
+Step 007 (dist=4.8mm): [phase=CRAWL_TO_GOAL|ss=1|pb=0|d=2.2|al=-0.03|n=[-0.07,-1.00,-0.03]|pos=[-19.1,-107.8,-46.0]] [phase=CRAWL_TO_GOAL] ##### Softmax; move_tangentially, confidence 100%). blend: 98% Q + 2% heuristic. Q recommends: move_tangentially - 6; Heuristics: move_tangentially - 6.  |mj=[-0.0189,-0.1077,-0.0490]|depth=2.2|on=1
+Step 008 (dist=2.1mm): [phase=CRAWL_TO_GOAL|ss=1|pb=0|d=2.2|al=-0.04|n=[-0.07,-1.00,-0.03]|pos=[-18.9,-107.7,-49.0]] [phase=CRAWL_TO_GOAL] ##### Softmax; move_tangentially, confidence 100%). blend: 98% Q + 2% heuristic. Q recommends: move_tangentially - 5; Heuristics: move_tangentially - 5.  |mj=[-0.0209,-0.1075,-0.0513]|depth=2.2|on=1
