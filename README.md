@@ -733,11 +733,11 @@ All methods trained on: cube, sphere, cylinder, flat_square, cone, thin_cylinder
 | **thin_cylinder** | 100% | 100% | 100% | **100%** |
 | **cylinder** | 100% | 100% | 98% | **99%** |
 | **cube** | 100% | 100% | 94% | **98%** |
+| **cone** | 96% | 66% | 74% | **79%** |
 | **vase** | 100% | 100% | 68% | **89%** |
 | **flat_square** | 100% | 86% | 66% | **84%** |
 | **mug** | 100% | 87% | 64% | **84%** |
 | **cup** ★ | 93% | 89% | 66% | **83%** |
-| **cone** | 96% | 66% | 74% | **79%** |
 
 #### Heuristic-Only Evaluation
 
@@ -746,12 +746,12 @@ All methods trained on: cube, sphere, cylinder, flat_square, cone, thin_cylinder
 | **thin_cylinder** | 100% | 99% | 99% | **99%** |
 | **cylinder** | 100% | 96% | 94% | **97%** |
 | **cube** | 100% | 98% | 91% | **96%** |
-| **vase** | 99% | 98% | 90% | **96%** |
 | **sphere** | 100% | 95% | 89% | **95%** |
-| **cup** | 99% | 84% | 85% | **89%** |
-| **mug** | 100% | 76% | 78% | **85%** |
 | **cone** | 95% | 67% | 78% | **80%** |
 | **flat_square** | 100% | 88% | 51% | **80%** |
+| **vase** | 99% | 98% | 90% | **96%** |
+| **mug** | 100% | 76% | 78% | **85%** |
+| **cup** | 99% | 84% | 85% | **89%** |
 
 ★ = unseen during training (generalization test)
 
@@ -763,10 +763,10 @@ All methods trained on: cube, sphere, cylinder, flat_square, cone, thin_cylinder
 | **thin_cylinder** | 96% | 100% | 99% |
 | **cylinder** | 97% | 99% | 97% |
 | **cube** | 97% | 98% | 96% |
-| **vase** | 90% | 89% | 96% |
-| **flat_square** | 82% | 84% | 80% |
-| **mug** | 78% | 84% | 85% |
 | **cone** | 80% | 79% | 80% |
+| **flat_square** | 82% | 84% | 80% |
+| **vase** | 90% | 89% | 96% |
+| **mug** | 78% | 84% | 85% |
 | **cup** ★ | 79% | 83% | 89% |
 | **Average** | **89%** | **91%** | **89%** |
 
@@ -857,21 +857,6 @@ The system self-regulates without manual intervention:
 - **L2**: SAC drops to 71%, heuristic budget automatically increases to 24%. The arbitrator detects ML underperformance and allocates more steps to the reliable fallback.
 - **Blend mode** (Q confirms SAC) consistently outperforms standalone SAC at L0-L1 (92% vs 97% — SAC is better alone on easy tasks) but provides the critical safety check at L2 where SAC's confidence doesn't correlate with actual success.
 
-### Areas for Improvement
-
-**1. SAC online learning shows limited improvement.** After 20 online SAC updates during 2000 adaptive episodes, SAC success rate did not significantly increase. The likely causes:
-- CQL critic is conservative by design — prevents overestimation but also slows learning
-- Actor updates are heavily regularized (BC lambda, reduced lr, every 10th step) to prevent catastrophic forgetting
-- The new object (cup) has limited successful trajectories for BC data
-- Online mini-batches (40 steps every 100 episodes) may be insufficient for meaningful policy improvement
-
-Potential solutions: larger online update batches, adaptive BC lambda decay based on success rate, curriculum-aware replay buffer prioritization.
-
-**2. L2 collision rate remains high.** 356 collisions across 2000 episodes (17.8%), primarily from MoveLinear actions. The detach→fly→land sequence is the riskiest phase — the agent sometimes flies into the object surface. Better depth-based collision avoidance during flight and more conservative landing approach could reduce this.
-
-**3. Heuristic-ML gap at L2.** On the hardest level, heuristics (72%) slightly outperform blend (63%). This suggests the learned policies haven't fully captured the geometric reasoning needed for opposite-side navigation. More training episodes on complex objects, or explicit curriculum for detach scenarios, could close this gap.
-
-
 ## YCB Results on MuJoCo Environment
 
 To validate that learned policies transfer beyond the training simulator, we evaluated on **real YCB objects** rendered in **MuJoCo** — a physics-based environment with realistic depth sensing, surface normals from mesh rendering, and physically-grounded agent movement. The agent was trained entirely on simple geometric primitives (cube, sphere, cylinder, etc.) in the lightweight trimesh environment and had **never seen any YCB object during training**.
@@ -881,7 +866,6 @@ To validate that learned policies transfer beyond the training simulator, we eva
 - **Environment**: MuJoCo with YCB object meshes (textured .obj), depth camera sensor (64×64), surface normal estimation via total least squares
 - **Agent**: Q-learning policy trained on trimesh primitives (no fine-tuning on YCB or MuJoCo)
 - **Objects**: 5 YCB objects spanning different geometric complexities
-- **Episodes**: 30 per level per object
 - **Curriculum**: Same 3-level difficulty as training
 
 | Level | Distance (mm) | Filter | Description |
@@ -1048,7 +1032,7 @@ pose         ← embodiment.position × 1000, quat_to_euler(embodiment.rotation)
 point_normal ← Monty: surface_normal_total_least_squares(semantic_3d, center_id, view_dir)
 depth        ← Monty: depth_map[cy, cx] × 1000
 k1, k2       ← Monty: principal_curvatures(semantic_3d, center_id, normal)
-on_object    ← depth < 5.0mm
+on_object    ← depth < 3.0mm
 path_blocked ← mujoco.mj_ray (physics-based ray cast)
 goal_normal  ← CAD mesh face normal → _dir_cad_to_mj (frame conversion)
 object_center← CAD centroid → _pos_cad_to_mj_mm
@@ -1230,6 +1214,20 @@ This is an **environment-level problem**, not an RL problem. Even a perfect poli
 - Landing approach lacks fine depth control — the agent sometimes overshoots and passes through the surface
 - FLY_TO_EDGE phase relies on cached fly direction from the last surface contact, which may be irrelevant after several air maneuvers
 
+**Architectural issue: strategic_direction store has no effect on action selection.**
+
+Analysis of the v1 action selection pipeline revealed that the strategic_direction Q-store (5D state, 9500+ points, 2 actions: fly_to_goal/bypass) does not meaningfully influence action selection. The execution order is:
+
+1. `_determine_phase()` — determines phase from geometry (path_blocked, hysteresis, depth)
+2. `_compute_heuristic_bias()` — generates action bias for this phase
+3. `combined = (1-eps) * Q_tactical + eps * heuristic` — blend is computed
+4. Strategic direction — overwrites `_current_phase`, but combined is already computed for the original phase
+
+The phase overwrite affects only the next step, where `_determine_phase()` re-determines the phase from geometry anyway, discarding the strategic override. The only indirect effect is through the hysteresis branch (`prev_phase == "FLY_TO_EDGE"`), which is unreliable.
+
+Additionally, the 5D direction state contains a redundancy: `lateral_deviation = sqrt(1 - angle_to_goal²)` is a deterministic function of `angle_to_goal`, so 2 of 5 features carry identical information.
+
+
 ### 4. Online SAC Learning Shows Limited Improvement
 
 **After 20 online SAC updates during 2000 adaptive episodes, SAC success rate did not meaningfully increase.** The conservative hyperparameters that prevent catastrophic forgetting also prevent fast adaptation:
@@ -1265,6 +1263,7 @@ This gap is expected for any sim-to-sim transfer and represents the baseline cos
 
 **Validation on YCB in Monty.** Key metric: does replacing JumpToGoal with RLGoalPolicy maintain classification accuracy and pose estimation quality while using only incremental actions?
 
+
 ### Near-term: Improve Core Navigation
 
 **Robust edge traversal.** The highest-impact improvement. Options under consideration:
@@ -1273,7 +1272,35 @@ This gap is expected for any sim-to-sim transfer and represents the baseline cos
 - Edge-aware movement protocol: detect proximity to mesh boundary edges and switch to a specialized crossing sequence (lift slightly, advance, re-snap)
 - For MuJoCo: multi-directional `mj_ray` probing for more reliable surface finding
 
-**Improved air navigation.** Increase air-start episode ratio beyond 33%. Consider dedicated air-navigation curriculum phases. Replace reactive flyby correction with predictive trajectory planning using depth lookahead.
+**Improved air navigation. - replace strategic_direction store with two tactical stores.**
+
+Split the single `q_store_free` into two phase-specific tactical stores:
+- `q_store_fly_to_goal` — actions when flying directly to goal (FLY_TO_GOAL, LAND phases)
+- `q_store_fly_to_edge` — actions when bypassing/orbiting obstacle (FLY_TO_EDGE phase)
+
+Phase is determined purely by `_determine_phase()` (geometry), then selects the appropriate store:
+
+```
+_determine_phase()              ← geometry → phase
+    │
+    ▼
+_compute_heuristic_bias(phase)  ← baseline behavior for this phase
+    │
+    ▼
+store = select_store(phase)     ← phase selects store
+q_values = store.get_q_values(state)
+    │
+    ▼
+combined = (1-eps) * Q + eps * heuristic
+    │
+    ▼
+softmax → action
+```
+
+This resolves the core conflict: the same position in air requires different actions depending on phase (fly toward goal vs orbit around obstacle). A single store learns contradictory Q-values for these situations. Two stores each learn a consistent policy without conflicts.
+
+This mirrors the existing surface/free split, which was motivated by the same principle — identical positions requiring different actions depending on context (on surface vs in air).
+
 
 **Landing precision.** Add depth-based approach control: when depth < N×free_step, switch to progressively smaller steps. Prevent overshoot by checking depth before each forward move, not after.
 

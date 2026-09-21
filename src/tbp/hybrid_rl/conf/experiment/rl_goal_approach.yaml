@@ -28,8 +28,8 @@ experiment:
     sac_eval_seeds: [44]
     adapt_seed: 99
 
-    promote_threshold: 0.7
-    promote_window: 200
+    promote_threshold: 0.5
+    promote_window: 100
 
     curriculum_levels:
       - [10.0, 60.0]    # L0: same_side, no path_blocked
@@ -272,7 +272,7 @@ experiment:
         6: 0.1
         7: 0.1
         8: 0.1
-        10: 0.1
+        10: 0.5
         11: 0.0
         14: 0.0
         18: 0.3

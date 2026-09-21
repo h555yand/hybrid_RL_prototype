@@ -54,6 +54,7 @@ from tbp.hybrid_rl.episode_pools import _is_reachable_by_surface
 from .arbitrator import sac_to_discrete
 from .action_interpreter import ActionInterpreter
 from tbp.hybrid_rl.ycb_utils import convert_ycb_objects
+from tbp.hybrid_rl.mujoco_env_adapter import MuJoCoEnvAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -2781,7 +2782,7 @@ class RLGoalApproachExperiment:
                     np.linalg.norm(goal_pose[:3] - pose[:3])
                 )
                 action_explanations.append(
-                    f"src={source} | {act_name} | "
+                    f"{act_name} | {source} | "
                     f"dist={dist_to_goal:.1f}"
                 )
 
@@ -3449,10 +3450,6 @@ class RLGoalApproachExperiment:
                 )
 
             # ═══ Create environments ═══
-            from tbp.hybrid_rl.mujoco_env_adapter import (
-                MuJoCoEnvAdapter,
-            )
-
             try:
                 mj_env = MuJoCoEnvAdapter(
                     mesh_path_mm=str(stl_path),

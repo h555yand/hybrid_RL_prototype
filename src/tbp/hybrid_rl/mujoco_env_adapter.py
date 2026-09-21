@@ -847,7 +847,147 @@ class MuJoCoEnvAdapter:
 
         # ═══ All attempts failed — rollback ═══
         self._set_pose_mj_mm(old_pos, old_euler)
-        
+    
+    def _snap_to_surface_new(self, prev_normal=None):
+        pos = self._get_pos_mj_mm()
+        euler = self._get_euler_deg()
+        rot = Rot.from_euler("xyz", euler, degrees=True)
+        forward = rot.apply([0, 0, -1])
+
+        # Save position before any approach
+        pos_after_move = pos.copy()
+
+        hit_dist = self._mj_ray_cast(pos, forward)
+
+        if hit_dist < 0 or hit_dist >= 10.0:
+            hit_dist, forward = self._multi_probe_ray_cast(
+                pos, forward, rot,
+                max_dist=10.0,
+                surface_step=3.0,
+            )
+
+        if hit_dist < 0 or hit_dist >= 10.0:
+            # ═══ Fallback: -prev_normal (as before) ═══
+            if prev_normal is not None:
+                prev_n = np.array(prev_normal, dtype=float)
+                prev_n /= (np.linalg.norm(prev_n) + 1e-12)
+                prev_hit = self._mj_ray_cast(pos, -prev_n)
+                if prev_hit > 0 and prev_hit < 10.0:
+                    approach = prev_hit - SNAP_TARGET_DEPTH_MM
+                    new_pos = pos - prev_n * approach
+                    new_euler = self._look_at_direction(-prev_n)
+                    self._set_pose_mj_mm(new_pos, new_euler)
+                    # ═══ Validate via render ═══
+                    rendered = self._render_and_extract()
+                    if rendered["depth_mm"] >= NO_SURFACE_DEPTH_MM:
+                        return False
+                    return True
+            return False
+
+        # Approach to target depth
+        if abs(hit_dist - SNAP_TARGET_DEPTH_MM) > 0.3:
+            approach = hit_dist - SNAP_TARGET_DEPTH_MM
+            pos = pos + forward * approach
+            self._set_pose_mj_mm(pos, euler)
+
+        # Get normal from render
+        rendered = self._render_and_extract()
+        new_normal = rendered["point_normal"]
+
+        # ═══ Validate: render must see surface ═══
+        if rendered["depth_mm"] >= NO_SURFACE_DEPTH_MM:
+            return False
+
+        if new_normal is None:
+            if prev_normal is not None:
+                new_euler = self._look_at_direction(-np.array(prev_normal))
+                self._set_pose_mj_mm(pos, new_euler)
+                return True
+            return False
+
+        normal_arr = np.array(new_normal, dtype=float)
+        n_len = np.linalg.norm(normal_arr)
+        if n_len < 1e-8:
+            return False
+        normal_arr /= n_len
+
+        if prev_normal is not None:
+            prev_n = np.array(prev_normal, dtype=float)
+            prev_n /= (np.linalg.norm(prev_n) + 1e-12)
+            dot = float(np.dot(normal_arr, prev_n))
+
+            if dot < -0.1:
+                prev_hit = self._mj_ray_cast(pos_after_move, -prev_n)
+                if prev_hit > 0 and prev_hit < 5.0:
+                    approach = prev_hit - SNAP_TARGET_DEPTH_MM
+                    new_pos = pos_after_move - prev_n * approach
+                    new_euler = self._look_at_direction(-prev_n)
+                    self._set_pose_mj_mm(new_pos, new_euler)
+                    # ═══ Validate via render ═══
+                    rendered = self._render_and_extract()
+                    if rendered["depth_mm"] >= NO_SURFACE_DEPTH_MM:
+                        return False
+                    return True
+                else:
+                    normal_arr = -normal_arr
+
+            elif dot < 0:
+                normal_arr = -normal_arr
+
+        new_euler = self._look_at_direction(-normal_arr)
+        self._set_pose_mj_mm(pos, new_euler)
+        return True
+
+    def _multi_probe_ray_cast(
+        self,
+        pos: np.ndarray,
+        forward: np.ndarray,
+        rot,
+        max_dist: float = 10.0,
+        surface_step: float = 3.0,
+    ) -> tuple:
+        right = rot.apply([1, 0, 0])
+        up = rot.apply([0, 1, 0])
+
+        probe_angles = [15, 30, 45]
+
+        probe_dirs = [
+            up, -up, right, -right,
+            (up + right) / np.sqrt(2),
+            (up - right) / np.sqrt(2),
+            (-up + right) / np.sqrt(2),
+            (-up - right) / np.sqrt(2),
+        ]
+
+        for angle_deg in probe_angles:
+            angle_rad = np.radians(angle_deg)
+            cos_a = np.cos(angle_rad)
+            sin_a = np.sin(angle_rad)
+
+            # Чем больше угол — тем короче допустимая дистанция
+            # 15° → 2× surface_step = 6mm
+            # 30° → 1.5× surface_step = 4.5mm  
+            # 45° → 1× surface_step = 3mm
+            angle_factor = 2.0 - (angle_deg / 45.0)
+            probe_max_dist = min(surface_step * angle_factor, max_dist)
+
+            best_dist = probe_max_dist
+            best_direction = None
+
+            for probe_dir in probe_dirs:
+                probed = forward * cos_a + probe_dir * sin_a
+                probed /= (np.linalg.norm(probed) + 1e-12)
+
+                hit = self._mj_ray_cast(pos, probed)
+                if 0 < hit < best_dist:
+                    best_dist = hit
+                    best_direction = probed
+
+            if best_direction is not None:
+                return best_dist, best_direction
+
+        return -1.0, forward
+    
     def _snap_to_surface(self, prev_normal=None):
         pos = self._get_pos_mj_mm()  # позиция после tangential move
         euler = self._get_euler_deg()
