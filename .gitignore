@@ -83,6 +83,8 @@ local
 
 .vscode
 
+results_publish
+
 results
 
 src/tbp/tbp.monty

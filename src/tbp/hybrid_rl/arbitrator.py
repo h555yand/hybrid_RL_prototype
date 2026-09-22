@@ -254,16 +254,10 @@ class Arbitrator:
         self._episodes_on_level += 1
         self._current_episode_sources = []
 
-    def decide(
-        self,
-        state: np.ndarray,
-        current_pose: np.ndarray,
-        sensor_data: Dict[str, Any],
-    ) -> Tuple[int, np.ndarray, str]:
+    def decide(self, state, current_pose, sensor_data):
         self.stats["total_decisions"] += 1
         level = self._current_level
         has_sac = self.sac_actor is not None
-
         self._level_total_decisions[level] += 1
 
         # === Get proposals ===
@@ -276,7 +270,7 @@ class Arbitrator:
         else:
             sac_type, sac_params = q_type, q_params.copy()
 
-        # Track proposals
+        # Track proposals (без изменений)
         q_name = self._type_names.get(q_type, f"type_{q_type}")
         self.q_proposed_actions[q_name] += 1
         self.q_confidence_history.append(q_confidence)
@@ -288,90 +282,82 @@ class Arbitrator:
             if q_type == sac_type:
                 self.agreement_count += 1
 
+        # === Общий heuristic бюджет ===
+        total_on_level = max(self._level_total_decisions[level], 1)
+        heuristic_on_level = self._level_heuristic_decisions[level]
+        heuristic_ratio = heuristic_on_level / total_on_level
+
+        q_track, sac_track, b_track, h_track, best_ml_track, worst_ml_track, has_enough_data = (
+            self._get_level_tracks(level)
+        )
+        ml_track = (best_ml_track + worst_ml_track) * 0.5
+        current_eps = self._get_heuristic_eps(ml_track, h_track)
+        budget_available = heuristic_ratio < current_eps
+
         # === 1. Q-confident override ===
         q_conf_mean = (
             float(np.mean(self.q_confidence_history))
-            if self.q_confidence_history
-            else 0.0
+            if self.q_confidence_history else 0.0
         )
         q_conf_threshold = min(max(q_conf_mean * 0.9, 0.5), 1.0)
-        # q_conf_threshold = 0.1
         q_spread_threshold = 3.0
 
         if q_confidence >= q_conf_threshold and q_spread > q_spread_threshold:
             if q_type == sac_type:
-                # 1.1 Types agree: Q confirms SAC → use SAC params
+                # 1.1 Agree → blend (без изменений)
                 self._record_decision("blend")
                 self.blend_chosen_actions[q_name] += 1
                 self._current_episode_sources.append("blend")
-                blend_type = q_type
-                blend_params = sac_params
-                return blend_type, blend_params, (
+                return q_type, sac_params, (
                     f"q_confirms_sac("
                     f"conf={q_confidence:.2f},"
                     f"spread={q_spread:.1f})"
                 )
             else:
-                # 1.2 Types differ: conflict → heuristic decides
-                h_action = self._get_heuristic_action(
-                    state, current_pose, sensor_data
-                )
-                h_type = ExperienceExtractor.DISCRETE_TO_PSAC[h_action][0]
-                h_params = self._discrete_to_params(h_action)
-                self._record_decision("heuristic")
-                self._level_heuristic_decisions[level] += 1
-                h_name = self._type_names.get(h_type, f"type_{h_type}")
-                self.heuristic_chosen_actions[h_name] += 1
-                self._current_episode_sources.append("heuristic")
-                return h_type, h_params, (
-                    f"q_sac_conflict("
-                    f"q={q_name},sac={sac_name},"
-                    f"conf={q_confidence:.2f},"
-                    f"spread={q_spread:.1f})"
-                )
+                # 1.2 Conflict → heuristic ТОЛЬКО если бюджет есть
+                if budget_available:
+                    h_action = self._get_heuristic_action(
+                        state, current_pose, sensor_data
+                    )
+                    h_type = ExperienceExtractor.DISCRETE_TO_PSAC[h_action][0]
+                    h_params = self._discrete_to_params(h_action)
+                    self._record_decision("heuristic")
+                    self._level_heuristic_decisions[level] += 1
+                    h_name = self._type_names.get(h_type, f"type_{h_type}")
+                    self.heuristic_chosen_actions[h_name] += 1
+                    self._current_episode_sources.append("heuristic")
+                    return h_type, h_params, (
+                        f"q_sac_conflict("
+                        f"q={q_name},sac={sac_name},"
+                        f"conf={q_confidence:.2f},"
+                        f"spread={q_spread:.1f},"
+                        f"eps={current_eps:.3f})"
+                    )
+                # else: бюджет исчерпан → fall through to SAC default
 
-        # === 2. Track record scoring ===
-        q_track, sac_track, b_track, h_track, best_ml_track, worst_ml_track, has_enough_data = (
-            self._get_level_tracks(level)
-        )
-        ml_track = (best_ml_track + worst_ml_track) * 0.5
-
-        ml_trend_not_increasing = True
-        if has_enough_data:
-            ml_trend_not_increasing = not self._is_ml_trend_increasing(level)
-
-        ml_below_heuristic = worst_ml_track < h_track
-
-        use_heuristic = (
-            has_enough_data
-            and ml_below_heuristic
-            # and ml_trend_not_increasing
+        # === 2. Track record: ML хуже heuristic ===
+        ml_below_heuristic = (
+            has_enough_data and worst_ml_track < h_track
         )
 
-        if use_heuristic:
-            total_on_level = max(self._level_total_decisions[level], 1)
-            heuristic_on_level = self._level_heuristic_decisions[level]
-            heuristic_ratio = heuristic_on_level / total_on_level
-            current_eps = self._get_heuristic_eps(ml_track, h_track)
-
-            if heuristic_ratio < current_eps:
-                h_action = self._get_heuristic_action(
-                    state, current_pose, sensor_data
-                )
-                h_type = ExperienceExtractor.DISCRETE_TO_PSAC[h_action][0]
-                h_params = self._discrete_to_params(h_action)
-                self._record_decision("heuristic")
-                self._level_heuristic_decisions[level] += 1
-                h_name = self._type_names.get(h_type, f"type_{h_type}")
-                self.heuristic_chosen_actions[h_name] += 1
-                self._current_episode_sources.append("heuristic")
-                return h_type, h_params, (
-                    f"heuristic(ml_low,"
-                    f"best_ml={best_ml_track:.2f},"
-                    f"ht={h_track:.2f},"
-                    f"eps={current_eps:.3f},"
-                    f"used={heuristic_ratio:.3f})"
-                )
+        if ml_below_heuristic and budget_available:
+            h_action = self._get_heuristic_action(
+                state, current_pose, sensor_data
+            )
+            h_type = ExperienceExtractor.DISCRETE_TO_PSAC[h_action][0]
+            h_params = self._discrete_to_params(h_action)
+            self._record_decision("heuristic")
+            self._level_heuristic_decisions[level] += 1
+            h_name = self._type_names.get(h_type, f"type_{h_type}")
+            self.heuristic_chosen_actions[h_name] += 1
+            self._current_episode_sources.append("heuristic")
+            return h_type, h_params, (
+                f"heuristic(ml_low,"
+                f"best_ml={best_ml_track:.2f},"
+                f"ht={h_track:.2f},"
+                f"eps={current_eps:.3f},"
+                f"used={heuristic_ratio:.3f})"
+            )
 
         # === 3. SAC default ===
         if has_sac:
@@ -384,7 +370,8 @@ class Arbitrator:
                 f"st={sac_track:.2f},"
                 f"bt={b_track:.2f},"
                 f"ht={h_track:.2f},"
-                f"h_eps={self._get_heuristic_eps(ml_track, h_track):.3f})"
+                f"h_eps={current_eps:.3f},"
+                f"h_used={heuristic_ratio:.3f})"
             )
 
         # Fallback Q (no SAC)

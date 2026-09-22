@@ -1,5 +1,64 @@
 # Summary
 
+## Agenda
+### Key changes
+- 22D state
+- Q Strategic Level - detach, fly goal / edge
+- Phase system
+- Arbitrage algorithm - Q confidence, heuristic budget
+- MuJoCo integration
+
+### Training / validation results
+- Q, SAC, adaptive mode results on trimesh environment
+Log
+/home/aeisaev/Downloads/github/hybrid_RL_prototype/results_publish/adaptive_logs_cup/
+
+- YCB results on MuJoCo environment
+
+### Examples
+
+/results_publish/ycb-mujoco-Q/viz_ycb_mujoco_eval_ycb_banana/ep_00005_L2_success
+
+/results_publish/ycb-mujoco-Q/viz_ycb_mujoco_eval_ycb_cracker_box/ep_00007_L2_success
+
+/results_publish/ycb-mujoco-Q/viz_ycb_mujoco_eval_ycb_can/ep_00005_L2_success
+
+/results_publish/ycb-mujoco-Q/viz_ycb_mujoco_eval_ycb_bowl/ep_00020_L2_success
+/results_publish/ycb-mujoco-Q/viz_ycb_mujoco_eval_ycb_bowl/ep_00011_L2_collision
+
+/ycb-adapt/viz_ycb_mujoco_adaptive_ycb_mug/
+ep_00101_L1_success
+ep_00102_L1_success
+success edge traversal with fly
+ep_00207_L2_success
+ep_00085_L2_success
+ep_00056_L2_success
+
+ep_00204_L2_timeout
+ep_00205_L2_collision
+ep_00206_L2_collision
+ep_00209_L2_collision
+
+
+### Key findings
+- Q-learning, SAC, and adaptive arbitrage generalize to unseen objects (cup: 70-80% adaptive, never seen during training)
+- Sim-to-real transfer works — policies trained on trimesh primitives navigate YCB objects in MuJoCo without retraining (banana 99%, can 81%, box 83%)
+- The solution is ready for integration testing with Monty's Learning Module and Sensor Module
+    
+### This is a prototype. The goal is to demonstrate that the approach works, while being transparent about current limitations.
+Known Limitations
+- Surface movement mechanics - edge traversal is unreliable on complex geometry.
+- Navigation strategy for hollow objects - the agent doesn't always understand it needs to crawl to the rim, not toward the goal.
+- Air navigation instability - flying through air is less reliable than surface crawling.
+- Online SAC learning shows limited improvement - after 20 online SAC updates during 2000 adaptive episodes, SAC success rate did not meaningfully increase
+    
+
+### Next steps / Open questions
+- Monty Policy integration
+- Actions - move tang, snap
+- Surface / Distant agents
+
+
 ## This is a prototype to implement, test and proof ideas below.
 
 Replace the `JumpToGoalState` mixin in Monty's motor system with a model-free reinforcement learning (RL) agent that learns to navigate incrementally toward goal states provided by Learning Modules. Instead of teleporting the sensor to a target pose, the RL agent selects from existing Monty actions to move step-by-step toward the goal, learning from dense reward signals based on distance reduction.
@@ -1197,6 +1256,8 @@ This is an **environment-level problem**, not an RL problem. Even a perfect poli
 - MuJoCo: `_snap_to_surface` ray cast misses thin edge → returns False → rollback → agent oscillates at edge
 - Both: half-step edge traversal fallback works for ~60% of edge crossings but fails on acute angles (<60°)
 
+**Sim-to-real gap in snap mechanics.** Trimesh uses `nearest.on_surface` — a global nearest-point query that always finds the closest surface point at any distance, with no distance limit. MuJoCo uses directional ray casts which can miss surfaces that are nearby but not in the cast direction. This creates an asymmetry: trimesh never loses the surface during tangential moves (agent either snaps to new face or rolls back), while MuJoCo may fail to find a surface that trimesh would find trivially. Phase 1 mitigation (implemented): multi-directional ray cast probing (forward, -normal, multi-probe cones around both) to approximate trimesh's omnidirectional search. Phase 2 (planned): unified snap threshold in both environments — if nearest surface is beyond `step_size × 2`, leave agent in air instead of snapping or rolling back. This requires retraining so the agent learns to handle unintended surface loss during tangential moves.
+
 ### 2. Navigation Strategy for Hollow Objects
 
 **The agent doesn't always understand it needs to crawl to the rim, not toward the goal.** When the goal is inside a mug and the agent is on the outside wall, the correct strategy is: crawl up to rim → cross rim → descend inside. The heuristic system has a dedicated `CRAWL_TO_EDGE` phase for this, but Q-store/SAC can override it with "crawl toward goal" — which is impossible through a wall.
@@ -1227,7 +1288,6 @@ The phase overwrite affects only the next step, where `_determine_phase()` re-de
 
 Additionally, the 5D direction state contains a redundancy: `lateral_deviation = sqrt(1 - angle_to_goal²)` is a deterministic function of `angle_to_goal`, so 2 of 5 features carry identical information.
 
-
 ### 4. Online SAC Learning Shows Limited Improvement
 
 **After 20 online SAC updates during 2000 adaptive episodes, SAC success rate did not meaningfully increase.** The conservative hyperparameters that prevent catastrophic forgetting also prevent fast adaptation:
@@ -1250,7 +1310,19 @@ The architecture for online SAC updates is correct — the issue is hyperparamet
 - Coordinate frame transforms (refpos/refquat/scale) can introduce subtle geometric distortions
 - MuJoCo's `MoveTangentially` implementation differs from trimesh's direct position manipulation
 
+**Specific snap mechanism differences:**
+- Trimesh: `mesh.nearest.on_surface()` — O(log N) BVH query, always finds closest point, no distance limit, no directional bias
+- MuJoCo: `mj_ray()` — directional ray cast, can miss surfaces not in cast direction, limited to probed directions
+- Trimesh snap is position-based (project to nearest face), MuJoCo snap is direction-based (cast ray, approach hit point)
+- On flat/convex surfaces: both behave identically. On edges/rims/thin walls: trimesh succeeds ~95% of the time, MuJoCo ~70% (improved from ~50% with multi-directional probing)
+
 This gap is expected for any sim-to-sim transfer and represents the baseline cost that adaptive online learning is designed to close.
+
+### 6. Heuristic Budget Accounting
+
+**The heuristic budget (`heuristic_eps`) only limits one of two paths to heuristic selection.** The arbitrator selects heuristic actions via two independent paths: (1) Q-SAC conflict resolution — when Q and SAC disagree at high confidence, heuristic breaks the tie; (2) track record scoring — when ML performance is below heuristic baseline. Only path (2) is subject to the `heuristic_eps` budget. Path (1) has no budget limit, which can result in heuristic usage far exceeding the configured budget (observed: 24% actual vs 5% configured).
+
+**Status: Fixed.** Both paths now share a single budget. When budget is exhausted during Q-SAC conflict, the system falls back to SAC (default source) instead of heuristic.
 
 
 ## Roadmap
@@ -1263,16 +1335,19 @@ This gap is expected for any sim-to-sim transfer and represents the baseline cos
 
 **Validation on YCB in Monty.** Key metric: does replacing JumpToGoal with RLGoalPolicy maintain classification accuracy and pose estimation quality while using only incremental actions?
 
-
 ### Near-term: Improve Core Navigation
 
-**Robust edge traversal.** The highest-impact improvement. Options under consideration:
-- Multi-probe snap: when primary ray cast fails, try multiple directions (±normal, ±tangent, blended angles) to find the surface on the other side of the edge
-- Adaptive step size: reduce `surface_step` when approaching edges (detected by high curvature or rapid normal change)
-- Edge-aware movement protocol: detect proximity to mesh boundary edges and switch to a specialized crossing sequence (lift slightly, advance, re-snap)
-- For MuJoCo: multi-directional `mj_ray` probing for more reliable surface finding
+**Robust edge traversal.** The highest-impact improvement. Two-phase plan:
 
-**Improved air navigation. - replace strategic_direction store with two tactical stores.**
+*Phase 1 (implemented):* Multi-directional snap in MuJoCo. When forward ray cast fails after tangential move, probe in additional directions: `-prev_normal` (toward surface we came from), multi-probe cone around forward (15°-60°, 8 directions), multi-probe cone around `-prev_normal`. Pick closest hit. This approximates trimesh's `nearest.on_surface` using only ray casts. Normal consistency check (dot > -0.1) prevents snapping to wrong side of thin walls — same threshold as trimesh.
+
+*Phase 2 (requires retraining):* Unified snap threshold across both environments. Currently trimesh snaps at any distance (agent never falls off surface), MuJoCo has a 10mm limit (agent rolls back if surface not found). The correct behavior: snap only within `step_size × 2` (~6mm). Beyond that, the agent genuinely left the surface — leave in air, let the controller handle re-landing. This must be implemented in **both** trimesh and MuJoCo simultaneously to maintain zero sim-to-real gap, then the agent must be retrained to handle unintended surface loss. Expected benefits:
+- Agent learns to reduce step size near edges (SAC continuous step parameter)
+- No more infinite rollback loops (current primary cause of timeouts on rims)
+- Controller's existing FLY/LAND phases handle re-landing naturally
+- Consistent physics across training and deployment environments
+
+**Improved air navigation — replace strategic_direction store with two tactical stores.**
 
 Split the single `q_store_free` into two phase-specific tactical stores:
 - `q_store_fly_to_goal` — actions when flying directly to goal (FLY_TO_GOAL, LAND phases)
@@ -1301,7 +1376,6 @@ This resolves the core conflict: the same position in air requires different act
 
 This mirrors the existing surface/free split, which was motivated by the same principle — identical positions requiring different actions depending on context (on surface vs in air).
 
-
 **Landing precision.** Add depth-based approach control: when depth < N×free_step, switch to progressively smaller steps. Prevent overshoot by checking depth before each forward move, not after.
 
 ### Near-term: Tune Online Adaptation
@@ -1315,6 +1389,23 @@ This mirrors the existing surface/free split, which was motivated by the same pr
 
 **Strategic crawl-to-edge store.** Add a third strategic Q-store (alongside detach and direction) that learns when to crawl toward the rim vs toward the goal. State: [alignment, normal_agreement, distance_to_edge_estimate, on_object, path_blocked]. This would give the strategic level explicit control over the crawl-to-edge decision, rather than relying on heuristic phase detection.
 
+### Near-term: Sim-to-Real Consistency
+
+**Unified physics contract across environments.** The training environment (trimesh) and deployment environments (MuJoCo, robot) should produce identical agent behavior for identical actions. Current gaps:
+
+| Mechanic | Trimesh | MuJoCo | Robot (planned) |
+|----------|---------|--------|-----------------|
+| Surface snap | `nearest.on_surface` (global) | Ray cast (directional) | Depth camera + ICP |
+| Snap distance limit | None (any distance) | 10mm | TBD |
+| Edge traversal | Half-step + re-project | Half-step + multi-probe | TBD |
+| Normal estimation | Exact face normal | Rendered depth → TLS fit | Point cloud → local PCA |
+| Collision detection | Ray intersection + proximity | Ray cast + depth threshold | Force/torque sensor |
+
+**Convergence plan:**
+1. Add snap distance threshold to trimesh (`step_size × 2`) — agent learns to handle surface loss
+2. Match threshold in MuJoCo — zero gap for snap behavior
+3. Robot adapter inherits same threshold — consistent across all three
+4. Online adaptation handles remaining sensor/actuator differences
 
 ### Long-term: Real Robot Deployment
 

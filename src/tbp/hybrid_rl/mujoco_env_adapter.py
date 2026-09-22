@@ -30,6 +30,7 @@ MM_PER_M = 1000.0
 NO_SURFACE_DEPTH_MM = 100.0
 ON_OBJECT_DEPTH_MM = 3.0
 SNAP_TARGET_DEPTH_MM = 2.0
+SNAP_MAX_DIST = 15.0  # 5x surface_step, covers edge traversal
 
 # ═══════════════════════════════════════════════════
 # Monty imports
@@ -848,60 +849,99 @@ class MuJoCoEnvAdapter:
         # ═══ All attempts failed — rollback ═══
         self._set_pose_mj_mm(old_pos, old_euler)
     
-    def _snap_to_surface_new(self, prev_normal=None):
+    def _snap_to_surface(self, prev_normal=None):
+        """Find nearest surface and snap agent to it.
+
+        Strategy: cast rays in multiple directions, pick closest hit.
+        Mimics trimesh nearest.on_surface but via directional ray casts.
+
+        Order:
+            1. Forward (camera direction)
+            2. -prev_normal (toward surface we came from)
+            3. Multi-probe cone around forward
+            4. Multi-probe cone around -prev_normal
+
+        Returns True if snapped, False if no surface found (→ rollback).
+        """
         pos = self._get_pos_mj_mm()
         euler = self._get_euler_deg()
         rot = Rot.from_euler("xyz", euler, degrees=True)
         forward = rot.apply([0, 0, -1])
-
-        # Save position before any approach
         pos_after_move = pos.copy()
 
-        hit_dist = self._mj_ray_cast(pos, forward)
+        # ═══ Collect candidates (direction, distance) ═══
+        candidates = []
 
-        if hit_dist < 0 or hit_dist >= 10.0:
-            hit_dist, forward = self._multi_probe_ray_cast(
+        # 1. Forward
+        hit = self._mj_ray_cast(pos, forward)
+        if 0 < hit < SNAP_MAX_DIST:
+            candidates.append((forward.copy(), hit))
+
+        # 2. -prev_normal (toward surface we came from)
+        if prev_normal is not None:
+            prev_n = np.array(prev_normal, dtype=float)
+            prev_n /= (np.linalg.norm(prev_n) + 1e-12)
+            hit = self._mj_ray_cast(pos, -prev_n)
+            if 0 < hit < SNAP_MAX_DIST:
+                candidates.append((-prev_n.copy(), hit))
+
+        # 3. Multi-probe around forward
+        if not candidates:
+            hit, best_dir = self._multi_probe_ray_cast(
                 pos, forward, rot,
-                max_dist=10.0,
+                max_dist=SNAP_MAX_DIST,
                 surface_step=3.0,
             )
+            if 0 < hit < SNAP_MAX_DIST:
+                candidates.append((best_dir.copy(), hit))
 
-        if hit_dist < 0 or hit_dist >= 10.0:
-            # ═══ Fallback: -prev_normal (as before) ═══
-            if prev_normal is not None:
-                prev_n = np.array(prev_normal, dtype=float)
-                prev_n /= (np.linalg.norm(prev_n) + 1e-12)
-                prev_hit = self._mj_ray_cast(pos, -prev_n)
-                if prev_hit > 0 and prev_hit < 10.0:
-                    approach = prev_hit - SNAP_TARGET_DEPTH_MM
-                    new_pos = pos - prev_n * approach
-                    new_euler = self._look_at_direction(-prev_n)
-                    self._set_pose_mj_mm(new_pos, new_euler)
-                    # ═══ Validate via render ═══
-                    rendered = self._render_and_extract()
-                    if rendered["depth_mm"] >= NO_SURFACE_DEPTH_MM:
-                        return False
-                    return True
+        # 4. Multi-probe around -prev_normal
+        if not candidates and prev_normal is not None:
+            prev_n = np.array(prev_normal, dtype=float)
+            prev_n /= (np.linalg.norm(prev_n) + 1e-12)
+            neg_n = -prev_n
+            try:
+                align_rot, _ = Rot.align_vectors(
+                    [neg_n], [[0, 0, -1]]
+                )
+            except Exception:
+                align_rot = rot
+            hit, best_dir = self._multi_probe_ray_cast(
+                pos, neg_n, align_rot,
+                max_dist=SNAP_MAX_DIST,
+                surface_step=3.0,
+            )
+            if 0 < hit < SNAP_MAX_DIST:
+                candidates.append((best_dir.copy(), hit))
+
+        if not candidates:
             return False
 
-        # Approach to target depth
-        if abs(hit_dist - SNAP_TARGET_DEPTH_MM) > 0.3:
-            approach = hit_dist - SNAP_TARGET_DEPTH_MM
-            pos = pos + forward * approach
-            self._set_pose_mj_mm(pos, euler)
+        # ═══ Pick closest candidate ═══
+        candidates.sort(key=lambda c: c[1])
+        best_dir, best_dist = candidates[0]
 
-        # Get normal from render
+        # ═══ Compute snap position ═══
+        approach = best_dist - SNAP_TARGET_DEPTH_MM
+        if abs(approach) > 0.3:
+            snap_pos = pos + best_dir * approach
+        else:
+            snap_pos = pos.copy()
+
+        # ═══ Apply snap position ═══
+        self._set_pose_mj_mm(snap_pos, euler)
+
+        # ═══ Get normal from render ═══
         rendered = self._render_and_extract()
-        new_normal = rendered["point_normal"]
 
-        # ═══ Validate: render must see surface ═══
         if rendered["depth_mm"] >= NO_SURFACE_DEPTH_MM:
             return False
 
+        new_normal = rendered["point_normal"]
         if new_normal is None:
             if prev_normal is not None:
                 new_euler = self._look_at_direction(-np.array(prev_normal))
-                self._set_pose_mj_mm(pos, new_euler)
+                self._set_pose_mj_mm(snap_pos, new_euler)
                 return True
             return False
 
@@ -911,31 +951,47 @@ class MuJoCoEnvAdapter:
             return False
         normal_arr /= n_len
 
+        # ═══ Normal consistency (matches trimesh: dot > -0.1) ═══
         if prev_normal is not None:
             prev_n = np.array(prev_normal, dtype=float)
             prev_n /= (np.linalg.norm(prev_n) + 1e-12)
             dot = float(np.dot(normal_arr, prev_n))
 
             if dot < -0.1:
+                # Normal flipped — try to stay on same side
                 prev_hit = self._mj_ray_cast(pos_after_move, -prev_n)
-                if prev_hit > 0 and prev_hit < 5.0:
-                    approach = prev_hit - SNAP_TARGET_DEPTH_MM
-                    new_pos = pos_after_move - prev_n * approach
-                    new_euler = self._look_at_direction(-prev_n)
-                    self._set_pose_mj_mm(new_pos, new_euler)
-                    # ═══ Validate via render ═══
-                    rendered = self._render_and_extract()
-                    if rendered["depth_mm"] >= NO_SURFACE_DEPTH_MM:
-                        return False
-                    return True
-                else:
-                    normal_arr = -normal_arr
+                if 0 < prev_hit < 5.0:
+                    approach2 = prev_hit - SNAP_TARGET_DEPTH_MM
+                    alt_pos = pos_after_move - prev_n * approach2
+
+                    # Collision check for alternative position
+                    alt_vec = alt_pos - pos_after_move
+                    alt_dist = float(np.linalg.norm(alt_vec))
+                    safe = True
+                    if alt_dist > 0.5:
+                        alt_dir = alt_vec / alt_dist
+                        alt_hit = self._mj_ray_cast(
+                            pos_after_move, alt_dir
+                        )
+                        if 0 < alt_hit < alt_dist - 0.5:
+                            safe = False
+
+                    if safe:
+                        new_euler = self._look_at_direction(-prev_n)
+                        self._set_pose_mj_mm(alt_pos, new_euler)
+                        rendered = self._render_and_extract()
+                        if rendered["depth_mm"] < NO_SURFACE_DEPTH_MM:
+                            return True
+
+                # Could not stay on same side — accept edge traversal
+                self._edge_traversed = True
+                normal_arr = -normal_arr
 
             elif dot < 0:
                 normal_arr = -normal_arr
 
         new_euler = self._look_at_direction(-normal_arr)
-        self._set_pose_mj_mm(pos, new_euler)
+        self._set_pose_mj_mm(snap_pos, new_euler)
         return True
 
     def _multi_probe_ray_cast(
@@ -946,10 +1002,25 @@ class MuJoCoEnvAdapter:
         max_dist: float = 10.0,
         surface_step: float = 3.0,
     ) -> tuple:
+        """Cast rays in a cone around forward direction.
+
+        Probes at 15°, 30°, 45°, 60° from forward in 8 directions.
+        Returns closest hit within distance limits.
+
+        Args:
+            pos: Ray origin in MuJoCo mm.
+            forward: Central direction of cone.
+            rot: Rotation for computing right/up axes.
+            max_dist: Maximum hit distance to accept.
+            surface_step: Base step size for distance scaling.
+
+        Returns:
+            (distance, direction) of closest hit, or (-1.0, forward).
+        """
         right = rot.apply([1, 0, 0])
         up = rot.apply([0, 1, 0])
 
-        probe_angles = [15, 30, 45]
+        probe_angles = [15, 30, 45, 60]
 
         probe_dirs = [
             up, -up, right, -right,
@@ -959,20 +1030,14 @@ class MuJoCoEnvAdapter:
             (-up - right) / np.sqrt(2),
         ]
 
+        # Collect ALL hits, pick closest globally
+        best_dist = max_dist
+        best_direction = None
+
         for angle_deg in probe_angles:
             angle_rad = np.radians(angle_deg)
             cos_a = np.cos(angle_rad)
             sin_a = np.sin(angle_rad)
-
-            # Чем больше угол — тем короче допустимая дистанция
-            # 15° → 2× surface_step = 6mm
-            # 30° → 1.5× surface_step = 4.5mm  
-            # 45° → 1× surface_step = 3mm
-            angle_factor = 2.0 - (angle_deg / 45.0)
-            probe_max_dist = min(surface_step * angle_factor, max_dist)
-
-            best_dist = probe_max_dist
-            best_direction = None
 
             for probe_dir in probe_dirs:
                 probed = forward * cos_a + probe_dir * sin_a
@@ -983,12 +1048,12 @@ class MuJoCoEnvAdapter:
                     best_dist = hit
                     best_direction = probed
 
-            if best_direction is not None:
-                return best_dist, best_direction
+        if best_direction is not None:
+            return best_dist, best_direction
 
         return -1.0, forward
     
-    def _snap_to_surface(self, prev_normal=None):
+    def _snap_to_surface_old(self, prev_normal=None):
         pos = self._get_pos_mj_mm()  # позиция после tangential move
         euler = self._get_euler_deg()
         rot = Rot.from_euler("xyz", euler, degrees=True)

@@ -63,12 +63,12 @@ class RenderableEnv(Protocol):
         result: str = "",
     ) -> None:
         """Render a scene frame to file.
-        
+
         Each environment implements this with its own backend:
         - LightweightEnv: trimesh solid + x-ray split view
         - MuJoCoEnvAdapter: MuJoCo solid + x-ray split view
         - Future envs: camera feed, etc.
-        
+
         Args:
             agent_pose: Agent pose [x,y,z,rx,ry,rz] in env's native frame.
             goal_pose: Goal pose [x,y,z,rx,ry,rz] in env's native frame.
@@ -86,6 +86,13 @@ class RenderableEnv(Protocol):
 # Text overlay helper
 # ═══════════════════════════════════════════════════
 def add_text_overlay(img, text, step_num=0, distance=0.0, result=""):
+    """Add text overlay to frame image.
+
+    For adaptive mode: text is already a short label like
+    "Step 001 | dist=42.3mm | MoveTangentially | SAC"
+
+    For eval mode: text is interpretation string, extract action name.
+    """
     draw = ImageDraw.Draw(img)
     try:
         font = ImageFont.truetype(
@@ -93,26 +100,34 @@ def add_text_overlay(img, text, step_num=0, distance=0.0, result=""):
     except OSError:
         font = ImageFont.load_default()
 
-    # Short: just step + distance + action name
-    # Extract action name from interpretation
-    action_name = text
-    if "##### " in text:
+    # Check if text is already a short label (from adaptive mode)
+    if text.startswith("Step "):
+        header = text
+    elif "##### " in text:
+        # Eval mode: extract action name from interpretation
         after = text.split("##### ", 1)[1]
-        action_name = after.split(";")[0].strip()  # "Softmax" or "Random" or "Strategic"
+        action_name = after.split(";")[0].strip()
         if ";" in after:
             detail = after.split(";", 1)[1].strip()
-            action_name += ": " + detail.split(",")[0].strip()  # action name
-    
-    header = f"Step {step_num} | dist={distance:.1f}mm | {action_name}"
-    
+            action_name += ": " + detail.split(",")[0].strip()
+        header = f"Step {step_num} | dist={distance:.1f}mm | {action_name}"
+    else:
+        # Fallback: use text as-is, truncate if too long
+        header = (
+            text[:_MAX_LINE_LENGTH]
+            if len(text) > _MAX_LINE_LENGTH
+            else text
+        )
+
     bbox = draw.textbbox((_TEXT_X_START, _TEXT_Y_START), header, font=font)
     draw.rectangle(
         [bbox[0] - 2, bbox[1] - 1, bbox[2] + 2, bbox[3] + 1],
         fill=(0, 0, 0, 200),
     )
     draw.text((_TEXT_X_START, _TEXT_Y_START), header, fill="white", font=font)
-    
+
     return img
+
 
 # ═══════════════════════════════════════════════════
 # Episode text log (universal)
@@ -126,7 +141,7 @@ def save_text_log(
     extra_info: dict[str, Any] | None = None,
 ) -> None:
     """Save episode text log and metadata. Universal for all envs.
-    
+
     Creates:
         - actions.txt: human-readable step-by-step log
         - meta.json: machine-readable metadata
@@ -136,13 +151,17 @@ def save_text_log(
     # ═══ actions.txt ═══
     log_path = ep_dir / "actions.txt"
     with log_path.open("w") as f:
+        # Header: extra_info first (object, level, mode, etc.)
+        if extra_info:
+            for key, val in extra_info.items():
+                f.write(f"{key}: {val}\n")
+
+        # Episode summary
         f.write(f"Result: {result}\n")
-        f.write(f"Goal: {goal_pose.tolist()}\n")
         f.write(f"Steps: {len(episode_actions)}\n")
+        f.write(f"Goal: {goal_pose.tolist()}\n")
 
         if episode_poses:
-            f.write(f"Start: {episode_poses[0].tolist()}\n")
-            f.write(f"End: {episode_poses[-1].tolist()}\n")
             start_dist = float(np.linalg.norm(
                 goal_pose[:3] - episode_poses[0][:3]
             ))
@@ -151,11 +170,6 @@ def save_text_log(
             ))
             f.write(f"Start distance: {start_dist:.1f}mm\n")
             f.write(f"End distance: {end_dist:.1f}mm\n")
-
-        if extra_info:
-            f.write("\n")
-            for key, val in extra_info.items():
-                f.write(f"{key}: {val}\n")
 
         f.write("\n")
         for i, action in enumerate(episode_actions):
@@ -256,7 +270,7 @@ class EpisodeVisualizer:
 
     Usage:
         viz = EpisodeVisualizer(output_dir, "banana", "eval", "pictures")
-        
+
         # In episode loop:
         viz.save_episode(
             env=env,          # LightweightEnv or MuJoCoEnvAdapter
@@ -266,6 +280,7 @@ class EpisodeVisualizer:
             goal_pose=goal,
             poses=trajectory,
             actions=explanations,
+            actions_short=short_labels,
         )
 
     Visualization modes:
@@ -308,13 +323,14 @@ class EpisodeVisualizer:
         goal_pose: np.ndarray,
         poses: list[np.ndarray],
         actions: list[str],
+        actions_short: list[str] | None = None,
         extra_info: dict[str, Any] | None = None,
     ) -> None:
         """Save episode visualization.
-        
+
         Works with any environment that implements render_episode_frame().
         Falls back to text-only if env doesn't support rendering.
-        
+
         Args:
             env: Environment instance (LightweightEnv, MuJoCoEnvAdapter, etc.)
             episode: Episode number.
@@ -322,7 +338,9 @@ class EpisodeVisualizer:
             result: "success", "collision", or "timeout".
             goal_pose: Goal pose in env's native frame.
             poses: List of agent poses in env's native frame.
-            actions: List of action description strings.
+            actions: Full action description strings (for actions.txt).
+            actions_short: Short action labels (for frames/video).
+                If None, falls back to actions.
             extra_info: Optional dict with additional metadata.
         """
         if not self.should_save(level, result):
@@ -332,7 +350,7 @@ class EpisodeVisualizer:
         episode_id = f"ep_{episode + 1:05d}_L{level}_{result}"
         ep_dir = self.output_dir / episode_id
 
-        # ═══ 1. Always save text log ═══
+        # ═══ 1. Always save text log (full actions) ═══
         save_text_log(
             ep_dir=ep_dir,
             result=result,
@@ -342,9 +360,12 @@ class EpisodeVisualizer:
             extra_info=extra_info,
         )
 
-        # ═══ 2. Save frames if mode requires ═══
+        # ═══ 2. Save frames if mode requires (short labels for overlay) ═══
         if self.visualize_mode in ("pictures", "video"):
-            self._save_frames(env, ep_dir, goal_pose, poses, actions, result)
+            viz_labels = actions_short if actions_short else actions
+            self._save_frames(
+                env, ep_dir, goal_pose, poses, viz_labels, result
+            )
 
         # ═══ 3. Save video if mode requires ═══
         if self.visualize_mode == "video":
@@ -380,8 +401,10 @@ class EpisodeVisualizer:
         for i in range(total_steps):
             trail_so_far.append(poses[i])
 
-            if not should_save_frame(i, total_steps, 
-                                      frame_interval=self.timeout_frame_interval):
+            if not should_save_frame(
+                i, total_steps,
+                frame_interval=self.timeout_frame_interval,
+            ):
                 continue
 
             action_text = actions[i - 1] if 0 < i <= len(actions) else "INIT"
@@ -393,7 +416,11 @@ class EpisodeVisualizer:
                     agent_pose=poses[i],
                     goal_pose=goal_pose,
                     filepath=filepath,
-                    trail_poses=trail_so_far[:-1] if len(trail_so_far) > 1 else None,
+                    trail_poses=(
+                        trail_so_far[:-1]
+                        if len(trail_so_far) > 1
+                        else None
+                    ),
                     text=action_text,
                     step_num=i,
                     distance=distance,
@@ -434,9 +461,12 @@ def save_episode_frames(
             trail = []
             for i in range(total):
                 trail.append(episode_poses[i])
-                if should_save_frame(i, total, frame_interval=timeout_frame_interval):
+                if should_save_frame(
+                    i, total, frame_interval=timeout_frame_interval
+                ):
                     action_text = (
-                        episode_actions[i - 1] if 0 < i <= len(episode_actions) 
+                        episode_actions[i - 1]
+                        if 0 < i <= len(episode_actions)
                         else "INIT"
                     )
                     distance = float(np.linalg.norm(
@@ -447,7 +477,9 @@ def save_episode_frames(
                             agent_pose=episode_poses[i],
                             goal_pose=goal_pose,
                             filepath=str(ep_dir / f"step_{i:03d}.png"),
-                            trail_poses=trail[:-1] if len(trail) > 1 else None,
+                            trail_poses=(
+                                trail[:-1] if len(trail) > 1 else None
+                            ),
                             text=action_text,
                             step_num=i,
                             distance=distance,
@@ -466,7 +498,7 @@ def save_episode_frames(
         create_video_from_frames(ep_dir, fps=5)
 
 
-def _render_frames_trimesh_legacy(env, goal_pose, poses, actions, 
+def _render_frames_trimesh_legacy(env, goal_pose, poses, actions,
                                    ep_dir, result, interval):
     """Legacy trimesh rendering for envs without render_episode_frame."""
     # Import here to avoid circular deps

@@ -2709,6 +2709,7 @@ class RLGoalApproachExperiment:
             action_explanations: list[str] = []
             last_transitions: list = []
             collision_stats_before = dict(controller._collision_stats)
+            action_short_labels: list[str] = []
 
             # ═══ Step loop ═══
             for step in range(adaptive_max_steps):
@@ -2724,6 +2725,11 @@ class RLGoalApproachExperiment:
 
                 # Discrete index for Q-store learning
                 discrete_idx = sac_to_discrete(action_type, action_params)
+
+                # ═══ State debug BEFORE update_only (goal still set) ═══
+                state_debug = controller.get_state_debug_info(
+                    state, pose, sensor
+                )
 
                 # Save transitions before update_only clears them
                 last_transitions = controller._episode_transitions.copy()
@@ -2777,13 +2783,41 @@ class RLGoalApproachExperiment:
                 )
                 ep_sources.append(source_key)
 
-                # Action explanation for logging
+                # ═══ Action explanations ═══
                 dist_to_goal = float(
                     np.linalg.norm(goal_pose[:3] - pose[:3])
                 )
-                action_explanations.append(
-                    f"{act_name} | {source} | "
-                    f"dist={dist_to_goal:.1f}"
+
+                # Full debug (actions.txt)
+                params_str = self._format_action_params(
+                    action_type, action_params
+                )
+                act_full = (
+                    f"{act_name}({params_str})" if params_str
+                    else act_name
+                )
+
+                # Post-step sensor info
+                new_sensor = online_env.get_sensor_data()
+                env_pos = online_env.get_pose()[:3]
+
+                action_full = (
+                    f"{act_full} "
+                    f"{state_debug} "
+                    f"| {source} "
+                    f"|mj=[{env_pos[0]:.4f},"
+                    f"{env_pos[1]:.4f},"
+                    f"{env_pos[2]:.4f}]"
+                    f"|depth={new_sensor.get('depth', 0):.1f}"
+                    f"|on={int(new_sensor.get('on_object', False))}"
+                )
+                action_explanations.append(action_full)
+
+                # Short label (картинка/видео)
+                source_label = source_key.upper().replace("_", " ")
+                action_short_labels.append(
+                    f"Step {step + 1:03d} | dist={dist_to_goal:.1f}mm"
+                    f" | {act_name} | {source_label}"
                 )
 
                 if done:
@@ -2933,6 +2967,7 @@ class RLGoalApproachExperiment:
                     goal_pose=goal_pose,
                     poses=current_poses,
                     actions=action_explanations,
+                    actions_short=action_short_labels,
                     extra_info={
                         "object": object_name,
                         "mode": manager.mode,
@@ -3101,6 +3136,58 @@ class RLGoalApproachExperiment:
     # ══════════════════════════════════════════════════════
     # Adaptive helpers (extracted from inline code)
     # ══════════════════════════════════════════════════════
+    @staticmethod
+    def _format_action_params(action_type: int, action_params: np.ndarray) -> str:
+        """Human-readable action parameters for logging."""
+        if action_type == 0:
+            # MoveTangentially: [sin, cos, distance]
+            sin_a = float(action_params[0])
+            cos_a = float(action_params[1])
+            angle = float(np.degrees(np.arctan2(sin_a, cos_a))) % 360
+            dist = float(np.clip(action_params[2], 0.5, 15.0))
+            return f"angle={angle:.0f}°,step={dist:.1f}mm"
+        elif action_type == 1:
+            # MoveLinear: [distance]
+            dist = float(np.clip(action_params[0], -25.0, 25.0))
+            return f"step={dist:.1f}mm"
+        elif action_type == 2:
+            # Turn (yaw): [sin, cos]
+            sin_a = float(action_params[0])
+            cos_a = float(action_params[1])
+            angle = float(np.degrees(np.arctan2(sin_a, cos_a)))
+            angle = float(np.clip(angle, -45.0, 45.0))
+            return f"yaw={angle:.1f}°"
+        elif action_type == 3:
+            # Look (pitch): [sin, cos]
+            sin_a = float(action_params[0])
+            cos_a = float(action_params[1])
+            angle = float(np.degrees(np.arctan2(sin_a, cos_a)))
+            angle = float(np.clip(angle, -45.0, 45.0))
+            return f"pitch={angle:.1f}°"
+        elif action_type == 4:
+            # Rotate (roll): [sin, cos]
+            sin_a = float(action_params[0])
+            cos_a = float(action_params[1])
+            angle = float(np.degrees(np.arctan2(sin_a, cos_a)))
+            angle = float(np.clip(angle, -45.0, 45.0))
+            return f"roll={angle:.1f}°"
+        elif action_type == 5:
+            # OrientHorizontal: [rotation, left_dist, fwd_dist]
+            return (
+                f"rot={action_params[0]:.1f}°,"
+                f"left={action_params[1]:.1f}mm,"
+                f"fwd={action_params[2]:.1f}mm"
+            )
+        elif action_type == 6:
+            # OrientVertical: [rotation, down_dist, fwd_dist]
+            return (
+                f"rot={action_params[0]:.1f}°,"
+                f"down={action_params[1]:.1f}mm,"
+                f"fwd={action_params[2]:.1f}mm"
+            )
+        elif action_type == 7:
+            return ""
+        return ""
 
     @staticmethod
     def _build_per_source_analysis(

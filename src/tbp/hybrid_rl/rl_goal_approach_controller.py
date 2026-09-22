@@ -372,6 +372,68 @@ class RLGoalApproachController:
     # ══════════════════════════════════════════════════════════
     # PUBLIC API
     # ══════════════════════════════════════════════════════════
+    def get_state_debug_info(
+        self,
+        state: np.ndarray,
+        current_pose: np.ndarray,
+        sensor_data: Dict[str, Any],
+    ) -> str:
+        """Build debug prefix string for logging (no action selection).
+
+        Used by adaptive loop where action is chosen by Arbitrator,
+        but we still want phase/sensor context in logs.
+
+        Args:
+            state: Current state vector.
+            current_pose: Agent pose.
+            sensor_data: Current sensor readings.
+
+        Returns:
+            Debug string like "[phase=CRAWL_TO_GOAL|ss=1|pb=0|...]"
+        """
+        phase, subgoal_dir, phase_desc = self._determine_phase(
+            state, sensor_data, current_pose
+        )
+        self._current_phase = phase
+        self._current_subgoal_dir = subgoal_dir
+
+        same_side = sensor_data.get("same_side", True)
+        path_blocked = sensor_data.get("path_blocked", False)
+        depth = sensor_data.get("depth", 100.0)
+        alignment = float(state[12])
+        eff = self._compute_movement_efficiency(window=20)
+
+        normal_str = ""
+        pn = sensor_data.get("point_normal")
+        if pn is not None:
+            normal_str = f"|n=[{pn[0]:.2f},{pn[1]:.2f},{pn[2]:.2f}]"
+
+        pos_str = (
+            f"|pos=[{current_pose[0]:.1f},"
+            f"{current_pose[1]:.1f},"
+            f"{current_pose[2]:.1f}]"
+        )
+
+        subgoal_str = ""
+        if subgoal_dir is not None:
+            subgoal_str = (
+                f"|sd=[{subgoal_dir[0]:.2f},"
+                f"{subgoal_dir[1]:.2f},"
+                f"{subgoal_dir[2]:.2f}]"
+            )
+
+        return (
+            f"[phase={phase}"
+            f"|ss={int(same_side)}"
+            f"|pb={int(path_blocked)}"
+            f"|d={depth:.1f}"
+            f"|al={alignment:.2f}"
+            f"|eff={eff:.2f}"
+            f"{normal_str}"
+            f"{pos_str}"
+            f"{subgoal_str}]"
+        )
+    
     @property
     def is_training(self):
         if self.mode in ("train", "train_adapt_epsilon", "adaptive"):
@@ -1038,6 +1100,30 @@ class RLGoalApproachController:
                         )
 
                         if is_horizontal:
+                            stuck_threshold = self.config.get(
+                                "stuck_threshold", 0.15
+                            )
+                            eff = (
+                                self._compute_movement_efficiency(
+                                    window=20
+                                )
+                            )
+                            if eff < stuck_threshold:
+                                fly_dir = (
+                                    self._compute_detach_fly_direction(
+                                        current_pose,
+                                        sensor_data,
+                                    )
+                                )
+                                return (
+                                    "DETACH_NEEDED",
+                                    fly_dir,
+                                    f"stuck on horizontal surface "
+                                    f"(dist={distance:.0f}, "
+                                    f"eff={eff:.2f}, "
+                                    f"ss={same_side}, "
+                                    f"pb={path_blocked})",
+                                )
                             return (
                                 "CRAWL_TO_GOAL",
                                 None,
