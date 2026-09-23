@@ -848,8 +848,201 @@ class MuJoCoEnvAdapter:
 
         # ═══ All attempts failed — rollback ═══
         self._set_pose_mj_mm(old_pos, old_euler)
-    
+
     def _snap_to_surface(self, prev_normal=None):
+        """Snap agent to nearest surface after tangential move.
+
+        Emulates trimesh nearest.on_surface logic:
+            closest, _, face_id = mesh.nearest.on_surface([pos])
+            hit_n = mesh.face_normals[face_id]
+            agent_pos = closest + hit_n * 2.0
+            agent_rot = look_at(-hit_n)
+
+        In MuJoCo we use ray casts instead of nearest.on_surface:
+        1. Cast rays in multiple directions to find surface
+        2. Move to SNAP_TARGET_DEPTH_MM from surface
+        3. Orient camera toward surface (best_dir) so render can see it
+        4. Render to get actual surface normal
+        5. Re-orient by actual normal (-normal_arr)
+        6. Validate final orientation; fallback to best_dir if needed
+
+        Args:
+            prev_normal: Surface normal before the move (for consistency
+                check). None if no previous normal available.
+
+        Returns:
+            True if snapped successfully (agent on surface, camera
+            oriented toward it). False if no surface found (caller
+            should rollback).
+        """
+        pos = self._get_pos_mj_mm()
+        euler = self._get_euler_deg()
+        rot = Rot.from_euler("xyz", euler, degrees=True)
+        forward = rot.apply([0, 0, -1])
+        pos_after_move = pos.copy()
+
+        # ═══ Step 1: Find surface via ray casts ═══
+        candidates = []
+
+        # 1a. Forward (current camera direction)
+        hit = self._mj_ray_cast(pos, forward)
+        if 0 < hit < SNAP_MAX_DIST:
+            candidates.append((forward.copy(), hit))
+
+        # 1b. Toward previous surface (-prev_normal)
+        if prev_normal is not None:
+            prev_n = np.array(prev_normal, dtype=float)
+            prev_n /= (np.linalg.norm(prev_n) + 1e-12)
+            hit = self._mj_ray_cast(pos, -prev_n)
+            if 0 < hit < SNAP_MAX_DIST:
+                candidates.append((-prev_n.copy(), hit))
+
+        # 1c. Multi-probe cone around forward
+        if not candidates:
+            hit, probe_dir = self._multi_probe_ray_cast(
+                pos, forward, rot,
+                max_dist=SNAP_MAX_DIST, surface_step=3.0,
+            )
+            if 0 < hit < SNAP_MAX_DIST:
+                candidates.append((probe_dir.copy(), hit))
+
+        # 1d. Multi-probe cone around -prev_normal
+        if not candidates and prev_normal is not None:
+            prev_n = np.array(prev_normal, dtype=float)
+            prev_n /= (np.linalg.norm(prev_n) + 1e-12)
+            neg_n = -prev_n
+            try:
+                align_rot, _ = Rot.align_vectors([neg_n], [[0, 0, -1]])
+            except Exception:
+                align_rot = rot
+            hit, probe_dir = self._multi_probe_ray_cast(
+                pos, neg_n, align_rot,
+                max_dist=SNAP_MAX_DIST, surface_step=3.0,
+            )
+            if 0 < hit < SNAP_MAX_DIST:
+                candidates.append((probe_dir.copy(), hit))
+
+        # 1e. Toward object center (last resort for edges/rims)
+        if not candidates:
+            to_center = self._mj_center_mm - pos
+            to_center_dist = np.linalg.norm(to_center)
+            if to_center_dist > 1e-8:
+                to_center_dir = to_center / to_center_dist
+                hit = self._mj_ray_cast(pos, to_center_dir)
+                if 0 < hit < SNAP_MAX_DIST:
+                    candidates.append((to_center_dir.copy(), hit))
+
+        if not candidates:
+            return False
+
+        # ═══ Step 2: Compute snap position ═══
+        candidates.sort(key=lambda c: c[1])
+        best_dir, best_dist = candidates[0]
+
+        approach = best_dist - SNAP_TARGET_DEPTH_MM
+        if abs(approach) > 0.3:
+            snap_pos = pos + best_dir * approach
+        else:
+            snap_pos = pos.copy()
+
+        # ═══ Step 3: Orient toward found surface ═══
+        # Key fix: orient camera toward surface BEFORE rendering.
+        # Old code kept old euler → camera could miss surface on edges.
+        # This mirrors trimesh: agent_rot = look_at(-hit_n)
+        # where best_dir ≈ -hit_n (points from agent toward surface).
+        snap_euler = self._look_at_direction(best_dir)
+        self._set_pose_mj_mm(snap_pos, snap_euler)
+
+        # ═══ Step 4: Render to get actual surface normal ═══
+        rendered = self._render_and_extract()
+
+        if rendered["depth_mm"] >= NO_SURFACE_DEPTH_MM:
+            # Even looking toward best_dir we don't see surface.
+            # Ray cast found a hit but render disagrees — snap failed.
+            return False
+
+        new_normal = rendered["point_normal"]
+
+        if new_normal is None:
+            # Surface visible (depth < 100) but normal not computed
+            # at center pixel. Agent is near surface with camera
+            # pointing at it → depth < 3mm → on_object = True.
+            # Keep best_dir orientation — it's our best estimate.
+            return True
+
+        normal_arr = np.array(new_normal, dtype=float)
+        n_len = np.linalg.norm(normal_arr)
+        if n_len < 1e-8:
+            # Degenerate normal — keep best_dir orientation.
+            return True
+
+        normal_arr /= n_len
+
+        # ═══ Step 5: Normal consistency check ═══
+        # Mirrors trimesh logic:
+        #   if np.dot(hit_n, n) < 0: hit_n = -hit_n
+        #   can_transition = np.dot(hit_n, n) > -0.1
+        if prev_normal is not None:
+            prev_n = np.array(prev_normal, dtype=float)
+            prev_n /= (np.linalg.norm(prev_n) + 1e-12)
+            dot = float(np.dot(normal_arr, prev_n))
+
+            if dot < -0.1:
+                # Normal flipped >~95° — try to stay on same side.
+                # Mirrors trimesh edge traversal: try alt position
+                # along prev_normal direction.
+                prev_hit = self._mj_ray_cast(pos_after_move, -prev_n)
+                if 0 < prev_hit < 5.0:
+                    approach2 = prev_hit - SNAP_TARGET_DEPTH_MM
+                    alt_pos = pos_after_move - prev_n * approach2
+
+                    # Collision check for alternative position
+                    alt_vec = alt_pos - pos_after_move
+                    alt_dist = float(np.linalg.norm(alt_vec))
+                    safe = True
+                    if alt_dist > 0.5:
+                        alt_check_dir = alt_vec / alt_dist
+                        alt_hit = self._mj_ray_cast(
+                            pos_after_move, alt_check_dir
+                        )
+                        if 0 < alt_hit < alt_dist - 0.5:
+                            safe = False
+
+                    if safe:
+                        alt_euler = self._look_at_direction(-prev_n)
+                        self._set_pose_mj_mm(alt_pos, alt_euler)
+                        check = self._render_and_extract()
+                        if check["depth_mm"] < NO_SURFACE_DEPTH_MM:
+                            return True
+
+                # Could not stay on same side — accept edge traversal.
+                # This is legitimate (e.g. mug rim transition).
+                self._edge_traversed = True
+                # normal_arr is the measured normal on the new side.
+                # Don't flip it — it's correct for the new surface.
+
+            elif dot < 0:
+                # Slight flip (between -0.1 and 0) — correct sign.
+                normal_arr = -normal_arr
+
+        # ═══ Step 6: Final orientation by actual normal ═══
+        # Mirrors trimesh: agent_rot = look_at(-hit_n)
+        final_euler = self._look_at_direction(-normal_arr)
+        self._set_pose_mj_mm(snap_pos, final_euler)
+
+        # Validate: does camera still see surface after reorientation?
+        # On curved surfaces, -normal may point slightly away from
+        # where the surface actually is relative to snap_pos.
+        final_check = self._render_and_extract()
+        if final_check["depth_mm"] >= NO_SURFACE_DEPTH_MM:
+            # Normal-based orientation lost the surface.
+            # Fall back to snap_euler (best_dir) which we verified
+            # in Step 4 — it definitely sees the surface.
+            self._set_pose_mj_mm(snap_pos, snap_euler)
+
+        return True
+
+    def _snap_to_surface_old1(self, prev_normal=None):
         """Find nearest surface and snap agent to it.
 
         Strategy: cast rays in multiple directions, pick closest hit.

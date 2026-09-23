@@ -29,7 +29,7 @@ experiment:
     adapt_seed: 99
 
     promote_threshold: 0.5
-    promote_window: 100
+    promote_window: 10
 
     curriculum_levels:
       - [10.0, 60.0]    # L0: same_side, no path_blocked
