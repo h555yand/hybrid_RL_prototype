@@ -260,6 +260,29 @@ class Arbitrator:
         has_sac = self.sac_actor is not None
         self._level_total_decisions[level] += 1
 
+        # ═══ Forced heuristic override when stuck ═══
+        # Phase is set by controller.get_state_debug_info() called before decide().
+        # When DETACH_NEEDED, agent is physically stuck (eff≈0).
+        # Delegate to heuristic which will trigger detach via strategic heuristic.
+        phase = getattr(self.controller, '_current_phase', 'CRAWL_TO_GOAL')
+        if phase == "DETACH_NEEDED":
+            h_action = self._get_heuristic_action(state, current_pose, sensor_data)
+            h_type = ExperienceExtractor.DISCRETE_TO_PSAC[h_action][0]
+            h_params = self._discrete_to_params(h_action)
+
+            self._record_decision("heuristic")
+            self._level_heuristic_decisions[level] += 1
+            h_name = self._type_names.get(h_type, f"type_{h_type}")
+            self.heuristic_chosen_actions[h_name] += 1
+            self._current_episode_sources.append("heuristic")
+
+            eff = self.controller._compute_movement_efficiency(window=20)
+            return h_type, h_params, (
+                f"forced_heuristic("
+                f"phase=DETACH_NEEDED,"
+                f"eff={eff:.2f})"
+            )
+
         # === Get proposals ===
         q_action, q_confidence, q_spread = self._get_q_action(state)
         q_type = ExperienceExtractor.DISCRETE_TO_PSAC[q_action][0]

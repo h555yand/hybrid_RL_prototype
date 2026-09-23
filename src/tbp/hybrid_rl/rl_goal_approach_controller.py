@@ -3042,160 +3042,187 @@ class RLGoalApproachController:
         action_index = None
         strategic_source = None
 
-        # ═══ STRATEGIC LEVEL ═══
-        current_phase = getattr(
-            self, "_current_phase", "CRAWL_TO_GOAL"
-        )
+        current_phase = getattr(self, "_current_phase", "CRAWL_TO_GOAL")
         on_object = state[11] > 0.5
 
         self._episode_phase_counts[current_phase] = (
             self._episode_phase_counts.get(current_phase, 0) + 1
         )
 
-        s_eps = self.strategic_epsilon
-        cfg = self.config
-
-        if on_object:
+        # ═══ DETACH_NEEDED: forced detach, bypasses strategic Q ═══
+        if (
+            current_phase == "DETACH_NEEDED"
+            and on_object
+            and self._can_detach(state)
+        ):
             same_side = sensor_data.get("same_side", True)
             path_blocked = sensor_data.get("path_blocked", False)
+            if not same_side or path_blocked:
+                action_index = self.action_space.IDX_DETACH
+                strategic_source = "forced_detach(phase=DETACH_NEEDED)"
 
-            t_state = self._compute_detach_transition_state(
-                state, sensor_data,
-                movement_efficiency=self._compute_movement_efficiency(window=20),
-            )
-            strategic_q = self.strategic_detach.get_q_values(t_state)
-            strategic_h = self._compute_strategic_heuristic(
-                current_phase, on_object=True
-            )
-
-            has_data = (
-                self.strategic_detach.next_id > 0
-                and np.max(np.abs(strategic_q)) > 1e-6
-            )
-            if has_data:
-                sq_norm = self._normalize_values(strategic_q)
-                sh_norm = self._normalize_values(strategic_h)
-                strategic_combined = (
-                    (1 - s_eps) * sq_norm + s_eps * sh_norm
+                # Record for retrospective learning
+                t_state = self._compute_detach_transition_state(
+                    state, sensor_data,
+                    movement_efficiency=self._compute_movement_efficiency(window=20),
                 )
-            else:
-                strategic_combined = strategic_h.copy()
-
-            should_switch = (
-                strategic_combined[1] > strategic_combined[0]
-            )
-
-            if (
-                should_switch
-                and self._can_detach(state)
-                and (not same_side or path_blocked)
-            ):
-                action_index = (
-                    self.action_space.IDX_DETACH
-                )
-                strategic_source = (
-                    f"detach_switch("
-                    f"q=[{strategic_q[0]:.2f},"
-                    f"{strategic_q[1]:.2f}],"
-                    f"h=[{strategic_h[0]:.1f},"
-                    f"{strategic_h[1]:.1f}],"
-                    f"eps={s_eps:.2f})"
-                )
-                self._strategic_stats["detach_memory_triggered"] += 1
-
-                # ═══ CHANGED: сохраняем контекст для ретроспективного обучения ═══
                 self._pending_strategic_detach.append({
                     "state": t_state.copy(),
                     "step": len(self._episode_transitions),
-                    "phase_was_detach_needed": (
-                        current_phase == "DETACH_NEEDED"
-                    ),
+                    "phase_was_detach_needed": True,
                     "same_side_before": same_side,
                     "path_blocked_before": path_blocked,
                     "dist_before": float(state[13]),
                 })
-            else:
-                if not same_side or path_blocked:
+                self._strategic_stats["detach_memory_triggered"] += 1
+
+        # ═══ Strategic level (only when NOT forced) ═══
+        if action_index is None:
+
+            s_eps = self.strategic_epsilon
+            cfg = self.config
+
+            if on_object:
+                same_side = sensor_data.get("same_side", True)
+                path_blocked = sensor_data.get("path_blocked", False)
+
+                t_state = self._compute_detach_transition_state(
+                    state, sensor_data,
+                    movement_efficiency=self._compute_movement_efficiency(window=20),
+                )
+                strategic_q = self.strategic_detach.get_q_values(t_state)
+                strategic_h = self._compute_strategic_heuristic(
+                    current_phase, on_object=True
+                )
+
+                has_data = (
+                    self.strategic_detach.next_id > 0
+                    and np.max(np.abs(strategic_q)) > 1e-6
+                )
+                if has_data:
+                    sq_norm = self._normalize_values(strategic_q)
+                    sh_norm = self._normalize_values(strategic_h)
+                    strategic_combined = (
+                        (1 - s_eps) * sq_norm + s_eps * sh_norm
+                    )
+                else:
+                    strategic_combined = strategic_h.copy()
+
+                should_switch = (
+                    strategic_combined[1] > strategic_combined[0]
+                )
+
+                if (
+                    should_switch
+                    and self._can_detach(state)
+                    and (not same_side or path_blocked)
+                ):
+                    action_index = (
+                        self.action_space.IDX_DETACH
+                    )
                     strategic_source = (
-                        f"detach_stay("
+                        f"detach_switch("
                         f"q=[{strategic_q[0]:.2f},"
                         f"{strategic_q[1]:.2f}],"
+                        f"h=[{strategic_h[0]:.1f},"
+                        f"{strategic_h[1]:.1f}],"
+                        f"eps={s_eps:.2f})"
+                    )
+                    self._strategic_stats["detach_memory_triggered"] += 1
+
+                    # ═══ CHANGED: сохраняем контекст для ретроспективного обучения ═══
+                    self._pending_strategic_detach.append({
+                        "state": t_state.copy(),
+                        "step": len(self._episode_transitions),
+                        "phase_was_detach_needed": (
+                            current_phase == "DETACH_NEEDED"
+                        ),
+                        "same_side_before": same_side,
+                        "path_blocked_before": path_blocked,
+                        "dist_before": float(state[13]),
+                    })
+                else:
+                    if not same_side or path_blocked:
+                        strategic_source = (
+                            f"detach_stay("
+                            f"q=[{strategic_q[0]:.2f},"
+                            f"{strategic_q[1]:.2f}],"
+                            f"eps={s_eps:.2f})"
+                        )
+                        self._strategic_stats[
+                            "detach_heuristic_fallback"
+                        ] += 1
+
+            elif not on_object:
+                d_state = self._compute_direction_transition_state(
+                    state, sensor_data, current_pose
+                )
+                strategic_q = self.strategic_direction.get_q_values(
+                    d_state
+                )
+
+                # Fixed semantics: action=0=fly_to_goal, action=1=bypass
+                path_blocked = sensor_data.get("path_blocked", False)
+
+                strategic_h = np.zeros(2)
+                if path_blocked:
+                    strategic_h[1] += 3.0
+                    strategic_h[0] -= 1.0
+                else:
+                    strategic_h[0] += 3.0
+                    strategic_h[1] -= 3.0
+
+                has_data = (
+                    self.strategic_direction.next_id > 0
+                    and np.max(np.abs(strategic_q)) > 1e-6
+                )
+                if has_data:
+                    sq_norm = self._normalize_values(strategic_q)
+                    sh_norm = self._normalize_values(strategic_h)
+                    dir_combined = (
+                        (1 - s_eps) * sq_norm + s_eps * sh_norm
+                    )
+                else:
+                    dir_combined = strategic_h.copy()
+
+                should_bypass = dir_combined[1] > dir_combined[0]
+
+                if should_bypass:
+                    if self._current_phase != "FLY_TO_EDGE":
+                        self._current_phase = "FLY_TO_EDGE"
+                    strategic_source = (
+                        f"direction_bypass("
+                        f"q=[{strategic_q[0]:.2f},"
+                        f"{strategic_q[1]:.2f}],"
+                        f"h=[{strategic_h[0]:.1f},"
+                        f"{strategic_h[1]:.1f}],"
                         f"eps={s_eps:.2f})"
                     )
                     self._strategic_stats[
-                        "detach_heuristic_fallback"
+                        "direction_memory_keep_edge"
+                    ] += 1
+                else:
+                    if self._current_phase == "FLY_TO_EDGE":
+                        self._current_phase = "FLY_TO_GOAL"
+                        self._cached_fly_direction = None
+                    strategic_source = (
+                        f"direction_goal("
+                        f"q=[{strategic_q[0]:.2f},"
+                        f"{strategic_q[1]:.2f}],"
+                        f"h=[{strategic_h[0]:.1f},"
+                        f"{strategic_h[1]:.1f}],"
+                        f"eps={s_eps:.2f})"
+                    )
+                    self._strategic_stats[
+                        "direction_memory_to_goal"
                     ] += 1
 
-        elif not on_object:
-            d_state = self._compute_direction_transition_state(
-                state, sensor_data, current_pose
-            )
-            strategic_q = self.strategic_direction.get_q_values(
-                d_state
-            )
+                if not path_blocked:
+                    self._path_clear_streak += 1
+                else:
+                    self._path_clear_streak = 0
 
-            # Fixed semantics: action=0=fly_to_goal, action=1=bypass
-            path_blocked = sensor_data.get("path_blocked", False)
-
-            strategic_h = np.zeros(2)
-            if path_blocked:
-                strategic_h[1] += 3.0
-                strategic_h[0] -= 1.0
-            else:
-                strategic_h[0] += 3.0
-                strategic_h[1] -= 3.0
-
-            has_data = (
-                self.strategic_direction.next_id > 0
-                and np.max(np.abs(strategic_q)) > 1e-6
-            )
-            if has_data:
-                sq_norm = self._normalize_values(strategic_q)
-                sh_norm = self._normalize_values(strategic_h)
-                dir_combined = (
-                    (1 - s_eps) * sq_norm + s_eps * sh_norm
-                )
-            else:
-                dir_combined = strategic_h.copy()
-
-            should_bypass = dir_combined[1] > dir_combined[0]
-
-            if should_bypass:
-                if self._current_phase != "FLY_TO_EDGE":
-                    self._current_phase = "FLY_TO_EDGE"
-                strategic_source = (
-                    f"direction_bypass("
-                    f"q=[{strategic_q[0]:.2f},"
-                    f"{strategic_q[1]:.2f}],"
-                    f"h=[{strategic_h[0]:.1f},"
-                    f"{strategic_h[1]:.1f}],"
-                    f"eps={s_eps:.2f})"
-                )
-                self._strategic_stats[
-                    "direction_memory_keep_edge"
-                ] += 1
-            else:
-                if self._current_phase == "FLY_TO_EDGE":
-                    self._current_phase = "FLY_TO_GOAL"
-                    self._cached_fly_direction = None
-                strategic_source = (
-                    f"direction_goal("
-                    f"q=[{strategic_q[0]:.2f},"
-                    f"{strategic_q[1]:.2f}],"
-                    f"h=[{strategic_h[0]:.1f},"
-                    f"{strategic_h[1]:.1f}],"
-                    f"eps={s_eps:.2f})"
-                )
-                self._strategic_stats[
-                    "direction_memory_to_goal"
-                ] += 1
-
-            if not path_blocked:
-                self._path_clear_streak += 1
-            else:
-                self._path_clear_streak = 0
-
-        self._prev_phase = current_phase
+            self._prev_phase = current_phase
 
         # ═══ SOFTMAX SAMPLING (tactical level) ═══
         if action_index is None:
