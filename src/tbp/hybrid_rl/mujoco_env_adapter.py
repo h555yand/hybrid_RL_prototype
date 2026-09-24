@@ -209,11 +209,24 @@ class MuJoCoEnvAdapter:
         self.up_sign = float(np.sign(self.up_direction[self.height_axis]))
 
         cad_edge = temp.open_edge_height
-        # Convert edge height: it's along the CAD height axis
         edge_point_cad = np.zeros(3)
         edge_point_cad[temp.height_axis] = cad_edge
         edge_point_mj = self._pos_cad_to_mj_mm(edge_point_cad)
         self.open_edge_height = edge_point_mj[self.height_axis]
+
+        # ═══ FIX 6: Cache bottom height ═══
+        cad_bounds = self._cad_mesh.bounds  # [min, max]
+        mj_corners = np.array([
+            self._pos_cad_to_mj_mm(np.array([x, y, z]))
+            for x in [cad_bounds[0][0], cad_bounds[1][0]]
+            for y in [cad_bounds[0][1], cad_bounds[1][1]]
+            for z in [cad_bounds[0][2], cad_bounds[1][2]]
+        ])
+        h = self.height_axis
+        if self.up_sign > 0:
+            self._bottom_height_mj = float(mj_corners.min(axis=0)[h])
+        else:
+            self._bottom_height_mj = float(mj_corners.max(axis=0)[h])
 
     # ═══════════════════════════════════════════════════
     # Helpers
@@ -375,27 +388,61 @@ class MuJoCoEnvAdapter:
     # ═══════════════════════════════════════════════════
 
     def _compute_same_side(self, agent_normal: Optional[List[float]]) -> bool:
-        if self._goal_normal_mj is None or agent_normal is None:
+        if self._goal_normal_mj is None:
             return True
-
+        
         center = self._mj_center_mm
         agent_pos = self._get_pos_mj_mm()
         goal_pos = self._current_goal[:3]
         h = self.height_axis
         up = self.up_direction
-
-        an = np.array(agent_normal, dtype=float)
-        an_h = an.copy(); an_h[h] = 0.0
-        afc = agent_pos - center; afc[h] = 0.0
-        agent_out = np.dot(an_h, afc) > 0 if np.linalg.norm(an_h) >= 0.3 else np.dot(an, up) < 0
-
+        
+        # ═══ Agent side (position-based, no camera dependency) ═══
+        agent_inside = self._is_point_inside_mj(agent_pos)
+        agent_outward = not agent_inside
+        
+        # ═══ Goal side (on surface — reliable) ═══
         gn = np.array(self._goal_normal_mj, dtype=float)
         gn_h = gn.copy(); gn_h[h] = 0.0
         gfc = goal_pos - center; gfc[h] = 0.0
-        goal_out = np.dot(gn_h, gfc) > 0 if np.linalg.norm(gn_h) >= 0.3 else np.dot(gn, up) < 0
+        
+        if np.linalg.norm(gn_h) >= 0.3:
+            goal_outward = np.dot(gn_h, gfc) > 0
+        else:
+            goal_outward = np.dot(gn, up) < 0
+        
+        return agent_outward == goal_outward
 
-        return agent_out == goal_out
+    def _is_point_inside_mj(self, pos_mj_mm):
+        """Position-based inside/outside test via horizontal ray cast."""
+        center = self._mj_center_mm
+        h = self.height_axis
 
+        # Above rim = outside
+        point_height = pos_mj_mm[h]
+        rim_height = self.open_edge_height
+        if (point_height - rim_height) * self.up_sign > 0:
+            return False
+
+        # Below bottom = outside
+        if (self._bottom_height_mj - point_height) * self.up_sign > 5.0:
+            return False
+
+        from_center = pos_mj_mm - center
+        from_center_horiz = from_center.copy()
+        from_center_horiz[h] = 0.0
+        horiz_dist = float(np.linalg.norm(from_center_horiz))
+
+        if horiz_dist < 1e-8:
+            return True
+
+        direction = -from_center_horiz / horiz_dist
+        hit = self._mj_ray_cast(pos_mj_mm, direction)
+
+        if hit > 0 and hit < horiz_dist + 5.0:
+            return False
+
+        return True
     # ═══════════════════════════════════════════════════
     # path_blocked (MuJoCo frame)
     # ═══════════════════════════════════════════════════
@@ -560,6 +607,7 @@ class MuJoCoEnvAdapter:
             "same_side": same_side,
             "object_extents": self._mj_extents_mm.tolist(),
             "edge_traversed": self._edge_traversed,
+            "open_edge_height": self.open_edge_height,
         }
 
     # ═══════════════════════════════════════════════════

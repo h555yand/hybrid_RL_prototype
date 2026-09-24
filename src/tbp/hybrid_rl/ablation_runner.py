@@ -834,7 +834,7 @@ def run_episodes(  # noqa: PLR0913, C901, PLR0912, PLR0915
         if (
             (is_training or air_start_in_eval)
             and air_start_enabled
-            and episode % 3 == 2
+            # and episode % 3 == 2
         ):
             sensor = env.get_sensor_data()
             normal = sensor.get("point_normal")

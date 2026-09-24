@@ -13,14 +13,14 @@ experiment:
     regenerate_scripts: true
     do_train: false
     do_eval: false
-    do_heur_eval: false
+    do_heur_eval: true
     do_bc_train: false
     do_sac_train: false
     do_sac_eval: false
     do_adaptive: false
     do_ycb_eval: false
     do_ycb_mujoco_eval: false
-    do_ycb_mujoco_adaptive: true
+    do_ycb_mujoco_adaptive: false
 
     train_seeds: [11]
     eval_seeds: [44]
@@ -32,13 +32,13 @@ experiment:
     promote_window: 10
 
     curriculum_levels:
-      - [10.0, 60.0]    # L0: same_side, no path_blocked
-      - [10.0, 80.0]    # L1: same_side, path_blocked
+      #- [10.0, 60.0]    # L0: same_side, no path_blocked
+      #- [10.0, 80.0]    # L1: same_side, path_blocked
       - [10.0, 120.0]   # L2: different sides
 
     curriculum_filters:
-      - {same_side: true, path_blocked: false}
-      - {same_side: true, path_blocked: true}
+      #- {same_side: true, path_blocked: false}
+      #- {same_side: true, path_blocked: true}
       - {same_side: false}
 
     # ═══════════════════════════════════════════

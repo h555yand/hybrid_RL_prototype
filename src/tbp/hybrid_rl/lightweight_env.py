@@ -217,11 +217,22 @@ class LightweightEnv:
         # ═══ Curvature ═══
         curvature_data = self._estimate_curvature()
 
+        # ═══ same_side ═══
         same_side = True
         if hasattr(self, "_current_goal") and self._current_goal is not None:
-            same_side = _is_reachable_by_surface(
-                self, self.agent_pos, self._current_goal[:3]
-            )
+            on_object = bool(depth < 3.0)
+            
+            if on_object:
+                # On surface: use nearest.on_surface (reliable)
+                same_side = _is_reachable_by_surface(
+                    self, self.agent_pos, self._current_goal[:3]
+                )
+            else:
+                # In air: use ray-based inside/outside test
+                same_side = self._same_side_air(
+                    self.agent_pos, self._current_goal[:3],
+                    point_normal,
+                )
 
         return {
             "point_normal": point_normal,
@@ -240,8 +251,77 @@ class LightweightEnv:
             "same_side": same_side,
             "object_extents": (self.mesh.bounds[1] - self.mesh.bounds[0]).tolist(),
             "edge_traversed": getattr(self, "_edge_traversed", False),
+            "open_edge_height": self.open_edge_height,
         }
-    
+
+    def _same_side_air(self, agent_pos, goal_pos, agent_normal):
+        """Determine same_side when agent is in air.
+        
+        Agent side: horizontal ray cast toward center (position-based).
+        Goal side: normal-based (reliable for on-surface points).
+        """
+        center = np.array(self.mesh.centroid, dtype=float)
+        height_axis = self.height_axis
+        up = self.up_direction
+        up_sign = self.up_sign
+
+        # ═══ Agent: inside or outside? (position-based) ═══
+        from_center = agent_pos - center
+        from_center_horiz = from_center.copy()
+        from_center_horiz[height_axis] = 0.0
+        horiz_dist = float(np.linalg.norm(from_center_horiz))
+
+        # Above rim = outside
+        agent_height = agent_pos[height_axis]
+        rim_height = self.open_edge_height
+        margin = 5.0  # 5mm above rim before switching to "above" mode
+        above_rim = (agent_height - rim_height) * up_sign > margin
+
+        bbox_min = self.mesh.bounds[0]
+        bbox_max = self.mesh.bounds[1]
+        if up_sign > 0:
+            bottom_height = bbox_min[height_axis]
+        else:
+            bottom_height = bbox_max[height_axis]
+        below_bottom = (bottom_height - agent_height) * up_sign > 5.0
+
+        if above_rim:
+            agent_inside = False
+        elif below_bottom:
+            agent_inside = False
+        elif horiz_dist < 1e-8:
+            agent_inside = True  # at center, below rim
+        else:
+            direction = -from_center_horiz / horiz_dist
+            locations, _, _ = self.mesh.ray.intersects_location(
+                ray_origins=[agent_pos],
+                ray_directions=[direction],
+            )
+            if len(locations) > 0:
+                hit_distances = np.linalg.norm(locations - agent_pos, axis=1)
+                hits_before_center = int(np.sum(hit_distances < horiz_dist + 5.0))
+                agent_inside = hits_before_center == 0
+            else:
+                agent_inside = True  # no surface between agent and center
+
+        agent_outward = not agent_inside
+
+        # ═══ Goal side (normal-based, unchanged) ═══
+        _, _, goal_face = self.mesh.nearest.on_surface([goal_pos])
+        goal_normal = self.mesh.face_normals[goal_face[0]]
+
+        goal_n_horiz = goal_normal.copy()
+        goal_n_horiz[height_axis] = 0.0
+        goal_from_center = goal_pos - center
+        goal_from_center[height_axis] = 0.0
+
+        if np.linalg.norm(goal_n_horiz) >= 0.3:
+            goal_outward = float(np.dot(goal_n_horiz, goal_from_center)) > 0
+        else:
+            goal_outward = float(np.dot(goal_normal, up)) < 0
+
+        return agent_outward == goal_outward
+
     def get_pose(self):
         """The agent's current pose."""
         return np.concatenate([self.agent_pos, self.agent_rot])
