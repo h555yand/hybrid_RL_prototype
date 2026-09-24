@@ -588,6 +588,14 @@ class LightweightEnv:
             closest, dist_to_mesh, face_id = self.mesh.nearest.on_surface(
                 [self.agent_pos]
             )
+            # ═══ SNAP_MAX_DIST: sim-to-real parity with MuJoCo ═══
+            if dist_to_mesh[0] > 15.0:
+                # Too far from surface — don't snap.
+                # Agent stays at new position (in air).
+                # This matches MuJoCo behavior where ray cast
+                # won't find surface beyond SNAP_MAX_DIST.
+                return
+    
             hit_n = self.mesh.face_normals[face_id[0]]
             hit_n = hit_n / (np.linalg.norm(hit_n) + 1e-12)
 
