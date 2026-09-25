@@ -45,6 +45,11 @@ from tbp.hybrid_rl.arbitrator import sac_to_discrete
 from tbp.hybrid_rl.experience_extractor import ExperienceExtractor
 from tbp.hybrid_rl.monty_rl_bridge import MontyRLBridge
 from tbp.hybrid_rl.rl_goal_approach_controller import RLGoalApproachController
+import quaternion as qt
+from tbp.monty.frameworks.actions.actions import (
+    SetAgentPose,
+    SetSensorRotation,
+)
 
 if TYPE_CHECKING:
     from tbp.hybrid_rl.adaptive_manager import AdaptiveTrainingManager
@@ -194,12 +199,11 @@ class RLGoalPolicy(MotorPolicy):
         pass
 
     def reset(self) -> None:
-        """Reset navigation state between episodes."""
         self._nav_active = False
         self._nav_steps = 0
         self._current_goal = None
         self._last_termination = None
-        # Don't reset controller/manager — they persist across episodes
+        self._prev_goals_reached = self._controller._total_goals_reached
 
     def state_dict(self) -> Memento:
         return {
@@ -238,6 +242,7 @@ class RLGoalPolicy(MotorPolicy):
         self._nav_active = True
         self._nav_steps = 0
         self._last_termination = None
+        self._prev_goals_reached = self._controller._total_goals_reached
 
         # Set goal in bridge/adapter (computes goal_normal, enables same_side)
         self._bridge.set_goal(goal)
@@ -330,30 +335,37 @@ class RLGoalPolicy(MotorPolicy):
     def _finish_navigation(self) -> MotorPolicyResult:
         """Clean up after navigation ends.
 
-        Updates adaptive manager with episode outcome,
-        resets navigation state.
+        On success: returns SetAgentPose to sync Monty's simulator
+        to the final position reached by RL adapter.
+        This is equivalent to what JumpToGoal does — teleport + observe.
 
-        Returns:
-            MotorPolicyResult with status=READY.
+        On failure: returns empty actions, Monty agent stays where it was.
         """
-        # Determine success from controller stats
+        from scipy.spatial.transform import Rotation as Rot
+
+        # Determine success from controller
         success = False
         termination = "unknown"
-        if hasattr(self._controller, '_termination_counts'):
-            tc = self._controller._termination_counts
-            if tc.get("goal_reached", 0) > 0:
-                success = True
-                termination = "goal_reached"
-            elif tc.get("timeout", 0) > 0:
-                termination = "timeout"
-            elif tc.get("collision_surface_violation", 0) > 0:
-                termination = "collision"
+
+        # Check if controller ended the episode
+        # _total_goals_reached increments on goal_reached
+        prev_goals = getattr(self, '_prev_goals_reached', 0)
+        current_goals = self._controller._total_goals_reached
+        if current_goals > prev_goals:
+            success = True
+            termination = "goal_reached"
+        elif self._nav_steps >= self._max_nav_steps:
+            termination = "timeout"
+        elif not self._controller.is_active:
+            # Controller ended for other reason (collision, etc.)
+            termination = "collision"
+        self._prev_goals_reached = current_goals
 
         # Update adaptive manager
         if self._manager:
             self._manager.on_episode_complete(
                 success=success,
-                transitions=self._controller._episode_transitions,
+                transitions=[],
             )
             self._manager.arbitrator.on_episode_end(success)
 
@@ -364,11 +376,37 @@ class RLGoalPolicy(MotorPolicy):
             termination,
         )
 
+        # ═══ Sync Monty agent to adapter's final position ═══
+        actions = []
+        if success:
+            final_pos_mm = self._bridge._adapter._get_pos_mj_mm()
+            final_euler = self._bridge._adapter._get_euler_deg()
+
+            rot = Rot.from_euler("xyz", final_euler, degrees=True)
+            q = rot.as_quat()  # scipy returns xyzw
+            final_quat = qt.quaternion(q[3], q[0], q[1], q[2])
+
+            actions = [
+                SetAgentPose(
+                    agent_id=self._agent_id,
+                    location=tuple(final_pos_mm / 1000.0),  # mm → meters
+                    rotation_quat=final_quat,
+                ),
+                SetSensorRotation(
+                    agent_id=self._agent_id,
+                    rotation_quat=qt.one,
+                ),
+            ]
+
         self._nav_active = False
         self._current_goal = None
         self._last_termination = termination
 
-        return MotorPolicyResult([], status=PolicyStatus.READY)
+        return MotorPolicyResult(
+            actions=actions,
+            motor_only_step=not success,  # LM processes obs only on success
+            status=PolicyStatus.READY,
+        )
 
     # ══════════════════════════════════════════════════════════
     # DIAGNOSTICS

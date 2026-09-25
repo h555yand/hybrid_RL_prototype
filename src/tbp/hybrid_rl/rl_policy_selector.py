@@ -66,47 +66,47 @@ class RLPolicySelector(MotorPolicySelector):
     def __init__(
         self,
         rl_goal_policy: RLGoalPolicy,
-        look_at_goal: LookAtGoal,
         default: MotorPolicy,
+        look_at_goal: LookAtGoal | None = None,  # ← optional
     ):
-        """Initialize selector.
-
-        Args:
-            rl_goal_policy: RL navigation policy (replaces JumpToGoal).
-            look_at_goal: Salience-driven look-at policy for SM goals.
-            default: Default exploration policy (random walk etc).
-        """
         self._rl_goal = rl_goal_policy
         self._look_at_goal = look_at_goal
         self._default = default
         self._is_navigating: bool = False
-
-        # Telemetry
         self._selected_policies: list[MotorPolicy] = []
         self._selected_goals: list[Goal | None] = []
 
-    def fixme_provide_motor_system(
+    def fixme_provide_motor_system(self, motor_system):
+        self._rl_goal.fixme_provide_motor_system(motor_system)
+        if self._look_at_goal is not None:
+            self._look_at_goal.fixme_provide_motor_system(motor_system)
+        self._default.fixme_provide_motor_system(motor_system)
+
+    def fixme_provide_motor_system_old(
         self, motor_system: ExperimentMotorSystem
     ) -> None:
         self._rl_goal.fixme_provide_motor_system(motor_system)
         self._look_at_goal.fixme_provide_motor_system(motor_system)
         self._default.fixme_provide_motor_system(motor_system)
 
-    def reset(self) -> None:
+    def reset(self):
         self._rl_goal.reset()
-        self._look_at_goal.reset()
+        if self._look_at_goal is not None:
+            self._look_at_goal.reset()
         self._default.reset()
         self._is_navigating = False
         self._selected_policies = []
         self._selected_goals = []
 
-    def state_dict(self) -> Memento:
-        return {
+    def state_dict(self):
+        result = {
             "rl_goal": self._rl_goal.state_dict(),
-            "look_at_goal": self._look_at_goal.state_dict(),
             "default": self._default.state_dict(),
             "is_navigating": self._is_navigating,
         }
+        if self._look_at_goal is not None:
+            result["look_at_goal"] = self._look_at_goal.state_dict()
+        return result
 
     def __call__(
         self,
@@ -167,15 +167,14 @@ class RLPolicySelector(MotorPolicySelector):
             return result
 
         # ═══ 3. SM goals → look_at_goal ═══
-        sm_goals = [g for g in goals if g.sender_type == "SM"]
-        if sm_goals:
-            goal = highest_confidence_goal(sm_goals)
-            self._is_navigating = False
-            result = self._look_at_goal(
-                ctx, observations, state, percept, goal,
-            )
-            self._update_telemetry(self._look_at_goal, goal)
-            return result
+        if self._look_at_goal is not None:
+            sm_goals = [g for g in goals if g.sender_type == "SM"]
+            if sm_goals:
+                goal = highest_confidence_goal(sm_goals)
+                self._is_navigating = False
+                result = self._look_at_goal(ctx, observations, state, percept, goal)
+                self._update_telemetry(self._look_at_goal, goal)
+                return result
 
         # ═══ 4. Default exploration ═══
         self._is_navigating = False

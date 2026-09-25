@@ -1,0 +1,106 @@
+# @package _global_
+
+defaults:
+  - /monty: evidencegraph_exp1000_emin_t3_tot2500
+  - /monty/learning_module: evidence_tutorial_surf_agent_2obj
+  - /monty/sensor_module: camera_tutorial_surf_agent_2obj
+  - /monty/connectivity: 1lm_1sm
+  - /environment: mujoco_ycb_surf_agent
+  - /env_interface: tutorial_eval_2obj_predefined_r3
+  - /env_interface/transform: missing_depthto3d_sensor2_semantic0_clip
+  - /logging: basic_info_monty_runs
+
+experiment:
+  _target_: tbp.monty.frameworks.experiments.object_recognition_experiments.MontyObjectRecognitionExperiment
+  config:
+    show_sensor_output: false
+    max_train_steps: 1000
+    max_eval_steps: 500
+    max_total_steps: 5000
+    n_train_epochs: 3
+    model_name_or_path: ${path.expanduser:"~/tbp/results/monty/projects/surf_agent_1lm_2obj_train_mujoco/pretrained"}
+    n_eval_epochs: 1
+    match_criterion:
+      _target_: tbp.monty.experiment.match_criteria.AnyLMsMatch
+      count: 1
+    seed: 42
+    supervised_lm_ids: []
+    python_log_level: INFO
+
+    # ═══ Motor system: RLPolicySelector + SurfacePolicy ═══
+    monty_config:
+      motor_system_config:
+        _target_: tbp.monty.frameworks.models.motor_system.MotorSystem
+        policy_selector:
+          _target_: tbp.hybrid_rl.rl_policy_selector.RLPolicySelector
+          rl_goal_policy:
+            _target_: tbp.hybrid_rl.rl_goal_policy.RLGoalPolicy
+            agent_id: agent_id_0
+            sensor_id: view_finder
+            model_path: /home/aeisaev/Downloads/github/hybrid_RL_prototype/results/adapt-baseline/data/runs/q_store_seed_11
+            rl_config:
+              state_dim: 22
+              num_actions: 24
+              surface_step: 3.0
+              free_step: 8.0
+              free_step_small: 2.0
+              free_step_backward: 2.0
+              rotation_step: 5.0
+              rotation_step_big: 15.0
+              gamma: 0.95
+              alpha: 0.1
+              epsilon_start: 0.05
+              epsilon_min: 0.02
+              epsilon_decay: 0.999
+              goal_threshold: 4.0
+              max_steps_per_goal: 200
+              max_sensor_range: 100.0
+              min_valid_depth: 0.5
+              normal_flip_threshold: -0.5
+              reward_progress: 3.0
+              reward_goal_reached: 30.0
+              reward_step_penalty: -0.2
+              reward_surface_violation: -12.0
+              reward_timeout: -12.0
+              reward_drifted_away: -3.0
+              reward_near_goal_on_surface: 0.5
+              detour_alignment_threshold: -0.3
+              detour_negative_progress_clip_steps: 2.0
+              stuck_threshold: 0.05
+              k_neighbors: 7
+              max_points: 500000
+              insert_threshold: 0.50
+              warmup_episodes: 0
+              mode: adaptive
+              eval_epsilon: 0.02
+              strategic_eval_epsilon: 0.02
+            mujoco_adapter:
+              _target_: tbp.hybrid_rl.mujoco_env_adapter.MuJoCoEnvAdapter
+              mesh_path_mm: /home/aeisaev/Downloads/github/hybrid_RL_prototype/results/adapt-baseline/data/ycb/ycb_banana.stl
+              mujoco_object_name: banana
+              mujoco_data_path: /home/aeisaev/Downloads/tbp/data/mujoco/objects/ycb
+            mesh_path: null
+            max_nav_steps: 200
+            enable_online_learning: false
+          default:
+            _target_: tbp.monty.frameworks.models.motor_policies.SurfacePolicyCurvatureInformed
+            use_goal_driven_actions: false
+            agent_id: agent_id_0
+            desired_object_distance: 0.025
+            alpha: 0.1
+            pc_alpha: 0.5
+            max_pc_bias_steps: 32
+            min_general_steps: 8
+            min_heading_steps: 12
+            action_sampler:
+              _target_: tbp.monty.frameworks.actions.action_samplers.ConstantSampler
+              actions:
+              - tbp.monty.frameworks.actions.actions.MoveForward
+              - tbp.monty.frameworks.actions.actions.MoveTangentially
+              - tbp.monty.frameworks.actions.actions.OrientHorizontal
+              - tbp.monty.frameworks.actions.actions.OrientVertical
+              rotation_degrees: 5.0
+
+    logging:
+      output_dir: ${path.expanduser:"~/tbp/results/monty/projects"}
+      run_name: rl_surface_eval_mujoco
