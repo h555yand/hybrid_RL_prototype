@@ -284,7 +284,7 @@ class Arbitrator:
             )
 
         # === Get proposals ===
-        q_action, q_confidence, q_spread = self._get_q_action(state)
+        q_action, q_confidence, q_spread, q_recency = self._get_q_action(state)
         q_type = ExperienceExtractor.DISCRETE_TO_PSAC[q_action][0]
         q_params = self._discrete_to_params(q_action)
 
@@ -327,15 +327,34 @@ class Arbitrator:
 
         if q_confidence >= q_conf_threshold and q_spread > q_spread_threshold:
             if q_type == sac_type:
-                # 1.1 Agree → blend (без изменений)
-                self._record_decision("blend")
-                self.blend_chosen_actions[q_name] += 1
-                self._current_episode_sources.append("blend")
-                return q_type, sac_params, (
-                    f"q_confirms_sac("
-                    f"conf={q_confidence:.2f},"
-                    f"spread={q_spread:.1f})"
-                )
+                # Q свежий → Q params (дискретные, но правильное направление
+                #   на новой геометрии)
+                # Q устаревший → SAC params (непрерывные, лучше обобщает
+                #   на знакомых объектах)
+                if q_recency > 0.5:
+                    chosen_params = q_params
+                    param_source = "q_fresh"
+                    self._record_decision("q_store")
+                    self.q_chosen_actions[q_name] += 1
+                    self._current_episode_sources.append("q_store")
+                    return q_type, chosen_params, (
+                        f"q_confirms_sac({param_source},"
+                        f"recency={q_recency:.2f},"
+                        f"conf={q_confidence:.2f},"
+                        f"spread={q_spread:.1f})"
+                    )
+                else:
+                    chosen_params = sac_params
+                    param_source = "sac_general"
+                    self._record_decision("blend")
+                    self.blend_chosen_actions[q_name] += 1
+                    self._current_episode_sources.append("blend")
+                    return q_type, chosen_params, (
+                        f"q_confirms_sac({param_source},"
+                        f"recency={q_recency:.2f},"
+                        f"conf={q_confidence:.2f},"
+                        f"spread={q_spread:.1f})"
+                    )
             else:
                 # 1.2 Conflict → heuristic ТОЛЬКО если бюджет есть
                 if budget_available:
@@ -540,6 +559,7 @@ class Arbitrator:
             store.get_q_values_with_confidence(state)
         )
         confidence = confidence_info["overall"]
+        recency = confidence_info.get("recency", 0.5)  # ← NEW
 
         if np.max(np.abs(q_values)) > 1e-8:
             running_stats.update(q_values)
@@ -611,7 +631,7 @@ class Arbitrator:
         probs = exp_v / exp_v.sum()
         q_action = int(np.random.choice(len(probs), p=probs))
 
-        return q_action, q_confidence, q_spread
+        return q_action, q_confidence, q_spread, recency
 
     def _get_sensor_proxy(self) -> Optional[dict]:
         if self.controller._prev_sensor_data is not None:

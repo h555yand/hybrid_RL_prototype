@@ -386,27 +386,50 @@ class HNSWStateStore:
             most_common_count / len(neighbor_best_actions)
         )
 
-        # Overall confidence (weighted average)
-        # Proximity most important (data exists nearby),
-        # experience and consistency equally weighted.
+        # 4. Recency: how recently were neighbors updated?
+        #last_steps = np.array([
+        #    self.points[l].last_step for l in labels
+        #], dtype=float)
+        #weighted_last_step = float(
+        #    np.sum(weights * last_steps) / weight_sum
+        #)
+        #age = max(self.global_step - weighted_last_step, 0)
+        #midpoint = 2000.0
+        #steepness = 3.0 / midpoint
+        #recency = float(1.0 / (1.0 + np.exp(steepness * (age - midpoint))))
+
+        # 4. Recency
+        max_last_step = float(max(
+            self.points[l].last_step for l in labels
+        ))
+        age = self.global_step - max_last_step
+
+        # Процент от всей истории, но не менее 1000 шагов (~10 эпизодов)
+        window = max(self.global_step * 0.15, 1000.0)
+
+        # age < window → свежий (recency → 1.0)
+        # age > window → устаревший (recency → 0.0)
+        recency = float(max(1.0 - age / window, 0.0))
+
+        # Overall: proximity и recency — главные
         overall = float(
             0.4 * proximity
             + 0.3 * experience
             + 0.3 * consistency
         )
 
+        confidence_info = {
+            "proximity": proximity,
+            "experience": experience,
+            "consistency": consistency,
+            "recency": recency,
+            "overall": overall,
+        }
         # ═══ Q-value interpolation (same as get_q_values) ═══
         weights /= weight_sum
         q_values = np.zeros(self.num_actions)
         for i, label in enumerate(labels):
             q_values += weights[i] * self.points[label].q_values
-
-        confidence_info = {
-            "proximity": proximity,
-            "experience": experience,
-            "consistency": consistency,
-            "overall": overall,
-        }
 
         return q_values, confidence_info
     
