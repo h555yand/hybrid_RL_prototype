@@ -30,7 +30,7 @@ MM_PER_M = 1000.0
 NO_SURFACE_DEPTH_MM = 100.0
 ON_OBJECT_DEPTH_MM = 3.0
 SNAP_TARGET_DEPTH_MM = 2.0
-SNAP_MAX_DIST = 15.0  # 5x surface_step, covers edge traversal
+SNAP_MAX_DIST_DEFAULT = 15.0  # 5x surface_step, covers edge traversal
 
 # ═══════════════════════════════════════════════════
 # Monty imports
@@ -67,7 +67,21 @@ class MuJoCoEnvAdapter:
         zoom: float = _DEFAULT_ZOOM,
         hfov: float = _DEFAULT_HFOV,
         seed: Optional[int] = None,
+        external_sim=None,
+        agent_id: str = "rl_agent",
+        snap_max_dist: float = SNAP_MAX_DIST_DEFAULT,  # NEW
     ):
+        self._agent_id_local = AgentID(agent_id)    
+        self._snap_max_dist = snap_max_dist    
+
+        # Determine sensor ID
+        if external_sim is not None:
+            # Monty surface agent uses "patch" as primary sensor
+            self._sensor_id_local = SensorID("patch")
+            # self._sensor_id_local = SensorID("view_finder")
+        else:
+            self._sensor_id_local = _SENSOR_ID
+
         self._sensor_w, self._sensor_h = sensor_resolution
         self._zoom = zoom
         self._hfov = hfov
@@ -126,29 +140,33 @@ class MuJoCoEnvAdapter:
         self.mesh = self._cad_mesh
 
         # ═══ MuJoCo simulator ═══
-        res = Resolution2D(width=self._sensor_w, height=self._sensor_h)
-        sensor_configs = {
-            _SENSOR_ID: SensorConfig(resolution=res, zoom=zoom, semantic=True)
-        }
-        agent_factory = partial(
-            SurfaceAgent, agent_id=_AGENT_ID, sensor_configs=sensor_configs,
-        )
-        self._sim = MuJoCoSimulator(
-            agents=[agent_factory], data_path=mujoco_data_path,
-        )
-        self._sim.add_object(mujoco_object_name)
-        # ═══ Increase offscreen framebuffer for scene rendering ═══
-        self._sim.model.vis.global_.offwidth = 256
-        self._sim.model.vis.global_.offheight = 256
+        if external_sim is not None:
+            self._sim = external_sim
+            self._owns_sim = False
+        else:
+            res = Resolution2D(width=self._sensor_w, height=self._sensor_h)
+            sensor_configs = {
+                _SENSOR_ID: SensorConfig(resolution=res, zoom=zoom, semantic=True)
+            }
+            agent_factory = partial(
+                SurfaceAgent, agent_id=self._agent_id_local, sensor_configs=sensor_configs,
+            )
+            self._sim = MuJoCoSimulator(
+                agents=[agent_factory], data_path=mujoco_data_path,
+            )
+            self._sim.add_object(mujoco_object_name)
+            self._sim.model.vis.global_.offwidth = 256
+            self._sim.model.vis.global_.offheight = 256
+            self._owns_sim = True
 
         logger.info("MuJoCo initialized: object='%s'", mujoco_object_name)
 
         # ═══ Monty transforms ═══
         self._missing_to_max = MissingToMaxDepth(
-            agent_id=_AGENT_ID, max_depth=1.0, threshold=0.0,
+            agent_id=self._agent_id_local, max_depth=1.0, threshold=0.0,
         )
         self._depth_to_3d = DepthTo3DLocations(
-            agent_id=_AGENT_ID, sensor_ids=[_SENSOR_ID],
+            agent_id=self._agent_id_local, sensor_ids=[self._sensor_id_local],
             resolutions=[(self._sensor_h, self._sensor_w)],
             zooms=[zoom], hfov=[hfov],
             world_coord=True, get_all_points=True, use_semantic_sensor=False,
@@ -281,7 +299,7 @@ class MuJoCoEnvAdapter:
 
     @property
     def _embodiment(self):
-        return self._sim._agents[_AGENT_ID]._embodiment
+        return self._sim._agents[self._agent_id_local]._embodiment
 
     def _get_pos_mj_mm(self) -> np.ndarray:
         """Agent position in MuJoCo mm."""
@@ -299,7 +317,7 @@ class MuJoCoEnvAdapter:
         q = rot.as_quat()  # [x,y,z,w]
         quat_wxyz = (float(q[3]), float(q[0]), float(q[1]), float(q[2]))
         action = SetAgentPose(
-            agent_id=_AGENT_ID, location=pos_m, rotation_quat=quat_wxyz,
+            agent_id=self._agent_id_local, location=pos_m, rotation_quat=quat_wxyz,
         )
         self._sim.step([action])
 
@@ -315,7 +333,7 @@ class MuJoCoEnvAdapter:
         q = new_rot.as_quat()
         quat_wxyz = (float(q[3]), float(q[0]), float(q[1]), float(q[2]))
         action = SetAgentPose(
-            agent_id=_AGENT_ID, location=tuple(pos_m),
+            agent_id=self._agent_id_local, location=tuple(pos_m),
             rotation_quat=quat_wxyz,
         )
         self._sim.step([action])
@@ -335,7 +353,7 @@ class MuJoCoEnvAdapter:
         obs = self._missing_to_max(obs, ctx)
         obs = self._depth_to_3d(obs, ctx)
 
-        sensor_obs = obs[_AGENT_ID][_SENSOR_ID]
+        sensor_obs = obs[self._agent_id_local][self._sensor_id_local]
         depth_map = sensor_obs["depth"]
         semantic_3d = sensor_obs.get("semantic_3d")
         cam_to_world = sensor_obs.get("cam_to_world")
@@ -377,6 +395,19 @@ class MuJoCoEnvAdapter:
                             pass
                 except Exception:
                     pass
+        
+        # Ray cast depth override for shared simulator
+        if not self._owns_sim:
+            pos = self._get_pos_mj_mm()
+            euler = self._get_euler_deg()
+            rot_check = Rot.from_euler("xyz", euler, degrees=True)
+            fwd = rot_check.apply([0, 0, -1])
+            ray_depth = self._mj_ray_cast(pos, fwd)
+            if ray_depth > 0:
+                depth_mm = ray_depth
+                on_object = ray_depth < ON_OBJECT_DEPTH_MM
+                if point_normal is None and on_object:
+                    point_normal = (-fwd).tolist()
 
         return {
             "depth_mm": depth_mm, "point_normal": point_normal,
@@ -934,7 +965,7 @@ class MuJoCoEnvAdapter:
 
         # 1a. Forward (current camera direction)
         hit = self._mj_ray_cast(pos, forward)
-        if 0 < hit < SNAP_MAX_DIST:
+        if 0 < hit < self._snap_max_dist:
             candidates.append((forward.copy(), hit))
 
         # 1b. Toward previous surface (-prev_normal)
@@ -942,16 +973,16 @@ class MuJoCoEnvAdapter:
             prev_n = np.array(prev_normal, dtype=float)
             prev_n /= (np.linalg.norm(prev_n) + 1e-12)
             hit = self._mj_ray_cast(pos, -prev_n)
-            if 0 < hit < SNAP_MAX_DIST:
+            if 0 < hit < self._snap_max_dist:
                 candidates.append((-prev_n.copy(), hit))
 
         # 1c. Multi-probe cone around forward
         if not candidates:
             hit, probe_dir = self._multi_probe_ray_cast(
                 pos, forward, rot,
-                max_dist=SNAP_MAX_DIST, surface_step=3.0,
+                max_dist=self._snap_max_dist, surface_step=3.0,
             )
-            if 0 < hit < SNAP_MAX_DIST:
+            if 0 < hit < self._snap_max_dist:
                 candidates.append((probe_dir.copy(), hit))
 
         # 1d. Multi-probe cone around -prev_normal
@@ -965,9 +996,9 @@ class MuJoCoEnvAdapter:
                 align_rot = rot
             hit, probe_dir = self._multi_probe_ray_cast(
                 pos, neg_n, align_rot,
-                max_dist=SNAP_MAX_DIST, surface_step=3.0,
+                max_dist=self._snap_max_dist, surface_step=3.0,
             )
-            if 0 < hit < SNAP_MAX_DIST:
+            if 0 < hit < self._snap_max_dist:
                 candidates.append((probe_dir.copy(), hit))
 
         # 1e. Toward object center (last resort for edges/rims)
@@ -977,7 +1008,7 @@ class MuJoCoEnvAdapter:
             if to_center_dist > 1e-8:
                 to_center_dir = to_center / to_center_dist
                 hit = self._mj_ray_cast(pos, to_center_dir)
-                if 0 < hit < SNAP_MAX_DIST:
+                if 0 < hit < self._snap_max_dist:
                     candidates.append((to_center_dir.copy(), hit))
 
         if not candidates:
@@ -1115,7 +1146,7 @@ class MuJoCoEnvAdapter:
 
         # 1. Forward
         hit = self._mj_ray_cast(pos, forward)
-        if 0 < hit < SNAP_MAX_DIST:
+        if 0 < hit < self._snap_max_dist:
             candidates.append((forward.copy(), hit))
 
         # 2. -prev_normal (toward surface we came from)
@@ -1123,17 +1154,17 @@ class MuJoCoEnvAdapter:
             prev_n = np.array(prev_normal, dtype=float)
             prev_n /= (np.linalg.norm(prev_n) + 1e-12)
             hit = self._mj_ray_cast(pos, -prev_n)
-            if 0 < hit < SNAP_MAX_DIST:
+            if 0 < hit < self._snap_max_dist:
                 candidates.append((-prev_n.copy(), hit))
 
         # 3. Multi-probe around forward
         if not candidates:
             hit, best_dir = self._multi_probe_ray_cast(
                 pos, forward, rot,
-                max_dist=SNAP_MAX_DIST,
+                max_dist=self._snap_max_dist,
                 surface_step=3.0,
             )
-            if 0 < hit < SNAP_MAX_DIST:
+            if 0 < hit < self._snap_max_dist:
                 candidates.append((best_dir.copy(), hit))
 
         # 4. Multi-probe around -prev_normal
@@ -1149,10 +1180,10 @@ class MuJoCoEnvAdapter:
                 align_rot = rot
             hit, best_dir = self._multi_probe_ray_cast(
                 pos, neg_n, align_rot,
-                max_dist=SNAP_MAX_DIST,
+                max_dist=self._snap_max_dist,
                 surface_step=3.0,
             )
-            if 0 < hit < SNAP_MAX_DIST:
+            if 0 < hit < self._snap_max_dist:
                 candidates.append((best_dir.copy(), hit))
 
         if not candidates:
@@ -1392,7 +1423,7 @@ class MuJoCoEnvAdapter:
         forward = rot.apply([0, 0, -1])
 
         distance_m = step_mm / MM_PER_M
-        action = MoveForward(agent_id=_AGENT_ID, distance=distance_m)
+        action = MoveForward(agent_id=self._agent_id_local, distance=distance_m)
         self._sim.step([action])
 
         self._passed_through = False
@@ -1405,14 +1436,14 @@ class MuJoCoEnvAdapter:
 
     def _do_orient_horizontal(self, rotation_deg, forward_mm, left_mm):
         action = OrientHorizontal(
-            agent_id=_AGENT_ID, rotation_degrees=-rotation_deg,
+            agent_id=self._agent_id_local, rotation_degrees=-rotation_deg,
             left_distance=left_mm / MM_PER_M, forward_distance=forward_mm / MM_PER_M,
         )
         self._sim.step([action])
 
     def _do_orient_vertical(self, rotation_deg, forward_mm, down_mm):
         action = OrientVertical(
-            agent_id=_AGENT_ID, rotation_degrees=rotation_deg,
+            agent_id=self._agent_id_local, rotation_degrees=rotation_deg,
             down_distance=down_mm / MM_PER_M, forward_distance=forward_mm / MM_PER_M,
         )
         self._sim.step([action])
@@ -1483,12 +1514,7 @@ class MuJoCoEnvAdapter:
         distance: float = 0.0,
         result: str = "",
     ) -> None:
-        """Render split-view frame: MuJoCo solid + MuJoCo x-ray.
-        
-        Implements RenderableEnv protocol.
-        Left: colored MuJoCo scene with agent/goal/trail markers.
-        Right: same scene with transparent mesh (alpha=0.15).
-        """
+        """Render split-view frame: MuJoCo solid + MuJoCo x-ray."""
         import mujoco
         from mujoco import mj_forward
         from PIL import Image as _Image, ImageDraw as _ImageDraw, ImageFont as _ImageFont
@@ -1496,16 +1522,24 @@ class MuJoCoEnvAdapter:
         from .visualize_env import add_text_overlay
 
         mj_forward(self._sim.model, self._sim.data)
-
         _Path(filepath).parent.mkdir(parents=True, exist_ok=True)
 
-        # Scene resolution
-        w, h = 512, 256
-        half_w = w // 2  # = 256
+        # Render at framebuffer size
+        fb_w = self._sim.model.vis.global_.offwidth
+        fb_h = self._sim.model.vis.global_.offheight
+        render_half_w = min(fb_w, 256)
+        render_h = min(fb_h, 256)
+
+        # Target output size (upscale if needed)
+        target_half_w = 256
+        target_h = 256
+        target_w = target_half_w * 2
 
         # Renderer
         if self._scene_renderer is None:
-            self._scene_renderer = mujoco.Renderer(self._sim.model, height=h, width=half_w)
+            self._scene_renderer = mujoco.Renderer(
+                self._sim.model, height=render_h, width=render_half_w
+            )
 
         # Camera setup
         agent_m = np.array(self._embodiment.position, dtype=float)
@@ -1520,7 +1554,10 @@ class MuJoCoEnvAdapter:
         to_agent = agent_m.copy()
         to_agent[2] = 0
         ta_len = np.linalg.norm(to_agent)
-        azimuth = np.degrees(np.arctan2(to_agent[1], to_agent[0])) if ta_len > 1e-5 else 135
+        azimuth = (
+            np.degrees(np.arctan2(to_agent[1], to_agent[0]))
+            if ta_len > 1e-5 else 135
+        )
 
         camera = mujoco.MjvCamera()
         camera.type = mujoco.mjtCamera.mjCAMERA_FREE
@@ -1530,9 +1567,8 @@ class MuJoCoEnvAdapter:
         camera.elevation = -25
 
         def _build_scene_geoms(scene):
-            # Agent position from argument, not embodiment
             agent_m_local = agent_pose[:3] / MM_PER_M
-            
+
             # Trail
             if trail_poses:
                 trail = trail_poses[-50:]
@@ -1547,7 +1583,7 @@ class MuJoCoEnvAdapter:
                     )
                     scene.ngeom += 1
 
-            # Agent (blue) — from agent_pose argument
+            # Agent (blue)
             if scene.ngeom < scene.maxgeom:
                 mujoco.mjv_initGeom(
                     scene.geoms[scene.ngeom], mujoco.mjtGeom.mjGEOM_SPHERE,
@@ -1565,7 +1601,7 @@ class MuJoCoEnvAdapter:
                 )
                 scene.ngeom += 1
 
-            # Gaze (red) — from agent_pose rotation
+            # Gaze (red)
             if scene.ngeom < scene.maxgeom:
                 rot = Rot.from_euler("xyz", agent_pose[3:], degrees=True)
                 fwd = rot.apply([0, 0, -1])
@@ -1583,7 +1619,11 @@ class MuJoCoEnvAdapter:
                     elif np.linalg.norm(v) < 1e-8:
                         rm = np.eye(3)
                     else:
-                        vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+                        vx = np.array([
+                            [0, -v[2], v[1]],
+                            [v[2], 0, -v[0]],
+                            [-v[1], v[0], 0],
+                        ])
                         rm = np.eye(3) + vx + vx @ vx / (1 + c)
                     mujoco.mjv_initGeom(
                         scene.geoms[scene.ngeom], mujoco.mjtGeom.mjGEOM_CAPSULE,
@@ -1593,63 +1633,90 @@ class MuJoCoEnvAdapter:
                     scene.ngeom += 1
 
         def _render_view(transparent=False):
-            """Render one view (solid or wireframe x-ray)."""
-            import mujoco
             model = self._sim.model
-
             max_geom = 100
             scene = mujoco.MjvScene(model, maxgeom=max_geom)
-            
+
             opt = mujoco.MjvOption()
             if transparent:
                 opt.flags[mujoco.mjtVisFlag.mjVIS_TEXTURE] = False
                 scene_flags_wireframe = True
             else:
                 scene_flags_wireframe = False
-            
+
             mujoco.mjv_updateScene(
                 model, self._sim.data, opt, None,
                 camera, mujoco.mjtCatBit.mjCAT_ALL, scene,
             )
-            
+
             if scene_flags_wireframe:
                 scene.flags[mujoco.mjtRndFlag.mjRND_WIREFRAME] = True
-            
+
             _build_scene_geoms(scene)
 
             mujoco.mjr_render(
-                mujoco.MjrRect(0, 0, half_w, h),
+                mujoco.MjrRect(0, 0, render_half_w, render_h),
                 scene, self._scene_renderer._mjr_context,
             )
-            rgb = np.empty((h, half_w, 3), dtype=np.uint8)
+            rgb = np.empty((render_h, render_half_w, 3), dtype=np.uint8)
             mujoco.mjr_readPixels(
-                rgb, None, mujoco.MjrRect(0, 0, half_w, h),
+                rgb, None, mujoco.MjrRect(0, 0, render_half_w, render_h),
                 self._scene_renderer._mjr_context,
             )
             return np.flipud(rgb)
-        
+
         try:
             rgb_solid = _render_view(transparent=False)
             rgb_xray = _render_view(transparent=True)
 
             img_left = _Image.fromarray(rgb_solid)
             img_right = _Image.fromarray(rgb_xray)
-            merged = _Image.new("RGB", (w, h))
+
+            # Upscale to target size
+            img_left = img_left.resize((target_half_w, target_h), _Image.LANCZOS)
+            img_right = img_right.resize((target_half_w, target_h), _Image.LANCZOS)
+
+            merged = _Image.new("RGB", (target_w, target_h))
             merged.paste(img_left, (0, 0))
-            merged.paste(img_right, (half_w, 0))
+            merged.paste(img_right, (target_half_w, 0))
+
+            # Adaptive font size based on image dimensions
+            font_size = max(target_h // 25, 8)
+            try:
+                font = _ImageFont.truetype(
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", font_size
+                )
+            except OSError:
+                font = _ImageFont.load_default()
 
             if text:
-                merged = add_text_overlay(merged, text, step_num, distance, result)
+                # Draw text with adaptive font
+                draw = _ImageDraw.Draw(merged)
+                # Wrap text to fit image width
+                max_chars = target_w // (font_size * 0.6)
+                lines = []
+                for line in text.split("\n"):
+                    while len(line) > max_chars:
+                        lines.append(line[:int(max_chars)])
+                        line = line[int(max_chars):]
+                    lines.append(line)
+
+                y_pos = 5
+                for line in lines[:6]:  # max 6 lines
+                    draw.text((5, y_pos), line, fill="white", font=font)
+                    y_pos += font_size + 2
 
             # Labels
             draw = _ImageDraw.Draw(merged)
+            label_font_size = max(font_size - 2, 8)
             try:
-                font = _ImageFont.truetype(
-                    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 12)
+                label_font = _ImageFont.truetype(
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", label_font_size
+                )
             except OSError:
-                font = _ImageFont.load_default()
-            draw.text((10, h - 20), "SOLID", fill="white", font=font)
-            draw.text((half_w + 10, h - 20), "X-RAY", fill="white", font=font)
+                label_font = font
+            draw.text((5, target_h - label_font_size - 5), "SOLID", fill="white", font=label_font)
+            draw.text((target_half_w + 5, target_h - label_font_size - 5), "X-RAY", fill="white", font=label_font)
 
             merged.save(filepath, format="PNG")
 
@@ -1660,7 +1727,7 @@ class MuJoCoEnvAdapter:
         from mujoco import mj_forward
         from PIL import Image
         mj_forward(self._sim.model, self._sim.data)
-        cam_name = f"{_AGENT_ID}.{_SENSOR_ID}"
+        cam_name = f"{self._agent_id_local}.{self._sensor_id_local}"
         res = Resolution2D(width=self._sensor_w, height=self._sensor_h)
         renderer = self._sim.renderer_for_res(res)
         renderer.update_scene(self._sim.data, camera=cam_name)
@@ -1853,7 +1920,7 @@ class MuJoCoEnvAdapter:
             except Exception:
                 pass
             self._scene_renderer = None
-        if self._sim is not None:
+        if self._owns_sim and self._sim is not None:
             self._sim.close()
             self._sim = None
 

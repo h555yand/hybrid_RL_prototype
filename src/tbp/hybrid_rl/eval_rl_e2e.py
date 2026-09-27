@@ -1,23 +1,21 @@
 """End-to-end eval: RLGoalPolicy replaces JumpToGoal in Monty pipeline.
 
-Steps:
-1. Load pretrained Monty model (banana + mug graphs)
-2. Create MuJoCo environment with banana
-3. Create RLPolicySelector with RLGoalPolicy + SurfacePolicy
-4. Run eval: LM recognizes object using RL navigation for hypothesis testing
+Uses shared MuJoCo simulator — one coordinate system, no offset.
 
 Run:
-    export MONTY_DATA=~/Downloads/tbp/data
     python eval_rl_e2e.py
 """
-from tbp.monty.frameworks.run_env import setup_env
-
-import logging
 import os
 
-os.environ.setdefault("MONTY_DATA", os.path.expanduser("~/Downloads/tbp/data"))
+os.environ["MONTY_DATA"] = os.path.expanduser("~/Downloads/tbp/data")
+
+from tbp.monty.frameworks.run_env import setup_env
 
 setup_env()
+
+import logging
+from pathlib import Path
+import json
 
 import hydra
 import numpy as np
@@ -36,6 +34,10 @@ Q_STORE = os.path.expanduser(
     "~/Downloads/github/hybrid_RL_prototype/results/adapt-baseline"
     "/data/runs/q_store_seed_11"
 )
+SAC_DIR = os.path.expanduser(
+    "~/Downloads/github/hybrid_RL_prototype/results/adapt-baseline"
+    "/data/runs/sac_seed_55"
+)
 BANANA_STL = os.path.expanduser(
     "~/Downloads/github/hybrid_RL_prototype/results/adapt-baseline"
     "/data/ycb/ycb_banana.stl"
@@ -48,51 +50,69 @@ MUJOCO_DATA = os.path.expanduser(
 logger.info("Loading baseline experiment config...")
 
 with hydra.initialize_config_dir(version_base=None, config_dir=MONTY_CONF):
+    #config = hydra.compose(
+    #    config_name="experiment",
+    #    overrides=[
+    #        "experiment=tutorial/surf_agent_2obj_eval_mujoco",
+    #        f"experiment.config.model_name_or_path={PRETRAINED}",
+    #        "experiment.config.n_eval_epochs=1",
+    #        "experiment.config.max_eval_steps=50",
+    #        "experiment.config.show_sensor_output=false",
+    #    ],
+    #)
     config = hydra.compose(
         config_name="experiment",
         overrides=[
             "experiment=tutorial/surf_agent_2obj_eval_mujoco",
             f"experiment.config.model_name_or_path={PRETRAINED}",
-            "experiment.config.n_eval_epochs=1",
-            "experiment.config.max_eval_steps=300",
             "experiment.config.show_sensor_output=false",
+            # ═══ Control experiments ═══
+            "experiment.config.eval_env_interface_args.object_names=[banana]",  # только banana
+            "experiment.config.n_eval_epochs=1",      # 3 ротации = 3 эпизода
+            "experiment.config.max_eval_steps=50",    # max Monty steps per episode
         ],
     )
-
 # ═══ Step 2: Instantiate and enter experiment context ═══
 logger.info("Instantiating experiment...")
 experiment = instantiate_experiment(config.experiment)
 
-logger.info("Entering experiment context (initializes model + environment)...")
+logger.info("Entering experiment context...")
 experiment.__enter__()
 
-# ═══ Step 3: Replace motor system with RLPolicySelector ═══
-logger.info("Replacing motor system with RLPolicySelector...")
+# ═══ Step 3: Get Monty's simulator (shared!) ═══
+monty_sim = experiment.env
+logger.info("Monty simulator: %s", type(monty_sim).__name__)
 
-from tbp.monty.frameworks.agents import AgentID
-from tbp.monty.frameworks.sensors import SensorID
+for agent_id, agent in monty_sim._agents.items():
+    emb = agent._embodiment
+    logger.info(
+        "  Agent %s: pos=%s rot=%s",
+        agent_id, emb.position, emb.rotation,
+    )
+
+# ═══ Step 4: Create adapter using Monty's simulator ═══
+logger.info("Creating MuJoCo adapter with shared simulator...")
+
 from tbp.hybrid_rl.mujoco_env_adapter import MuJoCoEnvAdapter
-from tbp.hybrid_rl.rl_goal_policy import RLGoalPolicy
-from tbp.hybrid_rl.rl_policy_selector import RLPolicySelector
-from tbp.monty.frameworks.models.motor_system import MotorSystem
 
-# Get the original surface policy from the existing motor system
-original_selector = experiment.model.motor_system._policy_selector
-original_policy = original_selector._policy  # SurfacePolicyCurvatureInformed
-
-# Disable goal-driven actions in surface policy (RL handles goals now)
-original_policy.use_goal_driven_actions = False
-
-# Create MuJoCo adapter for RL
-logger.info("Creating MuJoCo adapter for RL...")
 adapter = MuJoCoEnvAdapter(
     mesh_path_mm=BANANA_STL,
     mujoco_object_name="banana",
     mujoco_data_path=MUJOCO_DATA,
     seed=42,
+    external_sim=monty_sim,
+    agent_id="agent_id_0",
 )
 
-# Create RLGoalPolicy
+# ═══ Step 5: Create RLGoalPolicy ═══
+logger.info("Creating RLGoalPolicy...")
+
+from tbp.monty.frameworks.agents import AgentID
+from tbp.monty.frameworks.sensors import SensorID
+from tbp.hybrid_rl.rl_goal_policy import RLGoalPolicy
+from tbp.hybrid_rl.rl_policy_selector import RLPolicySelector
+from tbp.monty.frameworks.models.motor_system import MotorSystem
+
 rl_config = {
     "state_dim": 22,
     "num_actions": 24,
@@ -143,28 +163,82 @@ rl_policy = RLGoalPolicy(
     enable_online_learning=True,
 )
 
-# Create RLPolicySelector (look_at_goal=None for surface agent)
+# ═══ Load SAC into adaptive manager ═══
+if rl_policy._manager is not None and os.path.exists(
+    os.path.join(SAC_DIR, "sac_actor.pt")
+):
+    from tbp.hybrid_rl.sac_trainer import PSACTrainer
+    from tbp.hybrid_rl.experience_extractor import ExperienceExtractor
+
+    num_types = len(ExperienceExtractor.get_type_names())
+    sac_trainer = PSACTrainer(
+        state_dim=rl_config.get("state_dim", 22),
+        num_types=num_types,
+    )
+    sac_trainer.load(SAC_DIR)
+    rl_policy._manager.sac_trainer = sac_trainer
+    logger.info("SAC loaded from %s", SAC_DIR)
+
+# ═══ Step 6: Replace motor system ═══
+logger.info("Replacing motor system with RLPolicySelector...")
+
+original_selector = experiment.model.motor_system._policy_selector
+original_policy = original_selector._policy
+original_policy.use_goal_driven_actions = False
+
 rl_selector = RLPolicySelector(
     rl_goal_policy=rl_policy,
     default=original_policy,
 )
 
-# Replace motor system
 new_motor_system = MotorSystem(policy_selector=rl_selector)
 experiment.model.motor_system = new_motor_system
 
-# ═══ Step 4: Run eval ═══
+# ═══ Step 7: Run eval ═══
 logger.info("=" * 60)
-logger.info("Running eval with RLGoalPolicy...")
+logger.info("Running eval with RLGoalPolicy (shared simulator)...")
 logger.info("Objects: banana + mug (pretrained)")
-logger.info("RL model: Q-store trained on trimesh primitives")
+logger.info("RL model: Q-store + SAC trained on trimesh primitives")
 logger.info("=" * 60)
 
 try:
     experiment.run()
+    # ═══ Check Monty recognition result ═══
+    log_dir = Path(Q_STORE).parent / "monty_integration_logs"
+    
+    # Read eval stats if available
+    eval_output = Path(os.path.expanduser(
+        "~/tbp/results/monty/projects/surf_agent_2obj_eval_mujoco"
+    ))
+    eval_csv = eval_output / "eval_stats.csv"
+    if eval_csv.exists():
+        import csv
+        with eval_csv.open() as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                logger.info("MONTY RESULT: %s", dict(row))
+                
+                # Append to episode_log
+                result_path = log_dir / "monty_results.txt"
+                with result_path.open("a") as rf:
+                    rf.write(f"{dict(row)}\n")
+    
     logger.info("=" * 60)
     logger.info("END-TO-END EVAL COMPLETE!")
+    
+    # Print RL navigation summary
+    rl_log = log_dir / "episode_log.json"
+    if rl_log.exists():
+        with rl_log.open() as f:
+            episodes = json.load(f)
+        successes = sum(1 for e in episodes if e["success"])
+        logger.info(
+            "RL Navigation: %d/%d goals reached",
+            successes, len(episodes),
+        )
+    
     logger.info("=" * 60)
+
 except Exception as e:
     logger.error("Eval failed: %s", e, exc_info=True)
 finally:
