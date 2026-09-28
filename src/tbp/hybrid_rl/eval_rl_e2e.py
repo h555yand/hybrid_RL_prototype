@@ -68,7 +68,7 @@ with hydra.initialize_config_dir(version_base=None, config_dir=MONTY_CONF):
             "experiment.config.show_sensor_output=false",
             # ═══ Control experiments ═══
             "experiment.config.eval_env_interface_args.object_names=[banana]",  # только banana
-            "experiment.config.n_eval_epochs=1",      # 3 ротации = 3 эпизода
+            "experiment.config.n_eval_epochs=1",      # 1 ротации = 1 эпизода
             "experiment.config.max_eval_steps=50",    # max Monty steps per episode
         ],
     )

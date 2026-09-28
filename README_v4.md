@@ -1,83 +1,62 @@
 # Summary
 
-## Phase 1 Summary: RL Navigation Integration with Monty
+## Agenda
+### Key changes
+- 22D state
+- Q Strategic Level - detach, fly goal / edge
+- Phase system
+- Arbitrage algorithm - Q confidence, heuristic budget
+- MuJoCo integration
 
-### Что сделано
+### Training / validation results
+- Q, SAC, adaptive mode results on trimesh environment
+Log
+/home/aeisaev/Downloads/github/hybrid_RL_prototype/results_publish/adaptive_logs_cup/
 
-Заменили телепортацию (`JumpToGoalState`) в Monty на инкрементальную RL навигацию. Агент физически ползает по поверхности объекта к целевой точке, выбранной hypothesis-testing системой Monty (GSG).
+- YCB results on MuJoCo environment
 
-### Архитектура
+### Examples
 
-```
-Monty Main Loop
-  → MotorSystem → RLPolicySelector
-      ├── GSG goal → RLGoalPolicy (RL навигация)
-      │     ├── MontyRLBridge (конвертация данных)
-      │     ├── MuJoCoEnvAdapter (shared simulator)
-      │     ├── AdaptiveTrainingManager + Arbitrator
-      │     └── RLGoalApproachController (Q-store + SAC + heuristic)
-      └── No goal → SurfacePolicy (обычный crawl)
-```
+/results_publish/ycb-mujoco-Q/viz_ycb_mujoco_eval_ycb_banana/ep_00005_L2_success
 
-### Созданные файлы
+/results_publish/ycb-mujoco-Q/viz_ycb_mujoco_eval_ycb_cracker_box/ep_00007_L2_success
 
-| Файл | Назначение |
-|------|-----------|
-| `monty_rl_bridge.py` | Monty ↔ RL конвертация (м↔мм, quaternion↔euler) |
-| `rl_goal_policy.py` | MotorPolicy — snap, навигация, return to Monty |
-| `rl_policy_selector.py` | Маршрутизация GSG→RL, остальное→SurfacePolicy |
-| `eval_rl_e2e.py` | End-to-end тест с Monty pipeline |
-| `test_rl_goal_policy.py` | 12 unit тестов |
-| `test_rl_goal_policy_mujoco.py` | 6 integration тестов |
+/results_publish/ycb-mujoco-Q/viz_ycb_mujoco_eval_ycb_can/ep_00005_L2_success
 
-### Изменения в существующих файлах
+/results_publish/ycb-mujoco-Q/viz_ycb_mujoco_eval_ycb_bowl/ep_00020_L2_success
+/results_publish/ycb-mujoco-Q/viz_ycb_mujoco_eval_ycb_bowl/ep_00011_L2_collision
 
-| Файл | Что изменено |
-|------|-------------|
-| `mujoco_env_adapter.py` | `external_sim`, `agent_id`, `snap_max_dist` параметры; ray cast depth override для shared sim; адаптивный render size |
+/ycb-adapt/viz_ycb_mujoco_adaptive_ycb_mug/
+ep_00101_L1_success
+ep_00102_L1_success
+success edge traversal with fly
+ep_00207_L2_success
+ep_00085_L2_success
+ep_00056_L2_success
 
-### Ключевые решения
+ep_00204_L2_timeout
+ep_00205_L2_collision
+ep_00206_L2_collision
+ep_00209_L2_collision
 
-**Shared simulator** — один MuJoCo simulator для Monty и RL. Нет проблем с координатами, нет sync.
 
-**Snap agent/goal к поверхности** — Monty agent на 25mm от поверхности, RL agent на 2mm. При старте навигации snap через `_snap_to_surface` с увеличенным порогом. При завершении — return к Monty goal position (30mm).
+### Key findings
+- Q-learning, SAC, and adaptive arbitrage generalize to unseen objects (cup: 70-80% adaptive, never seen during training)
+- Sim-to-real transfer works — policies trained on trimesh primitives navigate YCB objects in MuJoCo without retraining (banana 99%, can 81%, box 83%)
+- The solution is ready for integration testing with Monty's Learning Module and Sensor Module
+    
+### This is a prototype. The goal is to demonstrate that the approach works, while being transparent about current limitations.
+Known Limitations
+- Surface movement mechanics - edge traversal is unreliable on complex geometry.
+- Navigation strategy for hollow objects - the agent doesn't always understand it needs to crawl to the rim, not toward the goal.
+- Air navigation instability - flying through air is less reliable than surface crawling.
+- Online SAC learning shows limited improvement - after 20 online SAC updates during 2000 adaptive episodes, SAC success rate did not meaningfully increase
+    
 
-**Ray cast depth override** — Monty `patch` sensor с zoom=10 не видит поверхность на 2mm. Depth вычисляется через `mj_ray_cast` вместо render для shared sim.
-
-**Adaptive Arbitrage** — Q-store + SAC + heuristic выбирают действие на каждом шаге. Pretrained на trimesh примитивах, работает на YCB banana в MuJoCo.
-
-### Результаты
-
-```
-Monty Recognition: 6/6 = 100% correct (mug + banana, 3 ротации)
-RL Navigation:     3/4 = 75% goal reached (ползая по поверхности)
-                   Avg steps to goal: 18 steps
-                   Avg distance: 52mm → 2.6mm
-```
-
-### Тесты
-
-```
-Unit tests:        12/12 passed
-Integration tests: 6/6 passed  
-End-to-end:        6/6 Monty correct, 3/4 RL goals reached
-```
-
-### Известные ограничения Phase 1
-
-1. **Один объект** — adapter привязан к одному CAD mesh. Multi-object требует dynamic adapter reload.
-2. **`motor_only_step=True`** — LM не обрабатывает промежуточные observations. Directed exploration — Phase 2.
-3. **`_mj_center_mm` хардкод** — center объекта `(0, 1500, 0)mm` из Monty config. Нужно получать динамически.
-4. **Normal approximation** — при depth < 3mm normal из `-forward` (approximate). Render normal недоступен с zoom=10 на 2mm.
-
-### Phase 2 план
-
-1. Directed exploration — `motor_only_step=False`, LM обрабатывает observations при crawl
-2. Dynamic adapter — менять CAD mesh при смене объекта
-3. Multi-object eval — mug, banana, can, box, bowl
-4. Online learning — Q-store адаптируется к новым объектам через Monty
-5. Сравнение с baseline JumpToGoal — accuracy, steps, time
-
+### Next steps / Open questions
+- Monty Policy integration
+- Actions - move tang, snap
+- Surface / Distant agents
 
 
 ## This is a prototype to implement, test and proof ideas below.

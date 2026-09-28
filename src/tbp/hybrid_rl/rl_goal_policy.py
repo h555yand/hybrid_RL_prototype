@@ -153,6 +153,7 @@ class RLGoalPolicy(MotorPolicy):
         self._prev_goals_reached = self._controller._total_goals_reached
         self._monty_goal_pose_mm = None
         self._rl_goal_pose_mm = None
+        self._monty_start_euler = None
 
     def state_dict(self):
         return {"nav_active": self._nav_active, "nav_steps": self._nav_steps}
@@ -186,11 +187,15 @@ class RLGoalPolicy(MotorPolicy):
 
         self._bridge.set_goal(goal)
 
-        # ═══ 1) Save original Monty goal (30mm from surface) ═══
+        # ═══ 1) Save original Monty goal and start position ═══
         goal_pose_mm = self._bridge.goal_to_pose_mm(goal)
         self._monty_goal_pose_mm = goal_pose_mm.copy()
+        self._monty_start_pos_mm = np.array(
+            state[self._agent_id].position, dtype=float
+        ) * 1000.0
+        self._monty_start_euler = self._bridge._adapter._get_euler_deg().copy()
 
-        # Update adapter center for shared sim (Monty object at (0, 1500, 0)mm)
+        # Update adapter center for shared sim
         if not self._bridge._adapter._owns_sim:
             self._bridge._adapter._mj_center_mm = np.array([0.0, 1500.0, 0.0])
 
@@ -213,11 +218,9 @@ class RLGoalPolicy(MotorPolicy):
         # ═══ 3) Snap goal to surface ═══
         goal_pos = goal_pose_mm[:3].copy()
 
-        # Temporarily place agent at goal position to snap goal
         agent_pos_backup = self._bridge._adapter._get_pos_mj_mm().copy()
         agent_euler_backup = self._bridge._adapter._get_euler_deg().copy()
 
-        # Move agent to goal position with orientation toward object
         obj_center_monty = np.array([0.0, 1500.0, 0.0])
         to_obj = obj_center_monty - goal_pos
         to_obj_len = float(np.linalg.norm(to_obj))
@@ -229,7 +232,6 @@ class RLGoalPolicy(MotorPolicy):
         goal_euler = self._bridge._adapter._look_at_direction(to_obj_dir)
         self._bridge._adapter._set_pose_mj_mm(goal_pos, goal_euler)
 
-        # Snap from goal position
         self._bridge._adapter._snap_max_dist = 200.0
         goal_snap_ok = self._bridge._adapter._snap_to_surface()
         self._bridge._adapter._snap_max_dist = original_snap
@@ -245,10 +247,8 @@ class RLGoalPolicy(MotorPolicy):
         goal_pose_mm_surface[:3] = goal_surface_pos
         goal_pose_mm_surface[3:6] = goal_surface_euler
 
-        # Restore agent to snapped start position
         self._bridge._adapter._set_pose_mj_mm(agent_pos_backup, agent_euler_backup)
 
-        # Restore agent snap (moving to goal position broke it)
         self._bridge._adapter._snap_max_dist = 35.0
         self._bridge._adapter._snap_to_surface()
         self._bridge._adapter._snap_max_dist = original_snap
@@ -272,9 +272,6 @@ class RLGoalPolicy(MotorPolicy):
 
         dist = float(np.linalg.norm(goal_pose_mm_surface[:3] - start_pos_mm))
 
-        self._monty_start_pos_mm = np.array(
-            state[self._agent_id].position, dtype=float
-        ) * 1000.0
         self._current_poses = [self._bridge._adapter.get_pose().copy()]
         self._action_explanations = []
         self._action_short_labels = []
@@ -392,7 +389,7 @@ class RLGoalPolicy(MotorPolicy):
             self._manager.on_episode_complete(success=success, transitions=[])
             self._manager.arbitrator.on_episode_end(success)
 
-        # Use RL surface goal for distance
+        # Compute final distance
         rl_goal = self._rl_goal_pose_mm if self._rl_goal_pose_mm is not None else np.zeros(6)
         final_pos = self._bridge._adapter.get_pose()[:3]
         final_dist = float(np.linalg.norm(rl_goal[:3] - final_pos))
@@ -492,32 +489,31 @@ class RLGoalPolicy(MotorPolicy):
             except Exception as e:
                 logger.warning("Visualizer failed: %s", e, exc_info=True)
 
-        # ═══ Return agent to Monty goal position (30mm from surface) ═══
-        actions = []
+        # ═══ Return agent to Monty position ═══
         if success:
-            monty_goal = self._monty_goal_pose_mm
-            if monty_goal is not None:
-                final_pos_mm = monty_goal[:3]
-                final_euler = monty_goal[3:6]
-            else:
-                final_pos_mm = self._bridge._adapter._get_pos_mj_mm()
-                final_euler = self._bridge._adapter._get_euler_deg()
+            # Success: move agent to Monty goal position (30mm from surface)
+            final_pos_mm = self._monty_goal_pose_mm[:3]
+            final_euler = self._monty_goal_pose_mm[3:6]
+        else:
+            # Failure: return agent to pre-navigation position (25mm from surface)
+            final_pos_mm = self._monty_start_pos_mm
+            final_euler = self._monty_start_euler
 
-            rot = Rot.from_euler("xyz", final_euler, degrees=True)
-            q = rot.as_quat()
-            final_quat = qt.quaternion(q[3], q[0], q[1], q[2])
+        rot = Rot.from_euler("xyz", final_euler, degrees=True)
+        q = rot.as_quat()
+        final_quat = qt.quaternion(q[3], q[0], q[1], q[2])
 
-            actions = [
-                SetAgentPose(
-                    agent_id=self._agent_id,
-                    location=tuple(final_pos_mm / 1000.0),
-                    rotation_quat=final_quat,
-                ),
-                SetSensorRotation(
-                    agent_id=self._agent_id,
-                    rotation_quat=qt.one,
-                ),
-            ]
+        actions = [
+            SetAgentPose(
+                agent_id=self._agent_id,
+                location=tuple(final_pos_mm / 1000.0),
+                rotation_quat=final_quat,
+            ),
+            SetSensorRotation(
+                agent_id=self._agent_id,
+                rotation_quat=qt.one,
+            ),
+        ]
 
         self._nav_active = False
         self._current_goal = None
