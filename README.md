@@ -1,83 +1,196 @@
 # Summary
 
-## Phase 1 Summary: RL Navigation Integration with Monty
+## Phase 1: Monty Integration — RL Navigation Replaces Teleportation
 
-### Что сделано
+### Architecture
 
-Заменили телепортацию (`JumpToGoalState`) в Monty на инкрементальную RL навигацию. Агент физически ползает по поверхности объекта к целевой точке, выбранной hypothesis-testing системой Monty (GSG).
+The integration replaces Monty's `JumpToGoalState` teleportation with incremental RL navigation. When Monty's hypothesis-testing system (GSG) generates a goal state for disambiguation, instead of teleporting the sensor to the target pose, the RL agent physically navigates there step-by-step using learned policies.
 
-### Архитектура
-
-```
-Monty Main Loop
-  → MotorSystem → RLPolicySelector
-      ├── GSG goal → RLGoalPolicy (RL навигация)
-      │     ├── MontyRLBridge (конвертация данных)
-      │     ├── MuJoCoEnvAdapter (shared simulator)
-      │     ├── AdaptiveTrainingManager + Arbitrator
-      │     └── RLGoalApproachController (Q-store + SAC + heuristic)
-      └── No goal → SurfacePolicy (обычный crawl)
-```
-
-### Созданные файлы
-
-| Файл | Назначение |
-|------|-----------|
-| `monty_rl_bridge.py` | Monty ↔ RL конвертация (м↔мм, quaternion↔euler) |
-| `rl_goal_policy.py` | MotorPolicy — snap, навигация, return to Monty |
-| `rl_policy_selector.py` | Маршрутизация GSG→RL, остальное→SurfacePolicy |
-| `eval_rl_e2e.py` | End-to-end тест с Monty pipeline |
-| `test_rl_goal_policy.py` | 12 unit тестов |
-| `test_rl_goal_policy_mujoco.py` | 6 integration тестов |
-
-### Изменения в существующих файлах
-
-| Файл | Что изменено |
-|------|-------------|
-| `mujoco_env_adapter.py` | `external_sim`, `agent_id`, `snap_max_dist` параметры; ray cast depth override для shared sim; адаптивный render size |
-
-### Ключевые решения
-
-**Shared simulator** — один MuJoCo simulator для Monty и RL. Нет проблем с координатами, нет sync.
-
-**Snap agent/goal к поверхности** — Monty agent на 25mm от поверхности, RL agent на 2mm. При старте навигации snap через `_snap_to_surface` с увеличенным порогом. При завершении — return к Monty goal position (30mm).
-
-**Ray cast depth override** — Monty `patch` sensor с zoom=10 не видит поверхность на 2mm. Depth вычисляется через `mj_ray_cast` вместо render для shared sim.
-
-**Adaptive Arbitrage** — Q-store + SAC + heuristic выбирают действие на каждом шаге. Pretrained на trimesh примитивах, работает на YCB banana в MuJoCo.
-
-### Результаты
+#### System Overview
 
 ```
-Monty Recognition: 6/6 = 100% correct (mug + banana, 3 ротации)
-RL Navigation:     3/4 = 75% goal reached (ползая по поверхности)
-                   Avg steps to goal: 18 steps
-                   Avg distance: 52mm → 2.6mm
+┌─────────────────────────────────────────────────────────────────┐
+│  Monty Experiment Loop                                          │
+│                                                                  │
+│  for each object × rotation:                                     │
+│    SurfacePolicy crawls → LM accumulates evidence               │
+│    GSG generates hypothesis-testing goal                         │
+│         │                                                        │
+│         ▼                                                        │
+│    ┌─────────────────────────────────────────────────────┐       │
+│    │  RLPolicySelector                                    │       │
+│    │  Routes goals by sender_type:                        │       │
+│    │    GSG goal → RLGoalPolicy (RL navigation)           │       │
+│    │    No goal  → SurfacePolicy (standard crawl)         │       │
+│    └─────────────────────────────────────────────────────┘       │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-### Тесты
+#### RL Navigation Pipeline
+
+When a GSG goal is received, `RLGoalPolicy` executes a multi-step navigation episode within a single Monty matching step:
 
 ```
-Unit tests:        12/12 passed
-Integration tests: 6/6 passed  
-End-to-end:        6/6 Monty correct, 3/4 RL goals reached
+RLGoalPolicy receives GSG Goal
+│
+├── 1. LAND: Snap agent to surface (2mm)
+│     Monty agent is 25mm from surface → snap via _snap_to_surface()
+│     with temporarily increased snap threshold (35mm)
+│
+├── 2. LAND GOAL: Snap goal to surface (2mm)
+│     GSG goal is 30mm from surface → temporarily move agent to goal
+│     position, snap via _snap_to_surface(), record surface position
+│
+├── 3. NAVIGATE: RL crawls along surface (N steps)
+│     Each step:
+│       → Adapter provides pose + sensor data (ray cast depth override)
+│       → Controller computes 22D state vector
+│       → Arbitrator selects action (Q-store / SAC / heuristic)
+│       → Adapter executes action (tangential move + snap)
+│       → Q-store learns from transition
+│       → Returns IN_PROGRESS to Monty (motor_only_step=True)
+│
+├── 4a. SUCCESS: Goal reached (distance < 4mm)
+│     → SetAgentPose to original Monty goal position (30mm from surface)
+│     → LM processes observation at goal (motor_only_step=False)
+│
+└── 4b. FAILURE: Timeout or collision
+      → SetAgentPose to pre-navigation position (25mm from surface)
+      → LM does not process (motor_only_step=True)
 ```
 
-### Известные ограничения Phase 1
+#### Shared Simulator Architecture
 
-1. **Один объект** — adapter привязан к одному CAD mesh. Multi-object требует dynamic adapter reload.
-2. **`motor_only_step=True`** — LM не обрабатывает промежуточные observations. Directed exploration — Phase 2.
-3. **`_mj_center_mm` хардкод** — center объекта `(0, 1500, 0)mm` из Monty config. Нужно получать динамически.
-4. **Normal approximation** — при depth < 3mm normal из `-forward` (approximate). Render normal недоступен с zoom=10 на 2mm.
+The RL adapter and Monty share a single MuJoCo simulator instance. This eliminates coordinate system mismatches and ensures both systems see the same physical state.
 
-### Phase 2 план
+```
+┌──────────────────────────────────────────────┐
+│  MuJoCoSimulator (single instance)            │
+│  Created by Monty experiment                  │
+│  Shared via experiment.env                    │
+│                                               │
+│  ┌─────────────┐    ┌──────────────────────┐ │
+│  │ Monty        │    │ MuJoCoEnvAdapter     │ │
+│  │ SurfaceAgent │◄──►│ (external_sim mode)  │ │
+│  │ agent_id_0   │    │ Same agent, same sim │ │
+│  └─────────────┘    └──────────────────────┘ │
+│         │                      │              │
+│    env_interface          adapter provides:   │
+│    .step(actions)         .get_sensor_data()  │
+│    .observations          .step_continuous()  │
+│    .states                ._snap_to_surface() │
+│                           ._mj_ray_cast()     │
+└──────────────────────────────────────────────┘
+```
 
-1. Directed exploration — `motor_only_step=False`, LM обрабатывает observations при crawl
-2. Dynamic adapter — менять CAD mesh при смене объекта
-3. Multi-object eval — mug, banana, can, box, bowl
-4. Online learning — Q-store адаптируется к новым объектам через Monty
-5. Сравнение с baseline JumpToGoal — accuracy, steps, time
+#### Key Classes
 
+| Class | Role |
+|-------|------|
+| `RLPolicySelector` | Routes GSG goals to RL, other steps to SurfacePolicy. Implements `MotorPolicySelector` protocol. Tracks navigation state (IN_PROGRESS / READY). |
+| `RLGoalPolicy` | Implements `MotorPolicy` protocol. Manages navigation lifecycle: snap to surface, navigate, return to Monty position. Handles logging and visualization. |
+| `MontyRLBridge` | Converts between Monty (meters, quaternions, Goal/Message objects) and RL (mm, euler degrees, numpy arrays). Delegates geometric queries to adapter. |
+| `MuJoCoEnvAdapter` | Provides RL environment interface on shared simulator. Ray cast depth override for close-range sensing. Surface snapping via multi-probe ray cast. |
+| `AdaptiveTrainingManager` | Manages online Q-learning and SAC updates. Monitors performance via Arbitrator track records. |
+| `Arbitrator` | Per-step action source selection: Q-store confidence × track record scoring. Selects between Q-store, SAC, and heuristic fallback. |
+| `RLGoalApproachController` | Core RL controller. Computes 22D state vector, manages Q-stores (tactical + strategic), phase system, reward computation. |
+
+#### Data Flow
+
+```
+Monty → RL:
+  Goal.location (meters)           → MontyRLBridge.goal_to_pose_mm() → [x,y,z,rx,ry,rz] (mm)
+  Goal.pose_vectors[0]             → yaw/pitch euler angles
+  MotorSystemState.position        → agent position (meters → mm)
+
+RL Internal:
+  MuJoCoEnvAdapter.get_sensor_data() → depth (ray cast), normal, curvatures, on_object
+  MuJoCoEnvAdapter.step_continuous() → execute action in shared MuJoCo
+  MuJoCoEnvAdapter._snap_to_surface() → multi-probe ray cast + orient camera
+
+RL → Monty:
+  Success: SetAgentPose(Monty goal position) → LM processes observation
+  Failure: SetAgentPose(pre-navigation position) → LM skips
+```
+
+#### Coordinate Handling
+
+The shared simulator uses Monty's world frame. Object is placed at `(0, 1.5, 0)m` by Monty. All positions are in this frame — no coordinate conversion needed between Monty and RL.
+
+The only conversion is units: Monty uses meters, RL uses millimeters. `MontyRLBridge` handles `× 1000` conversion.
+
+Surface distance difference: Monty agent operates at 25mm from surface (camera zoom=10), RL agent operates at 2mm (trained on trimesh). Snap-to-surface at navigation start/end bridges this gap.
+
+#### Sim-to-Real Transfer
+
+The RL policy is trained entirely on simple geometric primitives (cube, sphere, cylinder, mug, vase) in a lightweight trimesh environment. Without any retraining, it navigates YCB objects (banana) in MuJoCo through Monty's pipeline. The 22D state vector captures frame-invariant geometric relationships (relative direction, surface normal, curvatures, alignment) that transfer across objects and simulators.
+
+### Testing Pipeline
+
+#### Unit Tests (no MuJoCo required)
+
+```
+python -m pytest tests/test_rl_goal_policy.py -v -s -n0
+```
+
+12 tests covering:
+- `MontyRLBridge`: unit conversion (meters↔mm), Goal→pose, percept→sensor_data
+- `RLPolicySelector`: GSG goals → RL, SM goals → LookAt, no goals → default, navigation state tracking
+- `RLGoalPolicy`: lifecycle (start→step→finish), null goal handling, motor_only_step
+
+#### Integration Tests (requires MuJoCo + pretrained Q-store)
+
+```
+python -m pytest tests/test_rl_goal_policy_mujoco.py -v -s -n0
+```
+
+6 tests covering:
+- Bridge + Adapter data round-trip
+- Single navigation step (IN_PROGRESS)
+- Multi-step navigation with progress tracking
+- Navigation completion (READY)
+- Multiple sequential episodes with reset
+- Q-store loading and stats
+
+#### End-to-End Test (full Monty pipeline)
+
+```
+python eval_rl_e2e.py
+```
+
+Prerequisites:
+1. Pretrained Monty model (banana + mug graphs):
+   ```
+   python src/tbp/tbp.monty/run.py experiment=tutorial/surf_agent_2obj_train_mujoco
+   ```
+2. Pretrained RL model (Q-store + SAC from trimesh training)
+3. YCB banana mesh converted to mm STL
+
+The end-to-end test:
+1. Loads Monty eval experiment via Hydra
+2. Initializes shared MuJoCo simulator
+3. Creates MuJoCoEnvAdapter with shared simulator
+4. Creates RLGoalPolicy with pretrained Q-store + SAC
+5. Replaces Monty's motor system with RLPolicySelector
+6. Runs Monty eval: SurfacePolicy crawls + RLGoalPolicy navigates to GSG goals
+7. Outputs: Monty eval_stats.csv, RL episode_log.json, per-episode actions.txt, visualization
+
+#### Results
+
+```
+Monty Recognition: 6/6 correct (banana + mug, 3 rotations each)
+RL Navigation:     3/4 goals reached (75%), crawling on surface
+                   Average 18 steps to goal, 52mm → 2.6mm
+```
+
+### Known Limitations (Phase 1)
+
+- **Single object**: Adapter CAD mesh is fixed at initialization. Multi-object requires dynamic mesh reload.
+- **No intermediate observations**: `motor_only_step=True` during navigation. LM does not process observations along the path.
+- **Object center hardcoded**: `(0, 1500, 0)mm` from Monty config. Should be obtained dynamically.
+- **Approximate normals**: At 2mm from surface with zoom=10 sensor, renderer cannot compute normals. Ray cast provides depth; normal approximated as `-forward`.
+- **Convex objects only**: Surface navigation tested on banana (convex). Hollow objects (mug, cup) require detach/fly/land which needs further testing in shared simulator context.
 
 
 ## This is a prototype to implement, test and proof ideas below.
