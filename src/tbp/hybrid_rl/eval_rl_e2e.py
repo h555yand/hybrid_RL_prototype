@@ -150,6 +150,8 @@ rl_config = {
     "mode": "adaptive",
     "eval_epsilon": 0.02,
     "strategic_eval_epsilon": 0.02,
+    # "observe_every_n_steps": 0,   # Phase 1: no intermediate observations
+    "observe_every_n_steps": 5, # Phase 2: directed exploration
 }
 
 rl_policy = RLGoalPolicy(

@@ -65,6 +65,12 @@ class RLGoalPolicy(MotorPolicy):
         self._max_nav_steps = max_nav_steps
         self._enable_learning = enable_online_learning
 
+        self._observe_every_n_steps: int = rl_config.get("observe_every_n_steps", 0)
+        # 0 = only final observation (Phase 1 behavior)
+        # 1 = every step (full directed exploration, slowest)
+        # 5 = every 5th step (balanced)
+        # 10 = every 10th step (fast)
+
         self._bridge = MontyRLBridge(agent_id, rl_config, mujoco_adapter)
 
         self._controller = RLGoalApproachController.load(
@@ -294,6 +300,13 @@ class RLGoalPolicy(MotorPolicy):
         return self._navigation_step(state, percept)
 
     def _navigation_step(self, state, percept):
+        # ═══ Restore after observation lift ═══
+        if getattr(self, '_lifted_for_observation', False):
+            self._bridge._adapter._set_pose_mj_mm(
+                self._pre_lift_pos, self._pre_lift_euler
+            )
+            self._lifted_for_observation = False
+
         self._nav_steps += 1
 
         current_pose_mm = self._bridge._adapter.get_pose()
@@ -321,7 +334,6 @@ class RLGoalPolicy(MotorPolicy):
             adapter_pos = self._bridge._adapter.get_pose()
             self._current_poses.append(adapter_pos.copy())
 
-            # Use RL surface goal for distance, not Monty goal
             rl_goal = self._rl_goal_pose_mm
             dist_to_goal = float(np.linalg.norm(
                 rl_goal[:3] - adapter_pos[:3]
@@ -363,12 +375,29 @@ class RLGoalPolicy(MotorPolicy):
                 )
             return self._finish_navigation()
 
+        # ═══ Directed exploration: lift for Monty observation ═══
+        if self._observe_every_n_steps > 0 and self._nav_steps % self._observe_every_n_steps == 0:
+            self._pre_lift_pos = self._bridge._adapter._get_pos_mj_mm().copy()
+            self._pre_lift_euler = self._bridge._adapter._get_euler_deg().copy()
+
+            rot_mat = Rot.from_euler("xyz", self._pre_lift_euler, degrees=True)
+            backward = -rot_mat.apply([0, 0, -1])
+            lifted_pos = self._pre_lift_pos + backward * 23.0
+            self._bridge._adapter._set_pose_mj_mm(lifted_pos, self._pre_lift_euler)
+            self._lifted_for_observation = True
+
+            return MotorPolicyResult(
+                actions=[],
+                motor_only_step=False,
+                status=PolicyStatus.IN_PROGRESS,
+            )
+
         return MotorPolicyResult(
             actions=[],
             motor_only_step=True,
             status=PolicyStatus.IN_PROGRESS,
         )
-
+    
     def _finish_navigation(self):
         success = False
         termination = "unknown"
