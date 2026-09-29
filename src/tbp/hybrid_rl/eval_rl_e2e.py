@@ -70,8 +70,8 @@ with hydra.initialize_config_dir(version_base=None, config_dir=MONTY_CONF):
             f"experiment.config.model_name_or_path={PRETRAINED}",
             "experiment.config.show_sensor_output=false",
             # ═══ Control experiments ═══
-            "experiment.config.eval_env_interface_args.object_names=[mug]",  # только banana
-            "experiment.config.n_eval_epochs=1",      # 1 ротации = 1 эпизода
+            "experiment.config.eval_env_interface_args.object_names=[mug, banana]",  # только banana
+            "experiment.config.n_eval_epochs=3",      # 1 ротации = 1 эпизода
             "experiment.config.max_eval_steps=50",    # max Monty steps per episode
         ],
     )
@@ -99,12 +99,9 @@ logger.info("Creating MuJoCo adapter with shared simulator...")
 from tbp.hybrid_rl.mujoco_env_adapter import MuJoCoEnvAdapter
 
 adapter = MuJoCoEnvAdapter(
-    mesh_path_mm=MUG_STL,
-    mujoco_object_name="mug",
-    mujoco_data_path=MUJOCO_DATA,
-    seed=42,
     external_sim=monty_sim,
     agent_id="agent_id_0",
+    seed=42,
 )
 
 # ═══ Step 5: Create RLGoalPolicy ═══
@@ -163,10 +160,13 @@ rl_policy = RLGoalPolicy(
     model_path=Q_STORE,
     rl_config=rl_config,
     mujoco_adapter=adapter,
-    mesh_path=MUG_STL,
+    mesh_path=None,           # ← no CAD dependency
     max_nav_steps=500,
     enable_online_learning=True,
 )
+
+# Pass experiment reference for object name lookup
+rl_policy.set_experiment_ref(experiment)
 
 # ═══ Load SAC into adaptive manager ═══
 if rl_policy._manager is not None and os.path.exists(

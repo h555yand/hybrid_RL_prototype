@@ -60,25 +60,23 @@ class MuJoCoEnvAdapter:
 
     def __init__(
         self,
-        mesh_path_mm: str,
-        mujoco_object_name: str,
-        mujoco_data_path: str,
+        mesh_path_mm: Optional[str] = None,  # ← CHANGED: was required str
+        mujoco_object_name: str = "",
+        mujoco_data_path: str = "",
         sensor_resolution: Tuple[int, int] = (64, 64),
         zoom: float = _DEFAULT_ZOOM,
         hfov: float = _DEFAULT_HFOV,
         seed: Optional[int] = None,
         external_sim=None,
         agent_id: str = "rl_agent",
-        snap_max_dist: float = SNAP_MAX_DIST_DEFAULT,  # NEW
+        snap_max_dist: float = SNAP_MAX_DIST_DEFAULT,
     ):
-        self._agent_id_local = AgentID(agent_id)    
-        self._snap_max_dist = snap_max_dist    
+        self._agent_id_local = AgentID(agent_id)
+        self._snap_max_dist = snap_max_dist
 
         # Determine sensor ID
         if external_sim is not None:
-            # Monty surface agent uses "patch" as primary sensor
             self._sensor_id_local = SensorID("patch")
-            # self._sensor_id_local = SensorID("view_finder")
         else:
             self._sensor_id_local = _SENSOR_ID
 
@@ -89,67 +87,104 @@ class MuJoCoEnvAdapter:
         if seed is not None:
             np.random.seed(seed)
 
-        # ═══ Load MuJoCo metadata ═══
-        from tbp.monty.simulators.mujoco.objects import load_object_metadata, ObjectMetadata
-        metadata_path = Path(mujoco_data_path) / mujoco_object_name / "metadata.json"
-        if metadata_path.exists():
-            metadata = load_object_metadata(metadata_path, mujoco_object_name)
-        else:
-            metadata = ObjectMetadata()
+        # ═══════════════════════════════════════════════════
+        # NEW: Determine CAD vs no-CAD mode
+        # ═══════════════════════════════════════════════════
+        self._has_cad = mesh_path_mm is not None
 
-        self._mj_refpos = np.array(metadata.refpos, dtype=float)
-        self._mj_refquat = np.array(metadata.refquat, dtype=float)  # WXYZ
-        self._mj_scale = np.array(metadata.scale, dtype=float)
+        if self._has_cad:
+            # ═══ CAD path: load metadata + mesh (original behavior) ═══
+            from tbp.monty.simulators.mujoco.objects import (
+                load_object_metadata, ObjectMetadata,
+            )
+            metadata_path = (
+                Path(mujoco_data_path) / mujoco_object_name / "metadata.json"
+            )
+            if metadata_path.exists():
+                metadata = load_object_metadata(metadata_path, mujoco_object_name)
+            else:
+                metadata = ObjectMetadata()
 
-        # Pre-compute rotation objects
-        rw, rx, ry, rz = self._mj_refquat
-        self._ref_rot = Rot.from_quat([rx, ry, rz, rw])          # refquat
-        self._ref_rot_inv = Rot.from_quat([-rx, -ry, -rz, rw])   # conjugate
+            self._mj_refpos = np.array(metadata.refpos, dtype=float)
+            self._mj_refquat = np.array(metadata.refquat, dtype=float)
+            self._mj_scale = np.array(metadata.scale, dtype=float)
 
-        logger.info(
-            "MuJoCo metadata: refpos=%s, refquat=%s, scale=%s",
-            self._mj_refpos.tolist(), self._mj_refquat.tolist(),
-            self._mj_scale.tolist(),
-        )
+            rw, rx, ry, rz = self._mj_refquat
+            self._ref_rot = Rot.from_quat([rx, ry, rz, rw])
+            self._ref_rot_inv = Rot.from_quat([-rx, -ry, -rz, rw])
 
-        # ═══ CAD model (trimesh, mm) — for surface sampling only ═══
-        self._cad_mesh = trimesh.load(mesh_path_mm, force="mesh")
-        if isinstance(self._cad_mesh, trimesh.Scene):
-            self._cad_mesh = trimesh.util.concatenate(
-                list(self._cad_mesh.geometry.values())
+            logger.info(
+                "MuJoCo metadata: refpos=%s, refquat=%s, scale=%s",
+                self._mj_refpos.tolist(),
+                self._mj_refquat.tolist(),
+                self._mj_scale.tolist(),
             )
 
-        # ═══ Convert CAD metadata to MuJoCo frame (mm) ═══
-        cad_center_mm = np.array(self._cad_mesh.centroid, dtype=float)
-        self._mj_center_mm = self._pos_cad_to_mj_mm(cad_center_mm)
+            # ═══ CAD model (trimesh, mm) ═══
+            self._cad_mesh = trimesh.load(mesh_path_mm, force="mesh")
+            if isinstance(self._cad_mesh, trimesh.Scene):
+                self._cad_mesh = trimesh.util.concatenate(
+                    list(self._cad_mesh.geometry.values())
+                )
 
-        cad_bounds_min = self._cad_mesh.bounds[0]
-        cad_bounds_max = self._cad_mesh.bounds[1]
-        mj_corners = np.array([
-            self._pos_cad_to_mj_mm(np.array([x, y, z]))
-            for x in [cad_bounds_min[0], cad_bounds_max[0]]
-            for y in [cad_bounds_min[1], cad_bounds_max[1]]
-            for z in [cad_bounds_min[2], cad_bounds_max[2]]
-        ])
-        self._mj_extents_mm = (mj_corners.max(axis=0) - mj_corners.min(axis=0))
+            # ═══ Convert CAD metadata to MuJoCo frame (mm) ═══
+            cad_center_mm = np.array(self._cad_mesh.centroid, dtype=float)
+            self._mj_center_mm = self._pos_cad_to_mj_mm(cad_center_mm)
 
-        # Up direction: compute in CAD, convert to MuJoCo
-        self._compute_up_direction_mj()
+            cad_bounds_min = self._cad_mesh.bounds[0]
+            cad_bounds_max = self._cad_mesh.bounds[1]
+            mj_corners = np.array([
+                self._pos_cad_to_mj_mm(np.array([x, y, z]))
+                for x in [cad_bounds_min[0], cad_bounds_max[0]]
+                for y in [cad_bounds_min[1], cad_bounds_max[1]]
+                for z in [cad_bounds_min[2], cad_bounds_max[2]]
+            ])
+            self._mj_extents_mm = mj_corners.max(axis=0) - mj_corners.min(axis=0)
 
-        # Expose mesh for get_random_surface_point compatibility
-        self.mesh = self._cad_mesh
+            self._compute_up_direction_mj()
+            self.mesh = self._cad_mesh
+
+        else:
+            # ═══ No-CAD path: identity transforms, placeholders ═══
+            assert external_sim is not None, (
+                "mesh_path_mm is required when external_sim is not provided"
+            )
+            self._cad_mesh = None
+            self.mesh = None
+
+            self._mj_refpos = np.zeros(3)
+            self._mj_refquat = np.array([1.0, 0.0, 0.0, 0.0])
+            self._mj_scale = np.ones(3)
+            self._ref_rot = Rot.identity()
+            self._ref_rot_inv = Rot.identity()
+
+            # Placeholders — filled by discover_object()
+            self._mj_center_mm = np.zeros(3)
+            self._mj_extents_mm = np.array([100.0, 100.0, 100.0])
+            self.up_direction = np.array([0.0, 1.0, 0.0])
+            self.up_sign = 1.0
+            self.height_axis = 1
+            self.open_edge_height = 0.0
+            self._bottom_height_mj = 0.0
+
+            logger.info("MuJoCo adapter: no-CAD mode (shared simulator)")
 
         # ═══ MuJoCo simulator ═══
         if external_sim is not None:
             self._sim = external_sim
             self._owns_sim = False
         else:
+            assert self._has_cad, "Standalone simulator requires mesh_path_mm"
             res = Resolution2D(width=self._sensor_w, height=self._sensor_h)
             sensor_configs = {
-                _SENSOR_ID: SensorConfig(resolution=res, zoom=zoom, semantic=True)
+                _SENSOR_ID: SensorConfig(
+                    resolution=res, zoom=zoom, semantic=True,
+                )
             }
             agent_factory = partial(
-                SurfaceAgent, agent_id=self._agent_id_local, sensor_configs=sensor_configs,
+                SurfaceAgent,
+                agent_id=self._agent_id_local,
+                sensor_configs=sensor_configs,
             )
             self._sim = MuJoCoSimulator(
                 agents=[agent_factory], data_path=mujoco_data_path,
@@ -159,17 +194,24 @@ class MuJoCoEnvAdapter:
             self._sim.model.vis.global_.offheight = 256
             self._owns_sim = True
 
-        logger.info("MuJoCo initialized: object='%s'", mujoco_object_name)
+        logger.info(
+            "MuJoCo initialized: object='%s', has_cad=%s",
+            mujoco_object_name, self._has_cad,
+        )
 
         # ═══ Monty transforms ═══
         self._missing_to_max = MissingToMaxDepth(
             agent_id=self._agent_id_local, max_depth=1.0, threshold=0.0,
         )
         self._depth_to_3d = DepthTo3DLocations(
-            agent_id=self._agent_id_local, sensor_ids=[self._sensor_id_local],
+            agent_id=self._agent_id_local,
+            sensor_ids=[self._sensor_id_local],
             resolutions=[(self._sensor_h, self._sensor_w)],
-            zooms=[zoom], hfov=[hfov],
-            world_coord=True, get_all_points=True, use_semantic_sensor=False,
+            zooms=[zoom],
+            hfov=[hfov],
+            world_coord=True,
+            get_all_points=True,
+            use_semantic_sensor=False,
         )
 
         # ═══ Episode state ═══
@@ -182,7 +224,7 @@ class MuJoCoEnvAdapter:
         self._last_detach_sub_steps = 1
         self._prev_normal: Optional[List[float]] = None
 
-        # ═══ Scene renderer (for visualization, separate from sensor) ═══
+        # ═══ Scene renderer ═══
         self._scene_renderer = None
         self._scene_res = (256, 256)
 
@@ -245,6 +287,170 @@ class MuJoCoEnvAdapter:
             self._bottom_height_mj = float(mj_corners.min(axis=0)[h])
         else:
             self._bottom_height_mj = float(mj_corners.max(axis=0)[h])
+
+    # ═══════════════════════════════════════════════════
+    # Runtime object discovery (no CAD)
+    # ═══════════════════════════════════════════════════
+
+    def discover_object(self, hint_pos_mm: Optional[np.ndarray] = None):
+        """Discover object geometry via MuJoCo ray cast. No CAD needed.
+
+        Estimates center, extents, up direction, open_edge_height,
+        bottom_height. Safe to call multiple times (idempotent).
+
+        Args:
+            hint_pos_mm: Approximate object position in MuJoCo mm.
+                If None, uses current agent position.
+        """
+        if hint_pos_mm is None:
+            hint_pos_mm = self._get_pos_mj_mm()
+
+        # 1. Center
+        self._mj_center_mm = self._estimate_center_runtime(hint_pos_mm)
+
+        # 2. Extents (depends on center)
+        self._mj_extents_mm = self._estimate_extents_runtime()
+
+        # 3. Up direction
+        self._estimate_up_direction_runtime()
+
+        # 4. Open edge & bottom height
+        self._estimate_open_edge_runtime()
+
+        logger.info(
+            "Object discovered: center=%s, extents=%s, up=%s, "
+            "edge_h=%.1f, bottom_h=%.1f",
+            self._mj_center_mm.round(1).tolist(),
+            self._mj_extents_mm.round(1).tolist(),
+            self.up_direction.tolist(),
+            self.open_edge_height,
+            self._bottom_height_mj,
+        )
+
+    def _estimate_center_runtime(
+        self, hint_pos_mm: np.ndarray
+    ) -> np.ndarray:
+        """Estimate object center via opposing ray casts.
+
+        For each axis, casts rays from far away in +/- directions.
+        Center = midpoint between first hit from each side.
+        Iterates 3 times for convergence on asymmetric shapes.
+
+        Args:
+            hint_pos_mm: Starting guess for center position.
+
+        Returns:
+            Estimated center in MuJoCo mm.
+        """
+        center = hint_pos_mm.copy()
+        far_dist = 500.0
+
+        for _iteration in range(3):
+            new_center = center.copy()
+
+            for axis in range(3):
+                hit_positions = []
+
+                for sign in [1.0, -1.0]:
+                    origin = center.copy()
+                    origin[axis] += sign * far_dist
+
+                    direction = np.zeros(3)
+                    direction[axis] = -sign
+
+                    hit = self._mj_ray_cast(origin, direction)
+                    if 0 < hit < far_dist * 2:
+                        hit_pos = origin[axis] + (-sign) * hit
+                        hit_positions.append(hit_pos)
+
+                if len(hit_positions) == 2:
+                    new_center[axis] = (
+                        hit_positions[0] + hit_positions[1]
+                    ) / 2.0
+                elif len(hit_positions) == 1:
+                    # Only one side hit — keep hint for this axis
+                    pass
+
+            center = new_center
+
+        return center
+
+    def _estimate_up_direction_runtime(self) -> None:
+        """Estimate up direction from MuJoCo gravity vector.
+
+        Reads model.opt.gravity directly — reliable and scene-independent.
+        Fallback: Y-up (standard for YCB in Monty MuJoCo setup).
+        """
+        try:
+            gravity = self._sim.model.opt.gravity  # e.g. [0, 0, -9.81]
+            g_norm = np.linalg.norm(gravity)
+            if g_norm > 1e-6:
+                self.up_direction = -gravity / g_norm
+            else:
+                self.up_direction = np.array([0.0, 1.0, 0.0])
+        except (AttributeError, Exception):
+            self.up_direction = np.array([0.0, 1.0, 0.0])
+
+        self.height_axis = int(np.argmax(np.abs(self.up_direction)))
+        self.up_sign = float(np.sign(self.up_direction[self.height_axis]))
+
+    def _estimate_open_edge_runtime(self) -> None:
+        """Estimate open edge height and bottom via vertical ray cast scan.
+
+        Scans horizontal slices from top to bottom. For each height,
+        casts 4 horizontal rays through center. If none hit, that
+        height is above the object (or inside an opening).
+
+        Open edge = highest height where at least one ray hits.
+        For solid objects: open_edge ≈ top of bounding box.
+        For hollow objects (mug): open_edge ≈ rim height.
+        """
+        h = self.height_axis
+        center = self._mj_center_mm
+        half_h = self._mj_extents_mm[h] / 2.0
+
+        # Horizontal axes (the two axes that aren't height)
+        horiz_axes = [a for a in range(3) if a != h]
+
+        # Scan from top down
+        n_probes = 30
+        top = center[h] + half_h * self.up_sign
+        bottom = center[h] - half_h * self.up_sign
+
+        open_edge = top  # default: solid object
+
+        for i in range(n_probes):
+            frac = i / (n_probes - 1)  # 0 = top, 1 = bottom
+            probe_height = top + (bottom - top) * frac
+
+            any_hit = False
+            for ax in horiz_axes:
+                for sign in [1.0, -1.0]:
+                    origin = center.copy()
+                    origin[h] = probe_height
+                    origin[ax] += sign * 300.0
+
+                    direction = np.zeros(3)
+                    direction[ax] = -sign
+
+                    hit = self._mj_ray_cast(origin, direction)
+                    if 0 < hit < 600.0:
+                        any_hit = True
+                        break
+                if any_hit:
+                    break
+
+            if any_hit:
+                open_edge = probe_height
+                break
+
+        self.open_edge_height = open_edge
+
+        # Bottom height
+        if self.up_sign > 0:
+            self._bottom_height_mj = center[h] - half_h
+        else:
+            self._bottom_height_mj = center[h] + half_h
 
     # ═══════════════════════════════════════════════════
     # Helpers
@@ -519,7 +725,11 @@ class MuJoCoEnvAdapter:
     def get_random_surface_point(self, **kwargs) -> np.ndarray:
         """Generate random surface point. Returns 6D pose in MuJoCo mm."""
         from tbp.hybrid_rl.lightweight_env import LightweightEnv
-
+        if not self._has_cad:
+            raise RuntimeError(
+                "get_random_surface_point requires CAD mesh. "
+                "Provide mesh_path_mm to constructor."
+            )
         # Convert reference_pos from MuJoCo mm to CAD mm
         if "reference_pos" in kwargs and kwargs["reference_pos"] is not None:
             ref_mj_mm = np.array(kwargs["reference_pos"], dtype=float)
@@ -563,14 +773,21 @@ class MuJoCoEnvAdapter:
     def set_goal(self, goal_pose):
         """Set goal in MuJoCo mm."""
         self._current_goal = np.array(goal_pose, dtype=float)
-        if self._owns_sim:
+        if self._has_cad:
             goal_pos_cad_mm = self._pos_mj_mm_to_cad_mm(goal_pose[:3])
             self._goal_normal_mj = self._get_goal_normal_mj(goal_pos_cad_mm)
         else:
             self._goal_normal_mj = self._get_goal_normal_runtime(goal_pose[:3])
-
+            
     def _get_goal_normal_mj(self, goal_pos_cad_mm: np.ndarray) -> List[float]:
         """Get goal normal from CAD, convert to MuJoCo frame."""
+        if not self._has_cad:
+            raise RuntimeError("_get_goal_normal_mj requires CAD mesh")
+        _, _, face_id = self._cad_mesh.nearest.on_surface([goal_pos_cad_mm])
+        normal_cad = self._cad_mesh.face_normals[face_id[0]]
+        normal_mj = self._dir_cad_to_mj(normal_cad)
+        normal_mj /= (np.linalg.norm(normal_mj) + 1e-12)
+        return normal_mj.tolist()
         _, _, face_id = self._cad_mesh.nearest.on_surface([goal_pos_cad_mm])
         normal_cad = self._cad_mesh.face_normals[face_id[0]]
         normal_mj = self._dir_cad_to_mj(normal_cad)
@@ -592,31 +809,48 @@ class MuJoCoEnvAdapter:
         self._last_detach_sub_steps = 1
 
         if position is not None:
-            # position is in CAD mm (from episode pool)
-            pos_mj_mm = self._pos_cad_to_mj_mm(np.array(position, dtype=float))
-            if rotation is not None:
-                # rotation is CAD euler — convert forward direction
-                cad_rot = Rot.from_euler("xyz", rotation, degrees=True)
-                fwd_cad = cad_rot.apply([0, 0, -1])
-                fwd_mj = self._dir_cad_to_mj(fwd_cad)
-                euler = self._look_at_direction(fwd_mj)
+            if self._has_cad:
+                # position is in CAD mm — convert to MuJoCo
+                pos_mj_mm = self._pos_cad_to_mj_mm(
+                    np.array(position, dtype=float)
+                )
+                if rotation is not None:
+                    cad_rot = Rot.from_euler("xyz", rotation, degrees=True)
+                    fwd_cad = cad_rot.apply([0, 0, -1])
+                    fwd_mj = self._dir_cad_to_mj(fwd_cad)
+                    euler = self._look_at_direction(fwd_mj)
+                else:
+                    euler = np.zeros(3)
             else:
-                euler = np.zeros(3)
+                # No CAD — position already in MuJoCo mm
+                pos_mj_mm = np.array(position, dtype=float)
+                if rotation is not None:
+                    euler = np.array(rotation, dtype=float)
+                else:
+                    euler = np.zeros(3)
         else:
-            # Random point on CAD surface → convert to MuJoCo
-            points, face_ids = self._cad_mesh.sample(1, return_index=True)
-            normal_cad = self._cad_mesh.face_normals[face_ids[0]]
-            pos_cad_mm = points[0] + normal_cad * 2.0
+            if self._has_cad:
+                # Random point on CAD surface → convert to MuJoCo
+                points, face_ids = self._cad_mesh.sample(
+                    1, return_index=True,
+                )
+                normal_cad = self._cad_mesh.face_normals[face_ids[0]]
+                pos_cad_mm = points[0] + normal_cad * 2.0
 
-            pos_mj_mm = self._pos_cad_to_mj_mm(pos_cad_mm)
-            normal_mj = self._dir_cad_to_mj(-normal_cad)  # look at surface
-            euler = self._look_at_direction(normal_mj)
+                pos_mj_mm = self._pos_cad_to_mj_mm(pos_cad_mm)
+                normal_mj = self._dir_cad_to_mj(-normal_cad)
+                euler = self._look_at_direction(normal_mj)
 
-            if rotation is not None:
-                cad_rot = Rot.from_euler("xyz", rotation, degrees=True)
-                fwd_cad = cad_rot.apply([0, 0, -1])
-                fwd_mj = self._dir_cad_to_mj(fwd_cad)
-                euler = self._look_at_direction(fwd_mj)
+                if rotation is not None:
+                    cad_rot = Rot.from_euler("xyz", rotation, degrees=True)
+                    fwd_cad = cad_rot.apply([0, 0, -1])
+                    fwd_mj = self._dir_cad_to_mj(fwd_cad)
+                    euler = self._look_at_direction(fwd_mj)
+            else:
+                raise RuntimeError(
+                    "Random reset requires CAD mesh. "
+                    "Provide position explicitly or use mesh_path_mm."
+                )
 
         euler = self._normalize_euler(euler)
         self._set_pose_mj_mm(pos_mj_mm, euler)
@@ -1461,15 +1695,19 @@ class MuJoCoEnvAdapter:
 
     def pose_mj_to_cad(self, pose_mj: np.ndarray) -> np.ndarray:
         """Convert 6D pose from MuJoCo frame to CAD frame for visualization."""
+        if not self._has_cad:
+            # No CAD — identity transform, return as-is
+            return pose_mj.copy()
+
         pos_cad = self._pos_mj_mm_to_cad_mm(pose_mj[:3])
-        
+
         mj_rot = Rot.from_euler("xyz", pose_mj[3:], degrees=True)
         fwd_mj = mj_rot.apply([0, 0, -1])
         fwd_cad = self._dir_mj_to_cad(fwd_mj)
         d = fwd_cad / (np.linalg.norm(fwd_cad) + 1e-12)
         r, _ = Rot.align_vectors([d], [[0, 0, -1]])
         euler_cad = r.as_euler("xyz", degrees=True)
-        
+
         return np.concatenate([pos_cad, euler_cad])
 
     def _do_move_forward(self, step_mm: float):
@@ -1655,7 +1893,7 @@ class MuJoCoEnvAdapter:
             if scene.ngeom < scene.maxgeom:
                 mujoco.mjv_initGeom(
                     scene.geoms[scene.ngeom], mujoco.mjtGeom.mjGEOM_SPHERE,
-                    [sphere_size * 1.3, 0, 0], goal_m, np.eye(3).flatten(),
+                    [sphere_size * 1.0, 0, 0], goal_m, np.eye(3).flatten(),
                     [0.2, 1.0, 0.2, 1.0],
                 )
                 scene.ngeom += 1

@@ -139,46 +139,64 @@ def save_text_log(
     episode_poses: list[np.ndarray],
     episode_actions: list[str],
     extra_info: dict[str, Any] | None = None,
+    actions_header: str = "",
+    actions_short: list[str] | None = None,
 ) -> None:
     """Save episode text log and metadata. Universal for all envs.
 
     Creates:
         - actions.txt: human-readable step-by-step log
         - meta.json: machine-readable metadata
+
+    Args:
+        actions_header: If provided, replaces the auto-generated header.
+            Used by monty_integration to include coordinate debug info.
+        actions_short: If provided, used as step prefix labels.
+            Falls back to "Step NNN (dist=X.Xmm)" format.
     """
     ep_dir.mkdir(parents=True, exist_ok=True)
 
     # ═══ actions.txt ═══
     log_path = ep_dir / "actions.txt"
     with log_path.open("w") as f:
-        # Header: extra_info first (object, level, mode, etc.)
-        if extra_info:
-            for key, val in extra_info.items():
-                f.write(f"{key}: {val}\n")
+        if actions_header:
+            # ═══ Custom header (monty_integration, etc.) ═══
+            f.write(actions_header)
+            f.write("\n\n")
+        else:
+            # ═══ Auto-generated header ═══
+            if extra_info:
+                for key, val in extra_info.items():
+                    f.write(f"{key}: {val}\n")
 
-        # Episode summary
-        f.write(f"Result: {result}\n")
-        f.write(f"Steps: {len(episode_actions)}\n")
-        f.write(f"Goal: {goal_pose.tolist()}\n")
+            f.write(f"Result: {result}\n")
+            f.write(f"Steps: {len(episode_actions)}\n")
+            f.write(f"Goal: {goal_pose.tolist()}\n")
 
-        if episode_poses:
-            start_dist = float(np.linalg.norm(
-                goal_pose[:3] - episode_poses[0][:3]
-            ))
-            end_dist = float(np.linalg.norm(
-                goal_pose[:3] - episode_poses[-1][:3]
-            ))
-            f.write(f"Start distance: {start_dist:.1f}mm\n")
-            f.write(f"End distance: {end_dist:.1f}mm\n")
+            if episode_poses:
+                start_dist = float(np.linalg.norm(
+                    goal_pose[:3] - episode_poses[0][:3]
+                ))
+                end_dist = float(np.linalg.norm(
+                    goal_pose[:3] - episode_poses[-1][:3]
+                ))
+                f.write(f"Start distance: {start_dist:.1f}mm\n")
+                f.write(f"End distance: {end_dist:.1f}mm\n")
 
-        f.write("\n")
+            f.write("\n")
+
+        # ═══ Step-by-step log ═══
+        f.write("=" * 100 + "\n")
         for i, action in enumerate(episode_actions):
-            if i < len(episode_poses) - 1:
+            if actions_short and i < len(actions_short):
+                prefix = actions_short[i]
+            elif i < len(episode_poses) - 1:
                 pose = episode_poses[i + 1]
                 dist = float(np.linalg.norm(goal_pose[:3] - pose[:3]))
-                f.write(f"Step {i+1:03d} (dist={dist:.1f}mm): {action}\n")
+                prefix = f"Step {i+1:03d} (dist={dist:.1f}mm)"
             else:
-                f.write(f"Step {i+1:03d}: {action}\n")
+                prefix = f"Step {i+1:03d}"
+            f.write(f"{prefix}: {action}\n")
 
     # ═══ meta.json ═══
     meta = {
@@ -196,7 +214,6 @@ def save_text_log(
     meta_path = ep_dir / "meta.json"
     with meta_path.open("w") as f:
         json.dump(meta, f, indent=2)
-
 
 # ═══════════════════════════════════════════════════
 # Video creation (universal)
@@ -325,23 +342,22 @@ class EpisodeVisualizer:
         actions: list[str],
         actions_short: list[str] | None = None,
         extra_info: dict[str, Any] | None = None,
+        actions_header: str = "",
     ) -> None:
         """Save episode visualization.
 
-        Works with any environment that implements render_episode_frame().
-        Falls back to text-only if env doesn't support rendering.
-
         Args:
-            env: Environment instance (LightweightEnv, MuJoCoEnvAdapter, etc.)
+            env: Environment instance.
             episode: Episode number.
             level: Curriculum level.
             result: "success", "collision", or "timeout".
             goal_pose: Goal pose in env's native frame.
-            poses: List of agent poses in env's native frame.
-            actions: Full action description strings (for actions.txt).
-            actions_short: Short action labels (for frames/video).
-                If None, falls back to actions.
-            extra_info: Optional dict with additional metadata.
+            poses: List of agent poses.
+            actions: Full action description strings.
+            actions_short: Short action labels for frames.
+            extra_info: Optional metadata dict.
+            actions_header: Custom header for actions.txt.
+                If provided, replaces auto-generated header.
         """
         if not self.should_save(level, result):
             return
@@ -350,7 +366,7 @@ class EpisodeVisualizer:
         episode_id = f"ep_{episode + 1:05d}_L{level}_{result}"
         ep_dir = self.output_dir / episode_id
 
-        # ═══ 1. Always save text log (full actions) ═══
+        # ═══ 1. Always save text log ═══
         save_text_log(
             ep_dir=ep_dir,
             result=result,
@@ -358,9 +374,11 @@ class EpisodeVisualizer:
             episode_poses=poses,
             episode_actions=actions,
             extra_info=extra_info,
+            actions_header=actions_header,
+            actions_short=actions_short,
         )
 
-        # ═══ 2. Save frames if mode requires (short labels for overlay) ═══
+        # ═══ 2. Save frames if mode requires ═══
         if self.visualize_mode in ("pictures", "video"):
             viz_labels = actions_short if actions_short else actions
             self._save_frames(
@@ -376,7 +394,7 @@ class EpisodeVisualizer:
             "Saved episode %s to %s (%s)",
             episode_id, ep_dir, self.visualize_mode,
         )
-
+        
     def _save_frames(
         self,
         env: Any,
@@ -530,7 +548,7 @@ def visualize_agent_goal(env, agent_pose, goal_pose):
     agent_sphere = trimesh.primitives.Sphere(radius=1.0, center=agent_pose[:3])
     agent_sphere.visual.face_colors = [0, 50, 255, 255]
     scene.add_geometry(agent_sphere)
-    goal_sphere = trimesh.primitives.Sphere(radius=1.4, center=goal_pose[:3])
+    goal_sphere = trimesh.primitives.Sphere(radius=1.0, center=goal_pose[:3])
     goal_sphere.visual.face_colors = [0, 255, 0, 255]
     scene.add_geometry(goal_sphere)
     scene.show(smooth=False)

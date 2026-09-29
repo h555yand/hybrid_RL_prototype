@@ -116,29 +116,10 @@ class RLPolicySelector(MotorPolicySelector):
         percept: Message,
         goals: Sequence[Goal],
     ) -> MotorPolicyResult:
-        """Select policy and return actions.
-
-        Priority:
-        1. Continue RL navigation (if active)
-        2. Start RL navigation for new GSG goal
-        3. LookAtGoal for SM goals
-        4. Default exploration
-
-        Args:
-            ctx: Runtime context.
-            observations: Environment observations.
-            state: Motor system state.
-            percept: CMP Message from first sensor module.
-            goals: Sequence of goals from LMs and SMs.
-
-        Returns:
-            MotorPolicyResult from selected policy.
-        """
         gsg_goals = [g for g in goals if g.sender_type == "GSG"]
 
         # ═══ 1. Continue RL navigation ═══
         if self._is_navigating:
-            # Pass current GSG goal (may have changed) or None
             goal = (
                 highest_confidence_goal(gsg_goals) if gsg_goals else None
             )
@@ -152,11 +133,17 @@ class RLPolicySelector(MotorPolicySelector):
 
             if result.actions or result.status == PolicyStatus.IN_PROGRESS:
                 return result
-            # Navigation finished — fall through to check for new goals
 
         # ═══ 2. New GSG goal → start RL navigation ═══
         if gsg_goals:
             goal = highest_confidence_goal(gsg_goals)
+
+            # Object name: auto-detected in _start_navigation,
+            # fallback from goal metadata
+            fallback_name = self._extract_object_name(goal)
+            if fallback_name:
+                self._rl_goal.set_object_name(fallback_name)
+
             result = self._rl_goal(
                 ctx, observations, state, percept, goal,
             )
@@ -172,7 +159,9 @@ class RLPolicySelector(MotorPolicySelector):
             if sm_goals:
                 goal = highest_confidence_goal(sm_goals)
                 self._is_navigating = False
-                result = self._look_at_goal(ctx, observations, state, percept, goal)
+                result = self._look_at_goal(
+                    ctx, observations, state, percept, goal,
+                )
                 self._update_telemetry(self._look_at_goal, goal)
                 return result
 
@@ -183,7 +172,7 @@ class RLPolicySelector(MotorPolicySelector):
         )
         self._update_telemetry(self._default, None)
         return result
-
+    
     def _update_telemetry(
         self,
         policy: MotorPolicy,
@@ -191,3 +180,15 @@ class RLPolicySelector(MotorPolicySelector):
     ) -> None:
         self._selected_policies.append(policy)
         self._selected_goals.append(goal)
+    
+    def _extract_object_name(self, goal: Goal) -> str:
+        """Extract object name from goal metadata (fallback)."""
+        try:
+            mf = goal.morphological_features
+            if mf:
+                for key in ("object_name", "most_likely_object"):
+                    if key in mf:
+                        return str(mf[key])
+        except (AttributeError, TypeError):
+            pass
+        return ""

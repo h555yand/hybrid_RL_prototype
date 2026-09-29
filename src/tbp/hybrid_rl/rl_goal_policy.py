@@ -81,11 +81,15 @@ class RLGoalPolicy(MotorPolicy):
         self._controller.mode = "adaptive"
 
         self._manager: Optional[AdaptiveTrainingManager] = None
-        if enable_online_learning and mesh_path:
+        if enable_online_learning:
             from tbp.hybrid_rl.adaptive_manager import AdaptiveTrainingManager
-            from tbp.hybrid_rl.lightweight_env import LightweightEnv
 
-            trimesh_env = LightweightEnv(mesh_path)
+            if mesh_path:
+                from tbp.hybrid_rl.lightweight_env import LightweightEnv
+                trimesh_env = LightweightEnv(mesh_path)
+            else:
+                trimesh_env = None
+
             self._manager = AdaptiveTrainingManager(
                 controller=self._controller,
                 env=trimesh_env,
@@ -93,6 +97,12 @@ class RLGoalPolicy(MotorPolicy):
                 runs_dir=str(Path(model_path).parent),
                 mesh_path=mesh_path,
             )
+
+            if not mesh_path:
+                logger.info(
+                    "AdaptiveManager: inference-only mode "
+                    "(no mesh -> no offline retrain, SAC inference OK)"
+                )
 
         self._nav_active: bool = False
         self._nav_steps: int = 0
@@ -112,6 +122,8 @@ class RLGoalPolicy(MotorPolicy):
         self._action_short_labels: list[str] = []
         self._start_distance: float = 0.0
         self._monty_start_pos_mm: Optional[np.ndarray] = None
+        self._current_object_name: str = "unknown"
+        self._experiment_ref = None
 
         # Visualizer
         self._visualizer = None
@@ -184,12 +196,40 @@ class RLGoalPolicy(MotorPolicy):
             stats["arbitrator"] = self._manager.arbitrator.get_stats()
         return stats
 
+    def set_object_name(self, name: str):
+        """Set current object name for logging."""
+        self._current_object_name = name
+
+    def set_experiment_ref(self, experiment):
+        """Store reference to Monty experiment for object name lookup."""
+        self._experiment_ref = experiment
+
+    def _get_object_name_from_experiment(self) -> str:
+        """Get current object name from Monty experiment."""
+        exp = self._experiment_ref
+        if exp is None:
+            return ""
+
+        try:
+            return str(exp.logger_args["target"]["object"])
+        except (AttributeError, KeyError, TypeError):
+            return ""
+                
     def _start_navigation(self, state, percept, goal):
         self._current_goal = goal
         self._nav_active = True
         self._nav_steps = 0
         self._last_termination = None
         self._prev_goals_reached = self._controller._total_goals_reached
+        
+        # ═══ Auto-detect object name from experiment ═══
+        if self._experiment_ref is not None:
+            try:
+                obj_name = self._get_object_name_from_experiment()
+                if obj_name:
+                    self._current_object_name = obj_name
+            except Exception:
+                pass
 
         self._bridge.set_goal(goal)
 
@@ -202,25 +242,22 @@ class RLGoalPolicy(MotorPolicy):
         self._monty_start_euler = self._bridge._adapter._get_euler_deg().copy()
 
         # Update adapter center for shared sim
+        # ═══ Discover object geometry via ray cast (no hardcoded values) ═══
         if not self._bridge._adapter._owns_sim:
-            self._bridge._adapter._mj_center_mm = np.array([0.0, 1500.0, 0.0])
-            self._bridge._adapter._mj_extents_mm = self._bridge._adapter._estimate_extents_runtime()
-            self._bridge._adapter.up_direction = np.array([0.0, 1.0, 0.0])
-            self._bridge._adapter.up_sign = 1.0
-            self._bridge._adapter.height_axis = 1
-            center = self._bridge._adapter._mj_center_mm
-            extents = self._bridge._adapter._mj_extents_mm
-            self._bridge._adapter.open_edge_height = center[1] + extents[1] / 2.0
-            self._bridge._adapter._bottom_height_mj = center[1] - extents[1] / 2.0
-           
+            goal_hint = goal_pose_mm[:3].copy()
+
+            # Skip re-discovery if goal is near already-discovered object
+            current_center = self._bridge._adapter._mj_center_mm
+            max_extent = float(max(self._bridge._adapter._mj_extents_mm))
+            dist_to_center = float(np.linalg.norm(goal_hint - current_center))
+
+            if dist_to_center > max_extent * 2.0 or max_extent < 2.0:
+                self._bridge._adapter.discover_object(hint_pos_mm=goal_hint)
+                           
             logger.info(
-                "  object props: center=%s extents=%s up=%s height_axis=%d open_edge=%.1f bottom=%.1f",
+                "  object props: center=%s extents=%s",
                 self._bridge._adapter._mj_center_mm.round(1).tolist(),
                 self._bridge._adapter._mj_extents_mm.round(1).tolist(),
-                self._bridge._adapter.up_direction.tolist(),
-                self._bridge._adapter.height_axis,
-                self._bridge._adapter.open_edge_height,
-                self._bridge._adapter._bottom_height_mj,
             )
 
         # ═══ 2) Snap agent to surface ═══
@@ -445,69 +482,82 @@ class RLGoalPolicy(MotorPolicy):
             self._manager.arbitrator.on_episode_end(success)
 
         # Compute final distance
-        rl_goal = self._rl_goal_pose_mm if self._rl_goal_pose_mm is not None else np.zeros(6)
+        rl_goal = (
+            self._rl_goal_pose_mm
+            if self._rl_goal_pose_mm is not None
+            else np.zeros(6)
+        )
         final_pos = self._bridge._adapter.get_pose()[:3]
         final_dist = float(np.linalg.norm(rl_goal[:3] - final_pos))
 
         logger.info(
-            "RLGoalPolicy ep %d: %s after %d steps, "
+            "RLGoalPolicy ep %d [%s]: %s after %d steps, "
             "dist %.1f→%.1fmm",
-            self._total_nav_episodes, termination,
-            self._nav_steps, self._start_distance, final_dist,
+            self._total_nav_episodes, self._current_object_name,
+            termination, self._nav_steps,
+            self._start_distance, final_dist,
         )
 
-        # Save actions.txt
-        actions_path = (
-            self._log_dir
-            / f"actions_ep_{self._total_nav_episodes:05d}_{termination}.txt"
-        )
-        with actions_path.open("w") as f:
-            f.write(f"source: monty_integration\n")
-            f.write(f"Result: {termination}\n")
-            f.write(f"Steps: {self._nav_steps}\n")
-            f.write(f"RL Goal (surface): {rl_goal.tolist()}\n")
-            if self._monty_goal_pose_mm is not None:
-                f.write(f"Monty Goal (original): {self._monty_goal_pose_mm.tolist()}\n")
-            f.write(f"Start distance: {self._start_distance:.1f}mm\n")
-            f.write(f"End distance: {final_dist:.1f}mm\n")
-            f.write(f"\n")
-            f.write(f"=== Coordinate Debug ===\n")
-            f.write(f"Adapter object center: "
-                    f"{self._bridge._adapter._mj_center_mm.round(1).tolist()}\n")
-            f.write(f"Adapter object extents: "
-                    f"{self._bridge._adapter._mj_extents_mm.round(1).tolist()}\n")
-            f.write(f"Adapter agent final pos: "
-                    f"{self._bridge._adapter._get_pos_mj_mm().round(1).tolist()}\n")
-            final_sd = self._bridge._adapter.get_sensor_data()
-            f.write(f"Adapter agent final depth: "
-                    f"{final_sd.get('depth', -1):.1f}mm\n")
-            f.write(f"Adapter agent on_object: "
-                    f"{final_sd.get('on_object', False)}\n")
-            if len(self._current_poses) > 0:
-                f.write(f"First adapter pos: "
-                        f"{np.array(self._current_poses[0][:3]).round(1).tolist()}\n")
-            if len(self._current_poses) > 1:
-                f.write(f"Last adapter pos: "
-                        f"{np.array(self._current_poses[-1][:3]).round(1).tolist()}\n")
-            if self._monty_start_pos_mm is not None:
-                f.write(f"\n=== Monty Original ===\n")
-                f.write(f"Monty agent pos (mm): "
-                        f"{self._monty_start_pos_mm.round(1).tolist()}\n")
-            if self._monty_goal_pose_mm is not None:
-                f.write(f"Monty goal pos (mm): "
-                        f"{self._monty_goal_pose_mm[:3].round(1).tolist()}\n")
-            f.write(f"\n")
-            f.write("=" * 100 + "\n")
-            for i, explanation in enumerate(self._action_explanations):
-                dist_label = (
-                    self._action_short_labels[i]
-                    if i < len(self._action_short_labels) else ""
-                )
-                f.write(f"{dist_label}: {explanation}\n")
+        # ═══ Build enriched header for actions.txt ═══
+        actions_header_lines = [
+            f"source: monty_integration",
+            f"Object: {self._current_object_name}",
+            f"Result: {termination}",
+            f"Steps: {self._nav_steps}",
+            f"RL Goal (surface): {rl_goal.tolist()}",
+        ]
+        if self._monty_goal_pose_mm is not None:
+            actions_header_lines.append(
+                f"Monty Goal (original): "
+                f"{self._monty_goal_pose_mm.tolist()}"
+            )
+        actions_header_lines.extend([
+            f"Start distance: {self._start_distance:.1f}mm",
+            f"End distance: {final_dist:.1f}mm",
+            f"",
+            f"=== Coordinate Debug ===",
+            f"Adapter object center: "
+            f"{self._bridge._adapter._mj_center_mm.round(1).tolist()}",
+            f"Adapter object extents: "
+            f"{self._bridge._adapter._mj_extents_mm.round(1).tolist()}",
+            f"Adapter agent final pos: "
+            f"{self._bridge._adapter._get_pos_mj_mm().round(1).tolist()}",
+        ])
+        final_sd = self._bridge._adapter.get_sensor_data()
+        actions_header_lines.extend([
+            f"Adapter agent final depth: "
+            f"{final_sd.get('depth', -1):.1f}mm",
+            f"Adapter agent on_object: "
+            f"{final_sd.get('on_object', False)}",
+        ])
+        if len(self._current_poses) > 0:
+            actions_header_lines.append(
+                f"First adapter pos: "
+                f"{np.array(self._current_poses[0][:3]).round(1).tolist()}"
+            )
+        if len(self._current_poses) > 1:
+            actions_header_lines.append(
+                f"Last adapter pos: "
+                f"{np.array(self._current_poses[-1][:3]).round(1).tolist()}"
+            )
+        if self._monty_start_pos_mm is not None:
+            actions_header_lines.extend([
+                f"",
+                f"=== Monty Original ===",
+                f"Monty agent pos (mm): "
+                f"{self._monty_start_pos_mm.round(1).tolist()}",
+            ])
+        if self._monty_goal_pose_mm is not None:
+            actions_header_lines.append(
+                f"Monty goal pos (mm): "
+                f"{self._monty_goal_pose_mm[:3].round(1).tolist()}"
+            )
+        actions_header = "\n".join(actions_header_lines)
 
         # Episode log
         ep_entry = {
             "episode": self._total_nav_episodes,
+            "object": self._current_object_name,
             "success": success,
             "termination": termination,
             "steps": self._nav_steps,
@@ -520,7 +570,7 @@ class RLGoalPolicy(MotorPolicy):
         with log_path.open("w") as f:
             json.dump(self._episode_log, f, indent=2)
 
-        # Visualizer
+        # Visualizer (single source of truth for actions.txt)
         if self._visualizer is not None and self._current_goal is not None:
             try:
                 viz_result = {
@@ -539,7 +589,11 @@ class RLGoalPolicy(MotorPolicy):
                     poses=self._current_poses,
                     actions=self._action_explanations,
                     actions_short=self._action_short_labels,
-                    extra_info={"source": "monty_integration"},
+                    extra_info={
+                        "source": "monty_integration",
+                        "object": self._current_object_name,
+                    },
+                    actions_header=actions_header,
                 )
             except Exception as e:
                 logger.warning("Visualizer failed: %s", e, exc_info=True)

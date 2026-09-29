@@ -117,7 +117,7 @@ class AdaptiveTrainingManager:
         # Components
         self.sac_trainer: PSACTrainer | None = None
         self.action_space = controller.action_space
-        mesh_name = Path(mesh_path).stem
+        mesh_name = Path(mesh_path).stem if mesh_path else "unknown"
         self.extractor = ExperienceExtractor(
             config=config, mesh_name=mesh_name
         )
@@ -343,7 +343,7 @@ class AdaptiveTrainingManager:
             )
         )
         added = 0
-        mesh_name = Path(self.mesh_path).stem
+        mesh_name = Path(self.mesh_path).stem if self.mesh_path else "unknown"
         for tr in all_normalized:
             if tr.next_state is not None:
                 self.sac_trainer.buffer.add(
@@ -379,7 +379,7 @@ class AdaptiveTrainingManager:
             >= self._critic_warmup_threshold
         )
 
-        mesh_name = Path(self.mesh_path).stem
+        mesh_name = Path(self.mesh_path).stem if self.mesh_path else "unknown"
         for step_i in range(self.online_sac_update_steps):
             batch = self.sac_trainer.buffer.sample_balanced(
                 self.sac_trainer.batch_size,
@@ -434,6 +434,19 @@ class AdaptiveTrainingManager:
     def _trigger_offline(self):
         self.total_offline_iterations += 1
         self._episodes_since_offline = 0
+        # ═══ Guard: offline retrain requires CAD mesh ═══
+        if self.env is None or self.mesh_path is None:
+            logger.warning(
+                "OFFLINE retrain skipped: no mesh/env available "
+                "(no-CAD inference-only mode)"
+            )
+            return
+
+        logger.info(
+            "AdaptiveTraining: OFFLINE #%d (rate=%.3f)",
+            self.total_offline_iterations,
+            self.success_rate,
+        )
 
         logger.info(
             "AdaptiveTraining: OFFLINE #%d (rate=%.3f)",
