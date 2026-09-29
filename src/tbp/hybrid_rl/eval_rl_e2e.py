@@ -42,6 +42,9 @@ BANANA_STL = os.path.expanduser(
     "~/Downloads/github/hybrid_RL_prototype/results/adapt-baseline"
     "/data/ycb/ycb_banana.stl"
 )
+MUG_STL = os.path.expanduser(
+    "~/Downloads/github/hybrid_RL_prototype/results/adapt-baseline/data/mug.stl"
+)
 MUJOCO_DATA = os.path.expanduser(
     "~/Downloads/tbp/data/mujoco/objects/ycb"
 )
@@ -67,7 +70,7 @@ with hydra.initialize_config_dir(version_base=None, config_dir=MONTY_CONF):
             f"experiment.config.model_name_or_path={PRETRAINED}",
             "experiment.config.show_sensor_output=false",
             # ═══ Control experiments ═══
-            "experiment.config.eval_env_interface_args.object_names=[banana]",  # только banana
+            "experiment.config.eval_env_interface_args.object_names=[mug]",  # только banana
             "experiment.config.n_eval_epochs=1",      # 1 ротации = 1 эпизода
             "experiment.config.max_eval_steps=50",    # max Monty steps per episode
         ],
@@ -96,8 +99,8 @@ logger.info("Creating MuJoCo adapter with shared simulator...")
 from tbp.hybrid_rl.mujoco_env_adapter import MuJoCoEnvAdapter
 
 adapter = MuJoCoEnvAdapter(
-    mesh_path_mm=BANANA_STL,
-    mujoco_object_name="banana",
+    mesh_path_mm=MUG_STL,
+    mujoco_object_name="mug",
     mujoco_data_path=MUJOCO_DATA,
     seed=42,
     external_sim=monty_sim,
@@ -160,7 +163,7 @@ rl_policy = RLGoalPolicy(
     model_path=Q_STORE,
     rl_config=rl_config,
     mujoco_adapter=adapter,
-    mesh_path=BANANA_STL,
+    mesh_path=MUG_STL,
     max_nav_steps=500,
     enable_online_learning=True,
 )

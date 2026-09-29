@@ -494,6 +494,20 @@ class MuJoCoEnvAdapter:
     # ═══════════════════════════════════════════════════
     # Surface point generation (CAD → MuJoCo)
     # ═══════════════════════════════════════════════════
+    def _get_goal_normal_runtime(self, goal_pos_mm):
+        """Get approximate goal normal via ray cast toward object center."""
+        center = self._mj_center_mm
+        to_center = center - goal_pos_mm
+        to_center_len = float(np.linalg.norm(to_center))
+        if to_center_len < 1e-8:
+            return [0.0, 1.0, 0.0]
+        to_center_dir = to_center / to_center_len
+        
+        hit = self._mj_ray_cast(goal_pos_mm, to_center_dir)
+        if hit > 0:
+            return (-to_center_dir).tolist()
+        return [0.0, 1.0, 0.0]
+    
     def _pos_mj_mm_to_cad_mm(self, pos_mj_mm: np.ndarray) -> np.ndarray:
         """MuJoCo mm → CAD mm (inverse of _pos_cad_to_mj_mm)."""
         pos_mj_m = pos_mj_mm / MM_PER_M
@@ -549,8 +563,11 @@ class MuJoCoEnvAdapter:
     def set_goal(self, goal_pose):
         """Set goal in MuJoCo mm."""
         self._current_goal = np.array(goal_pose, dtype=float)
-        goal_pos_cad_mm = self._pos_mj_mm_to_cad_mm(goal_pose[:3])
-        self._goal_normal_mj = self._get_goal_normal_mj(goal_pos_cad_mm)
+        if self._owns_sim:
+            goal_pos_cad_mm = self._pos_mj_mm_to_cad_mm(goal_pose[:3])
+            self._goal_normal_mj = self._get_goal_normal_mj(goal_pos_cad_mm)
+        else:
+            self._goal_normal_mj = self._get_goal_normal_runtime(goal_pose[:3])
 
     def _get_goal_normal_mj(self, goal_pos_cad_mm: np.ndarray) -> List[float]:
         """Get goal normal from CAD, convert to MuJoCo frame."""
@@ -1121,6 +1138,48 @@ class MuJoCoEnvAdapter:
 
         return True
 
+    def _estimate_extents_runtime(self):
+        """Estimate object extents via ray cast from outside toward center."""
+        center = self._mj_center_mm
+        half_extents = np.zeros(3)
+        far_dist = 500.0
+
+        for axis in range(3):
+            for sign in [1.0, -1.0]:
+                direction = np.zeros(3)
+                direction[axis] = -sign
+
+                origin = center.copy()
+                origin[axis] += sign * far_dist
+
+                hit = self._mj_ray_cast(origin, direction)
+                if 0 < hit < far_dist:
+                    half_extents[axis] = max(half_extents[axis], far_dist - hit)
+
+        # Also probe at offsets to catch angled surfaces
+        for axis in range(3):
+            other_axes = [i for i in range(3) if i != axis]
+            for offset in [-20.0, 0.0, 20.0]:
+                for sign in [1.0, -1.0]:
+                    direction = np.zeros(3)
+                    direction[axis] = -sign
+
+                    origin = center.copy()
+                    origin[axis] += sign * far_dist
+                    origin[other_axes[0]] += offset
+
+                    hit = self._mj_ray_cast(origin, direction)
+                    if 0 < hit < far_dist:
+                        half_extents[axis] = max(half_extents[axis], far_dist - hit)
+
+        extents = half_extents * 2.0
+
+        for axis in range(3):
+            if extents[axis] < 1.0:
+                extents[axis] = 100.0
+
+        return extents
+            
     def _snap_to_surface_old1(self, prev_normal=None):
         """Find nearest surface and snap agent to it.
 

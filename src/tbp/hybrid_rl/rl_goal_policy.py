@@ -204,6 +204,24 @@ class RLGoalPolicy(MotorPolicy):
         # Update adapter center for shared sim
         if not self._bridge._adapter._owns_sim:
             self._bridge._adapter._mj_center_mm = np.array([0.0, 1500.0, 0.0])
+            self._bridge._adapter._mj_extents_mm = self._bridge._adapter._estimate_extents_runtime()
+            self._bridge._adapter.up_direction = np.array([0.0, 1.0, 0.0])
+            self._bridge._adapter.up_sign = 1.0
+            self._bridge._adapter.height_axis = 1
+            center = self._bridge._adapter._mj_center_mm
+            extents = self._bridge._adapter._mj_extents_mm
+            self._bridge._adapter.open_edge_height = center[1] + extents[1] / 2.0
+            self._bridge._adapter._bottom_height_mj = center[1] - extents[1] / 2.0
+           
+            logger.info(
+                "  object props: center=%s extents=%s up=%s height_axis=%d open_edge=%.1f bottom=%.1f",
+                self._bridge._adapter._mj_center_mm.round(1).tolist(),
+                self._bridge._adapter._mj_extents_mm.round(1).tolist(),
+                self._bridge._adapter.up_direction.tolist(),
+                self._bridge._adapter.height_axis,
+                self._bridge._adapter.open_edge_height,
+                self._bridge._adapter._bottom_height_mj,
+            )
 
         # ═══ 2) Snap agent to surface ═══
         original_snap = self._bridge._adapter._snap_max_dist
@@ -219,6 +237,14 @@ class RLGoalPolicy(MotorPolicy):
             snap_ok,
             start_sensor.get("depth", -1),
             start_sensor.get("on_object", False),
+        )
+        # Debug same_side
+        test_sd = self._bridge._adapter.get_sensor_data()
+        logger.info(
+            "  same_side debug: ss=%s, agent=[%.1f,%.1f,%.1f], goal=[%.1f,%.1f,%.1f]",
+            test_sd.get("same_side"),
+            *self._bridge._adapter._get_pos_mj_mm(),
+            *goal_pose_mm[:3],
         )
 
         # ═══ 3) Snap goal to surface ═══
