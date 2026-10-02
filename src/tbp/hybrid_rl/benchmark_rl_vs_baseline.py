@@ -265,16 +265,12 @@ def run_experiment(mode_name):
                     result["primary_performance"] = str(lm.terminal_state)
 
                 # GSG goals
-                if hasattr(lm, 'gsg') and lm.gsg is not None:
-                    result["goal_states_attempted"] = getattr(
-                        lm.gsg, 'goal_states_attempted', 0
-                    )
-                    result["goal_state_achieved"] = getattr(
-                        lm.gsg, 'goal_state_achieved', 0
-                    )
-                else:
-                    result["goal_states_attempted"] = 0
-                    result["goal_state_achieved"] = 0
+                result["goal_states_attempted"] = len(
+                    lm.buffer.stats.get("goal_states", [])
+                )
+                result["goal_state_achieved"] = lm.buffer.stats.get(
+                    "goal_state_achieved", 0
+                )
 
                 break  # only first LM
 
