@@ -449,6 +449,14 @@ class RLGoalPolicy(MotorPolicy):
             self._bridge._adapter._set_pose_mj_mm(lifted_pos, self._pre_lift_euler)
             self._lifted_for_observation = True
 
+            # ═══ DEBUG: verify agent position in MuJoCo ═══
+            actual_pos = self._bridge._adapter._get_pos_mj_mm()
+            logger.info(
+                "DIRECTED_EXPLORATION: nav_step=%d, lifted_pos=[%.1f,%.1f,%.1f], "
+                "actual_mj_pos=[%.1f,%.1f,%.1f]",
+                self._nav_steps, *lifted_pos, *actual_pos,
+            )
+
             return MotorPolicyResult(
                 actions=[],
                 motor_only_step=False,
