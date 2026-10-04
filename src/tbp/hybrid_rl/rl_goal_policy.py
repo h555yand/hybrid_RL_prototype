@@ -111,6 +111,12 @@ class RLGoalPolicy(MotorPolicy):
         self._prev_goals_reached: int = 0
         self._monty_goal_pose_mm: Optional[np.ndarray] = None
         self._rl_goal_pose_mm: Optional[np.ndarray] = None
+        # Directed exploration state
+        self._last_observe_pos: Optional[np.ndarray] = None
+        self._last_observe_step: int = 0
+        self._last_observe_normal: Optional[np.ndarray] = None
+        self._last_observe_k1: Optional[float] = None
+        self._stuck_counter: int = 0
 
         # Logging
         self._log_dir = Path(model_path).parent / "monty_integration_logs"
@@ -172,6 +178,11 @@ class RLGoalPolicy(MotorPolicy):
         self._monty_goal_pose_mm = None
         self._rl_goal_pose_mm = None
         self._monty_start_euler = None
+        self._last_observe_pos = None
+        self._last_observe_step = 0
+        self._last_observe_normal = None
+        self._last_observe_k1 = None
+        self._stuck_counter = 0
 
     def state_dict(self):
         return {"nav_active": self._nav_active, "nav_steps": self._nav_steps}
@@ -359,6 +370,12 @@ class RLGoalPolicy(MotorPolicy):
             *goal_pose_mm_surface[:3],
             dist,
         )
+        # Reset directed exploration state
+        self._last_observe_pos = None
+        self._last_observe_step = 0
+        self._last_observe_normal = None
+        self._last_observe_k1 = None
+        self._stuck_counter = 0
 
         return self._navigation_step(state, percept)
 
@@ -439,7 +456,7 @@ class RLGoalPolicy(MotorPolicy):
             return self._finish_navigation()
 
         # ═══ Directed exploration: lift for Monty observation ═══
-        if self._observe_every_n_steps > 0 and self._nav_steps % self._observe_every_n_steps == 0:
+        if self._observe_every_n_steps > 0 and self._should_observe():
             self._pre_lift_pos = self._bridge._adapter._get_pos_mj_mm().copy()
             self._pre_lift_euler = self._bridge._adapter._get_euler_deg().copy()
 
@@ -449,11 +466,10 @@ class RLGoalPolicy(MotorPolicy):
             self._bridge._adapter._set_pose_mj_mm(lifted_pos, self._pre_lift_euler)
             self._lifted_for_observation = True
 
-            # ═══ DEBUG: verify agent position in MuJoCo ═══
             actual_pos = self._bridge._adapter._get_pos_mj_mm()
             logger.info(
                 "DIRECTED_EXPLORATION: nav_step=%d, lifted_pos=[%.1f,%.1f,%.1f], "
-                "actual_mj_pos=[%.1f,%.1f,%.1f]",
+                "actual_mj_pos=[%.1f,%.1f,%.1f], trigger=adaptive",
                 self._nav_steps, *lifted_pos, *actual_pos,
             )
 
@@ -469,6 +485,138 @@ class RLGoalPolicy(MotorPolicy):
             status=PolicyStatus.IN_PROGRESS,
         )
     
+    def _should_observe(self) -> bool:
+        """Decide whether to send observation to LM on this step.
+
+        Adaptive strategy:
+        - Filter: off-object, bad depth, stuck agent
+        - Trigger: surface normal change (new face = high information)
+        - Trigger: curvature change (different surface region)
+        - Adaptive interval: more frequent near goal
+        """
+        logger.info("_should_observe called: nav_steps=%d, goal=%s",
+                     self._nav_steps, self._rl_goal_pose_mm is not None)
+        
+        if self._rl_goal_pose_mm is None:
+            return False
+
+        sensor_data = self._bridge._adapter.get_sensor_data()
+        current_pos = self._bridge._adapter._get_pos_mj_mm()
+
+        # ═══ Filter 1: Must be on object ═══
+        if not sensor_data.get("on_object", False):
+            logger.debug("OBSERVE_SKIP: not on object")
+            return False
+
+        # ═══ Filter 2: Depth must be reasonable ═══
+        depth = sensor_data.get("depth", -1)
+        if depth < 0 or depth > 15:
+            logger.debug("OBSERVE_SKIP: bad depth=%.1f", depth)
+            return False
+
+        # ═══ Filter 3: Must have moved enough ═══
+        if self._last_observe_pos is not None:
+            moved = float(np.linalg.norm(
+                current_pos[:3] - self._last_observe_pos[:3]
+            ))
+            if moved < 3.0:
+                self._stuck_counter += 1
+                if self._stuck_counter > 3:
+                    logger.debug(
+                        "OBSERVE_SKIP: stuck (moved=%.1fmm, count=%d)",
+                        moved, self._stuck_counter,
+                    )
+                return False
+            else:
+                self._stuck_counter = 0
+
+        # ═══ Get current normal ═══
+        raw_normal = sensor_data.get("point_normal", None)
+        current_normal = None
+        if raw_normal is not None:
+            current_normal = np.array(raw_normal, dtype=float)
+            n_len = np.linalg.norm(current_normal)
+            if n_len > 0.1:
+                current_normal = current_normal / n_len
+            else:
+                current_normal = None
+
+        # ═══ Trigger 1: Normal changed (new face) ═══
+        if current_normal is not None and self._last_observe_normal is not None:
+            dot = float(np.clip(
+                np.dot(current_normal, self._last_observe_normal), -1, 1
+            ))
+            normal_change = 1.0 - abs(dot)
+            if normal_change > 0.3:
+                logger.info(
+                    "OBSERVE_TRIGGER: normal changed %.2f at step %d",
+                    normal_change, self._nav_steps,
+                )
+                self._update_observe_state(
+                    current_pos, current_normal, sensor_data
+                )
+                return True
+
+        # ═══ Trigger 2: Curvature changed ═══
+        current_k1 = sensor_data.get("k1", None)
+        if (
+            current_k1 is not None
+            and self._last_observe_k1 is not None
+            and current_k1 != 0
+        ):
+            k1_change = abs(current_k1 - self._last_observe_k1)
+            if k1_change > 0.5:
+                logger.info(
+                    "OBSERVE_TRIGGER: curvature changed %.2f at step %d",
+                    k1_change, self._nav_steps,
+                )
+                self._update_observe_state(
+                    current_pos, current_normal, sensor_data
+                )
+                return True
+
+        # ═══ Adaptive interval by distance to goal ═══
+        dist_to_goal = float(np.linalg.norm(
+            self._rl_goal_pose_mm[:3] - current_pos[:3]
+        ))
+
+        if dist_to_goal > 80:
+            interval = 10
+        elif dist_to_goal > 40:
+            interval = 7
+        elif dist_to_goal > 15:
+            interval = 4
+        else:
+            interval = 2
+
+        steps_since_last = self._nav_steps - self._last_observe_step
+        if steps_since_last >= interval:
+            logger.info(
+                "OBSERVE_TRIGGER: interval=%d, dist=%.1fmm at step %d",
+                interval, dist_to_goal, self._nav_steps,
+            )
+            self._update_observe_state(
+                current_pos, current_normal, sensor_data
+            )
+            return True
+
+        return False
+
+    def _update_observe_state(
+        self,
+        pos: np.ndarray,
+        normal: Optional[np.ndarray],
+        sensor_data: dict,
+    ) -> None:
+        """Update tracking state after deciding to observe."""
+        self._last_observe_pos = pos.copy()
+        self._last_observe_step = self._nav_steps
+        if normal is not None:
+            self._last_observe_normal = normal.copy()
+        k1 = sensor_data.get("k1", None)
+        if k1 is not None:
+            self._last_observe_k1 = k1
+
     def _finish_navigation(self):
         success = False
         termination = "unknown"
@@ -611,10 +759,40 @@ class RLGoalPolicy(MotorPolicy):
             # Success: move agent to Monty goal position (30mm from surface)
             final_pos_mm = self._monty_goal_pose_mm[:3]
             final_euler = self._monty_goal_pose_mm[3:6]
+            observe = True
         else:
-            # Failure: return agent to pre-navigation position (25mm from surface)
-            final_pos_mm = self._monty_start_pos_mm
-            final_euler = self._monty_start_euler
+            # Failure: agent is still on surface at some point.
+            # Instead of returning to start silently, observe at current
+            # position — it's still a valid surface observation.
+            current_pos = self._bridge._adapter._get_pos_mj_mm()
+            current_euler = self._bridge._adapter._get_euler_deg()
+            current_sensor = self._bridge._adapter.get_sensor_data()
+
+            if current_sensor.get("on_object", False) and current_sensor.get("depth", 100) < 15:
+                # Agent is on surface — lift and observe here
+                rot_mat = Rot.from_euler("xyz", current_euler, degrees=True)
+                backward = -rot_mat.apply([0, 0, -1])
+                lifted_pos = current_pos + backward * 23.0
+
+                final_pos_mm = lifted_pos
+                final_euler = current_euler
+                observe = True
+
+                logger.info(
+                    "RLGoalPolicy: failed navigation, observing at "
+                    "current pos=[%.1f,%.1f,%.1f] (depth=%.1f)",
+                    *current_pos, current_sensor.get("depth", -1),
+                )
+            else:
+                # Agent is off surface — return to start, no observation
+                final_pos_mm = self._monty_start_pos_mm
+                final_euler = self._monty_start_euler
+                observe = False
+
+                logger.info(
+                    "RLGoalPolicy: failed navigation, off surface, "
+                    "returning to start",
+                )
 
         rot = Rot.from_euler("xyz", final_euler, degrees=True)
         q = rot.as_quat()
@@ -640,6 +818,6 @@ class RLGoalPolicy(MotorPolicy):
 
         return MotorPolicyResult(
             actions=actions,
-            motor_only_step=not success,
+            motor_only_step=not observe,
             status=PolicyStatus.READY,
         )

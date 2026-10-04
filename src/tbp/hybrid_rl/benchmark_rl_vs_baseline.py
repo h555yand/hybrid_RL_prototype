@@ -55,7 +55,7 @@ EXPERIMENT_OVERRIDES = [
     "experiment.config.show_sensor_output=false",
     "experiment.config.eval_env_interface_args.object_names=[master_chef_can, cracker_box]",
     "experiment.config.n_eval_epochs=3",
-    "experiment.config.max_eval_steps=50",
+    "experiment.config.max_eval_steps=100",
 ]
 
 # ═══ RL config (shared between rl_no_de and rl_de5) ═══

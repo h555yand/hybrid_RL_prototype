@@ -1,5 +1,204 @@
 # Summary
 
+# Hybrid RL Navigation for Monty Object Recognition
+
+## 1. Architecture: Monty–RL Integration
+
+### Overview
+
+The Thousand Brains Project's Monty system recognizes objects by accumulating **evidence** for hypotheses (object identity × pose) as a sensor agent explores object surfaces. The standard approach uses **teleportation** (JumpToGoal) to instantly move the agent to target points selected by the Goal State Generator (GSG). We replace teleportation with **realistic RL surface navigation**, preserving Monty's recognition pipeline while adding biologically plausible movement.
+
+### System Components
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    MONTY RECOGNITION LOOP                     │
+│                                                               │
+│  ┌──────────┐   ┌──────────┐   ┌────────────┐   ┌────────┐ │
+│  │ Evidence  │──▶│   GSG    │──▶│ RL Policy  │──▶│  SM    │ │
+│  │ GraphLM   │   │ Goal Gen │   │ Selector   │   │Sensors │ │
+│  │ (evidence │◀──│(discrim. │   │            │   │(patch) │──┘
+│  │  update)  │   │ points)  │   │            │   └────────┘
+│  └──────────┘   └──────────┘   └─────┬──────┘
+│       ▲                              │
+│       │                              ▼
+│       │                     ┌────────────────┐
+│       │                     │  RLGoalPolicy  │
+│       │                     │  ┌───────────┐ │
+│       │                     │  │RL Surface │ │
+│       │                     │  │Controller │ │
+│       │                     │  │(Q+SAC)    │ │
+│       │                     │  └───────────┘ │
+│       │                     │  ┌───────────┐ │
+│       │                     │  │ MuJoCo    │ │
+│       └─────────────────────│  │ Adapter   │ │
+│        intermediate obs     │  └───────────┘ │
+│                             └────────────────┘
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Component Roles
+
+| Component | Role | Key Mechanism |
+|-----------|------|---------------|
+| **EvidenceGraphLM** | Accumulates evidence for object×pose hypotheses | Displacement-based hypothesis shifting + feature comparison |
+| **GSG** | Selects maximally discriminating target points on object graph | Picks locations where competing hypotheses predict different features |
+| **RLPolicySelector** | Routes GSG goals to RL navigation, SM goals to LookAt, no goals to default crawl | Drop-in replacement for DistantPolicySelector |
+| **RLGoalPolicy** | Navigates agent along object surface to GSG target | Q-learning + SAC hybrid controller with adaptive arbitration |
+| **MuJoCoEnvAdapter** | Bridges RL controller with shared MuJoCo simulator | Ray-cast based surface snapping, sensor data extraction |
+
+### Data Flow: One Recognition Cycle
+
+```
+Step 0:  Full step — SM extracts features → LM updates evidence
+         → GSG generates goal G1 (maximally discriminating point)
+         → RLPolicySelector routes G1 to RLGoalPolicy
+         → RL snaps agent to surface, begins navigation
+
+Steps 1-N: motor_only — RL navigates along surface
+         → LM is NOT called (no matching_steps consumed)
+         → Adaptive observation triggers when informative
+
+Step K:  Intermediate observation (adaptive trigger)
+         → Agent lifted 23mm for sensor clearance
+         → SM extracts features → LM updates evidence
+         → Terminal condition checked (may recognize early!)
+         → Agent restored to surface position
+
+Step N:  Navigation complete → observation at goal/current position
+         → Full evidence update → GSG generates next goal
+         → Cycle repeats until recognition or timeout
+```
+
+---
+
+## 2. Directed Exploration: Intermediate Observations During Navigation
+
+### Problem
+
+Standard RL navigation treats the path to a GSG goal as dead time — the agent moves but Monty learns nothing until arrival. With teleportation this is instant, but with realistic navigation it can take 20-50 steps.
+
+### Solution: Adaptive Directed Exploration
+
+During RL navigation, the agent periodically sends observations to the Learning Module. Instead of blind fixed-interval transmission (every N steps), we use an **adaptive strategy** that maximizes information per observation:
+
+#### Adaptive Triggers
+
+```python
+def _should_observe(self) -> bool:
+    # Filter: skip low-quality observations
+    - Off object → skip
+    - Bad depth (>15mm) → skip  
+    - Agent stuck (moved <3mm) → skip
+
+    # Trigger: high-information events
+    - Surface normal changed >30° → observe (new face!)
+    - Principal curvature changed significantly → observe
+    
+    # Adaptive interval: more frequent near goal
+    - dist > 80mm → every 10 steps
+    - dist > 40mm → every 7 steps
+    - dist > 15mm → every 4 steps
+    - dist < 15mm → every 2 steps (near GSG target = high value)
+```
+
+#### Why This Works
+
+1. **Displacement is computed correctly**: LM tracks `buffer.last_location` which only updates on observation steps. Accumulated displacement over motor_only steps is applied as a single vector, correctly shifting all hypotheses.
+
+2. **Each observation is a full matching step**: LM doesn't distinguish intermediate from target observations — it runs the same evidence update pipeline (displace hypotheses → compare features → update evidence → threshold matches).
+
+3. **Early recognition is possible**: `check_terminal_conditions()` runs after every observation. If intermediate evidence is sufficient, the episode ends without reaching the GSG target.
+
+4. **Failed navigations still contribute**: When RL fails to reach a goal (collision/timeout), the agent observes at its current surface position instead of silently returning to start.
+
+### Results
+
+| Configuration | Accuracy | Matching Steps | Monty Steps | Goals Achieved |
+|--------------|----------|---------------|-------------|----------------|
+| Baseline (teleport) | 6/6 (100%) | 26.0 ± 4.2 | 101 ± 18 | 81% |
+| RL + fixed every-5 | 5/6 (83%) | 30.3 ± 10.2 | 165 ± 73 | 50% |
+| **RL + adaptive** | **6/6 (100%)** | **28.3 ± 5.8** | **192 ± 80** | **85%** |
+
+Key improvements from adaptive over fixed:
+- **Accuracy**: 83% → 100% (eliminated timeout on hard cases)
+- **Matching steps**: 30.3 → 28.3 (fewer wasted observations)
+- **Goals achieved**: 50% → 85% (fewer goals needed = fewer navigation failures)
+
+---
+
+## 3. Future Improvements
+
+### 3.1 Online Graph Learning During Navigation
+
+**Current limitation**: Object graphs are built in a separate pretraining phase. During evaluation, the LM only reads from graphs — it never updates them.
+
+**Proposed improvement**: Use intermediate observations during RL navigation to **enrich object graphs online**.
+
+```
+Episode 1: LM knows 5000 graph points for master_chef_can
+           Navigation adds 15 new surface observations
+           → Graph grows to 5015 points (denser coverage)
+
+Episode 5: Graph enriched from multiple navigation trajectories
+           → Better feature coverage from diverse viewpoints
+           → Fewer GSG goals needed for recognition
+           → matching_steps decrease over time
+```
+
+**Implementation approach**:
+- After each intermediate observation, if LM has high confidence (>threshold) about object identity, add the observation to the graph
+- Use displacement tracking to place new points in correct model-relative coordinates
+- Requires careful handling of the train/eval boundary — either a new "online learning" mode or selective graph updates during eval
+
+**Expected benefit**: Self-improving recognition — each episode makes future episodes faster.
+
+### 3.2 Model-Based RL Navigation Using Monty's Object Graphs
+
+**Current limitation**: The RL controller navigates "blindly" — it knows the goal position but has no model of the object's surface geometry. It discovers the surface through trial and error (ray casts, collisions, edge detection).
+
+**Proposed improvement**: Use Monty's learned object graphs as a **world model** for RL navigation planning.
+
+```
+Current RL (model-free):
+  Agent at point A, goal at point G
+  → Try actions, snap to surface, hope for the best
+  → Fails at edges, collisions, wrong-side goals
+
+Model-based RL with Monty graph:
+  Agent at point A, goal at point G
+  LM hypothesis: "this is master_chef_can, agent is at node 42"
+  → Graph contains surface topology: nodes, normals, connectivity
+  → Plan path through graph: node 42 → 43 → 44 → ... → goal region
+  → RL follows planned waypoints along known surface
+  → Edge transitions predicted from graph normals
+```
+
+**Implementation approach**:
+1. **Graph-based path planning**: Once LM has a confident hypothesis, extract the object graph and find shortest path from current estimated position to GSG goal
+2. **Waypoint navigation**: Convert graph path to sequence of intermediate waypoints for RL controller
+3. **Surface-aware actions**: Use graph normals at waypoints to predict edge transitions and adjust navigation strategy
+4. **Fallback**: If hypothesis is uncertain, fall back to current model-free navigation
+
+**Expected benefits**:
+- **Higher goal achievement rate**: Path planning avoids impossible routes (e.g., through object interior)
+- **Fewer collisions**: Edge transitions predicted from graph topology
+- **Faster navigation**: Direct paths instead of surface crawling
+- **Synergy with online learning**: Richer graphs → better planning → more observations → even richer graphs
+
+### 3.3 Adaptive Observation Budget
+
+**Current limitation**: Intermediate observations consume `matching_steps` budget equally with GSG target observations, despite being less informative on average.
+
+**Proposed improvement**: Differentiate between "exploration observations" (intermediate, lower weight) and "exploitation observations" (at GSG targets, full weight) in the matching_steps budget.
+
+### 3.4 GSG-Aware Navigation
+
+**Current limitation**: GSG may generate a new goal during intermediate observation, but RL ignores it until current navigation completes.
+
+**Proposed improvement**: Allow mid-navigation goal switching when GSG generates a significantly better target (e.g., closer, higher discrimination value). This requires the GSG to communicate goal quality scores and the RL controller to support dynamic re-targeting.
+
+
 ## Phase 1: Monty Integration — RL Navigation Replaces Teleportation
 
 ### Architecture
