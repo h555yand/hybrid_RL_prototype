@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 # ═══ Paths ═══
 MONTY_CONF = os.path.join(os.path.dirname(tbp.monty.__file__), "conf")
 PRETRAINED = os.path.expanduser(
-    "~/tbp/results/monty/projects/surf_agent_1lm_2obj_train_mujoco/pretrained"
+    "~/tbp/results/monty/projects/surf_agent_1lm_2obj_train_mujoco_rl/pretrained"
 )
 Q_STORE = os.path.expanduser(
     "~/Downloads/github/hybrid_RL_prototype/results/adapt-baseline"
@@ -53,7 +53,7 @@ EXPERIMENT_OVERRIDES = [
     "experiment=tutorial/surf_agent_2obj_eval_mujoco",
     f"experiment.config.model_name_or_path={PRETRAINED}",
     "experiment.config.show_sensor_output=false",
-    "experiment.config.eval_env_interface_args.object_names=[mug, banana]",
+    "experiment.config.eval_env_interface_args.object_names=[master_chef_can, cracker_box]",
     "experiment.config.n_eval_epochs=3",
     "experiment.config.max_eval_steps=50",
 ]
@@ -180,9 +180,27 @@ def run_experiment(mode_name):
     experiment = instantiate_experiment(config.experiment)
     experiment.__enter__()
 
+    # ═══ DEBUG ═══
+    try:
+        iface = experiment.env_interface
+        print(f"DEBUG env_interface type: {type(iface)}")
+        print(f"DEBUG object_names: {iface._object_names}")
+    except AttributeError:
+        for attr in dir(iface):
+            if 'object' in attr.lower():
+                print(f"  {attr} = {getattr(iface, attr)}")
+
+    lm = experiment.model.learning_modules[0]
+    print(f"DEBUG LM memory: {lm.get_all_known_object_ids()}")
+
     adapter = None
     try:
         if mode_name != "baseline":
+            # ═══ Clean old RL logs ═══
+            rl_log_src = Path(Q_STORE).parent / "monty_integration_logs"
+            if rl_log_src.exists():
+                shutil.rmtree(rl_log_src)
+                logger.info("Cleaned old RL logs: %s", rl_log_src)
             adapter = setup_rl_motor_system(
                 experiment, mode["observe_every_n_steps"],
             )

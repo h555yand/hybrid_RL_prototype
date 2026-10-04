@@ -162,7 +162,14 @@ python eval_rl_e2e.py
 Prerequisites:
 1. Pretrained Monty model (banana + mug graphs):
    ```
+   src/tbp/tbp.monty/src/tbp/monty/conf/experiment/tutorial/surf_agent_2obj_train_mujoco.yaml
+
+./src/tbp/tbp.monty/src/tbp/monty/conf/env_interface/tutorial_train_2obj_predefined.yaml
    python src/tbp/tbp.monty/run.py experiment=tutorial/surf_agent_2obj_train_mujoco
+
+   src/tbp/tbp.monty/src/tbp/monty/conf/experiment/tutorial/surf_agent_2obj_eval_mujoco.yaml
+   src/tbp/tbp.monty/src/tbp/monty/conf/env_interface/tutorial_eval_2obj_predefined_r3.yaml
+
    ```
 2. Pretrained RL model (Q-store + SAC from trimesh training)
 3. YCB banana mesh converted to mm STL
