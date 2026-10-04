@@ -129,74 +129,273 @@ Key improvements from adaptive over fixed:
 
 ## 3. Future Improvements
 
-### 3.1 Online Graph Learning During Navigation
+### 3.1 RL-Driven Training: Goal-Directed Object Exploration
 
-**Current limitation**: Object graphs are built in a separate pretraining phase. During evaluation, the LM only reads from graphs — it never updates them.
+#### Problem: Current Training is Inefficient
 
-**Proposed improvement**: Use intermediate observations during RL navigation to **enrich object graphs online**.
-
-```
-Episode 1: LM knows 5000 graph points for master_chef_can
-           Navigation adds 15 new surface observations
-           → Graph grows to 5015 points (denser coverage)
-
-Episode 5: Graph enriched from multiple navigation trajectories
-           → Better feature coverage from diverse viewpoints
-           → Fewer GSG goals needed for recognition
-           → matching_steps decrease over time
-```
-
-**Implementation approach**:
-- After each intermediate observation, if LM has high confidence (>threshold) about object identity, add the observation to the graph
-- Use displacement tracking to place new points in correct model-relative coordinates
-- Requires careful handling of the train/eval boundary — either a new "online learning" mode or selective graph updates during eval
-
-**Expected benefit**: Self-improving recognition — each episode makes future episodes faster.
-
-### 3.2 Model-Based RL Navigation Using Monty's Object Graphs
-
-**Current limitation**: The RL controller navigates "blindly" — it knows the goal position but has no model of the object's surface geometry. It discovers the surface through trial and error (ray casts, collisions, edge detection).
-
-**Proposed improvement**: Use Monty's learned object graphs as a **world model** for RL navigation planning.
+Monty's current pretraining uses **random surface crawling** to build object graphs:
 
 ```
-Current RL (model-free):
-  Agent at point A, goal at point G
+Current approach:
+  14 rotations × 1000 steps = 14,000 steps per object
+  SurfacePolicyCurvatureInformed with use_goal_driven_actions=false
+  → Random walk with curvature bias
+  → Uneven coverage: dense near start, sparse elsewhere
+  → No awareness of what's already been explored
+```
+
+This is biologically implausible — humans explore objects with **purpose**, not random wandering. Each touch and rotation is driven by a question: "What's on the other side?", "Is there a handle?", "How does the top feel?"
+
+#### Solution: Coverage-Driven Exploration with RL Navigation
+
+Replace random crawling with **goal-directed exploration** using the same RL navigation system developed for eval. A new `CoverageGoalGenerator` analyzes the growing graph and directs the agent to unexplored areas.
+
+```
+Proposed approach:
+  2-3 rotations × 80-120 steps = 200-360 steps per object
+  CoverageGoalGenerator → RLGoalPolicy (same as eval)
+  → Targeted navigation to coverage frontiers
+  → Uniform coverage with 10x fewer steps
+  → RL learns object-specific navigation during training
+```
+
+#### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│              RL-DRIVEN TRAINING LOOP                         │
+│                                                              │
+│  ┌──────────┐   ┌──────────────┐   ┌────────────────────┐  │
+│  │ GraphLM  │──▶│  Coverage    │──▶│   RLGoalPolicy     │  │
+│  │ (builds  │   │  Goal Gen    │   │   (navigates to    │  │
+│  │  graph   │   │  (finds      │   │    frontier)       │  │
+│  │  online) │◀──│   gaps)      │   │                    │  │
+│  └──────────┘   └──────────────┘   └────────────────────┘  │
+│       │                                     │               │
+│       │         Graph grows                 │               │
+│       │         with each                   │               │
+│       │         observation                 ▼               │
+│       │                            Intermediate obs         │
+│       └────────────────────────────via adaptive DE──────────┘
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### Three-Level Goal Generation
+
+The `CoverageGoalGenerator` adapts its strategy based on how much of the object has been explored:
+
+**Level 1 — Direction-based (graph < 10 points)**
+
+No graph exists yet. Goals are expressed as directions, not coordinates.
+
+```python
+# Agent is on surface but knows almost nothing about the object.
+# Strategy: move along surface in a consistent direction to build
+# an initial cluster of observations.
+
+goal = agent_pos + tangent_direction * 30.0  # 30mm along surface
+# Stop condition: normal change > 30° (found an edge/new face)
+```
+
+**Level 2 — Frontier-based (graph 10-200 points)**
+
+Graph has partial coverage. Goals target the **boundary of explored area**.
+
+```python
+# Find the edge of what we've explored and push beyond it.
+# Like a cartographer mapping coastline — always moving to where
+# the map ends.
+
+graph_center = mean(graph_points)
+distances = norm(graph_points - graph_center)
+frontier_point = graph_points[argmax(distances)]
+
+# Goal: 30mm beyond the frontier, along the surface
+direction = normalize(frontier_point - graph_center)
+goal = frontier_point + project_to_surface(direction) * 30.0
+```
+
+**Level 3 — Gap-based (graph > 200 points)**
+
+Graph has substantial coverage. Goals target the **largest uncovered regions**.
+
+```python
+# Voxelize the explored space. Find empty voxels adjacent to
+# filled ones. The largest cluster of empty voxels = biggest gap
+# in our knowledge.
+
+voxel_grid = voxelize(graph_points, voxel_size=5.0)  # 5mm voxels
+frontier_voxels = find_empty_neighbors(voxel_grid)
+largest_gap = largest_connected_component(frontier_voxels)
+goal = center_of(largest_gap)
+```
+
+#### Example: Learning master_chef_can (cylinder)
+
+```
+Step 0:    Agent on side wall. Graph empty.
+           Level 1: "Move 30mm along surface"
+           RL crawls, collects 15 points.
+
+Step 15:   Graph: 15 points on one patch of wall.
+           Level 2: frontier = edge of cluster
+           "Go to edge of explored area + 30mm beyond"
+           RL navigates, collects 15 more points.
+
+Step 30:   Graph: 30 points, strip of wall covered.
+           Level 2: "Opposite edge — go the other way"
+           RL navigates in reverse direction.
+
+Step 60:   Graph: 80 points, half the wall covered.
+           Level 2: frontier = top edge → "Go to the lid"
+           RL traverses rim edge → collects lid points.
+
+Step 80:   Graph: 120 points, wall + lid.
+           Level 3: voxel analysis finds gap on opposite wall
+           Goal = center of largest uncovered region.
+           RL navigates around cylinder.
+
+Step 120:  Graph: 200 points, uniform coverage.
+           CoverageAnalyzer: coverage ≈ 75%
+           → Episode complete.
+
+Total: 120 steps (vs 1000 with random crawl)
+Coverage: uniform (vs clustered with random crawl)
+Bonus: RL learned to traverse this cylinder's rim
+```
+
+#### Key Design Principle: RLGoalPolicy Doesn't Change
+
+The same `RLGoalPolicy` used for eval handles training navigation. It receives `Goal(location=[x,y,z])` and navigates there — it doesn't know or care whether the goal came from GSG (eval) or CoverageGoalGenerator (training).
+
+```
+Eval:     GSG → Goal([x,y,z]) → RLGoalPolicy → navigate
+Training: CoverageGoalGen → Goal([x,y,z]) → RLGoalPolicy → navigate
+                                    ↑
+                              Same interface,
+                              same RL controller
+```
+
+#### Benefits
+
+| Aspect | Current Training | RL-Driven Training |
+|--------|-----------------|-------------------|
+| Steps per object | 14,000 (14 rot × 1000) | ~300 (3 rot × 100) |
+| Coverage quality | Uneven, clustered near start | Uniform, frontier-driven |
+| Adaptivity | None — fixed 1000 steps | Stops when coverage sufficient |
+| Navigation learning | None — random crawl | RL improves with each object |
+| Rotations needed | 14 (fixed) | 2-3 (adaptive) |
+| Biological plausibility | Low — random walk | High — goal-directed exploration |
+
+#### Synergy: Training Improves Eval
+
+```
+Training with RL:
+  → RL learns surface navigation on diverse objects
+  → Graphs built with uniform coverage
+  → RL discovers edge-traversal strategies per object type
+
+Eval with RL:
+  → Same RL controller, already experienced with similar surfaces
+  → Denser graphs → better feature matching → fewer GSG goals needed
+  → Edge traversal learned during training → fewer collisions
+  → Potential: object-specific navigation policies
+```
+
+### 3.2 Model-Based Navigation Using Monty's Object Graphs
+
+#### Current Limitation
+
+The RL controller navigates **model-free** — it knows the goal position but has no model of the object's surface geometry. It discovers the surface through trial and error (ray casts, collisions, edge detection).
+
+#### Proposed Improvement
+
+Once the LM has a confident hypothesis about object identity, use the learned object graph as a **world model** for navigation planning.
+
+```
+Model-free (current):
+  Agent at A, goal at G
   → Try actions, snap to surface, hope for the best
   → Fails at edges, collisions, wrong-side goals
 
-Model-based RL with Monty graph:
-  Agent at point A, goal at point G
-  LM hypothesis: "this is master_chef_can, agent is at node 42"
-  → Graph contains surface topology: nodes, normals, connectivity
-  → Plan path through graph: node 42 → 43 → 44 → ... → goal region
-  → RL follows planned waypoints along known surface
+Model-based (proposed):
+  Agent at A, goal at G
+  LM: "This is master_chef_can, agent is near node 42"
+  → Graph has surface topology: nodes, normals, connectivity
+  → Plan path: node 42 → 43 → 44 → ... → goal region
+  → RL follows waypoints along known surface
   → Edge transitions predicted from graph normals
 ```
 
-**Implementation approach**:
-1. **Graph-based path planning**: Once LM has a confident hypothesis, extract the object graph and find shortest path from current estimated position to GSG goal
-2. **Waypoint navigation**: Convert graph path to sequence of intermediate waypoints for RL controller
-3. **Surface-aware actions**: Use graph normals at waypoints to predict edge transitions and adjust navigation strategy
-4. **Fallback**: If hypothesis is uncertain, fall back to current model-free navigation
+#### Implementation Approach
 
-**Expected benefits**:
-- **Higher goal achievement rate**: Path planning avoids impossible routes (e.g., through object interior)
-- **Fewer collisions**: Edge transitions predicted from graph topology
-- **Faster navigation**: Direct paths instead of surface crawling
-- **Synergy with online learning**: Richer graphs → better planning → more observations → even richer graphs
+1. **Graph-based path planning**: Extract object graph, find shortest surface path from estimated position to GSG goal using graph connectivity
+2. **Waypoint navigation**: Convert graph path to intermediate waypoints for RL controller
+3. **Surface-aware actions**: Use stored normals at waypoints to predict and prepare for edge transitions
+4. **Confidence-gated**: Only use graph planning when LM confidence exceeds threshold; fall back to model-free navigation otherwise
 
-### 3.3 Adaptive Observation Budget
+#### Expected Benefits
 
-**Current limitation**: Intermediate observations consume `matching_steps` budget equally with GSG target observations, despite being less informative on average.
+- Higher goal achievement rate (avoids impossible routes)
+- Fewer collisions (edge transitions predicted from topology)
+- Faster navigation (direct paths vs surface crawling)
+- Self-reinforcing: richer graphs → better planning → more observations → richer graphs
 
-**Proposed improvement**: Differentiate between "exploration observations" (intermediate, lower weight) and "exploitation observations" (at GSG targets, full weight) in the matching_steps budget.
+### 3.3 Online Graph Enrichment During Eval
 
-### 3.4 GSG-Aware Navigation
+#### Current Limitation
 
-**Current limitation**: GSG may generate a new goal during intermediate observation, but RL ignores it until current navigation completes.
+Object graphs are frozen after pretraining. During eval, the LM reads from graphs but never updates them, even when it receives high-quality observations at novel viewpoints.
 
-**Proposed improvement**: Allow mid-navigation goal switching when GSG generates a significantly better target (e.g., closer, higher discrimination value). This requires the GSG to communicate goal quality scores and the RL controller to support dynamic re-targeting.
+#### Proposed Improvement
+
+When the LM has high confidence about object identity, add intermediate observations to the graph in real-time.
+
+```
+Episode 1: Graph has 5000 points. Navigation adds 15 new observations.
+           → Graph grows to 5015 points (denser coverage)
+
+Episode 5: Graph enriched from multiple trajectories.
+           → Better coverage from diverse viewpoints
+           → Fewer GSG goals needed for recognition
+           → matching_steps decrease over episodes
+```
+
+This creates a **self-improving system**: each recognition episode makes future recognition faster and more accurate.
+
+### 3.4 Adaptive Observation Budget
+
+#### Current Limitation
+
+Intermediate observations consume `matching_steps` budget equally with GSG target observations, despite being less informative on average.
+
+#### Proposed Improvement
+
+Differentiate between "exploration observations" (intermediate, during navigation) and "exploitation observations" (at GSG targets). Options:
+
+- Don't count intermediate observations against matching_steps budget
+- Weight intermediate observations at 0.5× in the budget
+- Dynamically adjust max_eval_steps based on navigation distance
+
+### 3.5 GSG-Aware Navigation
+
+#### Current Limitation
+
+GSG may generate a new, better goal during an intermediate observation, but RL ignores it until current navigation completes.
+
+#### Proposed Improvement
+
+Allow mid-navigation goal switching when:
+- New GSG goal is significantly closer than current goal
+- New goal has higher discrimination value
+- Current navigation is struggling (low progress, near timeout)
+
+This requires GSG to communicate goal quality scores and the RL controller to support dynamic re-targeting.
+
+
+
+
+
 
 
 ## Phase 1: Monty Integration — RL Navigation Replaces Teleportation
