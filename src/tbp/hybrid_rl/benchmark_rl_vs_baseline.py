@@ -55,7 +55,7 @@ EXPERIMENT_OVERRIDES = [
     "experiment.config.show_sensor_output=false",
     "experiment.config.eval_env_interface_args.object_names=[master_chef_can, cracker_box]",
     "experiment.config.n_eval_epochs=3",
-    "experiment.config.max_eval_steps=100",
+    "experiment.config.max_eval_steps=50",
 ]
 
 # ═══ RL config (shared between rl_no_de and rl_de5) ═══
@@ -99,7 +99,7 @@ RL_CONFIG_BASE = {
 }
 
 MODES = {
-    "baseline": {"description": "Standard Monty with JumpToGoal"},
+    #"baseline": {"description": "Standard Monty with JumpToGoal"},
     #"rl_no_de": {"description": "RL Navigation, no directed exploration",
     #             "observe_every_n_steps": 0},
     "rl_de5":   {"description": "RL Navigation + directed exploration every 5 steps",

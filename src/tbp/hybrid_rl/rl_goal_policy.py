@@ -183,6 +183,8 @@ class RLGoalPolicy(MotorPolicy):
         self._last_observe_normal = None
         self._last_observe_k1 = None
         self._stuck_counter = 0
+        # ═══ NEW: Ensure GSG is re-enabled on reset ═══
+        self._set_gsg_navigation_active(False)
 
     def state_dict(self):
         return {"nav_active": self._nav_active, "nav_steps": self._nav_steps}
@@ -244,6 +246,9 @@ class RLGoalPolicy(MotorPolicy):
 
         self._bridge.set_goal(goal)
 
+        # ═══ NEW: Suppress GSG goal generation during RL navigation ═══
+        self._set_gsg_navigation_active(True)
+
         # ═══ 1) Save original Monty goal and start position ═══
         goal_pose_mm = self._bridge.goal_to_pose_mm(goal)
         self._monty_goal_pose_mm = goal_pose_mm.copy()
@@ -253,18 +258,20 @@ class RLGoalPolicy(MotorPolicy):
         self._monty_start_euler = self._bridge._adapter._get_euler_deg().copy()
 
         # Update adapter center for shared sim
-        # ═══ Discover object geometry via ray cast (no hardcoded values) ═══
+        # ═══ CHANGED: Always re-discover object geometry ═══
+        # Objects change between episodes (master_chef_can → cracker_box),
+        # but adapter keeps center/extents from previous object.
+        # Old logic skipped discover if goal was near old center,
+        # causing wrong center for new object.
+        #
+        # Fix: always discover, using midpoint between agent and goal
+        # as hint (closer to true center than goal on object edge).
         if not self._bridge._adapter._owns_sim:
-            goal_hint = goal_pose_mm[:3].copy()
+            agent_pos_mm = self._bridge._adapter._get_pos_mj_mm()
+            goal_hint = (goal_pose_mm[:3] + agent_pos_mm) / 2.0
 
-            # Skip re-discovery if goal is near already-discovered object
-            current_center = self._bridge._adapter._mj_center_mm
-            max_extent = float(max(self._bridge._adapter._mj_extents_mm))
-            dist_to_center = float(np.linalg.norm(goal_hint - current_center))
+            self._bridge._adapter.discover_object(hint_pos_mm=goal_hint)
 
-            if dist_to_center > max_extent * 2.0 or max_extent < 2.0:
-                self._bridge._adapter.discover_object(hint_pos_mm=goal_hint)
-                           
             logger.info(
                 "  object props: center=%s extents=%s",
                 self._bridge._adapter._mj_center_mm.round(1).tolist(),
@@ -286,14 +293,39 @@ class RLGoalPolicy(MotorPolicy):
             start_sensor.get("depth", -1),
             start_sensor.get("on_object", False),
         )
-        # Debug same_side
-        test_sd = self._bridge._adapter.get_sensor_data()
-        logger.info(
-            "  same_side debug: ss=%s, agent=[%.1f,%.1f,%.1f], goal=[%.1f,%.1f,%.1f]",
-            test_sd.get("same_side"),
-            *self._bridge._adapter._get_pos_mj_mm(),
-            *goal_pose_mm[:3],
-        )
+        
+        # ═══ NEW: Validate snap — agent must be on surface ═══
+        if not start_sensor.get("on_object", False):
+            logger.info(
+                "  snap validation FAILED: depth=%.1f, on_object=%s. "
+                "Re-snapping toward object center.",
+                start_sensor.get("depth", -1),
+                start_sensor.get("on_object", False),
+            )
+
+            center = self._bridge._adapter._mj_center_mm
+            pos = self._bridge._adapter._get_pos_mj_mm()
+            to_center = center - pos
+            to_center_len = float(np.linalg.norm(to_center))
+
+            if to_center_len > 1e-8:
+                to_center_dir = to_center / to_center_len
+                euler = self._bridge._adapter._look_at_direction(to_center_dir)
+                self._bridge._adapter._set_pose_mj_mm(pos, euler)
+
+                self._bridge._adapter._snap_max_dist = 50.0
+                snap_ok = self._bridge._adapter._snap_to_surface()
+                self._bridge._adapter._snap_max_dist = original_snap
+
+                start_pos_mm = self._bridge._adapter._get_pos_mj_mm()
+                start_sensor = self._bridge._adapter.get_sensor_data()
+
+                logger.info(
+                    "  re-snap result: ok=%s depth=%.1f on_object=%s",
+                    snap_ok,
+                    start_sensor.get("depth", -1),
+                    start_sensor.get("on_object", False),
+                )
 
         # ═══ 3) Snap goal to surface ═══
         goal_pos = goal_pose_mm[:3].copy()
@@ -494,8 +526,6 @@ class RLGoalPolicy(MotorPolicy):
         - Trigger: curvature change (different surface region)
         - Adaptive interval: more frequent near goal
         """
-        logger.info("_should_observe called: nav_steps=%d, goal=%s",
-                     self._nav_steps, self._rl_goal_pose_mm is not None)
         
         if self._rl_goal_pose_mm is None:
             return False
@@ -809,6 +839,9 @@ class RLGoalPolicy(MotorPolicy):
                 rotation_quat=qt.one,
             ),
         ]
+        
+        # ═══ NEW: Re-enable GSG goal generation ═══
+        self._set_gsg_navigation_active(False)
 
         self._nav_active = False
         self._current_goal = None
@@ -821,3 +854,28 @@ class RLGoalPolicy(MotorPolicy):
             motor_only_step=not observe,
             status=PolicyStatus.READY,
         )
+
+    def _set_gsg_navigation_active(self, active: bool) -> None:
+        """Set GSG navigation_active flag to suppress/enable goal generation.
+
+        During RL navigation, GSG should not generate new hypothesis-testing
+        goals because:
+        1. They would be ignored by RLPolicySelector (navigation in progress)
+        2. They would be logged as "attempted" with incorrect achieved status
+        3. Evidence updates from directed exploration still happen normally
+
+        Args:
+            active: True to suppress GSG goals, False to re-enable.
+        """
+        if self._experiment_ref is None:
+            return
+        try:
+            for lm in self._experiment_ref.model.learning_modules:
+                if hasattr(lm, 'gsg') and lm.gsg is not None:
+                    lm.gsg.navigation_active = active
+                    logger.debug(
+                        "GSG navigation_active=%s for LM %s",
+                        active, lm.learning_module_id,
+                    )
+        except (AttributeError, TypeError) as e:
+            logger.debug("Could not set GSG navigation_active: %s", e)

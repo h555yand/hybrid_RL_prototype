@@ -1,5 +1,3 @@
-# Summary
-
 # Hybrid RL Navigation for Monty Object Recognition
 
 ## 1. Architecture: Monty–RL Integration
@@ -54,6 +52,7 @@ Step 0:  Full step — SM extracts features → LM updates evidence
          → GSG generates goal G1 (maximally discriminating point)
          → RLPolicySelector routes G1 to RLGoalPolicy
          → RL snaps agent to surface, begins navigation
+         → GSG suppressed (navigation_active=True)
 
 Steps 1-N: motor_only — RL navigates along surface
          → LM is NOT called (no matching_steps consumed)
@@ -62,21 +61,49 @@ Steps 1-N: motor_only — RL navigates along surface
 Step K:  Intermediate observation (adaptive trigger)
          → Agent lifted 23mm for sensor clearance
          → SM extracts features → LM updates evidence
+         → GSG.step() runs but cannot generate new goals (suppressed)
          → Terminal condition checked (may recognize early!)
          → Agent restored to surface position
 
 Step N:  Navigation complete → observation at goal/current position
+         → GSG re-enabled (navigation_active=False)
          → Full evidence update → GSG generates next goal
          → Cycle repeats until recognition or timeout
 ```
 
 ---
 
-## 2. Directed Exploration: Intermediate Observations During Navigation
+## 2. GSG–RL Coordination: Suppressing Phantom Goals
 
 ### Problem
 
-Standard RL navigation treats the path to a GSG goal as dead time — the agent moves but Monty learns nothing until arrival. With teleportation this is instant, but with realistic navigation it can take 20-50 steps.
+During RL navigation, the GSG runs on every intermediate observation (matching step) and may generate new hypothesis-testing goals. These goals are ignored by the motor system (RL navigation is in progress), but the GSG still logs them as "attempted" and marks them as "not achieved" — creating phantom failures in the metrics.
+
+### Solution: `navigation_active` Flag
+
+When RL navigation starts, the GSG's `navigation_active` flag is set to `True`, preventing `_check_conditions_for_hypothesis_test()` from generating new goals. Evidence updates from directed exploration continue normally — only goal *generation* is suppressed.
+
+```python
+# EvidenceGoalGenerator._check_conditions_for_hypothesis_test()
+if self.navigation_active:
+    return False  # Don't generate goals during RL navigation
+
+# RLGoalPolicy._start_navigation()
+lm.gsg.navigation_active = True
+
+# RLGoalPolicy._finish_navigation()
+lm.gsg.navigation_active = False
+```
+
+**Impact**: Eliminated phantom goals (27 → 16 total goals), fixed false "not achieved" entries, and resolved a timeout failure caused by wasted matching steps on phantom goals.
+
+---
+
+## 3. Directed Exploration: Intermediate Observations During Navigation
+
+### Problem
+
+Standard RL navigation treats the path to a GSG goal as dead time — the agent moves but Monty learns nothing until arrival. With teleportation this is instant, but with realistic navigation it can take 20-80 steps.
 
 ### Solution: Adaptive Directed Exploration
 
@@ -112,20 +139,47 @@ def _should_observe(self) -> bool:
 
 4. **Failed navigations still contribute**: When RL fails to reach a goal (collision/timeout), the agent observes at its current surface position instead of silently returning to start.
 
-### Results
-
-| Configuration | Accuracy | Matching Steps | Monty Steps | Goals Achieved |
-|--------------|----------|---------------|-------------|----------------|
-| Baseline (teleport) | 6/6 (100%) | 26.0 ± 4.2 | 101 ± 18 | 81% |
-| RL + fixed every-5 | 5/6 (83%) | 30.3 ± 10.2 | 165 ± 73 | 50% |
-| **RL + adaptive** | **6/6 (100%)** | **28.3 ± 5.8** | **192 ± 80** | **85%** |
-
-Key improvements from adaptive over fixed:
-- **Accuracy**: 83% → 100% (eliminated timeout on hard cases)
-- **Matching steps**: 30.3 → 28.3 (fewer wasted observations)
-- **Goals achieved**: 50% → 85% (fewer goals needed = fewer navigation failures)
+5. **GSG coordination**: During navigation, GSG goal generation is suppressed via `navigation_active` flag, preventing phantom goals while allowing evidence updates from intermediate observations.
 
 ---
+
+## 4. Results
+
+### Benchmark: 2 objects × 3 rotations × 3 epochs = 6 episodes
+
+| Configuration | Accuracy | Matching Steps | Monty Steps | Goals | Evidence |
+|--------------|----------|---------------|-------------|-------|----------|
+| Baseline (teleport) | 6/6 (100%) | 26.0 ± 4.3 | 101 ± 18 | 3.5/ep | 23.7 ± 4.2 |
+| **RL + adaptive DE** | **6/6 (100%)** | **31.7 ± 4.3** | **198 ± 50** | **2.7/ep** | **26.6 ± 7.3** |
+
+### Per-Episode Comparison
+
+| # | Object | Rotation | Mode | Steps (match/total) | Goals | Evidence |
+|---|--------|----------|------|-------------------|-------|----------|
+| 1 | master_chef_can | [0,15,30] | base | 26 / 103 | 3 | 28.2 |
+| 1 | master_chef_can | [0,15,30] | **RL** | 31 / 190 | 3 | **33.2** |
+| 2 | cracker_box | [0,15,30] | base | 26 / 102 | 4 | 20.0 |
+| 2 | cracker_box | [0,15,30] | **RL** | 33 / 221 | **3** | 13.6 |
+| 3 | master_chef_can | [7,77,2] | base | 29 / 113 | 3 | 30.8 |
+| 3 | master_chef_can | [7,77,2] | **RL** | 36 / 172 | **2** | **34.9** |
+| 4 | cracker_box | [7,77,2] | base | 21 / 82 | 3 | 22.0 |
+| 4 | cracker_box | [7,77,2] | **RL** | 24 / 131 | **2** | 23.0 |
+| 5 | master_chef_can | [81,33,90] | base | 21 / 76 | 3 | 21.0 |
+| 5 | master_chef_can | [81,33,90] | **RL** | 31 / 188 | 3 | **30.3** |
+| 6 | cracker_box | [81,33,90] | base | 33 / 130 | 5 | 21.4 |
+| 6 | cracker_box | [81,33,90] | **RL** | 35 / 286 | **3** | **24.9** |
+
+### Key Findings
+
+1. **Accuracy parity**: RL+DE matches baseline teleportation at 100% accuracy on all test cases.
+
+2. **Higher evidence accumulation**: RL+DE accumulates 12% more evidence on average (26.6 vs 23.7) thanks to intermediate observations during navigation — the agent learns while moving.
+
+3. **Fewer GSG goals needed**: RL+DE requires 23% fewer hypothesis-testing goals per episode (2.7 vs 3.5) because directed exploration observations provide additional evidence that accelerates convergence.
+
+4. **Navigation cost**: RL+DE uses ~2× more total steps (198 vs 101) — the expected cost of replacing instant teleportation with realistic surface navigation. This is the price of biological plausibility.
+
+5. **Matching steps comparable**: Only +5.7 additional matching steps (31.7 vs 26.0), and these are productive — they come from directed exploration observations that contribute to evidence accumulation.
 
 ## 3. Future Improvements
 
@@ -396,410 +450,7 @@ This requires GSG to communicate goal quality scores and the RL controller to su
 
 
 
-
-
-## Phase 1: Monty Integration — RL Navigation Replaces Teleportation
-
-### Architecture
-
-The integration replaces Monty's `JumpToGoalState` teleportation with incremental RL navigation. When Monty's hypothesis-testing system (GSG) generates a goal state for disambiguation, instead of teleporting the sensor to the target pose, the RL agent physically navigates there step-by-step using learned policies.
-
-#### System Overview
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  Monty Experiment Loop                                          │
-│                                                                  │
-│  for each object × rotation:                                     │
-│    SurfacePolicy crawls → LM accumulates evidence               │
-│    GSG generates hypothesis-testing goal                         │
-│         │                                                        │
-│         ▼                                                        │
-│    ┌─────────────────────────────────────────────────────┐       │
-│    │  RLPolicySelector                                    │       │
-│    │  Routes goals by sender_type:                        │       │
-│    │    GSG goal → RLGoalPolicy (RL navigation)           │       │
-│    │    No goal  → SurfacePolicy (standard crawl)         │       │
-│    └─────────────────────────────────────────────────────┘       │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-#### RL Navigation Pipeline
-
-When a GSG goal is received, `RLGoalPolicy` executes a multi-step navigation episode within a single Monty matching step:
-
-```
-RLGoalPolicy receives GSG Goal
-│
-├── 1. LAND: Snap agent to surface (2mm)
-│     Monty agent is 25mm from surface → snap via _snap_to_surface()
-│     with temporarily increased snap threshold (35mm)
-│
-├── 2. LAND GOAL: Snap goal to surface (2mm)
-│     GSG goal is 30mm from surface → temporarily move agent to goal
-│     position, snap via _snap_to_surface(), record surface position
-│
-├── 3. NAVIGATE: RL crawls along surface (N steps)
-│     Each step:
-│       → Adapter provides pose + sensor data (ray cast depth override)
-│       → Controller computes 22D state vector
-│       → Arbitrator selects action (Q-store / SAC / heuristic)
-│       → Adapter executes action (tangential move + snap)
-│       → Q-store learns from transition
-│       → Returns IN_PROGRESS to Monty (motor_only_step=True)
-│
-├── 4a. SUCCESS: Goal reached (distance < 4mm)
-│     → SetAgentPose to original Monty goal position (30mm from surface)
-│     → LM processes observation at goal (motor_only_step=False)
-│
-└── 4b. FAILURE: Timeout or collision
-      → SetAgentPose to pre-navigation position (25mm from surface)
-      → LM does not process (motor_only_step=True)
-```
-
-#### Shared Simulator Architecture
-
-The RL adapter and Monty share a single MuJoCo simulator instance. This eliminates coordinate system mismatches and ensures both systems see the same physical state.
-
-```
-┌──────────────────────────────────────────────┐
-│  MuJoCoSimulator (single instance)            │
-│  Created by Monty experiment                  │
-│  Shared via experiment.env                    │
-│                                               │
-│  ┌─────────────┐    ┌──────────────────────┐ │
-│  │ Monty        │    │ MuJoCoEnvAdapter     │ │
-│  │ SurfaceAgent │◄──►│ (external_sim mode)  │ │
-│  │ agent_id_0   │    │ Same agent, same sim │ │
-│  └─────────────┘    └──────────────────────┘ │
-│         │                      │              │
-│    env_interface          adapter provides:   │
-│    .step(actions)         .get_sensor_data()  │
-│    .observations          .step_continuous()  │
-│    .states                ._snap_to_surface() │
-│                           ._mj_ray_cast()     │
-└──────────────────────────────────────────────┘
-```
-
-#### Key Classes
-
-| Class | Role |
-|-------|------|
-| `RLPolicySelector` | Routes GSG goals to RL, other steps to SurfacePolicy. Implements `MotorPolicySelector` protocol. Tracks navigation state (IN_PROGRESS / READY). |
-| `RLGoalPolicy` | Implements `MotorPolicy` protocol. Manages navigation lifecycle: snap to surface, navigate, return to Monty position. Handles logging and visualization. |
-| `MontyRLBridge` | Converts between Monty (meters, quaternions, Goal/Message objects) and RL (mm, euler degrees, numpy arrays). Delegates geometric queries to adapter. |
-| `MuJoCoEnvAdapter` | Provides RL environment interface on shared simulator. Ray cast depth override for close-range sensing. Surface snapping via multi-probe ray cast. |
-| `AdaptiveTrainingManager` | Manages online Q-learning and SAC updates. Monitors performance via Arbitrator track records. |
-| `Arbitrator` | Per-step action source selection: Q-store confidence × track record scoring. Selects between Q-store, SAC, and heuristic fallback. |
-| `RLGoalApproachController` | Core RL controller. Computes 22D state vector, manages Q-stores (tactical + strategic), phase system, reward computation. |
-
-#### Data Flow
-
-```
-Monty → RL:
-  Goal.location (meters)           → MontyRLBridge.goal_to_pose_mm() → [x,y,z,rx,ry,rz] (mm)
-  Goal.pose_vectors[0]             → yaw/pitch euler angles
-  MotorSystemState.position        → agent position (meters → mm)
-
-RL Internal:
-  MuJoCoEnvAdapter.get_sensor_data() → depth (ray cast), normal, curvatures, on_object
-  MuJoCoEnvAdapter.step_continuous() → execute action in shared MuJoCo
-  MuJoCoEnvAdapter._snap_to_surface() → multi-probe ray cast + orient camera
-
-RL → Monty:
-  Success: SetAgentPose(Monty goal position) → LM processes observation
-  Failure: SetAgentPose(pre-navigation position) → LM skips
-```
-
-#### Coordinate Handling
-
-The shared simulator uses Monty's world frame. Object is placed at `(0, 1.5, 0)m` by Monty. All positions are in this frame — no coordinate conversion needed between Monty and RL.
-
-The only conversion is units: Monty uses meters, RL uses millimeters. `MontyRLBridge` handles `× 1000` conversion.
-
-Surface distance difference: Monty agent operates at 25mm from surface (camera zoom=10), RL agent operates at 2mm (trained on trimesh). Snap-to-surface at navigation start/end bridges this gap.
-
-#### Sim-to-Real Transfer
-
-The RL policy is trained entirely on simple geometric primitives (cube, sphere, cylinder, mug, vase) in a lightweight trimesh environment. Without any retraining, it navigates YCB objects (banana) in MuJoCo through Monty's pipeline. The 22D state vector captures frame-invariant geometric relationships (relative direction, surface normal, curvatures, alignment) that transfer across objects and simulators.
-
-### Testing Pipeline
-
-#### Unit Tests (no MuJoCo required)
-
-```
-python -m pytest tests/test_rl_goal_policy.py -v -s -n0
-```
-
-12 tests covering:
-- `MontyRLBridge`: unit conversion (meters↔mm), Goal→pose, percept→sensor_data
-- `RLPolicySelector`: GSG goals → RL, SM goals → LookAt, no goals → default, navigation state tracking
-- `RLGoalPolicy`: lifecycle (start→step→finish), null goal handling, motor_only_step
-
-#### Integration Tests (requires MuJoCo + pretrained Q-store)
-
-```
-python -m pytest tests/test_rl_goal_policy_mujoco.py -v -s -n0
-```
-
-6 tests covering:
-- Bridge + Adapter data round-trip
-- Single navigation step (IN_PROGRESS)
-- Multi-step navigation with progress tracking
-- Navigation completion (READY)
-- Multiple sequential episodes with reset
-- Q-store loading and stats
-
-#### End-to-End Test (full Monty pipeline)
-
-```
-python eval_rl_e2e.py
-```
-
-Prerequisites:
-1. Pretrained Monty model (banana + mug graphs):
-   ```
-   src/tbp/tbp.monty/src/tbp/monty/conf/experiment/tutorial/surf_agent_2obj_train_mujoco.yaml
-
-./src/tbp/tbp.monty/src/tbp/monty/conf/env_interface/tutorial_train_2obj_predefined.yaml
-   python src/tbp/tbp.monty/run.py experiment=tutorial/surf_agent_2obj_train_mujoco
-
-   src/tbp/tbp.monty/src/tbp/monty/conf/experiment/tutorial/surf_agent_2obj_eval_mujoco.yaml
-   src/tbp/tbp.monty/src/tbp/monty/conf/env_interface/tutorial_eval_2obj_predefined_r3.yaml
-
-   ```
-2. Pretrained RL model (Q-store + SAC from trimesh training)
-3. YCB banana mesh converted to mm STL
-
-The end-to-end test:
-1. Loads Monty eval experiment via Hydra
-2. Initializes shared MuJoCo simulator
-3. Creates MuJoCoEnvAdapter with shared simulator
-4. Creates RLGoalPolicy with pretrained Q-store + SAC
-5. Replaces Monty's motor system with RLPolicySelector
-6. Runs Monty eval: SurfacePolicy crawls + RLGoalPolicy navigates to GSG goals
-7. Outputs: Monty eval_stats.csv, RL episode_log.json, per-episode actions.txt, visualization
-
-#### Results
-
-```
-Monty Recognition: 6/6 correct (banana + mug, 3 rotations each)
-RL Navigation:     3/4 goals reached (75%), crawling on surface
-                   Average 18 steps to goal, 52mm → 2.6mm
-```
-
-### Known Limitations (Phase 1)
-
-- **Single object**: Adapter CAD mesh is fixed at initialization. Multi-object requires dynamic mesh reload.
-- **No intermediate observations**: `motor_only_step=True` during navigation. LM does not process observations along the path.
-- **Object center hardcoded**: `(0, 1500, 0)mm` from Monty config. Should be obtained dynamically.
-- **Approximate normals**: At 2mm from surface with zoom=10 sensor, renderer cannot compute normals. Ray cast provides depth; normal approximated as `-forward`.
-- **Convex objects only**: Surface navigation tested on banana (convex). Hollow objects (mug, cup) require detach/fly/land which needs further testing in shared simulator context.
-
-## Phase 2: Directed Exploration + Dynamic Object Discovery
-
-### What Changed from Phase 1
-
-| Feature | Phase 1 | Phase 2 |
-|---------|---------|---------|
-| Object discovery | Hardcoded center `[0,1500,0]`, requires CAD mesh | Runtime ray cast discovery, no CAD needed |
-| Multi-object | Single object only | mug + banana in same eval run |
-| Intermediate observations | `motor_only_step=True` always | Every 5th step → Monty observes along path |
-| CAD dependency | `mesh_path_mm` required | Optional — inference works without mesh |
-| Object name logging | Not tracked | Object name in episode_log.json and actions.txt |
-| Adaptive manager | Requires mesh for creation | Inference-only mode when mesh=None |
-
-### Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  Monty Experiment Loop                                          │
-│                                                                  │
-│  for each object × rotation:                                     │
-│    SurfacePolicy crawls → LM accumulates evidence               │
-│    GSG generates hypothesis-testing goal                         │
-│         │                                                        │
-│         ▼                                                        │
-│    ┌─────────────────────────────────────────────────────┐       │
-│    │  RLPolicySelector                                    │       │
-│    │  Routes goals by sender_type:                        │       │
-│    │    GSG goal → RLGoalPolicy (RL navigation)           │       │
-│    │      + extracts object name from experiment          │       │
-│    │    No goal  → SurfacePolicy (standard crawl)         │       │
-│    └─────────────────────────────────────────────────────┘       │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### RL Navigation Pipeline (Updated)
-
-```
-RLGoalPolicy receives GSG Goal
-│
-├── 0. DISCOVER OBJECT (new in Phase 2)
-│     If shared sim (no CAD):
-│       → discover_object(hint_pos=goal_position)
-│       → _estimate_center_runtime: opposing ray casts, 3 iterations
-│       → _estimate_extents_runtime: 6-axis ray cast from outside
-│       → _estimate_up_direction_runtime: read model.opt.gravity
-│       → _estimate_open_edge_runtime: horizontal ray scan top→bottom
-│       Smart re-discovery: skip if goal near already-discovered object
-│
-├── 1. SNAP AGENT: Snap agent to surface (2mm)
-│     snap_max_dist temporarily increased to 35mm
-│
-├── 2. SNAP GOAL: Snap goal to surface (2mm)
-│     snap_max_dist temporarily increased to 200mm
-│     Agent position saved/restored around goal snap
-│
-├── 3. NAVIGATE: RL crawls along surface (N steps)
-│     Each step:
-│       → Adapter provides pose + sensor data (ray cast)
-│       → Controller computes 22D state vector
-│       → Arbitrator selects action (Q-store / SAC / heuristic)
-│       → Adapter executes action (tangential move + snap)
-│       → Q-store learns from transition
-│       │
-│       ├── Every 5th step: DIRECTED EXPLORATION (new in Phase 2)
-│       │     → Save current RL position
-│       │     → Lift agent 23mm backward (camera sees surface)
-│       │     → Return motor_only_step=False → Monty observes
-│       │     → Next step: restore RL position, continue navigation
-│       │
-│       └── Other steps: motor_only_step=True (Monty skips)
-│
-├── 4a. SUCCESS: Goal reached (distance < 4mm)
-│     → SetAgentPose to original Monty goal position
-│     → motor_only_step=False → LM processes observation
-│
-└── 4b. FAILURE: Timeout or collision
-      → SetAgentPose to pre-navigation position
-      → motor_only_step=True → LM skips
-```
-
-### Dynamic Object Discovery
-
-Phase 1 required CAD mesh at initialization and hardcoded object center. Phase 2 discovers object geometry at runtime via MuJoCo ray cast:
-
-```
-MuJoCoEnvAdapter (no CAD mode)
-│
-├── __init__(external_sim=monty_sim)     # No mesh_path_mm needed
-│     _has_cad = False
-│     Identity transforms (no CAD↔MuJoCo conversion)
-│     Placeholder geometry (filled by discover_object)
-│
-├── discover_object(hint_pos_mm)         # Called per navigation start
-│     │
-│     ├── _estimate_center_runtime(hint)
-│     │     For each axis: cast rays from ±500mm
-│     │     Center = midpoint of opposing hits
-│     │     3 iterations for convergence
-│     │
-│     ├── _estimate_extents_runtime()
-│     │     6-axis + offset probes from outside
-│     │     Uses discovered center
-│     │
-│     ├── _estimate_up_direction_runtime()
-│     │     Reads model.opt.gravity directly
-│     │     Fallback: Y-up
-│     │
-│     └── _estimate_open_edge_runtime()
-│           Horizontal rays from center at each height
-│           Open edge = transition from hits to misses (top→bottom)
-│
-└── Smart re-discovery in RLGoalPolicy:
-      Skip if goal within 2× max_extent of current center
-```
-
-### Directed Exploration
-
-During RL navigation, Monty receives intermediate observations every N steps. This allows the Learning Module to accumulate evidence along the navigation path, potentially recognizing the object before reaching the goal.
-
-```
-Navigation step 1-4: motor_only_step=True  (Monty skips)
-Navigation step 5:   LIFT + OBSERVE
-  ├── Save RL position (2mm from surface)
-  ├── Move agent 23mm backward (camera at ~25mm, Monty's working distance)
-  ├── Return motor_only_step=False → Monty processes observation
-  └── Next step: restore to saved RL position
-Navigation step 6-9: motor_only_step=True  (Monty skips)
-Navigation step 10:  LIFT + OBSERVE
-  ...
-```
-
-The 23mm lift distance matches Monty's standard operating distance (zoom=10 sensor). This ensures the observation quality matches what Monty expects from its SurfacePolicy crawl.
-
-### Key Classes (Updated)
-
-| Class | Role | Phase 2 Changes |
-|-------|------|-----------------|
-| `RLPolicySelector` | Routes GSG goals to RL | Extracts object name from `experiment.logger_args` |
-| `RLGoalPolicy` | Navigation lifecycle | `discover_object()` call, directed exploration every N steps, object name logging, enriched actions.txt |
-| `MontyRLBridge` | Monty↔RL conversion | No changes |
-| `MuJoCoEnvAdapter` | RL environment on shared sim | `mesh_path_mm` optional, `discover_object()`, `_has_cad` flag, CAD-only method guards |
-| `AdaptiveTrainingManager` | Online learning | Inference-only mode when `env=None`, `mesh_path=None` guards |
-| `EpisodeVisualizer` | Episode logging | `actions_header` parameter, `actions_short` labels in text log |
-
-### Logging
-
-#### episode_log.json
-```json
-{
-  "episode": 1,
-  "object": "mug",
-  "success": true,
-  "termination": "goal_reached",
-  "steps": 24,
-  "start_distance": 63.3,
-  "final_distance": 3.9
-}
-```
-
-#### actions.txt (single source of truth)
-```
-source: monty_integration
-Object: mug
-Result: goal_reached
-Steps: 24
-RL Goal (surface): [17.8, 1463.2, 2.0, ...]
-Monty Goal (original): [39.6, 1418.1, 4.5, ...]
-Start distance: 63.3mm
-End distance: 3.9mm
-
-=== Coordinate Debug ===
-Adapter object center: [-4.1, 1453.4, 3.1]
-Adapter object extents: [82.4, 156.1, 71.1]
-...
-
-====================================================================================================
-Step 001 | dist=62.1mm | MoveTangentially: MoveTangentially [phase=CRAWL_TO_GOAL|...]
-Step 002 | dist=59.8mm | MoveTangentially: ...
-```
-
-### Results (Phase 2)
-
-```
-Monty Recognition: 6/6 correct (banana + mug, 3 rotations each)
-
-RL Navigation (15 episodes):
-  Banana: 4/5 success (80%), avg 51 steps
-  Mug:    3/10 success (30%), avg 43 steps — collision on hollow geometry
-  Overall: 7/15 success (47%)
-
-Key: RL failure does not break Monty — fallback to standard exploration
-```
-
-### Known Limitations (Phase 2)
-
-- **Hollow object navigation**: Mug collision rate 70%. Surface navigation through rim/handle needs tuning for MuJoCo ray cast environment.
-- **Observation quality during lift**: 23mm backward lift is approximate. Camera may not perfectly match Monty's expected viewpoint on curved surfaces.
-- **No baseline comparison yet**: Need A/B test (RL on vs off) to quantify whether directed exploration improves recognition speed.
-- **Object name from experiment internals**: `experiment.logger_args["target"]["object"]` — fragile path, may break with Monty API changes.
-- **Offline retrain disabled without CAD**: AdaptiveTrainingManager cannot run offline Q/SAC retrain in no-CAD mode. Online Q-learning still works.
-
-
+# Summary - Previous stuff
 
 ## This is a prototype to implement, test and proof ideas below.
 

@@ -91,6 +91,7 @@ class Arbitrator:
         param_mean: Optional[np.ndarray] = None,
         param_std: Optional[np.ndarray] = None,
         min_eval_per_source: int = 5,
+        force_heuristic: bool = False,          # ← НОВОЕs
     ):
         self.controller = controller
         self.sac_actor = sac_actor
@@ -169,6 +170,7 @@ class Arbitrator:
         self._level_total_decisions: Dict[int, int] = defaultdict(int)
         self._level_heuristic_decisions: Dict[int, int] = defaultdict(int)
         self._heuristic_eps_min = 0.05
+        self._force_heuristic = force_heuristic
 
     def _warmup_running_stats(self):
         """Warm up RunningQStats from existing Q-store points."""
@@ -259,6 +261,23 @@ class Arbitrator:
         level = self._current_level
         has_sac = self.sac_actor is not None
         self._level_total_decisions[level] += 1
+
+        # self._force_heuristic = True
+        # ═══ НОВОЕ: Force heuristic mode ═══
+        if self._force_heuristic:
+            h_action = self._get_heuristic_action(state, current_pose, sensor_data)
+            h_type = ExperienceExtractor.DISCRETE_TO_PSAC[h_action][0]
+            h_params = self._discrete_to_params(h_action)
+
+            self._record_decision("heuristic")
+            self._level_heuristic_decisions[level] += 1
+            h_name = self._type_names.get(h_type, f"type_{h_type}")
+            self.heuristic_chosen_actions[h_name] += 1
+            self._current_episode_sources.append("heuristic")
+
+            return h_type, h_params, (
+                f"forced_heuristic(mode=force_all)"
+            )
 
         # ═══ Forced heuristic override when stuck ═══
         # Phase is set by controller.get_state_debug_info() called before decide().

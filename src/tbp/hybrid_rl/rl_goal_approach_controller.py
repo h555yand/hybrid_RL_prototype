@@ -429,9 +429,11 @@ class RLGoalApproachController:
             if hasattr(self, '_cross_side_debug') and self._cross_side_debug:
                 fly_debug_str += f"|cs={self._cross_side_debug}"
                 
+        snap_dbg = sensor_data.get("snap_debug", "")
+        snap_str = f"|{snap_dbg}" if snap_dbg else ""
+
         return (
             f"[phase={phase}"
-            f"|ss={int(same_side)}"
             f"|pb={int(path_blocked)}"
             f"|d={depth:.1f}"
             f"|al={alignment:.2f}"
@@ -439,7 +441,8 @@ class RLGoalApproachController:
             f"{normal_str}"
             f"{pos_str}"
             f"{subgoal_str}"
-            f"{fly_debug_str}]"
+            f"{fly_debug_str}"
+            f"{snap_str}]"
         )
     
     @property
@@ -1063,6 +1066,179 @@ class RLGoalApproachController:
             norm_depth,
         ], dtype=float)    
 
+    def _compute_fly_around_obstacle(
+        self,
+        current_pose: np.ndarray,
+        sensor_data: Dict[str, Any],
+    ) -> Optional[np.ndarray]:
+        """Compute fly direction to bypass obstacle between agent and goal.
+
+        Universal potential field approach:
+        fly = goal_pull + repulsion + orbit + vertical
+
+        Works for all object types (solid, hollow) without needing
+        inside/outside detection.
+
+        Components:
+        goal_pull:  weak attraction toward goal (always present)
+        repulsion:  push away from nearby surface (depth-based,
+                    prevents collision)
+        orbit:      tangent around object center biased toward goal
+                    (main bypass force when far from surface)
+        vertical:   pull toward goal height (helps with 3D bypass)
+
+        Anti-reversal safety: if repulsion would reverse the fly
+        direction, only the perpendicular component is kept.
+
+        Args:
+            current_pose: Agent pose [x, y, z, rx, ry, rz].
+            sensor_data: Current sensor readings.
+
+        Returns:
+            Unit direction vector in world space, or None.
+        """
+        goal_pos = self._current_goal[:3]
+        agent_pos = current_pose[:3]
+        depth = sensor_data.get("depth", 100.0)
+        normal = sensor_data.get("point_normal")
+
+        center_raw = sensor_data.get("object_center")
+        if center_raw is None:
+            goal_dir = goal_pos - agent_pos
+            g_len = np.linalg.norm(goal_dir)
+            if g_len > 1e-8:
+                return goal_dir / g_len
+            return None
+
+        center = np.array(center_raw, dtype=float)
+        up_raw = sensor_data.get("up_direction", [0, 0, 1])
+        up = np.array(up_raw, dtype=float)
+        height_axis = int(np.argmax(np.abs(up)))
+
+        # ═══ 1. Goal attraction ═══
+        goal_dir = goal_pos - agent_pos
+        goal_dist = np.linalg.norm(goal_dir)
+        if goal_dist < 1e-8:
+            return None
+        goal_dir_norm = goal_dir / goal_dist
+        goal_weight = 0.3
+
+        # ═══ 2. Obstacle repulsion ═══
+        repulsion = np.zeros(3)
+        if normal is not None and depth < 50.0:
+            n = np.array(normal, dtype=float)
+            n_len = np.linalg.norm(n)
+            if n_len > 1e-8:
+                n = n / n_len
+                free_step = self.action_space.free_step
+                strength = np.clip(
+                    free_step / max(depth, 1.0), 0.0, 3.0
+                )
+                repulsion = n * strength
+
+        # ═══ 3. Orbit component ═══
+        center_to_agent = agent_pos - center
+        center_to_agent[height_axis] = 0.0
+        ca_len = np.linalg.norm(center_to_agent)
+
+        orbit = np.zeros(3)
+        if ca_len > 1e-8:
+            radial = center_to_agent / ca_len
+
+            tangent1 = np.cross(up, center_to_agent)
+            t1_len = np.linalg.norm(tangent1)
+            if t1_len > 1e-8:
+                tangent1 /= t1_len
+                tangent2 = -tangent1
+
+                center_to_goal = goal_pos - center
+                center_to_goal[height_axis] = 0.0
+                dot1 = float(np.dot(tangent1, center_to_goal))
+                dot2 = float(np.dot(tangent2, center_to_goal))
+                tangent = tangent1 if dot1 >= dot2 else tangent2
+
+                orbit = tangent * 0.6 + radial * 0.2
+
+        # ═══ 4. Vertical component ═══
+        vertical = np.zeros(3)
+        height_diff = goal_pos[height_axis] - agent_pos[height_axis]
+        if abs(height_diff) > 5.0:
+            v_strength = np.clip(
+                abs(height_diff) / 50.0, 0.0, 0.8
+            )
+            vertical[height_axis] = (
+                np.sign(height_diff) * v_strength
+            )
+
+        # ═══ 5. Stuck escape ═══
+        escape = np.zeros(3)
+        if len(self._distance_history) >= 20:
+            recent = self._distance_history[-20:]
+            net_progress = recent[0] - recent[-1]
+            if net_progress < 1.0:
+                # Not making progress — add perpendicular kick
+                perp = np.cross(goal_dir_norm, up)
+                perp_len = np.linalg.norm(perp)
+                if perp_len > 1e-8:
+                    escape = (perp / perp_len) * 0.7
+                else:
+                    escape = up * 0.5
+
+        # ═══ Combine ═══
+        fly_dir = (
+            goal_dir_norm * goal_weight
+            + repulsion
+            + orbit
+            + vertical
+            + escape
+        )
+
+        # ═══ Anti-reversal safety ═══
+        # If repulsion reversed the direction relative to orbit+goal,
+        # keep only perpendicular component of repulsion.
+        base_dir = (
+            goal_dir_norm * goal_weight + orbit + vertical + escape
+        )
+        base_len = np.linalg.norm(base_dir)
+        if (
+            base_len > 1e-8
+            and np.linalg.norm(repulsion) > 1e-8
+            and np.dot(fly_dir, base_dir) < 0.1 * base_len
+        ):
+            base_norm = base_dir / base_len
+            rep_parallel = np.dot(repulsion, base_norm) * base_norm
+            rep_perp = repulsion - rep_parallel
+            fly_dir = base_dir + rep_perp
+
+        fly_len = np.linalg.norm(fly_dir)
+        if fly_len < 1e-8:
+            return goal_dir_norm
+
+        result = fly_dir / fly_len
+
+        # ═══ Debug ═══
+        self._fly_edge_debug = (
+            f"strat=pf"
+            f"|goal=[{goal_dir_norm[0]:.2f},"
+            f"{goal_dir_norm[1]:.2f},"
+            f"{goal_dir_norm[2]:.2f}]"
+            f"|rep=[{repulsion[0]:.2f},"
+            f"{repulsion[1]:.2f},"
+            f"{repulsion[2]:.2f}]"
+            f"|orb=[{orbit[0]:.2f},"
+            f"{orbit[1]:.2f},"
+            f"{orbit[2]:.2f}]"
+            f"|vert=[{vertical[0]:.2f},"
+            f"{vertical[1]:.2f},"
+            f"{vertical[2]:.2f}]"
+            f"|esc=[{escape[0]:.2f},"
+            f"{escape[1]:.2f},"
+            f"{escape[2]:.2f}]"
+            f"|d={depth:.1f}"
+        )
+
+        return result
+
     def _determine_phase(
         self,
         state: np.ndarray,
@@ -1070,84 +1246,24 @@ class RLGoalApproachController:
         current_pose: np.ndarray,
     ) -> Tuple[str, Optional[np.ndarray], str]:
         on_object = float(state[11]) > 0.5
-        same_side = sensor_data.get("same_side", True)
         path_blocked = sensor_data.get("path_blocked", False)
         distance = float(state[13])
         depth = sensor_data.get("depth", 100.0)
-
-        goal_pos = self._current_goal[:3]
 
         # ═══ ON SURFACE ═══
         if on_object:
             self._cached_orbit_direction = None
             self._orbit_direction_age = 0
 
-            if not same_side or path_blocked:
-                # ═══ Horizontal surface (rim/top/bottom) detection ═══
-                # On horizontal surfaces the agent is already at or near
-                # an edge. Crawling toward goal will naturally trigger
-                # edge traversal to descend/ascend to the target side.
-                # No need for CRAWL_TO_EDGE or DETACH.
-                point_normal = sensor_data.get("point_normal")
-                up_dir = np.asarray(
-                    sensor_data.get("up_direction", [0, 0, 1]),
-                    dtype=float,
-                )
-                if point_normal is not None:
-                    n = np.asarray(point_normal, dtype=float)
-                    n_len = np.linalg.norm(n)
-                    if n_len > 1e-8:
-                        n = n / n_len
-                        is_horizontal = (
-                            abs(float(np.dot(n, up_dir))) > 0.85
-                        )
-
-                        if is_horizontal:
-                            stuck_threshold = self.config.get(
-                                "stuck_threshold", 0.15
-                            )
-                            eff = (
-                                self._compute_movement_efficiency(
-                                    window=20
-                                )
-                            )
-                            if eff < stuck_threshold:
-                                fly_dir = (
-                                    self._compute_detach_fly_direction(
-                                        current_pose,
-                                        sensor_data,
-                                    )
-                                )
-                                return (
-                                    "DETACH_NEEDED",
-                                    fly_dir,
-                                    f"stuck on horizontal surface "
-                                    f"(dist={distance:.0f}, "
-                                    f"eff={eff:.2f}, "
-                                    f"ss={same_side}, "
-                                    f"pb={path_blocked})",
-                                )
-                            return (
-                                "CRAWL_TO_GOAL",
-                                None,
-                                f"on horizontal surface, crawl to goal "
-                                f"(dist={distance:.0f}, "
-                                f"ss={same_side}, "
-                                f"pb={path_blocked})",
-                            )
-
+            if path_blocked:
                 stuck_threshold = self.config.get(
                     "stuck_threshold", 0.15
                 )
-                eff = (
-                    self._compute_movement_efficiency(window=20)
-                )
+                eff = self._compute_movement_efficiency(window=20)
+
                 if eff < stuck_threshold:
-                    fly_dir = (
-                        self._compute_detach_fly_direction(
-                            current_pose,
-                            sensor_data,
-                        )
+                    fly_dir = self._compute_detach_fly_direction(
+                        current_pose, sensor_data,
                     )
                     return (
                         "DETACH_NEEDED",
@@ -1155,38 +1271,31 @@ class RLGoalApproachController:
                         f"stuck, consider detach "
                         f"(dist={distance:.0f}, "
                         f"eff={eff:.2f}, "
-                        f"ss={same_side}, "
                         f"pb={path_blocked})",
                     )
 
-                edge_dir = (
-                    self._compute_crawl_to_edge_direction(
-                        current_pose,
-                        sensor_data,
-                    )
+                edge_dir = self._compute_crawl_to_edge_direction(
+                    current_pose, sensor_data,
                 )
                 return (
                     "CRAWL_TO_EDGE",
                     edge_dir,
                     f"crawling to edge "
                     f"(dist={distance:.0f}, "
-                    f"ss={same_side}, "
                     f"pb={path_blocked})",
                 )
+
             return (
                 "CRAWL_TO_GOAL",
                 None,
                 f"crawl to goal "
                 f"(dist={distance:.0f}, "
-                f"ss={same_side}, "
                 f"pb={path_blocked})",
             )
 
         # ═══ IN AIR ═══
         else:
-            landing_threshold = (
-                8.0 * self.action_space.free_step
-            )
+            landing_threshold = 8.0 * self.action_space.free_step
 
             # EMERGENCY LANDING
             if depth < self.action_space.free_step:
@@ -1199,10 +1308,7 @@ class RLGoalApproachController:
                 )
 
             # Close to goal + path clear → land
-            if (
-                distance < landing_threshold
-                and not path_blocked
-            ):
+            if distance < landing_threshold and not path_blocked:
                 self._cached_orbit_direction = None
                 self._orbit_direction_age = 0
                 return (
@@ -1212,61 +1318,9 @@ class RLGoalApproachController:
                     f"(dist={distance:.0f})",
                 )
 
-            # ═══ Fix 8: Cross complete detection ═══
-            center_raw = sensor_data.get("object_center")
-            up_dir_raw = sensor_data.get("up_direction", [0, 0, 1])
-            up_dir_vec = np.asarray(up_dir_raw, dtype=float)
-            height_ax = int(np.argmax(np.abs(up_dir_vec)))
-            up_s = float(np.sign(up_dir_vec[height_ax]))
-            rim_h = sensor_data.get("open_edge_height", 40.0)
-            agent_h = current_pose[height_ax]
-            above_r = (agent_h - rim_h) * up_s > 0
-
-            if above_r and same_side and center_raw is not None:
-                center_vec = np.asarray(center_raw, dtype=float)
-                agent_to_center_h = center_vec - current_pose[:3]
-                agent_to_center_h[height_ax] = 0.0
-                dist_fc = float(np.linalg.norm(agent_to_center_h))
-                extents_list = sensor_data.get("object_extents", [84, 84, 84])
-                extents_horiz = [
-                    extents_list[i] for i in range(3) if i != height_ax
-                ]
-                rim_r = min(extents_horiz) * 0.5
-
-                if dist_fc > rim_r * 0.9:
-                    # Агент снаружи и выше rim — cross маневр завершён
-                    safe_distance = rim_r * 1.5
-
-                    if dist_fc < safe_distance:
-                        # Близко к горлышку — лететь ОТ центра
-                        if dist_fc > 1e-8:
-                            away_dir = -agent_to_center_h / dist_fc
-                        else:
-                            away_dir = np.zeros(3)
-                            away_dir[(height_ax + 1) % 3] = 1.0
-
-                        return (
-                            "FLY_TO_EDGE",
-                            away_dir,
-                            f"cross_retreat, outside+above_rim "
-                            f"(dist={distance:.0f}, "
-                            f"dist_fc={dist_fc:.0f}, "
-                            f"safe={safe_distance:.0f})",
-                        )
-                    else:
-                        # Далеко от горлышка — безопасно лететь к цели
-                        return (
-                            "FLY_TO_GOAL",
-                            None,
-                            f"cross_complete, outside+above_rim "
-                            f"(dist={distance:.0f}, "
-                            f"dist_fc={dist_fc:.0f}, "
-                            f"safe={safe_distance:.0f})",
-                        )
-        
-            # Path blocked → bypass obstacle using potential field
+            # Path blocked → bypass obstacle
             if path_blocked:
-                pf_dir = self._compute_fly_to_edge_direction(
+                pf_dir = self._compute_fly_around_obstacle(
                     current_pose, sensor_data
                 )
                 if pf_dir is not None:
@@ -1278,14 +1332,13 @@ class RLGoalApproachController:
                         f"depth={depth:.1f})",
                     )
 
-                # Fallback: fly toward goal anyway
                 return (
                     "FLY_TO_GOAL",
                     None,
                     f"bypass fallback "
                     f"(dist={distance:.0f})",
                 )
-            
+
             # ═══ Path NOT blocked — hysteresis ═══
             path_clear_streak = getattr(
                 self, "_path_clear_streak", 0
@@ -1302,20 +1355,14 @@ class RLGoalApproachController:
                     f"(dist={distance:.0f})",
                 )
 
-            prev_phase = getattr(
-                self, "_prev_phase", None
-            )
+            prev_phase = getattr(self, "_prev_phase", None)
             if prev_phase == "FLY_TO_EDGE":
                 cached_dir = getattr(
-                    self,
-                    "_cached_fly_direction",
-                    None,
+                    self, "_cached_fly_direction", None,
                 )
                 if cached_dir is None:
                     cached_dir = getattr(
-                        self,
-                        "_cached_orbit_direction",
-                        None,
+                        self, "_cached_orbit_direction", None,
                     )
                 return (
                     "FLY_TO_EDGE",
@@ -1334,281 +1381,7 @@ class RLGoalApproachController:
                 f"path clear, fly to goal "
                 f"(dist={distance:.0f})",
             )
-
-    def _determine_phase_old(
-        self,
-        state: np.ndarray,
-        sensor_data: Dict[str, Any],
-        current_pose: np.ndarray,
-    ) -> Tuple[str, Optional[np.ndarray], str]:
-        on_object = float(state[11]) > 0.5
-        same_side = sensor_data.get("same_side", True)
-        path_blocked = sensor_data.get("path_blocked", False)
-        distance = float(state[13])
-        depth = sensor_data.get("depth", 100.0)
-
-        goal_pos = self._current_goal[:3]
-
-        # ═══ ON SURFACE ═══
-        if on_object:
-            self._cached_orbit_direction = None
-            self._orbit_direction_age = 0
-
-            if not same_side or path_blocked:
-                stuck_threshold = self.config.get(
-                    "stuck_threshold", 0.15
-                )
-                eff = (
-                    self
-                    ._compute_movement_efficiency(
-                        window=20
-                    )
-                )
-                if eff < stuck_threshold:
-                    fly_dir = (
-                        self
-                        ._compute_detach_fly_direction(
-                            current_pose,
-                            sensor_data,
-                        )
-                    )
-                    return (
-                        "DETACH_NEEDED",
-                        fly_dir,
-                        f"stuck, consider detach "
-                        f"(dist={distance:.0f}, "
-                        f"eff={eff:.2f}, "
-                        f"ss={same_side}, "
-                        f"pb={path_blocked})",
-                    )
-
-                edge_dir = (
-                    self
-                    ._compute_crawl_to_edge_direction(
-                        current_pose,
-                        sensor_data,
-                    )
-                )
-                return (
-                    "CRAWL_TO_EDGE",
-                    edge_dir,
-                    f"crawling to edge "
-                    f"(dist={distance:.0f}, "
-                    f"ss={same_side}, "
-                    f"pb={path_blocked})",
-                )
-            return (
-                "CRAWL_TO_GOAL",
-                None,
-                f"crawl to goal "
-                f"(dist={distance:.0f}, "
-                f"ss={same_side}, "
-                f"pb={path_blocked})",
-            )
-                
-        # ═══ IN AIR ═══
-        else:
-            landing_threshold = (
-                8.0 * self.action_space.free_step
-            )
-
-            # EMERGENCY LANDING
-            if depth < 5.0:
-                return (
-                    "LAND",
-                    None,
-                    f"emergency landing, "
-                    f"depth={depth:.1f}mm "
-                    f"(dist={distance:.0f})",
-                )
-
-            # Close to goal + path clear → land
-            if (
-                distance < landing_threshold
-                and not path_blocked
-            ):
-                self._cached_orbit_direction = None
-                self._orbit_direction_age = 0
-                return (
-                    "LAND",
-                    None,
-                    f"near goal, landing "
-                    f"(dist={distance:.0f})",
-                )
-
-            # Path blocked → must bypass obstacle
-            if path_blocked:
-                fly_dir = getattr(
-                    self, "_cached_fly_direction", None
-                )
-
-                extents = sensor_data.get(
-                    "object_extents", [84, 84, 84]
-                )
-                max_extent = float(max(extents))
-
-                center_raw = sensor_data.get(
-                    "object_center"
-                )
-                too_far = False
-                dist_from_center = 0.0
-                if center_raw is not None:
-                    center = np.asarray(
-                        center_raw, dtype=float
-                    )
-                    dist_from_center = float(
-                        np.linalg.norm(
-                            current_pose[:3] - center
-                        )
-                    )
-                    too_far = (
-                        dist_from_center
-                        > max_extent * 1.5
-                    )
-
-                # Fallback: clear stale cache
-                if fly_dir is not None and not too_far:
-                    depth_now = sensor_data.get(
-                        "depth", 100.0
-                    )
-                    if (
-                        depth_now >= 100.0
-                        and len(self._distance_history)
-                        > 30
-                    ):
-                        recent_min = min(
-                            self._distance_history[-30:]
-                        )
-                        if distance > recent_min + 10.0:
-                            logger.debug(
-                                f"FLY_CACHE_STALE: "
-                                f"depth=100, "
-                                f"dist={distance:.0f}, "
-                                f"recent_min="
-                                f"{recent_min:.0f}, "
-                                f"clearing cache"
-                            )
-                            self._cached_fly_direction = (
-                                None
-                            )
-                            self._cached_orbit_direction = (
-                                None
-                            )
-                            fly_dir = None
-
-                if fly_dir is not None and not too_far:
-                    return (
-                        "FLY_TO_EDGE",
-                        fly_dir.copy(),
-                        f"bypassing, cached dir "
-                        f"(dist={distance:.0f}, "
-                        f"from_center="
-                        f"{dist_from_center:.0f})",
-                    )
-                else:
-                    orbit_age = getattr(
-                        self,
-                        "_orbit_direction_age",
-                        0,
-                    )
-                    cached_orbit = getattr(
-                        self,
-                        "_cached_orbit_direction",
-                        None,
-                    )
-
-                    if (
-                        cached_orbit is None
-                        or orbit_age > 10
-                    ):
-                        orbit_dir = (
-                            self._compute_orbit_direction(
-                                current_pose, sensor_data
-                            )
-                        )
-                        if orbit_dir is not None:
-                            self._cached_orbit_direction = (
-                                orbit_dir
-                            )
-                            self._orbit_direction_age = 0
-                            self._cached_fly_direction = (
-                                None
-                            )
-                        else:
-                            orbit_dir = cached_orbit
-                    else:
-                        orbit_dir = cached_orbit
-                        self._orbit_direction_age = (
-                            orbit_age + 1
-                        )
-
-                    if orbit_dir is not None:
-                        return (
-                            "FLY_TO_EDGE",
-                            orbit_dir.copy(),
-                            f"orbiting, age="
-                            f"{self._orbit_direction_age}"
-                            f" (dist={distance:.0f}, "
-                            f"from_center="
-                            f"{dist_from_center:.0f})",
-                        )
-
-                    return (
-                        "FLY_TO_GOAL",
-                        None,
-                        f"bypass fallback "
-                        f"(dist={distance:.0f})",
-                    )
-
-            # ═══ Path NOT blocked — hysteresis ═══
-            path_clear_streak = getattr(
-                self, "_path_clear_streak", 0
-            )
-
-            if path_clear_streak >= 3:
-                self._cached_orbit_direction = None
-                self._orbit_direction_age = 0
-                return (
-                    "FLY_TO_GOAL",
-                    None,
-                    f"path clear "
-                    f"{path_clear_streak} steps "
-                    f"(dist={distance:.0f})",
-                )
-
-            prev_phase = getattr(
-                self, "_prev_phase", None
-            )
-            if prev_phase == "FLY_TO_EDGE":
-                cached_dir = getattr(
-                    self,
-                    "_cached_fly_direction",
-                    None,
-                )
-                if cached_dir is None:
-                    cached_dir = getattr(
-                        self,
-                        "_cached_orbit_direction",
-                        None,
-                    )
-                return (
-                    "FLY_TO_EDGE",
-                    cached_dir,
-                    f"path clear but hysteresis "
-                    f"(streak={path_clear_streak}, "
-                    f"dist={distance:.0f})",
-                )
-
-            # Default: fly to goal
-            self._cached_orbit_direction = None
-            self._orbit_direction_age = 0
-            return (
-                "FLY_TO_GOAL",
-                None,
-                f"path clear, fly to goal "
-                f"(dist={distance:.0f})",
-            )
-                
+    
     # ══════════════════════════════════════════════════════════
     # COLLISION DETECTION
     # ══════════════════════════════════════════════════════════
@@ -1850,11 +1623,16 @@ class RLGoalApproachController:
             ]
 
         # ═══ 6.2 Successful landing ═══
+        curr_path_blocked = (
+            sensor_data.get("path_blocked", False)
+            if sensor_data is not None
+            else False
+        )
         successful_landing = (
             prev_on_object < 0.5
             and on_object > 0.5
             and collision is None
-            and curr_same_side
+            and not curr_path_blocked
         )
         if successful_landing:
             landing_radius = 8.0 * surface_step
@@ -2083,7 +1861,7 @@ class RLGoalApproachController:
             if (
                 strategic_h[1] > strategic_h[0]
                 and self._can_detach(state)
-                and (not same_side or path_blocked)
+                and (path_blocked)
             ):
                 action_index = self.action_space.IDX_DETACH
                 self._strategic_stats["detach_memory_triggered"] += 1
@@ -2095,12 +1873,11 @@ class RLGoalApproachController:
                     "state": t_state.copy(),
                     "step": len(self._episode_transitions),
                     "phase_was_detach_needed": current_phase == "DETACH_NEEDED",
-                    "same_side_before": same_side,
                     "path_blocked_before": path_blocked,
                     "dist_before": float(state[13]),
                 })
             else:
-                if not same_side or path_blocked:
+                if path_blocked:
                     self._strategic_stats["detach_heuristic_fallback"] += 1
 
         elif not on_object:
@@ -2350,7 +2127,7 @@ class RLGoalApproachController:
         ):
             same_side = sensor_data.get("same_side", True)
             path_blocked = sensor_data.get("path_blocked", False)
-            if not same_side or path_blocked:
+            if path_blocked:
                 action_index = self.action_space.IDX_DETACH
                 strategic_source = "forced_detach(phase=DETACH_NEEDED)"
 
@@ -2408,7 +2185,7 @@ class RLGoalApproachController:
                 if (
                     should_switch
                     and self._can_detach(state)
-                    and (not same_side or path_blocked)
+                    and (path_blocked)
                 ):
                     action_index = (
                         self.action_space.IDX_DETACH
@@ -2435,7 +2212,7 @@ class RLGoalApproachController:
                         "dist_before": float(state[13]),
                     })
                 else:
-                    if not same_side or path_blocked:
+                    if path_blocked:
                         strategic_source = (
                             f"detach_stay("
                             f"q=[{strategic_q[0]:.2f},"
@@ -4802,93 +4579,27 @@ class RLGoalApproachController:
             )
 
         return orbit_dir
-    
+
     def _compute_crawl_to_edge_direction(
         self,
         current_pose: np.ndarray,
         sensor_data: Dict[str, Any],
     ) -> Optional[np.ndarray]:
-        normal = sensor_data.get("point_normal")
-        if normal is None:
-            return None
-        n = np.asarray(normal, dtype=float)
-        n_len = np.linalg.norm(n)
-        if n_len < 1e-8:
-            return None
-        n /= n_len
+        """Compute surface-tangent direction toward edge when path is blocked.
 
-        up_dir = np.asarray(
-            sensor_data.get("up_direction", [0, 0, 1]), dtype=float
-        )
-        same_side = sensor_data.get("same_side", True)
+        Projects goal direction onto tangent plane. This naturally points
+        toward the nearest edge/corner that leads around the obstacle
+        to the goal.
 
-        if not same_side:
-            up_tangent = up_dir - np.dot(up_dir, n) * n
-            up_tangent_len = np.linalg.norm(up_tangent)
+        When projection degenerates (alignment ≈ -1.0, goal directly behind
+        normal), falls back to crawling toward the nearest edge along the
+        height axis on the goal's side. This prevents oscillation at the
+        "equator" of curved objects (cylinders, cones) where goal_dir
+        is parallel to the surface normal.
 
-            if up_tangent_len > 0.3:
-                crawl_dir = up_tangent / up_tangent_len
-            else:
-                center = np.asarray(
-                    sensor_data.get("object_center", [0, 0, 0]),
-                    dtype=float,
-                )
-                to_center = center - current_pose[:3]
-                to_center_t = to_center - np.dot(to_center, n) * n
-                tc_len = np.linalg.norm(to_center_t)
-
-                if tc_len > 1e-8:
-                    dot_normal_center = np.dot(n, to_center)
-                    if dot_normal_center > 0:
-                        crawl_dir = -to_center_t / tc_len
-                    else:
-                        crawl_dir = to_center_t / tc_len
-                else:
-                    crawl_dir = up_dir - np.dot(up_dir, n) * n
-                    cd_len = np.linalg.norm(crawl_dir)
-                    if cd_len < 1e-8:
-                        return None
-                    crawl_dir /= cd_len
-        else:
-            goal_dir = self._current_goal[:3] - current_pose[:3]
-            crawl_dir = goal_dir - np.dot(goal_dir, n) * n
-
-            crawl_len = np.linalg.norm(crawl_dir)
-            if crawl_len < 1e-8:
-                center = np.asarray(
-                    sensor_data.get("object_center", [0, 0, 0]),
-                    dtype=float,
-                )
-                away = current_pose[:3] - center
-                crawl_dir = away - np.dot(away, n) * n
-                crawl_len = np.linalg.norm(crawl_dir)
-                if crawl_len < 1e-8:
-                    return None
-
-        crawl_len = np.linalg.norm(crawl_dir)
-        if crawl_len < 1e-8:
-            return None
-        return crawl_dir / crawl_len
-        
-    def _compute_crawl_to_edge_direction_old(
-        self,
-        current_pose: np.ndarray,
-        sensor_data: Dict[str, Any],
-    ) -> Optional[np.ndarray]:
-        """Compute surface-tangent direction toward nearest edge/rim.
-
-        Mirrors the logic of _compute_detach_fly_direction but returns
-        a direction projected onto the tangent plane (for crawling,
-        not flying).
-
-        Strategy:
-        - not same_side + vertical wall: crawl up toward rim
-        (same as detach_fly's up_tangent logic)
-        - not same_side + horizontal surface: crawl away from center
-        toward edge (same as detach_fly's away_from_center logic)
-        - same_side + path_blocked: crawl toward goal projection
-        on tangent plane (toward nearest corner/edge that leads
-        to goal)
+        Args:
+            current_pose: Agent pose.
+            sensor_data: Current sensor readings.
 
         Returns:
             Unit vector in world space (tangent to surface), or None.
@@ -4902,65 +4613,127 @@ class RLGoalApproachController:
             return None
         n /= n_len
 
-        up_dir = np.asarray(
-            sensor_data.get("up_direction", [0, 0, 1]), dtype=float
+        # Project goal direction onto tangent plane
+        goal_dir = self._current_goal[:3] - current_pose[:3]
+        crawl_dir = goal_dir - np.dot(goal_dir, n) * n
+
+        crawl_len = np.linalg.norm(crawl_dir)
+        distance = float(np.linalg.norm(goal_dir))
+
+        # ═══ Degenerate case: goal directly behind normal ═══
+        # CHANGED: use relative threshold (crawl_len / distance < 0.15)
+        # instead of absolute. On curved surfaces near the "equator"
+        # (where goal_dir is nearly parallel to normal), the tangent
+        # projection can be small but non-zero (e.g., 4.6mm at dist=38mm).
+        # Absolute threshold misses these cases; relative threshold
+        # catches them reliably across all object sizes.
+        #
+        # crawl_len < 1.0: absolute minimum (complete degeneration)
+        # ratio < 0.15: projection is < 15% of distance = unstable
+        # distance > 10.0: don't apply ratio when very close to goal
+        degenerate = (
+            crawl_len < 1.0
+            or (distance > 10.0 and crawl_len / max(distance, 1e-8) < 0.15)
         )
-        same_side = sensor_data.get("same_side", True)
 
-        if not same_side:
-            # ═══ Opposite sides — mirror _compute_detach_fly_direction ═══
+        if degenerate:
+            center = np.asarray(
+                sensor_data.get("object_center", [0, 0, 0]),
+                dtype=float,
+            )
+            up_dir = np.asarray(
+                sensor_data.get("up_direction", [0, 1, 0]),
+                dtype=float,
+            )
 
-            # Project up onto tangent plane
-            up_tangent = up_dir - np.dot(up_dir, n) * n
-            up_tangent_len = np.linalg.norm(up_tangent)
+            # Which edge is on the goal's side?
+            goal_height = float(
+                np.dot(self._current_goal[:3] - center, up_dir)
+            )
+            agent_height = float(
+                np.dot(current_pose[:3] - center, up_dir)
+            )
 
-            if up_tangent_len > 0.3:
-                # Vertical wall: crawl up toward rim
-                crawl_dir = up_tangent / up_tangent_len
+            if abs(goal_height - agent_height) < 1.0:
+                # Same height — pick closer edge (tiebreaker)
+                extents = sensor_data.get(
+                    "object_extents", [84, 84, 84]
+                )
+                height_axis = int(np.argmax(np.abs(up_dir)))
+                half_height = extents[height_axis] / 2.0
+                dist_to_top = half_height - agent_height
+                dist_to_bottom = agent_height + half_height
+                edge_dir = (
+                    -up_dir if dist_to_bottom < dist_to_top
+                    else up_dir
+                )
+            elif goal_height < agent_height:
+                edge_dir = -up_dir
             else:
-                # Horizontal surface (bottom/top):
-                # crawl away from center toward edge
-                center = np.asarray(
-                    sensor_data.get("object_center", [0, 0, 0]),
-                    dtype=float,
-                )
-                away = current_pose[:3] - center
-                away_t = away - np.dot(away, n) * n
-                away_len = np.linalg.norm(away_t)
-                if away_len > 1e-8:
-                    crawl_dir = away_t / away_len
-                else:
-                    # Fallback: any direction away from center
-                    crawl_dir = up_dir - np.dot(up_dir, n) * n
-                    cd_len = np.linalg.norm(crawl_dir)
-                    if cd_len < 1e-8:
-                        return None
-                    crawl_dir /= cd_len
-        else:
-            # ═══ Same side, path blocked — crawl toward goal ═══
-            # Project goal direction onto tangent plane
-            # This naturally points toward the nearest edge/corner
-            # that leads to the goal
-            goal_dir = self._current_goal[:3] - current_pose[:3]
-            crawl_dir = goal_dir - np.dot(goal_dir, n) * n
+                edge_dir = up_dir
 
+            # Project edge direction onto tangent plane
+            crawl_dir = edge_dir - np.dot(edge_dir, n) * n
             crawl_len = np.linalg.norm(crawl_dir)
+
             if crawl_len < 1e-8:
-                # Goal directly behind normal — crawl away from center
-                center = np.asarray(
-                    sensor_data.get("object_center", [0, 0, 0]),
-                    dtype=float,
-                )
                 away = current_pose[:3] - center
                 crawl_dir = away - np.dot(away, n) * n
                 crawl_len = np.linalg.norm(crawl_dir)
                 if crawl_len < 1e-8:
                     return None
 
+        return crawl_dir / crawl_len
+
+    def _compute_crawl_to_edge_direction_old(
+        self,
+        current_pose: np.ndarray,
+        sensor_data: Dict[str, Any],
+    ) -> Optional[np.ndarray]:
+        """Compute surface-tangent direction toward edge when path is blocked.
+
+        Projects goal direction onto tangent plane. This naturally points
+        toward the nearest edge/corner that leads around the obstacle
+        to the goal.
+
+        If goal projection is degenerate (goal directly behind normal),
+        crawls away from object center toward nearest edge.
+
+        Args:
+            current_pose: Agent pose.
+            sensor_data: Current sensor readings.
+
+        Returns:
+            Unit vector in world space (tangent to surface), or None.
+        """
+        normal = sensor_data.get("point_normal")
+        if normal is None:
+            return None
+        n = np.asarray(normal, dtype=float)
+        n_len = np.linalg.norm(n)
+        if n_len < 1e-8:
+            return None
+        n /= n_len
+
+        # Project goal direction onto tangent plane
+        goal_dir = self._current_goal[:3] - current_pose[:3]
+        crawl_dir = goal_dir - np.dot(goal_dir, n) * n
+
         crawl_len = np.linalg.norm(crawl_dir)
         if crawl_len < 1e-8:
-            return None
+            # Goal directly behind normal — crawl away from center
+            center = np.asarray(
+                sensor_data.get("object_center", [0, 0, 0]),
+                dtype=float,
+            )
+            away = current_pose[:3] - center
+            crawl_dir = away - np.dot(away, n) * n
+            crawl_len = np.linalg.norm(crawl_dir)
+            if crawl_len < 1e-8:
+                return None
+
         return crawl_dir / crawl_len
+
 
     def _compute_detach_fly_direction(
         self,
@@ -5352,11 +5125,9 @@ class RLGoalApproachController:
                 self._strategic_stats["detach_total"] += 1
 
                 # ═══ CHANGED: reward based on geometric outcome ═══
-                same_side_before = pending.get("same_side_before", False)
                 path_blocked_before = pending.get("path_blocked_before", True)
 
                 # Find state after landing
-                same_side_after = None
                 path_blocked_after = None
                 landed = False
                 air_steps_after = 0
@@ -5366,9 +5137,6 @@ class RLGoalApproachController:
                     future_state = self._episode_transitions[j]["state"]
                     if future_state[11] > 0.5:  # landed
                         landed = True
-                        same_side_after = self._episode_transitions[j].get(
-                            "same_side", True
-                        )
                         path_blocked_after = self._episode_transitions[j].get(
                             "path_blocked", False
                         )
@@ -5377,24 +5145,18 @@ class RLGoalApproachController:
 
                 if goal_reached:
                     if not landed:
-                        # Never landed but somehow reached goal — unlikely, neutral
                         switch_target = 0.0
-                    elif not same_side_before and same_side_after:
-                        # Detach solved the same_side problem — full reward
+                    elif path_blocked_before and not path_blocked_after:
+                        # Detach unblocked the path — full reward
                         switch_target = 1.0
                         self._strategic_stats["detach_led_to_success"] += 1
-                    elif path_blocked_before and not path_blocked_after:
-                        # Detach unblocked the path — good reward
-                        switch_target = 0.8
-                        self._strategic_stats["detach_led_to_success"] += 1
-                    elif same_side_before and same_side_after:
-                        # Was on correct side, stayed on correct side
-                        # Detach was unnecessary but episode succeeded
-                        switch_target = 0.0  # neutral
+                    elif not path_blocked_before:
+                        # Path wasn't blocked, detach was unnecessary
+                        switch_target = 0.0
                         self._strategic_stats["detach_led_to_success"] += 1
                     else:
-                        # Landed on wrong side but still reached goal
-                        switch_target = 0.1
+                        # Landed but path still blocked — partial
+                        switch_target = 0.3
                         self._strategic_stats["detach_led_to_success"] += 1
 
                 elif termination_reason == "collision_surface_violation":

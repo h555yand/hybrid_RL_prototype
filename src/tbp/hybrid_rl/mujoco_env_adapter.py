@@ -227,6 +227,7 @@ class MuJoCoEnvAdapter:
         # ═══ Scene renderer ═══
         self._scene_renderer = None
         self._scene_res = (256, 256)
+        self._last_snap_debug = ""
 
     # ═══════════════════════════════════════════════════
     # Coordinate conversion (computed once, used everywhere)
@@ -623,8 +624,61 @@ class MuJoCoEnvAdapter:
     # ═══════════════════════════════════════════════════
     # same_side (MuJoCo frame)
     # ═══════════════════════════════════════════════════
+    def _compute_same_side(self, agent_normal):
+        if self._goal_normal_mj is None:
+            return True
+        
+        agent_pos = self._get_pos_mj_mm()
+        goal_pos = self._current_goal[:3]
+        center = self._mj_center_mm
+        h = self.height_axis
+        
+        a_from_c = (agent_pos - center).copy()
+        g_from_c = (goal_pos - center).copy()
+        a_from_c[h] = 0
+        g_from_c[h] = 0
+        
+        a_len = np.linalg.norm(a_from_c)
+        g_len = np.linalg.norm(g_from_c)
+        
+        if a_len < 1e-8 or g_len < 1e-8:
+            return True
+        
+        # Тест 1: противоположные стороны объекта?
+        horiz_dot = np.dot(a_from_c / a_len, g_from_c / g_len)
+        if horiz_dot < -0.3:
+            return False
+        
+        # Тест 2: goal inside/outside по нормали
+        gn = np.array(self._goal_normal_mj, dtype=float)
+        gn[h] = 0
+        gn_len = np.linalg.norm(gn)
+        
+        if gn_len < 0.3:
+            # Горизонтальная поверхность (дно/крышка) → same side
+            return True
+        
+        goal_outward = np.dot(gn / gn_len, g_from_c / g_len) > 0
+        
+        # Тест 3: agent inside/outside по ray cast от центра
+        ray_from_center = self._mj_ray_cast(center, a_from_c / a_len)
+        agent_outward = (ray_from_center > 0 and ray_from_center < a_len - 2.0)
+        
+        return agent_outward == goal_outward
 
-    def _compute_same_side(self, agent_normal: Optional[List[float]]) -> bool:
+    def _compute_same_side_old(self, agent_normal):
+        if self._goal_normal_mj is None:
+            return True
+        
+        agent_pos = self._get_pos_mj_mm()
+        goal_pos = self._current_goal[:3]
+        
+        agent_outward = not self._is_point_inside_mj(agent_pos)
+        goal_outward = not self._is_point_inside_mj(goal_pos)
+        
+        return agent_outward == goal_outward
+
+    def _compute_same_side_old(self, agent_normal: Optional[List[float]]) -> bool:
         if self._goal_normal_mj is None:
             return True
         
@@ -680,11 +734,80 @@ class MuJoCoEnvAdapter:
             return False
 
         return True
+    
     # ═══════════════════════════════════════════════════
     # path_blocked (MuJoCo frame)
     # ═══════════════════════════════════════════════════
 
     def _check_path_blocked(self, goal_pos_mj_mm: np.ndarray) -> bool:
+        """Check if direct path to goal is blocked.
+        
+        Uses lifted ray cast to avoid surface-to-surface false positives.
+        Additionally checks normal agreement: if agent and goal normals
+        are similar (same face/side), path is likely clear even if ray
+        cast reports blocked due to surface curvature.
+        """
+        agent_pos = self._get_pos_mj_mm()
+        goal_pos = goal_pos_mj_mm[:3]
+
+        direction_raw = goal_pos - agent_pos
+        dist_raw = float(np.linalg.norm(direction_raw))
+        if dist_raw < 1e-8:
+            return False
+
+        # ═══ Normal agreement check ═══
+        # If agent normal and goal normal point in similar direction,
+        # they are on the same face/side → path is not blocked
+        # by the object body (may be blocked by curvature artifact).
+        euler = self._get_euler_deg()
+        rot = Rot.from_euler("xyz", euler, degrees=True)
+        agent_normal = -rot.apply([0, 0, -1])  # outward
+        an_len = float(np.linalg.norm(agent_normal))
+        if an_len > 1e-8:
+            agent_normal = agent_normal / an_len
+        else:
+            agent_normal = np.array([0.0, 1.0, 0.0])
+
+        if self._goal_normal_mj is not None:
+            goal_normal = np.array(self._goal_normal_mj, dtype=float)
+            gn_len = float(np.linalg.norm(goal_normal))
+            if gn_len > 1e-8:
+                goal_normal = goal_normal / gn_len
+                
+                normal_dot = float(np.dot(agent_normal, goal_normal))
+                
+                # Same face: normals agree (dot > 0.5 ≈ < 60° apart)
+                # → path not blocked (curvature artifact)
+                if normal_dot > 0.5:
+                    return False
+        
+        # ═══ Lifted ray cast for remaining cases ═══
+        lift = 6.0  # mm
+        origin = agent_pos + agent_normal * lift
+
+        if self._goal_normal_mj is not None:
+            goal_normal = np.array(self._goal_normal_mj, dtype=float)
+            gn_len = float(np.linalg.norm(goal_normal))
+            if gn_len > 1e-8:
+                goal_normal = goal_normal / gn_len
+            else:
+                goal_normal = agent_normal
+        else:
+            goal_normal = agent_normal
+
+        target = goal_pos + goal_normal * lift
+
+        direction = target - origin
+        dist = float(np.linalg.norm(direction))
+        if dist < 1e-8:
+            return False
+
+        hit_dist = self._mj_ray_cast(origin, direction)
+        if hit_dist < 0:
+            return False
+        return hit_dist < (dist - 2.0)
+
+    def _check_path_blocked_old(self, goal_pos_mj_mm: np.ndarray) -> bool:
         """Check path blocked via MuJoCo ray cast."""
         agent_pos = self._get_pos_mj_mm()
         direction = goal_pos_mj_mm - agent_pos
@@ -869,7 +992,7 @@ class MuJoCoEnvAdapter:
 
         if self._current_goal is not None:
             goal_pos = self._current_goal[:3]
-            same_side = self._compute_same_side(rendered["point_normal"])
+            # same_side = self._compute_same_side(rendered["point_normal"])
             path_blocked = self._check_path_blocked(goal_pos)
 
         return {
@@ -890,6 +1013,7 @@ class MuJoCoEnvAdapter:
             "object_extents": self._mj_extents_mm.tolist(),
             "edge_traversed": self._edge_traversed,
             "open_edge_height": self.open_edge_height,
+            "snap_debug": self._last_snap_debug,
         }
 
     # ═══════════════════════════════════════════════════
@@ -1092,6 +1216,7 @@ class MuJoCoEnvAdapter:
         5. If snap fails, try half-step for edge traversal
         6. If all fails, rollback to original position
         """
+        self._last_snap_debug = ""  # NEW: reset snap debug
         pos = self._get_pos_mj_mm()
         euler = self._get_euler_deg()
         rot = Rot.from_euler("xyz", euler, degrees=True)
@@ -1153,7 +1278,19 @@ class MuJoCoEnvAdapter:
         snap_ok = self._snap_to_surface(prev_normal=normal)
 
         if snap_ok:
-            return  # snap_to_surface verified ray cast and normal — trust it
+            # ═══ NEW: Re-snap if agent lost surface after edge ═══
+            # On edges/curved surfaces, first snap may undershoot
+            # (depth=4-5mm instead of target 2mm) because ray cast
+            # hits surface at an angle. Agent ends up "in air"
+            # (depth > ON_OBJECT_DEPTH_MM) despite being on surface.
+            # Second snap from closer position with corrected
+            # orientation converges to target depth.
+            post_snap = self._render_and_extract()
+            if not post_snap["on_object"] and post_snap["depth_mm"] < 15.0:
+                self._snap_to_surface(
+                    prev_normal=post_snap.get("point_normal")
+                )
+            return
 
         # ═══ Snap failed — try half-step (edge traversal) ═══
         half_pos = old_pos + world_dir * step_mm * 0.5
@@ -1174,12 +1311,187 @@ class MuJoCoEnvAdapter:
 
             if snap_full:
                 self._edge_traversed = True
+                # ═══ NEW: Re-snap after edge traversal too ═══
+                post_edge = self._render_and_extract()
+                if not post_edge["on_object"] and post_edge["depth_mm"] < 15.0:
+                    self._snap_to_surface(
+                        prev_normal=post_edge.get("point_normal")
+                    )
                 return
 
         # ═══ All attempts failed — rollback ═══
         self._set_pose_mj_mm(old_pos, old_euler)
 
     def _snap_to_surface(self, prev_normal=None):
+        pos = self._get_pos_mj_mm()
+        euler = self._get_euler_deg()
+        rot = Rot.from_euler("xyz", euler, degrees=True)
+        forward = rot.apply([0, 0, -1])
+        pos_after_move = pos.copy()
+
+        # ═══ Step 1: Find surface via ray casts ═══
+        candidates = []
+        candidate_sources = []
+
+        # 1a. Forward (current camera direction)
+        hit = self._mj_ray_cast(pos, forward)
+        if 0 < hit < self._snap_max_dist:
+            candidates.append((forward.copy(), hit))
+            candidate_sources.append("forward")
+
+        # 1b. Toward previous surface (-prev_normal)
+        if prev_normal is not None:
+            prev_n = np.array(prev_normal, dtype=float)
+            prev_n /= (np.linalg.norm(prev_n) + 1e-12)
+            hit = self._mj_ray_cast(pos, -prev_n)
+            if 0 < hit < self._snap_max_dist:
+                candidates.append((-prev_n.copy(), hit))
+                candidate_sources.append("prev_normal")
+
+        # 1c. Multi-probe cone around forward
+        if not candidates:
+            hit, probe_dir = self._multi_probe_ray_cast(
+                pos, forward, rot,
+                max_dist=self._snap_max_dist, surface_step=3.0,
+            )
+            if 0 < hit < self._snap_max_dist:
+                candidates.append((probe_dir.copy(), hit))
+                candidate_sources.append("cone_fwd")
+
+        # 1d. Multi-probe cone around -prev_normal
+        if not candidates and prev_normal is not None:
+            prev_n = np.array(prev_normal, dtype=float)
+            prev_n /= (np.linalg.norm(prev_n) + 1e-12)
+            neg_n = -prev_n
+            try:
+                align_rot, _ = Rot.align_vectors([neg_n], [[0, 0, -1]])
+            except Exception:
+                align_rot = rot
+            hit, probe_dir = self._multi_probe_ray_cast(
+                pos, neg_n, align_rot,
+                max_dist=self._snap_max_dist, surface_step=3.0,
+            )
+            if 0 < hit < self._snap_max_dist:
+                candidates.append((probe_dir.copy(), hit))
+                candidate_sources.append("cone_pn")
+
+        # 1e. Toward object center (last resort for edges/rims)
+        if not candidates:
+            to_center = self._mj_center_mm - pos
+            to_center_dist = np.linalg.norm(to_center)
+            if to_center_dist > 1e-8:
+                to_center_dir = to_center / to_center_dist
+                hit = self._mj_ray_cast(pos, to_center_dir)
+                if 0 < hit < self._snap_max_dist:
+                    candidates.append((to_center_dir.copy(), hit))
+                    candidate_sources.append("to_center")
+
+        if not candidates:
+            self._last_snap_debug = "snap=FAIL|no_cands"
+            return False
+
+        # ═══ Step 2: Pick closest, compute snap position ═══
+        paired = list(zip(candidates, candidate_sources))
+        paired.sort(key=lambda c: c[0][1])
+        (best_dir, best_dist), best_source = paired[0]
+
+        self._last_snap_debug = (
+            f"snap={best_source}|sd={best_dist:.1f}"
+            f"|cands={','.join(candidate_sources)}"
+        )
+
+        approach = best_dist - SNAP_TARGET_DEPTH_MM
+        if abs(approach) > 0.3:
+            snap_pos = pos + best_dir * approach
+        else:
+            snap_pos = pos.copy()
+
+        # ═══ Step 3: Orient toward found surface ═══
+        snap_euler = self._look_at_direction(best_dir)
+        self._set_pose_mj_mm(snap_pos, snap_euler)
+
+        # ═══ Step 4: Render to get actual surface normal ═══
+        rendered = self._render_and_extract()
+
+        if rendered["depth_mm"] >= NO_SURFACE_DEPTH_MM:
+            self._last_snap_debug += "|render=NO_SURFACE"
+            return False
+
+        new_normal = rendered["point_normal"]
+
+        if new_normal is None:
+            self._last_snap_debug += "|render=no_normal"
+            return True
+
+        normal_arr = np.array(new_normal, dtype=float)
+        n_len = np.linalg.norm(normal_arr)
+        if n_len < 1e-8:
+            self._last_snap_debug += "|render=zero_normal"
+            return True
+
+        normal_arr /= n_len
+
+        # ═══ Step 5: Normal consistency check ═══
+        if prev_normal is not None:
+            prev_n = np.array(prev_normal, dtype=float)
+            prev_n /= (np.linalg.norm(prev_n) + 1e-12)
+            dot = float(np.dot(normal_arr, prev_n))
+
+            self._last_snap_debug += f"|ndot={dot:.2f}"
+
+            if dot < -0.1:
+                prev_hit = self._mj_ray_cast(pos_after_move, -prev_n)
+                if 0 < prev_hit < 5.0:
+                    approach2 = prev_hit - SNAP_TARGET_DEPTH_MM
+                    alt_pos = pos_after_move - prev_n * approach2
+
+                    alt_vec = alt_pos - pos_after_move
+                    alt_dist = float(np.linalg.norm(alt_vec))
+                    safe = True
+                    if alt_dist > 0.5:
+                        alt_check_dir = alt_vec / alt_dist
+                        alt_hit = self._mj_ray_cast(
+                            pos_after_move, alt_check_dir
+                        )
+                        if 0 < alt_hit < alt_dist - 0.5:
+                            safe = False
+
+                    if safe:
+                        alt_euler = self._look_at_direction(-prev_n)
+                        self._set_pose_mj_mm(alt_pos, alt_euler)
+                        check = self._render_and_extract()
+                        if check["depth_mm"] < NO_SURFACE_DEPTH_MM:
+                            self._last_snap_debug += "|fix=alt_pos"
+                            return True
+
+                self._edge_traversed = True
+                self._last_snap_debug += "|fix=edge_traversed"
+
+            elif dot < 0:
+                normal_arr = -normal_arr
+                self._last_snap_debug += "|fix=flip_normal"
+
+        # ═══ Step 6: Final orientation by actual normal ═══
+        final_euler = self._look_at_direction(-normal_arr)
+        self._set_pose_mj_mm(snap_pos, final_euler)
+
+        final_check = self._render_and_extract()
+        if final_check["depth_mm"] >= NO_SURFACE_DEPTH_MM:
+            self._set_pose_mj_mm(snap_pos, snap_euler)
+            self._last_snap_debug += "|fix=fallback_orient"
+
+        # Log final normal
+        fc_normal = final_check.get("point_normal") if final_check["depth_mm"] < NO_SURFACE_DEPTH_MM else None
+        if fc_normal is None:
+            fc_normal = rendered.get("point_normal")
+        if fc_normal is not None:
+            self._last_snap_debug += (
+                f"|fn=[{fc_normal[0]:.2f},{fc_normal[1]:.2f},{fc_normal[2]:.2f}]"
+            )
+
+        return True
+
+    def _snap_to_surface_old(self, prev_normal=None):
         """Snap agent to nearest surface after tangential move.
 
         Emulates trimesh nearest.on_surface logic:
@@ -1757,6 +2069,16 @@ class MuJoCoEnvAdapter:
 
         normal_arr = np.array(normal, dtype=float)
         normal_arr /= (np.linalg.norm(normal_arr) + 1e-12)
+
+        # ═══ NEW: Don't detach downward from bottom face ═══
+        # On bottom faces (normal pointing down), detaching along
+        # normal sends agent under/inside the object. Instead,
+        # detach upward so agent can fly around to goal.
+        # Threshold -0.7 ≈ 135° from vertical — only triggers
+        # on near-horizontal downward-facing surfaces (bottom).
+        up = np.array(self.up_direction, dtype=float)
+        if np.dot(normal_arr, up) < -0.7:
+            normal_arr = up.copy()
 
         old_pos = self._get_pos_mj_mm().copy()
 
