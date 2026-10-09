@@ -1,4 +1,4 @@
-# Bio-Inspired Hybrid RL for Object Surface Navigation
+# Bio-Inspired Hybrid RL for Object Navigation
 
 ## Abstract
 
