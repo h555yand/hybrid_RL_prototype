@@ -1,12 +1,3 @@
-# Copyright 2025-2026 Thousand Brains Project
-#
-# Copyright may exist in Contributors' modifications
-# and/or contributions to the work.
-#
-# Use of this source code is governed by the MIT
-# license that can be found in the LICENSE file or at
-# https://opensource.org/licenses/MIT.
-
 """AdaptiveTrainingManager: monitors performance and decides
 when/how to train for new objects.
 

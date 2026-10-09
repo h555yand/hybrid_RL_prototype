@@ -1,12 +1,3 @@
-# Copyright 2025-2026 Thousand Brains Project
-#
-# Copyright may exist in Contributors' modifications
-# and/or contributions to the work.
-#
-# Use of this source code is governed by the MIT
-# license that can be found in the LICENSE file or at
-# https://opensource.org/licenses/MIT.
-
 import logging
 from dataclasses import dataclass
 from typing import List, NewType, Optional, Tuple

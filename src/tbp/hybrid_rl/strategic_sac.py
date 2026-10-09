@@ -1,9 +1,3 @@
-# Copyright 2025-2026 Thousand Brains Project
-#
-# Use of this source code is governed by the MIT
-# license that can be found in the LICENSE file or at
-# https://opensource.org/licenses/MIT.
-
 """Strategic SAC for phase transition decisions.
 
 Small SAC network that learns when to switch phases:

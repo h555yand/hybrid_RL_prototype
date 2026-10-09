@@ -1,10 +1,3 @@
-# run.py
-# Copyright 2025-2026 Thousand Brains Project
-#
-# Use of this source code is governed by the MIT
-# license that can be found in the LICENSE file or at
-# https://opensource.org/licenses/MIT.
-
 """Entrypoint for running an experiment."""
 
 from tbp.monty.frameworks.run_env import setup_env

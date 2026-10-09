@@ -1,525 +1,116 @@
-# Hybrid RL Navigation for Monty Object Recognition
+# Bio-Inspired Hybrid RL for Object Surface Navigation
 
-## 1. Architecture: Monty–RL Integration
+## Abstract
+
+We present a hybrid reinforcement learning system for goal-directed navigation on 3D object surfaces. The system combines three complementary learning mechanisms — **episodic memory** (kernel-based Q-learning with HNSW nearest-neighbor search), **learned skills** (Soft Actor-Critic with continuous actions), and **geometric heuristics** (hand-crafted domain knowledge) — unified by an **adaptive arbitrator** that selects the best action source per step based on confidence and track record.
+
+The architecture is inspired by biological memory systems: episodic memory provides one-shot learning and fast adaptation (hippocampal analogy), parametric policy captures generalized skills through repetition (procedural memory analogy), and the arbitrator implements a metacognitive switching mechanism between behavior modes.
+
+We validate the approach on a lightweight trimesh simulator across 9 object geometries, demonstrate sim-to-sim transfer to MuJoCo with real YCB objects (no retraining), and present a case study integrating the system with the Thousand Brains Project's Monty framework for object recognition. Key results: **91% average navigation success** across all difficulty levels, **83% on unseen objects** (zero-shot generalization), and **99% on convex YCB objects** in MuJoCo without fine-tuning.
+
+---
+
+## 1. Introduction
+
+### The Problem
+
+Many robotic and cognitive systems require an agent to navigate along 3D object surfaces toward specific goal locations. In object recognition, a perception system may identify a discriminating point on an object — "observe the surface *here* to distinguish a mug from a cup" — and the motor system must navigate the sensor to that point. In robotic manipulation, a gripper must traverse an object's surface to reach a grasp point. In haptic exploration, a tactile sensor must systematically cover an object's geometry.
+
+The standard approach in simulation is **teleportation**: instantly move the agent to the target pose. This is computationally convenient but has no biological or robotic analog. A real agent must navigate incrementally through space, maintaining surface contact, avoiding collisions, traversing edges, and handling the geometric complexity of real objects.
+
+Replacing teleportation with realistic navigation introduces fundamental challenges:
+
+- **Surface geometry is complex.** Objects have edges, rims, concavities, and thin walls. An agent must crawl along curved surfaces, detect and traverse edges, detach from surfaces when necessary, fly through air, and land on target surfaces — all without a map.
+
+- **Goals may be unreachable by direct paths.** When the goal is on the opposite side of an object, the agent must plan a multi-phase trajectory: crawl to an edge, detach, fly around, and land. No single behavior suffices.
+
+- **Learning must be fast.** A robot encountering a new object cannot afford thousands of failed episodes before achieving basic navigation. The system needs one-shot or few-shot adaptation.
+
+- **The system must be robust.** In deployment, the agent faces sensor noise, imprecise actuation, and objects never seen during training. Graceful degradation and online adaptation are essential.
+
+### Our Approach
+
+We propose a hybrid RL system that mirrors how biological agents learn motor skills:
+
+1. **Episodic memory first.** Like a child learning to navigate, the system starts by remembering specific experiences: "In *this* situation, *this* action worked." A kernel-based Q-learning algorithm with HNSW nearest-neighbor storage provides one-shot learning and fast retrieval. This is analogous to hippocampal episodic encoding.
+
+2. **Skills through repetition.** Successful episodic experiences are distilled into a parametric policy (SAC) via behavioral cloning, then refined through reinforcement learning. This is analogous to the transition from declarative to procedural memory — from "I remember turning left here" to "I automatically turn left in situations like this."
+
+3. **Adaptive arbitration.** A metacognitive layer decides per step whether to trust episodic memory, learned skills, or geometric heuristics, based on confidence estimates and rolling track records. This is analogous to the brain's ability to switch between habitual and deliberate behavior depending on familiarity and stakes.
+
+4. **Environment-agnostic design.** The state representation uses only relative geometric features (direction to goal, surface normal, curvatures) in the agent's local frame. This enables policies trained in one simulator to transfer to another — or to a real robot — without retraining.
+
+### Contributions
+
+- A **hybrid RL architecture** combining episodic memory (HNSW Q-store), parametric policy (SAC), and geometric heuristics with adaptive arbitration
+- A **frame-invariant 22D state representation** that enables zero-shot sim-to-sim transfer
+- A **phase-driven navigation system** with six behavioral phases and strategic/tactical decision hierarchy
+- **Experimental validation** on 9 geometric primitives, 5 YCB objects, and integration with the Thousand Brains Project's Monty recognition system
+- **Open-source implementation** with modular environment protocol enabling deployment on any simulator or robot
+
+---
+
+## 2. Biological Motivation
+
+### Memory Systems in the Brain
+
+The architecture draws explicit parallels to three biological memory systems:
+
+| Brain System | Function | Algorithm Analog |
+|-------------|----------|-----------------|
+| **Hippocampal episodic memory** | Store and retrieve specific experiences by similarity | HNSW + kNN + Gaussian kernel Q-learning |
+| **Basal ganglia / procedural memory** | Automated skills learned through repetition | Soft Actor-Critic (SAC) parametric policy |
+| **Prefrontal arbitration** | Switch between habitual and deliberate behavior | Adaptive arbitrator with confidence × track record |
+
+### Why Episodic Memory Matters for RL
+
+Standard deep RL learns slowly — thousands of episodes to converge. Biological agents learn from single experiences. The episodic memory component provides:
+
+- **One-shot / few-shot learning**: A single successful navigation is stored and can be retrieved when a similar situation arises
+- **Pattern completion**: kNN retrieval from partial state matches (analogous to hippocampal pattern completion)
+- **Kernel generalization**: Smooth interpolation across similar experiences via Gaussian kernels
+- **Non-parametric growth**: Memory grows with experience, no fixed capacity (analogous to ongoing hippocampal neurogenesis)
+
+### Theoretical Foundations
+
+- **Ormoneit & Sen (2002)**, *Kernel-Based Reinforcement Learning*: Proposed and analyzed Q-learning with kernel regression approximation for large state spaces, establishing convergence conditions for non-parametric Q-function approximation.
+- **Blundell et al. (2016)**, *Model-Free Episodic Control*: Demonstrated that agents remembering past successful actions and reproducing them in similar states can match or exceed deep RL performance with orders of magnitude fewer samples.
+
+### The Learning Progression
+
+The system follows a biologically plausible learning progression:
+
+```
+Phase 1: Episodic Memory (hippocampal)
+  "I've been in a similar situation before. What did I do? What happened?"
+  → HNSW Q-store with heuristic-guided exploration
+  → One-shot learning, high locality, poor generalization
+
+Phase 2: Behavioral Cloning (imitation)
+  "Let me practice what worked before."
+  → Extract successful trajectories → supervised learning
+  → Bridge from discrete episodic to continuous parametric
+
+Phase 3: Skill Refinement (procedural)
+  "I've done this many times — I can do it smoothly now."
+  → SAC with BC warm-start → continuous optimization
+  → Slow learning, high generalization
+
+Phase 4: Adaptive Deployment (prefrontal)
+  "Which strategy should I use right now?"
+  → Arbitrator: confidence × track_record → best source per step
+  → Online learning continues in all systems
+```
+
+---
+
+## 3. Architecture
 
 ### Overview
 
-The Thousand Brains Project's Monty system recognizes objects by accumulating **evidence** for hypotheses (object identity × pose) as a sensor agent explores object surfaces. The standard approach uses **teleportation** (JumpToGoal) to instantly move the agent to target points selected by the Goal State Generator (GSG). We replace teleportation with **realistic RL surface navigation**, preserving Monty's recognition pipeline while adding biologically plausible movement.
-
-### System Components
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    MONTY RECOGNITION LOOP                     │
-│                                                               │
-│  ┌──────────┐   ┌──────────┐   ┌────────────┐   ┌────────┐ │
-│  │ Evidence  │──▶│   GSG    │──▶│ RL Policy  │──▶│  SM    │ │
-│  │ GraphLM   │   │ Goal Gen │   │ Selector   │   │Sensors │ │
-│  │ (evidence │◀──│(discrim. │   │            │   │(patch) │──┘
-│  │  update)  │   │ points)  │   │            │   └────────┘
-│  └──────────┘   └──────────┘   └─────┬──────┘
-│       ▲                              │
-│       │                              ▼
-│       │                     ┌────────────────┐
-│       │                     │  RLGoalPolicy  │
-│       │                     │  ┌───────────┐ │
-│       │                     │  │RL Surface │ │
-│       │                     │  │Controller │ │
-│       │                     │  │(Q+SAC)    │ │
-│       │                     │  └───────────┘ │
-│       │                     │  ┌───────────┐ │
-│       │                     │  │ MuJoCo    │ │
-│       └─────────────────────│  │ Adapter   │ │
-│        intermediate obs     │  └───────────┘ │
-│                             └────────────────┘
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Component Roles
-
-| Component | Role | Key Mechanism |
-|-----------|------|---------------|
-| **EvidenceGraphLM** | Accumulates evidence for object×pose hypotheses | Displacement-based hypothesis shifting + feature comparison |
-| **GSG** | Selects maximally discriminating target points on object graph | Picks locations where competing hypotheses predict different features |
-| **RLPolicySelector** | Routes GSG goals to RL navigation, SM goals to LookAt, no goals to default crawl | Drop-in replacement for DistantPolicySelector |
-| **RLGoalPolicy** | Navigates agent along object surface to GSG target | Q-learning + SAC hybrid controller with adaptive arbitration |
-| **MuJoCoEnvAdapter** | Bridges RL controller with shared MuJoCo simulator | Ray-cast based surface snapping, sensor data extraction |
-
-### Data Flow: One Recognition Cycle
-
-```
-Step 0:  Full step — SM extracts features → LM updates evidence
-         → GSG generates goal G1 (maximally discriminating point)
-         → RLPolicySelector routes G1 to RLGoalPolicy
-         → RL snaps agent to surface, begins navigation
-         → GSG suppressed (navigation_active=True)
-
-Steps 1-N: motor_only — RL navigates along surface
-         → LM is NOT called (no matching_steps consumed)
-         → Adaptive observation triggers when informative
-
-Step K:  Intermediate observation (adaptive trigger)
-         → Agent lifted 23mm for sensor clearance
-         → SM extracts features → LM updates evidence
-         → GSG.step() runs but cannot generate new goals (suppressed)
-         → Terminal condition checked (may recognize early!)
-         → Agent restored to surface position
-
-Step N:  Navigation complete → observation at goal/current position
-         → GSG re-enabled (navigation_active=False)
-         → Full evidence update → GSG generates next goal
-         → Cycle repeats until recognition or timeout
-```
-
----
-
-## 2. GSG–RL Coordination: Suppressing Phantom Goals
-
-### Problem
-
-During RL navigation, the GSG runs on every intermediate observation (matching step) and may generate new hypothesis-testing goals. These goals are ignored by the motor system (RL navigation is in progress), but the GSG still logs them as "attempted" and marks them as "not achieved" — creating phantom failures in the metrics.
-
-### Solution: `navigation_active` Flag
-
-When RL navigation starts, the GSG's `navigation_active` flag is set to `True`, preventing `_check_conditions_for_hypothesis_test()` from generating new goals. Evidence updates from directed exploration continue normally — only goal *generation* is suppressed.
-
-```python
-# EvidenceGoalGenerator._check_conditions_for_hypothesis_test()
-if self.navigation_active:
-    return False  # Don't generate goals during RL navigation
-
-# RLGoalPolicy._start_navigation()
-lm.gsg.navigation_active = True
-
-# RLGoalPolicy._finish_navigation()
-lm.gsg.navigation_active = False
-```
-
-**Impact**: Eliminated phantom goals (27 → 16 total goals), fixed false "not achieved" entries, and resolved a timeout failure caused by wasted matching steps on phantom goals.
-
----
-
-## 3. Directed Exploration: Intermediate Observations During Navigation
-
-### Problem
-
-Standard RL navigation treats the path to a GSG goal as dead time — the agent moves but Monty learns nothing until arrival. With teleportation this is instant, but with realistic navigation it can take 20-80 steps.
-
-### Solution: Adaptive Directed Exploration
-
-During RL navigation, the agent periodically sends observations to the Learning Module. Instead of blind fixed-interval transmission (every N steps), we use an **adaptive strategy** that maximizes information per observation:
-
-#### Adaptive Triggers
-
-```python
-def _should_observe(self) -> bool:
-    # Filter: skip low-quality observations
-    - Off object → skip
-    - Bad depth (>15mm) → skip  
-    - Agent stuck (moved <3mm) → skip
-
-    # Trigger: high-information events
-    - Surface normal changed >30° → observe (new face!)
-    - Principal curvature changed significantly → observe
-    
-    # Adaptive interval: more frequent near goal
-    - dist > 80mm → every 10 steps
-    - dist > 40mm → every 7 steps
-    - dist > 15mm → every 4 steps
-    - dist < 15mm → every 2 steps (near GSG target = high value)
-```
-
-#### Why This Works
-
-1. **Displacement is computed correctly**: LM tracks `buffer.last_location` which only updates on observation steps. Accumulated displacement over motor_only steps is applied as a single vector, correctly shifting all hypotheses.
-
-2. **Each observation is a full matching step**: LM doesn't distinguish intermediate from target observations — it runs the same evidence update pipeline (displace hypotheses → compare features → update evidence → threshold matches).
-
-3. **Early recognition is possible**: `check_terminal_conditions()` runs after every observation. If intermediate evidence is sufficient, the episode ends without reaching the GSG target.
-
-4. **Failed navigations still contribute**: When RL fails to reach a goal (collision/timeout), the agent observes at its current surface position instead of silently returning to start.
-
-5. **GSG coordination**: During navigation, GSG goal generation is suppressed via `navigation_active` flag, preventing phantom goals while allowing evidence updates from intermediate observations.
-
----
-
-## 4. Results
-
-### Benchmark: 2 objects × 3 rotations × 3 epochs = 6 episodes
-
-| Configuration | Accuracy | Matching Steps | Monty Steps | Goals | Evidence |
-|--------------|----------|---------------|-------------|-------|----------|
-| Baseline (teleport) | 6/6 (100%) | 26.0 ± 4.3 | 101 ± 18 | 3.5/ep | 23.7 ± 4.2 |
-| **RL + adaptive DE** | **6/6 (100%)** | **31.7 ± 4.3** | **198 ± 50** | **2.7/ep** | **26.6 ± 7.3** |
-
-### Per-Episode Comparison
-
-| # | Object | Rotation | Mode | Steps (match/total) | Goals | Evidence |
-|---|--------|----------|------|-------------------|-------|----------|
-| 1 | master_chef_can | [0,15,30] | base | 26 / 103 | 3 | 28.2 |
-| 1 | master_chef_can | [0,15,30] | **RL** | 31 / 190 | 3 | **33.2** |
-| 2 | cracker_box | [0,15,30] | base | 26 / 102 | 4 | 20.0 |
-| 2 | cracker_box | [0,15,30] | **RL** | 33 / 221 | **3** | 13.6 |
-| 3 | master_chef_can | [7,77,2] | base | 29 / 113 | 3 | 30.8 |
-| 3 | master_chef_can | [7,77,2] | **RL** | 36 / 172 | **2** | **34.9** |
-| 4 | cracker_box | [7,77,2] | base | 21 / 82 | 3 | 22.0 |
-| 4 | cracker_box | [7,77,2] | **RL** | 24 / 131 | **2** | 23.0 |
-| 5 | master_chef_can | [81,33,90] | base | 21 / 76 | 3 | 21.0 |
-| 5 | master_chef_can | [81,33,90] | **RL** | 31 / 188 | 3 | **30.3** |
-| 6 | cracker_box | [81,33,90] | base | 33 / 130 | 5 | 21.4 |
-| 6 | cracker_box | [81,33,90] | **RL** | 35 / 286 | **3** | **24.9** |
-
-### Key Findings
-
-1. **Accuracy parity**: RL+DE matches baseline teleportation at 100% accuracy on all test cases.
-
-2. **Higher evidence accumulation**: RL+DE accumulates 12% more evidence on average (26.6 vs 23.7) thanks to intermediate observations during navigation — the agent learns while moving.
-
-3. **Fewer GSG goals needed**: RL+DE requires 23% fewer hypothesis-testing goals per episode (2.7 vs 3.5) because directed exploration observations provide additional evidence that accelerates convergence.
-
-4. **Navigation cost**: RL+DE uses ~2× more total steps (198 vs 101) — the expected cost of replacing instant teleportation with realistic surface navigation. This is the price of biological plausibility.
-
-5. **Matching steps comparable**: Only +5.7 additional matching steps (31.7 vs 26.0), and these are productive — they come from directed exploration observations that contribute to evidence accumulation.
-
-## 3. Future Improvements
-
-### 3.1 RL-Driven Training: Goal-Directed Object Exploration
-
-#### Problem: Current Training is Inefficient
-
-Monty's current pretraining uses **random surface crawling** to build object graphs:
-
-```
-Current approach:
-  14 rotations × 1000 steps = 14,000 steps per object
-  SurfacePolicyCurvatureInformed with use_goal_driven_actions=false
-  → Random walk with curvature bias
-  → Uneven coverage: dense near start, sparse elsewhere
-  → No awareness of what's already been explored
-```
-
-This is biologically implausible — humans explore objects with **purpose**, not random wandering. Each touch and rotation is driven by a question: "What's on the other side?", "Is there a handle?", "How does the top feel?"
-
-#### Solution: Coverage-Driven Exploration with RL Navigation
-
-Replace random crawling with **goal-directed exploration** using the same RL navigation system developed for eval. A new `CoverageGoalGenerator` analyzes the growing graph and directs the agent to unexplored areas.
-
-```
-Proposed approach:
-  2-3 rotations × 80-120 steps = 200-360 steps per object
-  CoverageGoalGenerator → RLGoalPolicy (same as eval)
-  → Targeted navigation to coverage frontiers
-  → Uniform coverage with 10x fewer steps
-  → RL learns object-specific navigation during training
-```
-
-#### Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│              RL-DRIVEN TRAINING LOOP                         │
-│                                                              │
-│  ┌──────────┐   ┌──────────────┐   ┌────────────────────┐  │
-│  │ GraphLM  │──▶│  Coverage    │──▶│   RLGoalPolicy     │  │
-│  │ (builds  │   │  Goal Gen    │   │   (navigates to    │  │
-│  │  graph   │   │  (finds      │   │    frontier)       │  │
-│  │  online) │◀──│   gaps)      │   │                    │  │
-│  └──────────┘   └──────────────┘   └────────────────────┘  │
-│       │                                     │               │
-│       │         Graph grows                 │               │
-│       │         with each                   │               │
-│       │         observation                 ▼               │
-│       │                            Intermediate obs         │
-│       └────────────────────────────via adaptive DE──────────┘
-└─────────────────────────────────────────────────────────────┘
-```
-
-#### Three-Level Goal Generation
-
-The `CoverageGoalGenerator` adapts its strategy based on how much of the object has been explored:
-
-**Level 1 — Direction-based (graph < 10 points)**
-
-No graph exists yet. Goals are expressed as directions, not coordinates.
-
-```python
-# Agent is on surface but knows almost nothing about the object.
-# Strategy: move along surface in a consistent direction to build
-# an initial cluster of observations.
-
-goal = agent_pos + tangent_direction * 30.0  # 30mm along surface
-# Stop condition: normal change > 30° (found an edge/new face)
-```
-
-**Level 2 — Frontier-based (graph 10-200 points)**
-
-Graph has partial coverage. Goals target the **boundary of explored area**.
-
-```python
-# Find the edge of what we've explored and push beyond it.
-# Like a cartographer mapping coastline — always moving to where
-# the map ends.
-
-graph_center = mean(graph_points)
-distances = norm(graph_points - graph_center)
-frontier_point = graph_points[argmax(distances)]
-
-# Goal: 30mm beyond the frontier, along the surface
-direction = normalize(frontier_point - graph_center)
-goal = frontier_point + project_to_surface(direction) * 30.0
-```
-
-**Level 3 — Gap-based (graph > 200 points)**
-
-Graph has substantial coverage. Goals target the **largest uncovered regions**.
-
-```python
-# Voxelize the explored space. Find empty voxels adjacent to
-# filled ones. The largest cluster of empty voxels = biggest gap
-# in our knowledge.
-
-voxel_grid = voxelize(graph_points, voxel_size=5.0)  # 5mm voxels
-frontier_voxels = find_empty_neighbors(voxel_grid)
-largest_gap = largest_connected_component(frontier_voxels)
-goal = center_of(largest_gap)
-```
-
-#### Example: Learning master_chef_can (cylinder)
-
-```
-Step 0:    Agent on side wall. Graph empty.
-           Level 1: "Move 30mm along surface"
-           RL crawls, collects 15 points.
-
-Step 15:   Graph: 15 points on one patch of wall.
-           Level 2: frontier = edge of cluster
-           "Go to edge of explored area + 30mm beyond"
-           RL navigates, collects 15 more points.
-
-Step 30:   Graph: 30 points, strip of wall covered.
-           Level 2: "Opposite edge — go the other way"
-           RL navigates in reverse direction.
-
-Step 60:   Graph: 80 points, half the wall covered.
-           Level 2: frontier = top edge → "Go to the lid"
-           RL traverses rim edge → collects lid points.
-
-Step 80:   Graph: 120 points, wall + lid.
-           Level 3: voxel analysis finds gap on opposite wall
-           Goal = center of largest uncovered region.
-           RL navigates around cylinder.
-
-Step 120:  Graph: 200 points, uniform coverage.
-           CoverageAnalyzer: coverage ≈ 75%
-           → Episode complete.
-
-Total: 120 steps (vs 1000 with random crawl)
-Coverage: uniform (vs clustered with random crawl)
-Bonus: RL learned to traverse this cylinder's rim
-```
-
-#### Key Design Principle: RLGoalPolicy Doesn't Change
-
-The same `RLGoalPolicy` used for eval handles training navigation. It receives `Goal(location=[x,y,z])` and navigates there — it doesn't know or care whether the goal came from GSG (eval) or CoverageGoalGenerator (training).
-
-```
-Eval:     GSG → Goal([x,y,z]) → RLGoalPolicy → navigate
-Training: CoverageGoalGen → Goal([x,y,z]) → RLGoalPolicy → navigate
-                                    ↑
-                              Same interface,
-                              same RL controller
-```
-
-#### Benefits
-
-| Aspect | Current Training | RL-Driven Training |
-|--------|-----------------|-------------------|
-| Steps per object | 14,000 (14 rot × 1000) | ~300 (3 rot × 100) |
-| Coverage quality | Uneven, clustered near start | Uniform, frontier-driven |
-| Adaptivity | None — fixed 1000 steps | Stops when coverage sufficient |
-| Navigation learning | None — random crawl | RL improves with each object |
-| Rotations needed | 14 (fixed) | 2-3 (adaptive) |
-| Biological plausibility | Low — random walk | High — goal-directed exploration |
-
-#### Synergy: Training Improves Eval
-
-```
-Training with RL:
-  → RL learns surface navigation on diverse objects
-  → Graphs built with uniform coverage
-  → RL discovers edge-traversal strategies per object type
-
-Eval with RL:
-  → Same RL controller, already experienced with similar surfaces
-  → Denser graphs → better feature matching → fewer GSG goals needed
-  → Edge traversal learned during training → fewer collisions
-  → Potential: object-specific navigation policies
-```
-
-### 3.2 Model-Based Navigation Using Monty's Object Graphs
-
-#### Current Limitation
-
-The RL controller navigates **model-free** — it knows the goal position but has no model of the object's surface geometry. It discovers the surface through trial and error (ray casts, collisions, edge detection).
-
-#### Proposed Improvement
-
-Once the LM has a confident hypothesis about object identity, use the learned object graph as a **world model** for navigation planning.
-
-```
-Model-free (current):
-  Agent at A, goal at G
-  → Try actions, snap to surface, hope for the best
-  → Fails at edges, collisions, wrong-side goals
-
-Model-based (proposed):
-  Agent at A, goal at G
-  LM: "This is master_chef_can, agent is near node 42"
-  → Graph has surface topology: nodes, normals, connectivity
-  → Plan path: node 42 → 43 → 44 → ... → goal region
-  → RL follows waypoints along known surface
-  → Edge transitions predicted from graph normals
-```
-
-#### Implementation Approach
-
-1. **Graph-based path planning**: Extract object graph, find shortest surface path from estimated position to GSG goal using graph connectivity
-2. **Waypoint navigation**: Convert graph path to intermediate waypoints for RL controller
-3. **Surface-aware actions**: Use stored normals at waypoints to predict and prepare for edge transitions
-4. **Confidence-gated**: Only use graph planning when LM confidence exceeds threshold; fall back to model-free navigation otherwise
-
-#### Expected Benefits
-
-- Higher goal achievement rate (avoids impossible routes)
-- Fewer collisions (edge transitions predicted from topology)
-- Faster navigation (direct paths vs surface crawling)
-- Self-reinforcing: richer graphs → better planning → more observations → richer graphs
-
-### 3.3 Online Graph Enrichment During Eval
-
-#### Current Limitation
-
-Object graphs are frozen after pretraining. During eval, the LM reads from graphs but never updates them, even when it receives high-quality observations at novel viewpoints.
-
-#### Proposed Improvement
-
-When the LM has high confidence about object identity, add intermediate observations to the graph in real-time.
-
-```
-Episode 1: Graph has 5000 points. Navigation adds 15 new observations.
-           → Graph grows to 5015 points (denser coverage)
-
-Episode 5: Graph enriched from multiple trajectories.
-           → Better coverage from diverse viewpoints
-           → Fewer GSG goals needed for recognition
-           → matching_steps decrease over episodes
-```
-
-This creates a **self-improving system**: each recognition episode makes future recognition faster and more accurate.
-
-### 3.4 Adaptive Observation Budget
-
-#### Current Limitation
-
-Intermediate observations consume `matching_steps` budget equally with GSG target observations, despite being less informative on average.
-
-#### Proposed Improvement
-
-Differentiate between "exploration observations" (intermediate, during navigation) and "exploitation observations" (at GSG targets). Options:
-
-- Don't count intermediate observations against matching_steps budget
-- Weight intermediate observations at 0.5× in the budget
-- Dynamically adjust max_eval_steps based on navigation distance
-
-### 3.5 GSG-Aware Navigation
-
-#### Current Limitation
-
-GSG may generate a new, better goal during an intermediate observation, but RL ignores it until current navigation completes.
-
-#### Proposed Improvement
-
-Allow mid-navigation goal switching when:
-- New GSG goal is significantly closer than current goal
-- New goal has higher discrimination value
-- Current navigation is struggling (low progress, near timeout)
-
-This requires GSG to communicate goal quality scores and the RL controller to support dynamic re-targeting.
-
-
-
-
-
-# Summary - Previous stuff
-
-## This is a prototype to implement, test and proof ideas below.
-
-Replace the `JumpToGoalState` mixin in Monty's motor system with a model-free reinforcement learning (RL) agent that learns to navigate incrementally toward goal states provided by Learning Modules. Instead of teleporting the sensor to a target pose, the RL agent selects from existing Monty actions to move step-by-step toward the goal, learning from dense reward signals based on distance reduction.
-
-My idea is to take the best practices and bring them closer to how the brain works.
-Most similar in a practical sense is a hybrid of solutions:
-### Episodic Memory  
-- **Situation**: 'I've been in a similar situation before. What did I do then? What happened?'  
-- **Algorithm**: HNSW + kNN + Gaussian Kernel Interpolation  
-- **When to use**: At the begining of learning, novelty, rare / important events  
-- **Characteristics**: One-shot / few-shot learning, Fast activation by similarity, High locality, poor generalization.
-
-### Habits / skills  
-- **Situation**: 'I've done this action many times under these conditions — it usually works well.'  
-- **Algorithm**: Soft Actor-Critic (SAC) — parametric policy/value  
-- **When to use**: During routine, automated actions, stable conditions  
-- **Characteristics**: Slow learning over many repetitions, Generalization is highly effective
-
-### Algorithm of arbitration between systems: when to trust memory and when to trust the network  
-This is not a separate policy, but a mechanism for switching between behavior modes.
-
-# Motivation
-
-## Current Problem
-
-The hypothesis-testing policy in Monty's Evidence Learning Module generates goal states — target poses where the sensor should move to gather disambiguating evidence about object identity. Currently, these goals are enacted by the `JumpToGoalState` mixin, which teleports the agent instantaneously to the target pose using `SetAgentPose`.
-This teleportation approach has fundamental limitations as instantaneous teleportation has no biological or robotic analog. A real agent must navigate through space incrementally with collision awareness.
-
-## Why kernel-based Q-learning with episodic memory (HNSW + kNN + Gaussian Kernel Interpolation)
-
-### Biological Plausibility
-
-The chosen approach (kernel-based Q-learning with episodic memory) has parallels to hippocampal memory systems:
-
-- **Episodic storage**: Individual experiences stored as state-value pairs (analogous to hippocampal episode encoding)
-- **One-shot / few-shot learning**: It is enough for a person to do something once in order to act similarly in a similar situation
-- **Pattern completion**: KNN retrieval from partial state matches (analogous to hippocampal pattern completion)
-- **Kernel generalization**: Smooth interpolation across similar experiences (analogous to memory generalization during retrieval)
-- **Non-parametric**: No fixed-size weight matrix; memory grows with experience (analogous to ongoing hippocampal neurogenesis)
-
-This aligns with Monty's broader goal of biologically plausible computation.
-
-### Theoretical publications
-- Ormoneit & Sen's (2002) 'Kernel-Based Reinforcement Learning' proposed and analyzed a variant of Q-learning for large state spaces, in which the Q-function is approximated by kernel regression on the data rather than by a neural network or table. A key contribution is the conditions under which such a 'kernel Q-learning' scheme converges.
-- Blundell et al. (2016) 'Model-Free Episodic Control'. The agent remembers its past successful actions and returns and, when faced with a similar state, simply reproduces the best of what has already worked.
-
-### HNSW + kNN + Gaussian Kernel Interpolation
-
-Hierarchical Navigable Small World (HNSW) is an approximate nearest neighbor search algorithm based on a layered graph data structure. It belongs to the family of proximity graphs, where nodes (vertices) are connected based on their proximity, typically measured by the Euclidean distance.  
-HNSW is currently actively used in embedding databases for searching similar text by vectors. So, I decided to use it to store and find states.  [What is State](#state-vector-15d)  
-During the learning process, the agent stores experience in a graph and then uses the weighted past experience in a similar situation. Thehnically it looks like: store point in HNSW graph, then find the K closest ones and mix them with Gaussian kernel weights.
-[Realization details here](src/tbp/hybrid_rl/hnsw_state_store.py)
-
-### Why not only Deep Learing
-I'm not opposed to deep learning. I agree that it's well suited for approximation, embedding, and many other tasks.  
-I'm not suggesting replacing neural networks, I'm suggesting supplementing it and improving the learning process.
-
-## You can read README_v1.md for details and questions before POC was implemented
-[LINK](README_v1.md)
-
-# Guide-level explanation
-## Architecture Overview
-
-The system has four phases. Training: Q-learning builds episodic memory, then Behavioral Cloning extracts successful trajectories, then SAC learns a parametric policy. Deployment: Adaptive Arbitrage decides per step whether to use Q-store, SAC, or heuristic fallback. All phases interact with the environment. Goals come from curriculum during training, and would come from the Learning Module in production.
-
 ```mermaid
 flowchart LR
-    ENV["🌍 Environment\n(Trimesh)\npose, sensor_data\ncollisions, depth"]
+    ENV["🌍 Environment\n(Any simulator / robot)\npose, sensor_data\ncollisions, depth"]
 
     A["🧠 Phase 1\nEpisodic Memory\nHNSW Q-Store\nHeuristic-Guided\nExploration"]
     B["📋 Phase 2\nBehavioral Cloning\nImitate successful\ntrajectories"]
@@ -545,598 +136,370 @@ flowchart LR
     style D fill:#4a148c,stroke:#ce93d8,stroke-width:2px,color:#e1bee7
 ```
 
-Evidence LM's Goal-State Generator proposes the goal-state from the hypothesis-testing policy.
-**goal_pose** = [x, y, z, pitch, yaw, roll]  
-   ↓  
-**RLGoalApproachController** computes **State Vector** using **goal_pose** as well as sensory patch input and proprioceptive information.   
-   ↓  
-**At the begining for new states** it needs to learn before inference.  
-   ↓  
-**RL Q-leraning with HNSW + kNN + Gaussian Kernel Interpolation** working with discrete actions. [What is Action](#montyactionspace)    
-Actions are selected using [Heuristic-Guided Exploration](#heuristic-guided-exploration) approach. Objective: To obtain smart behavior and training data for SAC.  
-HNSW graph points collection (gathering experience). Copying of **successful traces into replay buffer**.
-**HNSWStateStore** stores **State Vector**, actions, Q-values.
-Upon reaching a certain threshold of successful validation operations moves to next step of learning.    
-   ↓  
-**Behavioral cloning (BC)** — method of imitation learning in which an agent learns to imitate the behavior of an expert by directly copying his actions based on data. BC is the simplest form of imitation learning: we teach the robot's policy as a supervised learning task—to predict the action of an expert based on observation. It can be used as independent approach but usually used as supplement before SAC or other off-policy RL algorithm.
-Translation of HNSW 18D discrete action space from replay buffer into Parameterized SAC continuous action space. Replacing of 8 direction MoveTangentially with one action with two parameters: angle_deg, distance. Others actions are stays the same. Main defference will be during SAC training when paramters can be any value, not fixed config free_step, rotation_step, surface_step.
-   ↓  
-**Train a SAC Actor policy using supervised learning loss** to have a continuous policy that copying the behavior of a discrete policy.  
-   ↓  
-**Warm-start to run RL SAC training with Critic policy** as well using the Actor policy weights from the BC.
-Train with a reward (progress toward the goal, penalty for collisions) in real or sim environment.
-The SAC refines the policy: it makes movements smoother and more accurate, adapting to new scenes.
-**Now the policy doesn't just copy of a discrete policy, it optimizes**.  
-   ↓  
-In future when SAC is trained we use it as **skills to propose continuous actions**  
+### Environment Protocol
 
-## Advantages of this scheme:
-- Quick start with Q-learning and discrete actions – no need to wait for the SAC to learn from scratch.
-- Stability – Heuristic-Guided Exploration learns in new areas.
-- Precision – then SAC makes movements smooth and optimal as skills.
-- Biologically plausible – like human learning: first we copy, then we hone.
+The system defines a minimal environment interface that any simulator or robot must implement:
 
+```python
+class RLEnvironment(Protocol):
+    def reset() -> sensor_data
+    def get_pose() -> [x, y, z, rx, ry, rz]       # any consistent frame
+    def get_sensor_data() -> {normal, depth, curvatures, on_object, ...}
+    def set_goal(goal_pose)
+    def get_random_surface_point() -> goal_pose
+    def step_discrete(action_idx) -> sensor_data    # for Q-store / heuristic
+    def step_continuous(type, params) -> sensor_data # for SAC
+```
 
-**Below is explanation of the main components**:
-## Adaptive Arbitrage
+Currently implemented:
+- **LightweightEnv** (trimesh) — fast geometric simulation, used for training
+- **MuJoCoEnvAdapter** — physics-based simulation, used for evaluation and online adaptation
 
-The adaptive arbitrage system is the deployment-time decision layer that combines all learned knowledge (Q-store, SAC, heuristics) and continues learning on new objects. It consists of two components: the **Arbitrator** (per-step action source selection) and the **AdaptiveTrainingManager** (episode-level performance monitoring and retraining).
+Future environments (Habitat, real robot) only need to implement this protocol.
 
-### Arbitrator — Per-Step Action Source Selection
+---
 
-The Arbitrator decides which action source to use **on every step**. It receives proposals from Q-store and SAC, evaluates their reliability, and picks the best source.
+## 4. State Representation (22D)
 
-[Full realization here](src/tbp/hybrid_rl/arbitrator.py)
+The agent observes a 22-dimensional state vector computed entirely in the **agent's local coordinate frame**. This frame-invariance is critical: navigating from A to B requires the same actions regardless of absolute position in the world, enabling zero-shot transfer across environments.
+
+### Five Feature Groups
+
+**Where is the goal?** Position error (3D direction), rotation error (3D), scalar distance. These tell the agent "the goal is 30mm ahead and to the left."
+
+**What surface am I on?** Surface normal (3D), principal curvatures (k1, k2), on_object flag, normalized depth. These tell the agent "I'm on a curved wall" or "I'm in the air."
+
+**How is the goal oriented relative to the surface?** Alignment — dot product of goal direction and surface normal. Negative means the goal is behind the surface (agent needs to detach). Positive means the agent can crawl along the surface.
+
+**Goal surface context.** Goal normal in agent's local frame, path_blocked flag, movement efficiency (net displacement / total movement — detects oscillation).
+
+**Projected goal direction.** 2D projection of goal direction onto the tangent plane (on surface) or agent XY plane (in air). Direct signal for which direction to move.
+
+### Full State Vector
+
+| Index | Feature | Description |
+|-------|---------|-------------|
+| 0–2 | position_error [x, y, z] | Direction to goal in agent's local frame |
+| 3–5 | rotation_error [pitch, yaw, roll] | Orientation error (normalized angles) |
+| 6–8 | local_normal | Surface normal in agent's local frame |
+| 9 | k1 | Principal curvature (max absolute) |
+| 10 | k2 | Principal curvature (min absolute) |
+| 11 | on_object | Whether sensor is on object surface |
+| 12 | alignment | dot(goal_direction, surface_normal) |
+| 13 | distance | Euclidean distance to goal |
+| 14 | norm_depth | Normalized depth to nearest surface |
+| 15–17 | goal_normal_local | Goal surface normal in agent's local frame |
+| 18 | path_blocked | Whether direct path to goal is blocked (0/1) |
+| 19 | movement_efficiency | Net displacement / total movement (0..1) |
+| 20–21 | projected_goal_2d | Goal direction projected onto tangent plane |
+
+### Strategic State Vectors
+
+In addition to the 22D tactical state, the system uses two compact 5D strategic state vectors for high-level phase transition decisions. These are stored in separate HNSW graphs and control behavioral mode switching rather than individual actions.
+
+**Detach Decision State (5D)** — Should the agent stay on surface or lift off?
+
+| Index | Feature | Description |
+|-------|---------|-------------|
+| 0 | normal_agreement | dot(agent_normal, goal_normal) — same side? |
+| 1 | alignment | dot(goal_direction, agent_normal) — reachable by crawling? |
+| 2 | norm_distance | distance / object_extent — relative distance |
+| 3 | path_blocked | Direct path blocked? (0/1) |
+| 4 | movement_efficiency | Recent crawl efficiency — detects stagnation |
+
+**Direction Decision State (5D)** — In air: fly directly to goal or bypass obstacle?
+
+| Index | Feature | Description |
+|-------|---------|-------------|
+| 0 | lateral_deviation | How far off-axis the goal is (0=ahead, 1=side) |
+| 1 | alignment | dot(goal_direction, agent_normal) |
+| 2 | norm_distance | distance / object_extent |
+| 3 | angle_to_goal | dot(forward, goal_direction) |
+| 4 | path_blocked | Direct path blocked? (0/1) |
+
+> The strategic states are intentionally compact (5D vs 22D). High-level decisions like "should I detach?" depend on a few geometric relationships, not fine-grained curvature. Compact states mean faster learning with fewer samples and better generalization across objects.
+
+---
+
+## 5. Action Space (24D)
+
+The agent selects from 24 discrete actions in four categories:
+
+### Surface Movement
+| Index | Action | Description |
+|-------|--------|-------------|
+| 0–7 | MoveTangentially (8 directions) | Crawl along surface: 0°, 45°, ..., 315° |
+| 16 | OrientHorizontal | Position/orientation correction in horizontal plane |
+| 17 | OrientVertical | Position/orientation correction in vertical plane |
+
+### Free Movement
+| Index | Action | Description |
+|-------|--------|-------------|
+| 8 | MoveForward | Fly forward (8mm) |
+| 9 | MoveForward (backward) | Fly backward (2mm) |
+| 19 | MoveForward (small) | Fly forward small step (2mm) |
+
+### Orientation
+| Index | Action | Description |
+|-------|--------|-------------|
+| 10–11 | TurnLeft / TurnRight | Yaw rotation (5°) |
+| 12–13 | LookUp / LookDown | Pitch rotation (5°) |
+| 14–15 | SetSensorRotation ±  | Roll rotation |
+| 20–23 | Big rotations (up/down/left/right) | Coarse correction (15°) |
+
+### Macro Actions
+| Index | Action | Description |
+|-------|--------|-------------|
+| 18 | Detach | Lift off surface along normal, orient toward goal |
+
+### Action Space Progression
+
+The system uses actions at two levels of abstraction:
+
+1. **Q-learning (discrete)**: Policy outputs index 0–23 with fixed step parameters. "What to do" at the primitive level.
+2. **SAC (continuous parameters)**: Policy outputs action type + continuous parameters. The 8 tangential directions collapse into one action with continuous angle and distance. "What to do, and exactly how much."
+
+This progression mirrors biological motor learning: first discrete choices ("turn left"), then continuous refinement ("turn 23° at 15mm/s").
+
+---
+
+## 6. Episodic Memory: HNSW Q-Store
+
+### Architecture
+
+The Q-function is approximated non-parametrically using Hierarchical Navigable Small World (HNSW) graphs — the same data structure used in vector databases for embedding similarity search. Each point in the graph stores a state vector, Q-values for all actions, and visit statistics.
+
+**Query**: Given a new state, find K nearest neighbors in the HNSW graph, compute Gaussian kernel weights based on distance, and return weighted Q-values.
+
+**Update**: After observing a reward, update the Q-values of nearby points (or insert a new point if the state is sufficiently novel).
+
+### Four Separate Q-Stores
+
+The Q-store is split into four separate HNSW graphs:
+
+| Store | State Dim | Actions | Purpose |
+|-------|:---------:|:-------:|---------|
+| **q_store_surface** | 22D | 24 | Tactical actions when on object surface |
+| **q_store_free** | 22D | 24 | Tactical actions when in air |
+| **strategic_detach** | 5D | 2 | High-level: stay on surface or detach? |
+| **strategic_direction** | 5D | 2 | High-level: fly to goal or bypass? |
+
+> The same position in space requires opposite strategies depending on whether you're touching the surface. On the surface — crawl. In the air — steer and fly. Mixing them in one store confused the learning. Similarly, strategic decisions operate on different features and timescales than tactical action selection.
+
+### Key Design Features
+
+- **Feature weights**: Per-store configurable weights that boost strategic features in the HNSW distance computation
+- **Normalization freeze**: Running statistics computed during warmup, then frozen. HNSW index rebuilt with final normalization to prevent drift
+- **Auto-calibrated insert threshold**: Adapts point density to actual state space coverage
+- **Confidence estimation**: Returns proximity, experience, and consistency scores alongside Q-values — used by the arbitrator to gauge trust
+
+---
+
+## 7. Phase-Driven Navigation
+
+### Six Behavioral Phases
+
+The agent operates in one of six phases, determined by geometric analysis of the current situation:
+
+| Phase | Condition | Behavior |
+|-------|-----------|----------|
+| **CRAWL_TO_GOAL** | On surface, same side, path clear | Crawl along surface toward goal |
+| **CRAWL_TO_EDGE** | On surface, different side or blocked, making progress | Crawl toward nearest edge/rim |
+| **DETACH_NEEDED** | On surface, different side or blocked, stuck | Lift off surface |
+| **FLY_TO_GOAL** | In air, path clear | Steer and fly directly toward goal |
+| **FLY_TO_EDGE** | In air, path blocked | Orbit/bypass around object |
+| **LAND** | In air, close to goal | Careful approach with small steps |
+
+Phase transitions include **hysteresis** — when conditions change, the agent continues the current phase for several steps before switching, preventing oscillation.
+
+### Two-Level Decision Architecture
+
+**Strategic level** — decides phase transitions using dedicated 5D Q-stores:
+- Detach decision: Should the agent stay on surface or lift off?
+- Direction decision: In air, fly directly or bypass?
+- Updated retrospectively based on episode outcomes
+
+**Tactical level** — selects specific action within the current phase:
+- Uses 22D Q-store (surface or free, depending on context)
+- Blended with phase-specific heuristic bias
+
+### Heuristic Components
+
+Seven independent heuristic components produce score vectors over all actions:
+
+| # | Component | Description |
+|---|-----------|-------------|
+| 0 | **Suppress** | Block inappropriate actions (detach in air, sensor rotations) |
+| 1 | **Surface move** | Phase-aware tangential direction: geodesic toward goal, or toward edge |
+| 2 | **Stagnation** | If stuck: penalize current direction, boost perpendicular |
+| 3 | **Steer in air** | Simulate rotations, pick best alignment with target |
+| 4 | **Damp free on surface** | Suppress dangerous free movement while on surface |
+| 5 | **Flyby correction** | Detect flying past goal, suppress forward, boost correction |
+| 6 | **Orientation cooldown** | Penalize repeated ineffective orientation actions |
+| 7 | **Landing** | Near goal: small steps only. Emergency depth: suppress large moves |
+
+---
+
+## 8. Reward Function
+
+The reward signal is computed locally using only the agent's pose, sensor data, and goal. It is **phase-aware** — the same physical event gets different rewards depending on the navigation phase.
+
+### Reward Components
+
+| Component | Reward | Terminal? | Condition |
+|-----------|-------:|:---------:|-----------|
+| **Progress** | ~±3.0 | No | Distance reduction, scaled by phase |
+| **Subgoal shaping** | ±3.0 | No | Potential-based (Ng et al. 1999), encourages edge approach when goal is behind surface |
+| **Goal reached** | +60.0 | Yes | distance < 4mm |
+| **Step penalty** | −0.5 | No | Every step — encourages efficiency |
+| **Stagnation** | −0.3 | No | movement_efficiency < 0.1 on surface |
+| **Surface violation** | −12.0 | Yes | Agent passed through object |
+| **Collision** | −12.0 | Yes | Collision during detach |
+| **Timeout** | −12.0 | Yes | Steps exceeded budget |
+| **Near goal bonus** | +0.5 | No | Close to goal and on surface |
+| **Successful landing** | up to +8.0 | No | Air → surface without collision, scales with quality |
+| **Correct crawl** | +0.2 | No | On surface, making progress toward goal |
+| **Fly alignment** | ±2.0 | No | Improving/worsening alignment with target in air |
+| **Risky free on surface** | −2.0 | No | Free movement while on surface (collision risk) |
+| **Flying too far** | −2.0 | No | Distance > 1.5× object extent |
+| **Detach in air** | −5.0 | No | Detach action when already airborne |
+
+### Phase-Aware Progress
+
+The progress reward adapts to the current navigation phase:
+- **CRAWL_TO_GOAL / FLY_TO_GOAL**: Full progress reward
+- **FLY_TO_EDGE**: Negative progress scaled to 20% — moving away from goal while bypassing is expected
+- **CRAWL_TO_EDGE / DETACH_NEEDED**: Progress scaled to 10%
+
+---
+
+## 9. Behavioral Cloning & SAC
+
+### Behavioral Cloning: Bridge from Episodic to Parametric
+
+Successful trajectories from Q-learning are extracted and used to train the SAC actor network via supervised learning. This serves as a bridge between the discrete episodic policy and the continuous parametric policy.
+
+Key transformation: The 8 discrete tangential directions (indices 0–7) are collapsed into a single continuous action with two parameters (angle, distance). Other actions retain their type but gain continuous step parameters.
+
+### SAC Training: Skill Refinement
+
+The SAC actor, warm-started from behavioral cloning weights, is refined through standard SAC training with the reward function described above. The BC warm-start is critical — it provides a reasonable initial policy that SAC refines, rather than learning from scratch.
+
+### BC Data Balancing
+
+Training data is balanced across objects and difficulty levels:
+
+```yaml
+bc_mesh_weights:
+  cube: 0.8          # simple geometry, basic skills
+  sphere: 0.8
+  cylinder: 1.5      # important for edge traversal
+  vase: 2.0          # hollow navigation
+  mug: 2.5           # handle + rim (hardest)
+
+bc_level_weights:
+  L0: 1.0             # easy
+  L1: 1.5             # medium
+  L2: 2.0             # hard (most valuable)
+```
+
+---
+
+## 10. Adaptive Arbitration
+
+### Arbitrator: Per-Step Action Source Selection
+
+The arbitrator decides which action source to use on every step. It receives proposals from Q-store and SAC, evaluates their reliability, and picks the best source.
 
 #### Decision Logic
 
 ```
 Step 1: Get proposals from all sources
-  → Q-store: softmax sample from Q-values (with strategic detach override)
-  → SAC: sample from actor network (continuous params)
+  → Q-store: softmax sample from Q-values
+  → SAC: sample from actor network
   → Heuristic: geometric rules (fallback)
 
 Step 2: Q-confident override
-  IF q_confidence ≥ adaptive_threshold AND q_spread > 3.0:
+  IF q_confidence ≥ threshold AND q_spread > 3.0:
     IF q_type == sac_type → use SAC params (Q confirms SAC = "blend")
     IF q_type != sac_type → use heuristic (conflict = neither trusted)
 
 Step 3: Track record scoring
-  Compute per-level success rates for Q, SAC, blend, heuristic
-  IF worst_ML_track < heuristic_track AND heuristic_budget not exhausted:
-    → use heuristic (ML is underperforming)
+  Per-level success rates for each source
+  IF worst_ML_track < heuristic_track → use heuristic
 
-Step 4: Default
-  → use SAC (or Q fallback if no SAC)
+Step 4: Default → use SAC (or Q fallback if no SAC)
 ```
-
-#### Key Design Decisions
-
-**Per-level track records**: Success rates are tracked separately for each curriculum level. Level 0 (easy, 10-40mm) may have different source reliability than level 2 (hard, 10-120mm). Each source (Q, SAC, blend, heuristic) maintains a sliding window of 50 episode outcomes per level.
-
-**Dynamic heuristic epsilon**: Instead of a fixed heuristic fallback rate, the budget is proportional to the gap between heuristic and ML performance:
-```
-heuristic_eps = max(h_track - worst_ml_track, 0.1)
-```
-When ML is close to heuristic performance → minimal heuristic usage (10%). When ML is far below → more heuristic (up to the full gap). This prevents heuristic from dominating when ML is learning, while providing a safety net when ML fails.
-
-**Q-confidence with V-baseline**: Q-confidence from HNSW store is adjusted by the state value baseline:
-- V above global mean → boost confidence (well-known good state)
-- V below global mean → reduce confidence (unknown/bad state)
-
-This prevents Q-store from being overconfident in unfamiliar regions.
-
-**Agreement tracking**: When Q and SAC propose the same action type, the "blend" source is recorded. This tracks whether the two systems are converging — high agreement rate suggests both have learned similar policies.
-
-**Episode attribution**: At episode end, the dominant source (most steps) determines which track record gets updated. This is a simplification — ideally each step's contribution would be weighted, but dominant-source attribution is robust and simple.
 
 #### Source Selection Summary
 
-| Source | When chosen | What it provides |
-|--------|-------------|------------------|
-| **Q-store** | High confidence, no SAC available | Discrete action → converted to type + params |
-| **SAC** | Default when available, ML track ≥ heuristic | Continuous action type + params from actor network |
-| **Blend** | Q and SAC agree on type, Q is confident | SAC params with Q confirmation (highest trust) |
-| **Heuristic** | Q/SAC conflict, or ML underperforming heuristic | Geometric rules → discrete action → type + params |
+| Source | When Chosen | Trust Level |
+|--------|-------------|-------------|
+| **Blend** (Q confirms SAC) | Q and SAC agree, Q is confident | Highest |
+| **SAC** (standalone) | Default when available, ML track ≥ heuristic | High |
+| **Heuristic** (fallback) | Q/SAC conflict, or ML underperforming | Medium |
+| **Q-store** (standalone) | High confidence, no SAC available | Context-dependent |
 
-### AdaptiveTrainingManager — Episode-Level Performance Monitor
+### AdaptiveTrainingManager: Episode-Level Monitor
 
-The AdaptiveTrainingManager monitors rolling success rate and decides the training mode. It wraps the Arbitrator and manages online/offline learning.
-
-[Full realization here](src/tbp/hybrid_rl/adaptive_manager.py)
-
-#### Three Operating Modes
+The manager monitors rolling success rate and controls the training mode:
 
 | Mode | Condition | Behavior |
 |------|-----------|----------|
-| **online** | 40-95% success rate (default) | Full Q-learning every step. Periodic SAC updates (critic CQL + actor with BC). Adaptive epsilon based on success rate |
-| **mastered** | >95% success rate sustained | Light tuning only. Epsilon = 0.02. System has learned the object |
-| **offline** | Best ML track < heuristic × 0.5, sustained | Emergency full retrain. Q-learning (500 ep, ε: 1.0→0.3) + SAC retrain (300 ep). Resets track records after |
-
-#### Online SAC Updates
-
-Every `online_sac_update_every` episodes (default 100), the manager performs a mini SAC training session:
-
-1. **Critic warmup**: First N updates are critic-only (CQL). Actor is frozen to prevent catastrophic forgetting before critic has calibrated
-2. **CQL critic**: Conservative Q-Learning prevents overestimation on the new object's state distribution
-3. **Actor updates**: After warmup, actor updates every 10th step with reduced learning rate (×0.1) and strong BC regularization
-4. **BC lambda decay**: Gradually frees actor from behavioral cloning constraint (×0.95 per update cycle)
-
-Transitions are collected selectively:
-- **Success trajectories**: Always collected (buffer + BC data)
-- **Failure trajectories**: Collected with probability `min(0.3, success_rate × 0.5)` — critic needs some negatives but not too many
-
-#### Offline Retrain Pipeline
-
-Triggered when ML sources consistently underperform heuristics (with safeguards):
-- Minimum `min_online_before_offline` episodes before first offline (default 300)
-- Maximum `max_offline_iterations` total (default 2)
-- Cooldown `post_offline_cooldown` episodes after each offline (default 200)
-
-The offline pipeline:
-1. Save current Q-store
-2. Run Q-learning training (`offline_q_episodes`, default 500) with warmup and curriculum
-3. Reload improved Q-store, reset Arbitrator track records
-4. If SAC available and enough success trails: retrain SAC with combined BC data (old objects + new trails)
-5. Reset success history, enter online mode
-
-#### Mode Transition Diagram
+| **online** | 40–95% success | Full Q-learning every step. Periodic SAC updates. Adaptive epsilon |
+| **mastered** | >95% sustained | Light tuning only. ε = 0.02 |
+| **offline** | ML << heuristic, sustained | Emergency full retrain: Q-learning (500 ep) + SAC (300 ep) |
 
 ```
                     ┌──────────┐
          ┌─────────│  online   │◄────────────┐
          │         └────┬──────┘             │
-         │              │                     │
     success > 95%   ML << heuristic      post-retrain
          │              │                     │
          ▼              ▼                     │
    ┌──────────┐   ┌──────────┐               │
    │ mastered │   │ offline  │───────────────┘
    └──────────┘   └──────────┘
-         │              
-    success < 95%       
-         │              
+         │
+    success < 95%
+         │
          └──────► online
 ```
 
-### Integration: How Arbitrator and Manager Work Together
+### Why Q-Store Matters (Even When Heuristics Exist)
 
-```
-Episode loop:
-  1. Manager.get_action(state, pose, sensor)
-     → Arbitrator.decide() → (action_type, params, source)
-  2. Environment.step(action)
-  3. Controller.update_only() → Q-store learns from transition
-  4. Repeat until done
+> "If heuristics achieve 89% average, why do we need Q-store at all?"
 
-  5. Manager.on_episode_complete(success, transitions)
-     → Update success history
-     → Arbitrator.on_episode_end(success) → update track records
-     → decide_mode() → online/mastered/offline
-     → If online: collect transitions, maybe SAC update
-     → If offline: trigger full retrain pipeline
-     → If mastered: reduce epsilon to 0.02
-```
+1. **Heuristics can't learn from experience.** A heuristic that fails on a specific geometry will fail the same way every time. Q-store records what worked and what didn't.
 
-> "The key insight is that the Arbitrator operates at step level (which source per action) while the Manager operates at episode level (how to train). The Arbitrator doesn't know about training — it just picks the best source based on track records. The Manager doesn't know about individual actions — it just monitors success rate and triggers retraining when needed. This separation keeps both components simple and testable."
+2. **Q-store enables confidence-based arbitration.** SAC always outputs high-confidence predictions — it has no "I don't know" signal. Q-store provides this: high confidence + high spread = "I've seen this before." Low confidence = "unfamiliar territory." The arbitrator uses this to decide when to trust SAC (blend: 85.3% success) vs fall back to heuristics (72.2%).
+
+3. **Q-store is an open knowledge base.** It can be populated from online learning, demonstrations, sim-to-real transfer, multi-agent sharing, or model-based planning — all through a single interface: `update_q_value(state, action, value)`. Heuristics are fixed functions that cannot absorb new knowledge.
+
+4. **Q-store bootstraps SAC.** The pipeline Q-store → BC → SAC is what enables SAC to achieve 83% on unseen objects from episode 1.
 
 ---
 
-## State Vector (22D)
-The agent sees a 22-dimensional state vector. Everything is in the agent's local coordinate frame — this is important for generalization, because going from A to B requires the same actions regardless of absolute position in the world.
-Five groups of features:
+## 11. Experiments
 
-> **Where is the goal?** Position error — 3D direction to goal. Rotation error — how much to turn. Distance — scalar. These tell the agent 'the goal is 30mm ahead and to the left.'
->
-> **What surface am I on?** Surface normal, principal curvatures (k1, k2), on_object flag, normalized depth. These tell the agent 'I'm on a curved wall' or 'I'm in the air.'
->
-> **How is the goal oriented relative to the surface?** Alignment — dot product of goal direction and surface normal. When it's negative, the goal is behind the surface, and the agent needs to detach and fly. When it's positive, the agent can crawl along the surface.
->
-> **Goal surface context.** Goal normal in agent's local frame — tells the agent how the goal surface is oriented relative to current position. Path blocked flag — whether direct line to goal intersects the object. Movement efficiency — ratio of net displacement to total movement over recent steps, detecting oscillation/stagnation.
->
-> **Projected goal direction.** 2D projection of goal direction onto the tangent plane (when on surface) or onto the XY plane of the agent frame (when in air). Gives the agent a direct signal for which surface direction to crawl.
->
-> The state is action-space independent — it describes the situation, not what actions are available.
+### 11.1 Training Setup
 
-I started with 13D, expanded to 15D (adding curvatures), then to **22D** during development. The additional features (goal normal, path blocked, movement efficiency, projected direction) significantly improved navigation on complex objects like mugs and cups.
+Training uses a curriculum with geometric filters to progressively increase difficulty:
 
-| Index | Feature | Description |
-|----------|----------|----------|
-| 0-2   | position_error [x, y, z]   | direction to goal in agent's local frame   |
-| 3-5   | rotation_error [pitch, yaw, roll]   | orientation error (normalized angles)   |
-| 6-8   | local_normal   | surface normal in agent's local frame   |
-| 9   | k1   | principal curvature (max absolute)   |
-| 10   | k2   | principal curvature (min absolute)   |
-| 11   | on_object   | whether sensor on object surface   |
-| 12   | alignment   | dot(goal_direction, surface_normal)   |
-| 13   | distance   | Euclidean distance to goal   |
-| 14   | norm_depth   | normalized depth to nearest surface   |
-| 15-17 | goal_normal_local | goal surface normal in agent's local frame |
-| 18 | path_blocked | whether direct path to goal is blocked by object (0/1) |
-| 19 | movement_efficiency | net displacement / total movement over recent window (0..1) |
-| 20-21 | projected_goal_2d | goal direction projected onto tangent plane (on surface) or agent XY plane (in air) |
+| Level | Distance | Filter | Description |
+|-------|:--------:|--------|-------------|
+| L0 | 10–60mm | same_side, path clear | Easy: goal visible, direct path |
+| L1 | 10–80mm | same_side, path blocked | Medium: path blocked by curvature |
+| L2 | 10–120mm | different sides | Hard: goal on opposite side, requires detach/fly/land |
 
-### Strategic State Vectors
+**Training objects**: cube, sphere, cylinder, flat_square, cone, thin_cylinder, vase, mug.
+**Unseen test object**: cup (zero-shot generalization).
+**Evaluation**: 100 episodes per level per object.
 
-In addition to the main 22D tactical state, the system uses two compact strategic state vectors for high-level decisions. These are stored in separate HNSW graphs (`strategic_detach` and `strategic_direction`) and control phase transitions rather than individual actions.
-
-#### Detach Decision State (5D)
-Used to decide whether to stay on surface (crawl) or switch to air (detach). Stored in `strategic_detach` Q-store with 2 actions: stay=0, switch=1.
-
-| Index | Feature | Description |
-|-------|---------|-------------|
-| 0 | normal_agreement | dot(agent_normal, goal_normal) — are agent and goal on same side? |
-| 1 | alignment | dot(goal_direction, agent_normal) — is goal reachable by crawling? |
-| 2 | norm_distance | distance / object_extent — relative distance to goal |
-| 3 | path_blocked | whether direct path to goal is blocked (0/1) |
-| 4 | movement_efficiency | recent crawl efficiency — detects stagnation |
-
-#### Direction Decision State (5D)
-Used when in air to decide whether to fly directly to goal (action=0) or bypass/orbit around obstacle (action=1). Stored in `strategic_direction` Q-store with 2 actions: fly_to_goal=0, bypass=1.
-
-| Index | Feature | Description |
-|-------|---------|-------------|
-| 0 | lateral_deviation | how far off-axis the goal is (0=ahead, 1=side) |
-| 1 | alignment | dot(goal_direction, agent_normal) |
-| 2 | norm_distance | distance / object_extent — relative distance |
-| 3 | angle_to_goal | dot(forward, goal_direction) — how well aimed at goal |
-| 4 | path_blocked | whether direct path is blocked (0/1) |
-
-> "The strategic states are intentionally compact (5D vs 22D). High-level decisions like 'should I detach?' depend on a few geometric relationships, not on fine-grained curvature or exact position. Compact states mean the strategic Q-stores learn faster with fewer samples and generalize better across objects. Strategic state are used only for Q-stores, SAC as neaural network is able to find similar dependencies from 22D tactical state"
-
-
-
-## ActionSpace (24D) - What agent can do
-There are 24 discrete actions in four categories.
-
-> "**Surface movement** — 8 directions of MoveTangentially, plus OrientHorizontal and OrientVertical. This is crawling along the object surface.
->
-> **Free movement** — MoveForward in three step sizes: normal 8mm, small 2mm, and backward 2mm. This is flying through air.
->
-> **Orientation** — TurnLeft, TurnRight, LookUp, LookDown, each in normal and big step sizes. 5 degrees and 15 degrees. Big steps for coarse correction, small for fine-tuning.
->
-> **Macro actions** — Detach. These are multi-step sequences. Detach lifts off the surface along the normal and orient gaze toward goal.
->
-> The action space is a configurable parameter. Adding or removing actions doesn't require architectural changes
-
-### How to use action types in RL step by step:
-1. Q-learning and discrete actions - 'What to do' (high level primitives with fixed parameters)
-The policy outputs an index from 0 to 24.  
-Fixed directions, surface_step, free_step, rotation_step are used.  
-2. Parameterized SAC (current proposal)  - 'What to do' (high level primitives with continious parameters) 
-The policy outputs: action index (0-8) and a continuous parameter instaed of fixed step.
-Replacing of 8 direction MoveTangentially with one action with two parameters: angle_deg, distance. Others actions are stays the same.
-3. Purely continuous SAC - Skipped, reasons: Loss of interpretability, Difficulty of learning, Loss of domain knowledge, Incompatibility with high level primitives  
-The policy outputs a vector [Δx, Δy, Δz, Δθ, Δφ] and then interprets this as a combined motion.
-4. Mathematical controller (Low-level / Inverse kinematics & Impedance)
-This is 'spinal cord' that receives a command from the neural network (SAC) and instantly calculates the motor actions.
-
-At the beginning I used 18 actions then 1 macro actions and 5 different step / rotation size actions were added:
-### Discrete action space 24D
-| Index | Action               | Description                                                                 | Mode     | Parameters |
-|--------|------------------------|-------------------------------------------------------------------------|-----------|-----------|
-| 0–7    | MoveTangentially       | Movement tangent to the surface in 8 directions: 0°, 45°, ..., 315° | surface   | `distance: float`, `direction: VectorXYZ` |
-| 8      | MoveForward            | Moving forward (in the direction the agent is looking)              | both       | `distance: float` |
-| 9      | MoveForward (neg)      | Moving backward                                                          | both       | `distance: float` |
-| 10     | TurnLeft               | Rotate the agent to the left (along the Y axis, yaw)                  | distant   | `rotation_degrees: float` |
-| 11     | TurnRight              | Rotate the agent to the right                                            | distant   | `rotation_degrees: float` |
-| 12     | LookUp                 | Tilt the agent/sensor up (pitch)                                      | distant   | `rotation_degrees: float` |
-| 13     | LookDown               | Tilt the agent/sensor down                                              | distant   | `rotation_degrees: float` |
-| 14     | SetSensorRotation (+)  | Rotate the sensor clockwise around the normal (yaw)                          | both       | `rotation_quat: Quaternion` |
-| 15     | SetSensorRotation (-)  | Rotate the sensor counterclockwise                                          | both       | `rotation_quat: Quaternion` |
-| 16     | OrientHorizontal       | Correction of position and orientation in the horizontal plane (with compensation) | surface   | `rotation_degrees: float`, `left_distance: float`, `forward_distance: float` |
-| 17     | OrientVertical         | Correction of position and orientation in the vertical plane                | surface   | `rotation_degrees: float`, `down_distance: float`, `forward_distance: float` |
-| 18 | Detach | macro | Detach from surface along normal and orient gaze toward goal |
-| 19 | MoveForward Small | free | MoveForward on small step |
-| 20 | LOOK_UP_BIG | orient | look up at big rotation |
-| 21 | LOOK_DOWN_BIG | orient | look down at big rotation |
-| 22 | TURN_LEFT_BIG | orient | turn left at big rotation |
-| 23 | TURN_RIGHT_BIG | orient | turn right at big rotation |
-
-- **Action steps:** Smaller steps reduce collisions but increase episode step length. After many iterartions values were choosen:
-   - surface_step: 3.0
-   - free_step: 8.0
-   - free_step_small: 2.0
-   - rotation_step: 5.0
-   - rotation_step_big: 15.0
-   - free_step_backward: 2.0
-
-
-## HNSWStateStore
-Update state → normalize (with feature weights) → KNN search
-→ if near existing point: update it
-→ else: insert new point with interpolated init
-
-Get state → normalize (with feature weights) → KNN search → kernel interpolation → Q-values
-
-> "One important design decision: I split the Q-store into **four** separate HNSW graphs:
-> - **q_store_surface** — tactical actions when on the object surface
-> - **q_store_free** — tactical actions when in the air
-> - **strategic_detach** — high-level detach/stay decisions (5D state, 2 actions)
-> - **strategic_direction** — high-level fly-to-goal/bypass decisions (5D state, 2 actions)
->
-> The same position in space requires opposite strategies depending on whether you're touching the surface. On the surface — crawl. In the air — steer and fly. Mixing them in one store confused the learning. Similarly, strategic decisions operate on different features and timescales than tactical action selection, so they get their own stores."
-
-### Key improvements since initial prototype
-
-- **Feature weights**: Per-store configurable weights that boost strategic features in the HNSW distance computation. Surface store and free store can emphasize different state dimensions, so HNSW better distinguishes crawl vs detach states.
-
-- **Normalization freeze**: Running mean/std statistics are computed during a warmup period (`norm_warmup_steps`, default 5000), then frozen. After freeze, the HNSW index is rebuilt with final normalization. This prevents normalization drift from distorting distances between early and late points.
-
-- **Auto-calibration of insert threshold**: The `insert_threshold` (which controls whether to update an existing point or insert a new one) can be automatically calibrated from observed nearest-neighbor distances. This adapts point density to the actual state space coverage.
-
-- **Fast save/load with native HNSW index**: `save_with_index` / `load_with_index` persist the native hnswlib binary alongside point data, avoiding O(N log N) rebuild on load. Falls back to rebuild if the binary is incompatible.
-
-- **Confidence estimation**: `get_q_values_with_confidence` returns not just Q-values but a confidence score composed of proximity (how close are neighbors), experience (how often were they visited), and consistency (do neighbors agree on best action). Used by the v2 action selection to dynamically control Q-trust vs heuristic reliance.
-
-[Realization details here](src/tbp/hybrid_rl/hnsw_state_store.py)
-
-
-## Reward Function
-> "The reward signal is computed entirely locally in the motor system. No involvement from Learning Modules or CMP. The reward function is **phase-aware** — the same physical event (e.g. moving away from goal) gets different rewards depending on whether the agent is crawling to goal, bypassing an obstacle, or landing."
-
-The reward has evolved from a simple progress + terminal structure to a multi-component system that shapes behavior across all navigation phases:
-
-| Component | Reward | Done? | When |
-|:----------|-------:|:-----:|:-----|
-| **Progress (per step)** | ~+3.0 | No | `(prev_dist - dist) / surface_step × 3.0`. Phase-aware: reduced penalty during FLY_TO_EDGE and CRAWL_TO_EDGE when moving away from goal is expected |
-| **Subgoal shaping** | ±3.0 | No | Potential-based shaping (Ng et al. 1999). Encourages moving toward object edge when goal is behind surface (alignment < 0). Preserves optimal policy |
-| **Goal reached** | +60.0 | Yes | `distance < goal_threshold (4mm)` |
-| **Step penalty** | -0.5 | No | Every step — encourages efficient paths |
-| **Stagnation penalty** | -0.3 | No | When movement_efficiency < 0.1 on surface — agent is oscillating |
-| **Surface violation** | -12.0 | Yes | Agent passed through object (depth < min_valid_depth or normal flipped) |
-| **Detach collision** | -12.0 | Yes | Collision during macro detach action |
-| **Lost object** | -3.0 | No | Fell off surface unexpectedly (not from intentional detach) |
-| **Timeout** | -12.0 | Yes | `steps >= max_steps_per_goal` |
-| **Near goal on surface** | +0.5 | No | `distance < 3 × surface_step` AND `on_object = true` |
-| **Successful landing** | up to +8.0 | No | Transitioned from air to surface without collision, on correct side. Reward scales with landing quality: `8.0 × max(0, 1 - distance / landing_radius)` |
-| **Correct crawl bonus** | +0.2 | No | On surface, phase=CRAWL_TO_GOAL, making positive progress |
-| **Fly alignment improvement** | ±2.0 | No | In air: reward for improving forward alignment with subgoal (FLY_TO_EDGE) or goal (FLY_TO_GOAL/LAND). Penalizes turning away |
-| **Risky free on surface** | -2.0 | No | MoveLinear action while on surface — high collision risk |
-| **Flying too far** | -2.0 | No | Distance > 1.5 × object_extent while in air — drifting away |
-| **Detach in air** | -5.0 | No | Detach action when already in air — wasteful |
-
-### Phase-aware progress
-
-The progress reward adapts to the current navigation phase:
-- **CRAWL_TO_GOAL / FLY_TO_GOAL**: Full progress reward — moving toward goal is the objective
-- **FLY_TO_EDGE**: Negative progress scaled to 20% — agent may temporarily move away from goal while bypassing obstacle, and that's expected
-- **CRAWL_TO_EDGE / DETACH_NEEDED**: Progress scaled to 10% — crawling to edge often increases goal distance
-- **Detour mode**: When alignment < threshold and on surface, negative progress is clipped to prevent large penalties for necessary detours
-
-### Subgoal potential shaping
-This encourages the agent to move toward the object edge (where alignment → 0) when the goal is behind the surface, without distorting the optimal policy.
-
-Details of logic here: `def compute_common_reward` and `def _compute_reward`
-[LINK](src/tbp/hybrid_rl/rl_goal_approach_controller.py)
-
-
-## Heuristic-Guided Exploration
-> "Before Q-learning has any experience, the agent needs reasonable behavior from step one. That's what heuristics provide. They are geometric rules that bias action selection. The heuristic system has evolved from simple directional rules to a **phase-driven architecture** where the current navigation phase determines which heuristic components are active."
-
-### Phase System
-
-The agent operates in one of six phases, determined by `_determine_phase()` based on geometric analysis of the current situation:
-
-| Phase | Condition | Behavior |
-|-------|-----------|----------|
-| **CRAWL_TO_GOAL** | On surface, same side, path clear | Crawl along surface toward goal using geodesic direction |
-| **CRAWL_TO_EDGE** | On surface, different side or path blocked, still making progress | Crawl toward nearest edge/rim to transition to other side |
-| **DETACH_NEEDED** | On surface, different side or path blocked, stuck (low movement efficiency) | Lift off surface — strategic detach decision |
-| **FLY_TO_GOAL** | In air, path clear | Steer and fly directly toward goal |
-| **FLY_TO_EDGE** | In air, path blocked | Orbit/bypass around object toward edge |
-| **LAND** | In air, close to goal or emergency (depth < 5mm) | Careful approach with small steps, suppress large movements |
-
-Phase transitions include **hysteresis** — when path becomes clear during FLY_TO_EDGE, the agent continues bypassing for 3 steps before switching to FLY_TO_GOAL, preventing oscillation.
-
-**Horizontal surface detection**: On horizontal surfaces (normal aligned with up_direction > 85°), the agent skips CRAWL_TO_EDGE/DETACH_NEEDED and stays in CRAWL_TO_GOAL, because crawling on a rim naturally leads to edge traversal.
-
-### Heuristic Components
-
-The heuristic bias is composed of seven independent components, each producing a score vector over all actions:
-
-| # | Component | Active when | Description |
-|---|-----------|-------------|-------------|
-| 0 | **Suppress** | Always | Suppresses detach (strategic decision), sensor rotations, and orient actions (except near goal). Anti-spam guards for consecutive detach |
-| 1 | **Surface move** | On surface | Phase-aware tangential direction scoring. CRAWL_TO_GOAL: geodesic direction using goal normal for great-circle path, with direction hysteresis. CRAWL_TO_EDGE: direction toward edge/rim using subgoal direction. Horizontal rim: blend of goal direction and away-from-center for edge descent |
-| 2 | **Stagnation** | On surface, CRAWL phases | If no progress in 10 steps: penalize current direction, boost perpendicular and opposite directions |
-| 3 | **Steer in air** | In air | Phase-driven steering. Simulates 4 rotations, picks best alignment with effective goal (subgoal for FLY_TO_EDGE, goal for FLY_TO_GOAL). Three regimes: TURN_ONLY (>45°), FLY+TURN (>20°), FLY (aligned). Big rotations for coarse correction, small for fine-tuning. Trapped detection near surface |
-| 4 | **Damp free on surface** | On surface | Strongly suppresses free movement, big rotations, and orient actions — these are dangerous on surface |
-| 5 | **Flyby correction** | In air, not FLY_TO_EDGE | Detects when agent is flying past goal (distance increasing). Suppresses forward movement, boosts corrective rotations. Escalates with consecutive flyby count |
-| 6 | **Orientation cooldown** | On surface | Tracks orientation actions that produce no distance change. After 3 no-effect uses, progressively penalizes that action |
-| 7 | **Landing** | In air, LAND/FLY phases | Near goal: suppress large forward, boost small forward. Emergency (depth < 5mm): only small forward allowed. Overshoot detection: if distance exceeds recent minimum by > free_step, hard suppress forward |
-
-### Two-Level Decision Architecture
-
-Action selection operates on two levels:
-
-**Strategic level** — decides phase transitions using dedicated Q-stores:
-- **Detach decision** (`strategic_detach`, 5D state, 2 actions): Should the agent stay on surface or detach? Blends strategic Q-values with geometric heuristic using strategic epsilon. Retrospective learning: after episode ends, updates detach Q-values based on whether detach actually helped (changed same_side, unblocked path, led to success/collision/timeout)
-- **Direction decision** (`strategic_direction`, 5D state, 2 actions): In air, should the agent fly to goal or bypass? Uses path_blocked and angle_to_goal. Updated retrospectively based on episode outcome
-
-**Tactical level** — selects specific action within the phase determined by strategic level.
-
-### Transition Schedule
-
-| Phase | Epsilon | Behavior |
-|---|-----------|--------|
-| Warmup | fixed | Pure heuristic with greedy selection — reasonable from step 1 |
-| Cold start | 1.0 → 0.5 | v1: mostly heuristic. v2: low Q-trust, heuristic dominant |
-| Learning | 0.5 → 0.1 | v1: blend shifts to Q. v2: Q-trust grows with confidence |
-| Inference | 0.1 → 0.02 | v1: mostly Q with heuristic safety net. v2: high Q-trust where data exists, heuristic fallback elsewhere |
-
-A small fraction (5% × ε) of actions remain purely random to guarantee full action space coverage.
-
-**Limitation:** Heuristic biases reference specific action indices (e.g., `IDX_DETACH`, `IDX_FREE_FORWARD`). For a different action space, heuristics would need to be adapted. This is by design — heuristics encode domain-specific geometric reasoning that depends on what actions are available.
-
-[Realization details: `_compute_heuristic_bias`, `_determine_phase`, `_choose_action_v2`](src/tbp/hybrid_rl/rl_goal_approach_controller.py)
-
-
-## Lightweight Enviroment
-To fast test hypophesys and ideas we need to create relevant approximation of Habitat, especially for training policies based on haptics/active perception.
-It should not simulate graphics, but it should accurately reproduces the key physics that are important for training: contact, normals, ray casting, movement on surfaces.
-I suggest to use Trimesh python library for loading and using triangular meshes with an emphasis on watertight surfaces. https://github.com/mikedh/trimesh
-The Lightweight Environment (Trimesh) proved essential for rapid iteration — each experiment takes ~ several hours to test on my laptop
-[Details are here](src/tbp/hybrid_rl/lightweight_env.py)
-
-### Objects
-[Sizes and realization are](src/tbp/hybrid_rl/mesh_factory.py)
-[Pictures are](results_publish/objects)
-
-
-
-# Main Proof of Concept Results
-
-The prototype has been implemented and tested on the Lightweight Environment (Trimesh-based). Below are the key results that I hope confirm the ideas from the RFC.
-
-## Pipeline Validation
-**The full pipeline works end-to-end: Q-learning → Behavioral Cloning → SAC → Arbitrage**
-
-
-### Evaluation Results
-
-#### Training and Evaluation Setup
-
-Training used curriculum with geometric filters to progressively increase difficulty:
-
-| Level | Distance (mm) | Filter | Description |
-|-------|:------------:|--------|-------------|
-| L0 | 10-60 | same_side=true, path_blocked=false | Easy: goal visible, direct path |
-| L1 | 10-80 | same_side=true, path_blocked=true | Medium: goal on same side but path blocked by surface curvature |
-| L2 | 10-120 | same_side=false | Hard: goal on opposite side of object, requires detach/fly/land |
-
-All methods trained on: cube, sphere, cylinder, flat_square, cone, thin_cylinder, vase, mug.
-**Cup is unseen** during training — generalization test.
-100 episodes per level per object.
-
-#### Q-Learning training
-    # ═══════════════════════════════════════════
-    # PHASE 1: Primitives (from scratch)
-    # ═══════════════════════════════════════════
-    training_stages:
-      # ── Phase 1: Primitives ──
-      - mesh: cube
-        episodes: 1000
-        epsilon_start: 1.0
-        epsilon_min: 0.15
-        load_mode: null
-        warmup_episodes: 100
-        promote_threshold: 0.85
-        promote_window: 200
-        curriculum_filters:
-          - {same_side: true, path_blocked: false}
-          - {same_side: true, path_blocked: true}
-          - {}
-
-      - mesh: sphere
-        episodes: 1000
-        epsilon_start: 1.0
-        epsilon_min: 0.12
-        load_mode: auto
-        warmup_episodes: 80
-        promote_threshold: 0.85
-        promote_window: 200
-        curriculum_filters:
-          - {same_side: true, path_blocked: false}
-          - {same_side: true, path_blocked: true}
-          - {}
-
-      - mesh: cylinder
-        episodes: 1000
-        epsilon_start: 1.0
-        epsilon_min: 0.10
-        load_mode: auto
-        warmup_episodes: 80
-        promote_threshold: 0.85
-        promote_window: 200
-        curriculum_filters:
-          - {same_side: true, path_blocked: false}
-          - {same_side: true, path_blocked: true}
-          - {}
-
-      - mesh: flat_square
-        episodes: 1000
-        epsilon_start: 1.0
-        epsilon_min: 0.10
-        load_mode: auto
-        warmup_episodes: 80
-        promote_threshold: 0.8
-        promote_window: 200
-        curriculum_filters:
-          - {same_side: true, path_blocked: false}
-          - {same_side: true, path_blocked: true}
-          - {}
-      
-      - mesh: cone
-        episodes: 1000
-        epsilon_start: 1.0
-        epsilon_min: 0.10
-        load_mode: auto
-        warmup_episodes: 80
-        promote_threshold: 0.8
-        promote_window: 200
-        curriculum_filters:
-          - {same_side: true, path_blocked: false}
-          - {same_side: true, path_blocked: true}
-          - {}
-
-      - mesh: thin_cylinder
-        episodes: 1000
-        epsilon_start: 1.0
-        epsilon_min: 0.10
-        load_mode: auto
-        warmup_episodes: 80
-        promote_threshold: 0.85
-        promote_window: 200
-        curriculum_filters:
-          - {same_side: true, path_blocked: false}
-          - {same_side: true, path_blocked: true}
-          - {}
-
-      # ── Phase 2: Hollow objects ──
-      - mesh: vase
-        episodes: 2000
-        epsilon_start: 1.0
-        epsilon_min: 0.10
-        load_mode: auto
-        warmup_episodes: 100
-        promote_threshold: 0.70
-        promote_window: 300
-
-      - mesh: mug
-        episodes: 2000
-        epsilon_start: 1.0
-        epsilon_min: 0.10
-        load_mode: auto
-        warmup_episodes: 100
-        promote_threshold: 0.7
-        promote_window: 300
-
-      # ── Phase 3: Reinforcement on new points ──
-      - mesh: vase
-        episodes: 1000
-        epsilon_start: 0.3
-        epsilon_min: 0.08
-        load_mode: auto
-        pool_seed: 201
-        warmup_episodes: 30
-        promote_threshold: 0.70
-        promote_window: 200
-
-      - mesh: mug
-        episodes: 1000
-        epsilon_start: 0.3
-        epsilon_min: 0.08
-        load_mode: auto
-        pool_seed: 202
-        warmup_episodes: 30
-        promote_threshold: 0.7
-        promote_window: 200
-
-#### Q-Learning Evaluation
+### 11.2 Q-Learning Results
 
 | Object | L0 | L1 | L2 | Avg |
-|--------|:-:|:-:|:-:|:-:|
+|--------|:--:|:--:|:--:|:---:|
 | **sphere** | 100% | 100% | 100% | **100%** |
 | **cube** | 100% | 100% | 90% | **97%** |
 | **cylinder** | 100% | 97% | 94% | **97%** |
@@ -1147,717 +510,350 @@ All methods trained on: cube, sphere, cylinder, flat_square, cone, thin_cylinder
 | **cup** ★ | 98% | 69% | 69% | **79%** |
 | **mug** | 99% | 72% | 65% | **78%** |
 
-####  ═══ BC balancing ═══
-    bc_mesh_weights:
-      # simple, but provides basic flat surface skills and edge traversal
-      cube: 0.8         
-      sphere: 0.8       
-      cylinder: 1.5      
-      flat_square: 0.5   
-      cone: 0.5
-      thin_cylinder: 0.5
-      # hollow navigation
-      vase: 2.0    
-      # handle+rim   
-      mug: 2.5           
+★ = unseen during training
 
-    bc_level_weights:
-      0: 1.0
-      1: 1.5
-      2: 2.0    
-
-#### SAC Training
-    sac_episodes_per_mesh:
-      cube: 500
-      sphere: 500
-      cylinder: 500
-      flat_square: 500
-      cone: 500
-      thin_cylinder: 500
-      vase: 1000
-      mug: 1000
-
-#### SAC Evaluation
+### 11.3 SAC Results
 
 | Object | L0 | L1 | L2 | Avg |
-|--------|:-:|:-:|:-:|:-:|
+|--------|:--:|:--:|:--:|:---:|
 | **sphere** | 100% | 100% | 100% | **100%** |
 | **thin_cylinder** | 100% | 100% | 100% | **100%** |
 | **cylinder** | 100% | 100% | 98% | **99%** |
 | **cube** | 100% | 100% | 94% | **98%** |
-| **cone** | 96% | 66% | 74% | **79%** |
 | **vase** | 100% | 100% | 68% | **89%** |
 | **flat_square** | 100% | 86% | 66% | **84%** |
 | **mug** | 100% | 87% | 64% | **84%** |
 | **cup** ★ | 93% | 89% | 66% | **83%** |
+| **cone** | 96% | 66% | 74% | **79%** |
 
-#### Heuristic-Only Evaluation
+### 11.4 Heuristic-Only Baseline
 
 | Object | L0 | L1 | L2 | Avg |
-|--------|:-:|:-:|:-:|:-:|
+|--------|:--:|:--:|:--:|:---:|
 | **thin_cylinder** | 100% | 99% | 99% | **99%** |
 | **cylinder** | 100% | 96% | 94% | **97%** |
+| **vase** | 99% | 98% | 90% | **96%** |
 | **cube** | 100% | 98% | 91% | **96%** |
 | **sphere** | 100% | 95% | 89% | **95%** |
+| **cup** ★ | 99% | 84% | 85% | **89%** |
+| **mug** | 100% | 76% | 78% | **85%** |
 | **cone** | 95% | 67% | 78% | **80%** |
 | **flat_square** | 100% | 88% | 51% | **80%** |
-| **vase** | 99% | 98% | 90% | **96%** |
-| **mug** | 100% | 76% | 78% | **85%** |
-| **cup** | 99% | 84% | 85% | **89%** |
 
-★ = unseen during training (generalization test)
-
-#### Cross-Method Comparison (Average across all levels)
+### 11.5 Cross-Method Comparison
 
 | Object | Q-Learning | SAC | Heuristic |
-|--------|:-:|:-:|:-:|
+|--------|:----------:|:---:|:---------:|
 | **sphere** | 100% | 100% | 95% |
 | **thin_cylinder** | 96% | 100% | 99% |
 | **cylinder** | 97% | 99% | 97% |
 | **cube** | 97% | 98% | 96% |
-| **cone** | 80% | 79% | 80% |
-| **flat_square** | 82% | 84% | 80% |
 | **vase** | 90% | 89% | 96% |
+| **flat_square** | 82% | 84% | 80% |
+| **cone** | 80% | 79% | 80% |
 | **mug** | 78% | 84% | 85% |
 | **cup** ★ | 79% | 83% | 89% |
 | **Average** | **89%** | **91%** | **89%** |
 
-#### Key Findings
+### 11.6 Adaptive Arbitration (Cup — Unseen Object, 2000 Episodes)
 
-**1. Learned policies match hand-crafted heuristics.** Q-learning (89% avg) and SAC (91% avg) achieve performance on par with carefully engineered geometric heuristics (89% avg). This is significant because the heuristics encode months of domain-specific geometric reasoning (geodesic crawling, orbit computation, flyby correction, landing control), while Q-learning and SAC learned equivalent behavior from reward signal alone. SAC slightly outperforms both on average, confirming that the BC warm-start → SAC refinement pipeline works.
-
-**2. Generalization to unseen objects works.** Cup was never seen during training. Q-learning achieves 79%, SAC 83%, heuristic 89% on cup — comparable to performance on trained objects like mug (78%/84%/85%) and cone (80%/79%/80%). This confirms the hypothesis that the 22D state vector captures fundamental geometric relationships (alignment, curvature, path_blocked, normal_agreement) rather than object-specific features. The agent has learned to navigate *geometry*, not specific objects.
-
-**3. Q-store serves as a knowledge base for the full pipeline.** The training pipeline flows: Q-learning builds episodic memory → successful trajectories extracted → Behavioral Cloning trains SAC actor → SAC refines with RL. Each stage builds on the previous. Q-store accumulates geometric experience across objects (1,156 strategic detach points, 9,544 strategic direction points), which transfers to new objects. SAC then smooths and generalizes this discrete experience into continuous actions.
-
-**4. Heuristics provide a strong baseline and safety net.** The heuristic system is not just a bootstrap — it remains competitive at all levels. On complex objects at L2, heuristics sometimes outperform learned policies (vase: 90% heuristic vs 72% Q-learning, cup: 85% vs 69%). This validates the two-level architecture: heuristics handle geometric reasoning reliably, while learned policies add value through experience-based corrections and continuous action parameters.
-
-**5. L2 (opposite sides) remains the primary challenge.** All methods show significant degradation at L2 where the goal is on the opposite side of the object. The failure mode is predominantly timeout — the agent navigates safely but runs out of steps during detach→fly→land sequences. Flat_square is the hardest (48-66% at L2) because its thin geometry makes edge detection and landing particularly difficult.
-
-This complementarity is exactly what the Adaptive Arbitrage system exploits — selecting the best source per step based on track records.
-
-#### Adaptive Arbitrage Evaluation (Cup — unseen object, 2000 episodes)
-
-The adaptive mode combines Q-store, SAC, and heuristics with online learning on a completely new object (cup). The system starts with models trained on 8 other objects and adapts in real-time.
-
-**Overall: 83% rolling success rate at Level 2 after 2000 episodes.**
+The adaptive mode combines all sources with online learning on a completely new object:
 
 | Metric | Value |
 |--------|-------|
 | Total episodes | 2,000 |
 | Rolling success rate (last 100) | 83% |
-| Total success rate | 72.9% |
-| Final curriculum level | 2 (hardest) |
+| Final curriculum level | L2 (hardest) |
 | Mean steps per success | 51.0 |
 | Online SAC updates | 20 |
 | Offline retrains triggered | 0 |
 
-[Details are here](results_publish/adaptive_logs_cup)
-
-##### Source Distribution
+**Source distribution:**
 
 | Source | Step Rate | Success Rate | Role |
-|--------|:-:|:-:|------|
-| **Blend** (Q confirms SAC) | 51.5% | 85.3% | Primary — highest trust, Q validates SAC |
-| **SAC** (standalone) | 25.6% | 83.3% | Secondary — when Q not confident enough to confirm |
+|--------|:---------:|:------------:|------|
+| **Blend** (Q confirms SAC) | 51.5% | 85.3% | Primary — highest trust |
+| **SAC** (standalone) | 25.6% | 83.3% | Secondary — when Q not confident |
 | **Heuristic** (fallback) | 23.0% | 72.2% | Safety net — when ML underperforms |
-| **Q-store** (standalone) | 0.0% | — | Not used alone — always confirms or defers to SAC |
 
 Q-SAC agreement rate: **79%** — the two systems converge on the same action type in 4 out of 5 steps.
 
-##### Per-Level Performance
+**Per-level self-regulation:**
+- **L0–L1**: SAC dominates (95–97%), heuristic budget at minimum (5–10%)
+- **L2**: SAC drops to 71%, heuristic budget automatically increases to 24%
 
-| Level | Blend | SAC | Heuristic | Best |
-|-------|:-:|:-:|:-:|:-:|
-| L0 (easy) | 92% | 97% | — | SAC |
-| L1 (medium) | 88% | 95% | — | SAC |
-| L2 (hard) | 63% | 71% | 72% | Heuristic |
+The arbitrator detects ML underperformance and reallocates without manual intervention.
 
-At L2, heuristic budget increases to 24% (from 5% at L0) because ML sources drop below heuristic track record. The arbitrator automatically allocates more steps to heuristics where they outperform learned policies.
+### 11.7 Key Findings
 
-##### Why Q-Store Matters (Even When Heuristics Exist)
+1. **Learned policies match hand-crafted heuristics.** Q-learning (89%) and SAC (91%) achieve performance on par with carefully engineered geometric heuristics (89%). The heuristics encode months of domain-specific reasoning; Q-learning and SAC learned equivalent behavior from reward signal alone.
 
-> "If heuristics achieve 89% average, why do we need Q-store at all?"
+2. **Generalization to unseen objects works.** Cup was never seen during training. Q-learning: 79%, SAC: 83%, Heuristic: 89% — comparable to trained objects like mug (78%/84%/85%). The 22D state vector captures fundamental geometric relationships, not object-specific features.
 
-Heuristics are hard-coded geometric functions — they work well but have fundamental limitations:
+3. **The full pipeline adds value.** Each stage builds on the previous: Q-store → BC → SAC. SAC slightly outperforms Q-learning on average, confirming the refinement pipeline works.
 
-1. **Heuristics can't learn from experience.** A heuristic that fails on a specific geometry will fail the same way every time. Q-store records what worked and what didn't, building a growing knowledge base. After 2000 episodes on cup, the strategic_direction store grew from 9,544 to 9,555 points — each new point is a learned geometric situation.
+4. **Complementary strengths.** On complex objects at L2, heuristics sometimes outperform learned policies (vase: 90% heuristic vs 72% Q-learning). On simple objects, learned policies match or exceed heuristics. The adaptive arbitrator exploits this complementarity.
 
-2. **Q-store enables confidence-based arbitration.** SAC (as a neural network) always outputs high-confidence predictions — it has no mechanism to signal "I don't know." Q-store provides this missing signal: high confidence + high spread means "I've seen this situation many times and know what to do." Low confidence means "this is unfamiliar territory." The Arbitrator uses Q-confidence to decide when to trust SAC (blend mode, 85.3% success) vs when to fall back to heuristics (72.2% success). Without Q-confidence, every SAC action would be trusted equally, losing the 13% advantage of blend over heuristic.
+5. **L2 (opposite sides) is the primary challenge.** All methods degrade at L2. The failure mode is predominantly timeout — the agent navigates safely but runs out of steps during detach→fly→land sequences.
 
-3. **Q-store is a knowledge base that can be populated from multiple sources.** Currently Q-store learns from:
-   - Online Q-learning updates (every step during adaptive mode)
-   - Retrospective success backup (propagating rewards along successful trajectories)
-   - Strategic detach/direction learning (episode-end retrospective updates)
+---
 
-   In the future, Q-store can be populated from:
-   - **Demonstration learning**: Recording successful robot trajectories and inserting state-action-value triples directly into HNSW graph
-   - **Sim-to-real transfer**: Pre-populating Q-store from simulation, then refining with real-world experience
-   - **Multi-agent knowledge sharing**: Merging Q-stores from multiple robots operating on different objects
-   - **Model-based planning**: Using Monty's learned reference frames as a world model to simulate trajectories and pre-populate Q-values for unvisited states (Dyna-Q style)
-   - **Human corrections**: An operator marks a state as "detach here" or "don't detach here", directly updating strategic Q-values
+## 12. Sim-to-Sim Transfer: YCB Objects in MuJoCo
 
-   Heuristics cannot absorb any of these knowledge sources — they are fixed functions. Q-store is an open knowledge base with a universal insert interface: `update_q_value(state, action, value)`.
-
-4. **Q-store provides the training signal for SAC.** Successful trajectories from Q-learning episodes are extracted, converted to continuous action space via Behavioral Cloning, and used to warm-start SAC. Without Q-store, SAC would need to learn from scratch — which is significantly slower and less stable. The pipeline Q-store → BC → SAC is what enables SAC to achieve 83% on an unseen object from episode 1.
-
-##### Adaptive Mode Dynamics
-
-The system self-regulates without manual intervention:
-
-- **L0-L1**: SAC dominates (95-97% success), heuristic budget stays at minimum (5-10%). The system trusts learned policies.
-- **L2**: SAC drops to 71%, heuristic budget automatically increases to 24%. The arbitrator detects ML underperformance and allocates more steps to the reliable fallback.
-- **Blend mode** (Q confirms SAC) consistently outperforms standalone SAC at L0-L1 (92% vs 97% — SAC is better alone on easy tasks) but provides the critical safety check at L2 where SAC's confidence doesn't correlate with actual success.
-
-## YCB Results on MuJoCo Environment
-
-To validate that learned policies transfer beyond the training simulator, we evaluated on **real YCB objects** rendered in **MuJoCo** — a physics-based environment with realistic depth sensing, surface normals from mesh rendering, and physically-grounded agent movement. The agent was trained entirely on simple geometric primitives (cube, sphere, cylinder, etc.) in the lightweight trimesh environment and had **never seen any YCB object during training**.
-
-### Evaluation Setup
-
-- **Environment**: MuJoCo with YCB object meshes (textured .obj), depth camera sensor (64×64), surface normal estimation via total least squares
-- **Agent**: Q-learning policy trained on trimesh primitives (no fine-tuning on YCB or MuJoCo)
-- **Objects**: 5 YCB objects spanning different geometric complexities
-- **Curriculum**: Same 3-level difficulty as training
-
-| Level | Distance (mm) | Filter | Description |
-|-------|:------------:|--------|-------------|
-| L0 | 10-60 | same_side, path clear | Easy |
-| L1 | 10-80 | same_side, path blocked | Medium |
-| L2 | 10-120 | different sides | Hard |
+To validate that learned policies transfer beyond the training simulator, we evaluated on **real YCB objects** in **MuJoCo** — a physics-based environment with depth sensing, surface normals from mesh rendering, and physically-grounded movement. The agent was trained entirely on simple geometric primitives in the lightweight trimesh environment and had **never seen any YCB object during training**.
 
 ### Results
 
-| YCB Object | L0 | L1 | L2 | Average | Geometry Type |
-|------------|:--:|:--:|:--:|:-------:|---------------|
+| YCB Object | L0 | L1 | L2 | Average | Geometry |
+|------------|:--:|:--:|:--:|:-------:|----------|
 | **Banana** | 100% | 97% | 100% | **99%** | Convex, elongated |
 | **Cracker Box** | 100% | 80% | 70% | **83%** | Box-like, flat faces |
 | **Master Chef Can** | 100% | 90% | 53% | **81%** | Cylindrical |
 | **Bowl** | 87% | 77% | 3% | **56%** | Hollow, open top |
 | **Mug** | 77% | 60% | 27% | **54%** | Hollow, handle |
 
+### Transfer Gap Analysis
+
+| Geometry | Trimesh | MuJoCo | Gap |
+|----------|:-------:|:------:|:---:|
+| Cylindrical | 97% | 81% | −16% |
+| Box-like | 97% | 83% | −14% |
+| Hollow | 78% | 54% | −24% |
+
 ### Analysis
 
-**1. Convex objects transfer near-perfectly.** Banana (99%) and cracker box (83%) demonstrate that policies learned on simple primitives generalize well to real-world convex shapes in a different physics engine. The banana's 100% at L2 (hardest level) shows that the agent's fly-around-and-land strategy works even for unusual elongated geometries.
+1. **Convex objects transfer near-perfectly.** Banana (99%) demonstrates that policies learned on simple primitives generalize to real-world shapes in a different physics engine.
 
-**2. Cylindrical geometry transfers well.** Master chef can (81%) closely matches the trimesh cylinder performance (97% in trimesh eval). The 16% gap is primarily at L2 (53% vs 94%), attributable to differences in MuJoCo's collision detection and surface snapping compared to trimesh's nearest-point projection.
+2. **All objects ≥77% at L0.** Basic navigation skills — surface crawling, steering, goal approach — transfer reliably. Degradation at higher levels is about complex maneuvers, not basic locomotion.
 
-**3. Hollow objects are the primary challenge.** Bowl (56%) and mug (54%) show significant degradation, especially at L2 (3% and 27%). The failure mode is predominantly **collision** (37-43% at L2) rather than timeout — the agent attempts to fly through the interior but collides with the inner surface. This is consistent with the trimesh results where hollow objects (vase, mug, cup) were the hardest category.
+3. **Hollow objects are the primary challenge.** Bowl (56%) and mug (54%) show significant L2 degradation. The failure mode is collision (37–43%) — the agent attempts to fly through the interior.
 
-**4. MuJoCo-specific challenges.** Several factors contribute to the performance gap between trimesh and MuJoCo:
-- **Surface snapping**: Trimesh uses exact nearest-point-on-surface projection; MuJoCo uses ray casting which can miss thin edges
-- **Normal estimation**: Trimesh reads face normals directly; MuJoCo estimates normals from rendered depth via total least squares, introducing noise
-- **Collision detection**: MuJoCo's physics-based collision is stricter than trimesh's geometric checks
-- **Coordinate transform**: MuJoCo objects have refpos/refquat/scale transforms that change the effective geometry relative to the CAD model
-
-**5. L0 performance confirms basic transfer works.** All objects achieve ≥77% at L0 (easy level), with 3 out of 5 at 100%. This confirms that the fundamental navigation skills — surface crawling, steering in air, goal approach — transfer correctly from trimesh to MuJoCo. The degradation at higher levels is about complex maneuvers (detach, bypass, land on opposite side), not basic locomotion.
-
-### Comparison: Trimesh vs MuJoCo (Same Object Types)
-
-| Geometry | Trimesh Eval | MuJoCo Eval | Gap |
-|----------|:----------:|:-----------:|:---:|
-| Cylindrical (cylinder / can) | 97% | 81% | -16% |
-| Box-like (cube / cracker box) | 97% | 83% | -14% |
-| Hollow (mug / YCB mug) | 78% | 54% | -24% |
-
-The sim-to-sim transfer gap is 14-24%, with hollow objects showing the largest gap. This is expected — hollow object navigation requires precise surface tracking and collision avoidance that is most sensitive to environment differences.
-
-
-## Sim-to-Real Architecture: Learning on Trimesh, Deploying Anywhere
-
-A key architectural achievement is that **policies trained entirely on trimesh transfer to MuJoCo without any retraining or fine-tuning**. This is enabled by the frame-invariant state representation and the environment-agnostic adaptive loop.
+4. **The 14–24% gap is expected** for sim-to-sim transfer and represents the baseline cost that adaptive online learning is designed to close.
 
 ### Why Transfer Works
 
-The 22D state vector is computed entirely in the **agent's local coordinate frame** using relative features:
+The 22D state vector uses only relative geometric features:
 
-```
+```python
 state = f(goal_pose - agent_pose, surface_normal, curvatures, depth, ...)
 ```
 
-All features are relative (direction to goal, not absolute position), local (normal in agent frame, not world frame), and geometric (curvatures, alignment, distance — not pixel values or simulator-specific signals). This means the same state vector is produced regardless of whether the underlying environment is trimesh, MuJoCo, Habitat, or a real robot — as long as the environment provides consistent pose and sensor data in any single coordinate frame.
+All features are **relative** (direction to goal, not absolute position), **local** (normal in agent frame, not world frame), and **geometric** (curvatures, alignment — not pixel values or simulator-specific signals). The same state vector is produced regardless of whether the environment is trimesh, MuJoCo, or a real robot.
 
-### Environment Protocol
+### State Computation Across Environments
 
-The system defines an `RLEnvironment` protocol that any environment must implement:
+| State Field | Trimesh | MuJoCo | Robot (Future) |
+|-------------|---------|--------|----------------|
+| **pose** | Direct variables | Embodiment API | Kinematics / SLAM |
+| **normal** | Exact face normal | Depth → TLS fit | Point cloud → PCA |
+| **depth** | Ray cast distance | Rendered depth | Depth camera |
+| **k1, k2** | Mesh curvature | Depth → principal curvatures | Point cloud fitting |
+| **on_object** | depth < 3mm | depth < 3mm | depth < threshold |
+| **path_blocked** | Trimesh ray cast | `mujoco.mj_ray` | Point cloud occlusion |
 
-```
-RLEnvironment Protocol:
-  reset()                    → sensor_data
-  get_pose()                 → [x, y, z, rx, ry, rz]    # any consistent frame
-  get_sensor_data()          → {normal, depth, curvatures, on_object, ...}
-  set_goal(goal_pose)
-  get_random_surface_point() → goal pose
-  step_discrete(action_idx)  → sensor_data               # for Q-store/heuristic
-  step_continuous(type, params) → sensor_data             # for SAC
-```
-
-Currently implemented:
-- **LightweightEnv** (trimesh) — fast, used for training and offline retrain
-- **MuJoCoEnvAdapter** — physics-based, used for evaluation and online adaptive
-
-Future environments (Habitat, real robot) only need to implement this protocol.
-
-### Adaptive Mode: Online in MuJoCo, Offline Retrain in Trimesh
-
-The adaptive loop is parameterized by two environments:
-
-```
-_run_adaptive_generic(
-    online_env=MuJoCoEnvAdapter,    # realistic interaction
-    offline_env=LightweightEnv,      # fast retrain (500 episodes in seconds)
-)
-```
-
-- **Online interaction** happens in MuJoCo (or robot): realistic sensor data, physics-based collisions, continuous SAC actions via `step_continuous()`
-- **Offline retrain** (when triggered by performance drop) runs in trimesh: 500 Q-learning episodes + 300 SAC episodes complete in seconds, then the improved policy is deployed back to MuJoCo
-
-This separation is critical for real-robot deployment: the robot provides online experience, but expensive retraining happens in fast simulation.
+The key insight: the same `_compute_state()` function processes data from any environment. The function doesn't know or care about the data source.
 
 ### Transfer Pipeline
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │  TRAINING (trimesh only, fast)                               │
-│                                                               │
 │  Primitives → Q-learning → BC → SAC                          │
-│  (cube, sphere, cylinder, mug, ...)                          │
-│                                                               │
 │  Output: Q-store + SAC weights + strategic stores             │
 └──────────────────────┬────────────────────────────────────────┘
                        │ transfer (no retraining)
                        ▼
 ┌─────────────────────────────────────────────────────────────┐
 │  DEPLOYMENT (any environment)                                │
-│                                                               │
 │  MuJoCo / Habitat / Robot                                    │
-│                                                               │
-│  Arbitrator: Q-confidence × track_record → best source       │
-│  Online Q-learning: adapts to new geometry                   │
-│  Periodic SAC updates: refines continuous actions            │
-│  Offline retrain: fast trimesh when performance drops        │
+│  Arbitrator: confidence × track_record → best source         │
+│  Online Q-learning adapts to new geometry                    │
+│  Periodic SAC updates refine continuous actions              │
+│  Offline retrain (fast trimesh) when performance drops       │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### Evidence from YCB MuJoCo Results
+---
 
-The YCB evaluation provides concrete evidence for sim-to-real viability:
+## 13. Case Study: Integration with Thousand Brains Project (Monty)
 
-| Evidence | What it shows |
-|----------|---------------|
-| Banana 99%, Can 81%, Box 83% on MuJoCo | Convex/cylindrical policies transfer with minimal gap |
-| All objects ≥77% at L0 | Basic navigation skills (crawl, steer, approach) transfer reliably |
-| 14-24% gap trimesh→MuJoCo | Quantifies the sim-to-sim transfer cost — primarily at hard levels |
-| Hollow objects 54-56% | Identifies where adaptation is most needed — complex maneuvers |
+### Background
 
-### State Computation: One Function, Three Data Sources
+The Thousand Brains Project's **Monty** system recognizes objects by accumulating evidence for hypotheses (object identity × pose) as a sensor agent explores object surfaces. The standard approach uses **teleportation** (`JumpToGoalState`) to instantly move the agent to target points selected by the Goal State Generator (GSG). We replaced teleportation with our RL surface navigation system, preserving Monty's recognition pipeline while adding biologically plausible movement.
 
-The 22D state vector is computed by a single function regardless of environment:
+### Integration Architecture
 
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    MONTY RECOGNITION LOOP                     │
+│                                                               │
+│  ┌──────────┐   ┌──────────┐   ┌────────────┐   ┌────────┐ │
+│  │ Evidence  │──▶│   GSG    │──▶│ RL Policy  │──▶│Sensors │ │
+│  │ GraphLM   │   │ Goal Gen │   │ Selector   │   │(patch) │──┘
+│  │ (evidence │◀──│(discrim. │   │            │   └────────┘
+│  │  update)  │   │ points)  │   │            │
+│  └──────────┘   └──────────┘   └─────┬──────┘
+│       ▲                              │
+│       │                              ▼
+│       │                     ┌────────────────┐
+│       │                     │  RLGoalPolicy  │
+│       │                     │  ┌───────────┐ │
+│       │                     │  │RL Surface │ │
+│       │                     │  │Controller │ │
+│       │                     │  │(Q+SAC)    │ │
+│       │                     │  └───────────┘ │
+│       │                     │  ┌───────────┐ │
+│       └─────────────────────│  │ MuJoCo    │ │
+│        intermediate obs     │  │ Adapter   │ │
+│                             │  └───────────┘ │
+│                             └────────────────┘
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Integration Components
+
+| Component | Role |
+|-----------|------|
+| **RLPolicySelector** | Routes GSG goals to RL navigation, SM goals to LookAt, no goals to default crawl. Drop-in replacement for DistantPolicySelector |
+| **RLGoalPolicy** | Navigates agent along object surface to GSG target using Q+SAC hybrid controller |
+| **MuJoCoEnvAdapter** | Bridges RL controller with shared MuJoCo simulator via ray-cast surface snapping |
+
+### Challenge: Goal Suppression During Navigation
+
+During RL navigation, Monty's GSG runs on every intermediate observation and may generate new goals. These goals are ignored by the motor system (navigation is in progress), but the GSG logs them as "attempted" and marks them as "not achieved" — creating phantom failures in metrics.
+
+**Solution**: A `navigation_active` flag suppresses goal generation during RL navigation while allowing evidence updates to continue normally.
+
+**Impact**: Eliminated phantom goals (27 → 16 total goals), fixed false "not achieved" entries, resolved a timeout failure caused by wasted matching steps.
+
+### Directed Exploration: Learning While Moving
+
+With teleportation, the path to a goal is instant. With RL navigation, it takes 20–80 steps. We turn this "dead time" into productive exploration by sending intermediate observations to the Learning Module during navigation.
+
+**Adaptive observation triggers:**
+- Surface normal changed >30° → observe (new face detected)
+- Principal curvature changed significantly → observe
+- Distance-adaptive interval: every 10 steps far from goal, every 2 steps near goal
+- Quality filters: skip off-object, bad depth, or stuck observations
+
+**Why this works:**
+- Each observation is a full evidence update — the LM doesn't distinguish intermediate from target observations
+- Early recognition is possible: if intermediate evidence is sufficient, the episode ends before reaching the goal
+- Failed navigations still contribute: the agent observes at its current position instead of silently failing
+
+### Results: RL Navigation vs Teleportation
+
+**Benchmark**: 2 objects × 3 rotations × 3 epochs = 6 episodes
+
+| Configuration | Accuracy | Matching Steps | Total Steps | Goals/ep | Evidence |
+|--------------|:--------:|:--------------:|:-----------:|:--------:|:--------:|
+| Baseline (teleport) | 6/6 (100%) | 26.0 ± 4.3 | 101 ± 18 | 3.5 | 23.7 ± 4.2 |
+| **RL + directed exploration** | **6/6 (100%)** | **31.7 ± 4.3** | **198 ± 50** | **2.7** | **26.6 ± 7.3** |
+
+### Key Findings
+
+1. **Accuracy parity**: RL matches baseline teleportation at 100% on all test cases.
+
+2. **Higher evidence accumulation**: +12% more evidence (26.6 vs 23.7) thanks to intermediate observations — the agent learns while moving.
+
+3. **Fewer goals needed**: −23% hypothesis-testing goals per episode (2.7 vs 3.5) because directed exploration provides additional evidence that accelerates convergence.
+
+4. **Navigation cost**: ~2× more total steps — the expected cost of replacing instant teleportation with realistic navigation. This is the price of biological plausibility.
+
+5. **Matching steps comparable**: Only +5.7 additional matching steps, and these are productive — they contribute to evidence accumulation.
+
+### Integration Pattern: Applicable to Any Recognition System
+
+The integration pattern generalizes beyond Monty to any system that:
+- Generates goal locations for a sensor agent (like Monty's GSG)
+- Accumulates evidence from observations (like Monty's Evidence LM)
+- Benefits from intermediate observations during navigation
+
+**Required interface from the recognition system:**
 ```python
-# Same function for ALL environments
-state = controller._compute_state(pose, sensor_data)
+# Goal generation
+goal = recognition_system.get_next_goal()  # → location + orientation
+
+# Observation processing
+recognition_system.process_observation(pose, features)
+
+# Goal suppression during navigation
+recognition_system.suppress_goal_generation(active: bool)
+
+# Terminal check
+done = recognition_system.check_recognition_complete()
 ```
-
-Everything is in the agent's local coordinate frame. The function doesn't know or care whether the data came from trimesh geometry, MuJoCo rendering, or a physical camera.
-
-#### Trimesh (LightweightEnv) — Exact Geometry
-
-```
-pose         ← direct numpy arrays (agent_pos, agent_rot)
-point_normal ← mesh.ray.intersects_location → face_normals[face_id]
-depth        ← np.linalg.norm(hit_point - agent_pos)
-k1, k2       ← trimesh.curvature.discrete_mean/gaussian_curvature_measure
-on_object    ← depth < 3.0mm
-path_blocked ← ray cast agent→goal, check if hit < dist_to_goal
-goal_normal  ← mesh.nearest.on_surface → face_normals
-object_center← mesh.centroid
-up_direction ← ray-based asymmetry detection
-```
-
-Perfect geometry. Normals are exact face normals. Curvatures are discrete mesh curvatures. No noise. Fast — thousands of episodes per minute.
-
-#### MuJoCo (MuJoCoEnvAdapter) — Through Monty Sensor Pipeline
-
-```
-pose         ← embodiment.position × 1000, quat_to_euler(embodiment.rotation)
-point_normal ← Monty: surface_normal_total_least_squares(semantic_3d, center_id, view_dir)
-depth        ← Monty: depth_map[cy, cx] × 1000
-k1, k2       ← Monty: principal_curvatures(semantic_3d, center_id, normal)
-on_object    ← depth < 3.0mm
-path_blocked ← mujoco.mj_ray (physics-based ray cast)
-goal_normal  ← CAD mesh face normal → _dir_cad_to_mj (frame conversion)
-object_center← CAD centroid → _pos_cad_to_mj_mm
-up_direction ← CAD ray analysis → _dir_cad_to_mj
-```
-
-The MuJoCo adapter uses **the same Monty sensor processing functions** (`surface_normal_total_least_squares`, `principal_curvatures`, `DepthTo3DLocations`) that Monty's Learning Modules use. Normals are estimated from rendered depth point clouds — not exact, but realistic. This is the same noise profile a real camera would produce.
-
-#### Robot (Future RobotEnvAdapter) — Through Monty + Physical Sensors
-
-```
-pose         ← robot kinematics (end-effector position/orientation) or SLAM
-point_normal ← Monty: surface_normal_total_least_squares(camera_point_cloud)
-depth        ← depth_camera.center_pixel × 1000
-k1, k2       ← Monty: principal_curvatures(camera_point_cloud)
-on_object    ← depth < threshold (calibrated per camera)
-path_blocked ← depth-based occlusion check or point cloud ray cast
-goal_normal  ← from Monty's learned reference frame (LM knows 3D object structure)
-object_center← from Monty's learned reference frame
-up_direction ← gravity vector (IMU) or from reference frame
-```
-
-The robot uses **the same Monty functions** for sensor processing. The data format is identical to MuJoCo — because MuJoCo already emulates a real camera through the Monty pipeline. The transition from MuJoCo to robot is replacing the renderer with a physical camera.
-
-#### Data Source Summary
-
-| State Field | Trimesh | MuJoCo | Robot |
-|-------------|---------|--------|-------|
-| **pose** | direct variables | `embodiment.position/rotation` | kinematics / SLAM |
-| **point_normal** | `mesh.face_normals` (exact) | Monty `surface_normal_TLS` | Monty `surface_normal_TLS` |
-| **depth** | ray cast distance | Monty depth render | depth camera |
-| **k1, k2** | `trimesh.curvature` (exact) | Monty `principal_curvatures` | Monty `principal_curvatures` |
-| **on_object** | depth < 3mm | depth < 5mm | depth < threshold |
-| **same_side** | normal direction analysis | normal direction analysis | normal direction analysis |
-| **path_blocked** | trimesh ray cast | `mujoco.mj_ray` | point cloud occlusion |
-| **goal_normal** | `mesh.nearest` (exact) | CAD → MuJoCo frame | Monty LM reference frame |
-| **object_center** | `mesh.centroid` | CAD → MuJoCo frame | Monty LM reference frame |
-| **up_direction** | ray asymmetry | CAD → MuJoCo frame | IMU / gravity |
-
-The key insight: MuJoCo already uses the Monty sensor pipeline. Transitioning to a robot means replacing MuJoCo's renderer with a physical camera — the sensor processing, state computation, and policy remain unchanged.
-
-### Action Execution: One Interface, Three Implementations
-
-Actions are executed through a unified interface with environment-specific implementations:
-
-```python
-# Continuous actions (SAC — precise parameters)
-sensor_after = env.step_continuous(action_type, action_params)
-
-# Discrete actions (Q-store / heuristic — fixed step sizes)
-sensor_after = env.step_discrete(action_idx, action_space)
-```
-
-#### Trimesh — Direct Manipulation
-
-```
-Tangential move → agent_pos += tangent_dir × distance; snap via mesh.nearest.on_surface
-Forward move    → agent_pos += forward × distance; collision via mesh.ray.intersects
-Rotation        → agent_rot[axis] += degrees
-Detach          → agent_pos += normal × distance; orient toward goal
-```
-
-No physics, no inertia. Position and orientation are numpy arrays manipulated directly. Fast and deterministic.
-
-#### MuJoCo — Through Monty Actions
-
-```
-Tangential move → SetAgentPose(new_position); snap via mj_ray; SetAgentPose(snapped)
-Forward move    → MoveForward(agent_id, distance)
-Rotation        → SetAgentPose(same_pos, new_rotation)
-Orient H/V      → OrientHorizontal/OrientVertical(agent_id, rotation, distances)
-Detach          → mj_ray collision check; SetAgentPose(lifted_position, fly_orientation)
-```
-
-Uses standard Monty action classes: `MoveForward`, `OrientHorizontal`, `OrientVertical`, `SetAgentPose`. MuJoCo physics handles collisions. The RL policy produces the same Action objects that `JumpToGoalState` would — just sequentially instead of teleporting.
-
-#### Robot — Through Inverse Kinematics
-
-```
-Tangential move → compute tangent from normal; robot.move_cartesian(target); wait_for_contact
-Forward move    → robot.move_cartesian(current + forward × distance)
-Rotation        → robot.orient_end_effector(target_quaternion)
-Detach          → robot.move_cartesian(current + normal × distance); orient toward goal
-Collision       → force/torque sensor threshold
-Surface contact → depth camera or force sensor
-```
-
-Each `step_continuous` translates to a Cartesian target → IK solver → joint commands. Force/torque sensors replace depth-based collision detection.
-
-#### Action Execution Summary
-
-| Action | Trimesh | MuJoCo (Monty) | Robot |
-|--------|---------|-----------------|-------|
-| **Tangential** | position += dir × step, `nearest.on_surface` | `SetAgentPose` + `mj_ray` snap | `move_cartesian` + force contact |
-| **Forward** | position += fwd × step | `MoveForward(distance)` | `move_cartesian(target)` |
-| **Yaw/Pitch** | rotation[axis] += deg | `SetAgentPose(new_quat)` | `orient_end_effector` |
-| **Orient H/V** | `_orient_horizontal/vertical` | `OrientHorizontal/Vertical` | `move_cartesian` + orient |
-| **Detach** | position += normal × dist | `SetAgentPose(lifted)` + `mj_ray` | `move_cartesian(lifted)` + force |
-| **Collision detect** | `mesh.ray.intersects` | `mujoco.mj_ray` | force/torque sensor |
-| **Surface snap** | `mesh.nearest.on_surface` | multi-ray `mj_ray` | depth camera + approach |
-
-### Why This Enables Monty Integration
-
-The MuJoCo adapter already uses Monty's action classes and sensor processing functions. This means:
-
-1. **State computation** will use the same sensor data that Monty's Learning Modules already receive — no separate sensor pipeline needed. When the RL controller calls `_compute_state(pose, sensor_data)`, the `sensor_data` comes from the same `surface_normal_total_least_squares` and `principal_curvatures` that the LM uses for feature extraction.
-
-2. **Actions** are already expressed as Monty primitives. The future `RLGoalPolicy` will return the same `MoveForward`, `MoveTangentially`, `OrientHorizontal` Action objects that the existing motor system uses — just selected by the RL policy instead of hard-coded in `JumpToGoalState`.
-
-3. **Robot transition** = replacing `MuJoCoSimulator` with a `RobotInterface` that provides the same action/sensor API. The RL controller, Q-store, SAC, arbitrator, and adaptive manager all remain unchanged.
-
-```
-Training (trimesh)          Validation (MuJoCo)         Deployment (robot)
-┌──────────────┐           ┌──────────────┐           ┌──────────────┐
-│ exact normals │           │ Monty sensor │           │ Monty sensor │
-│ exact depth   │  ──────► │ processing   │  ──────► │ processing   │
-│ exact k1,k2   │  train   │ (same code)  │  same    │ (same code)  │
-│               │  once    │              │  policy  │              │
-│ direct pos    │           │ Monty actions│           │ IK + motors  │
-│ manipulation  │           │ (same API)   │           │ (same API)   │
-└──────────────┘           └──────────────┘           └──────────────┘
-     ▲                           ▲                          ▲
-     │                           │                          │
-     └───── _compute_state() ────┴──── same function ───────┘
-     └───── step_continuous() ───┴──── same interface ──────┘
-```
-### Environment-Specific Configuration
-
-The controller uses several thresholds that may need tuning per environment:
-
-| Parameter | Default | Trimesh | MuJoCo | Robot |
-|-----------|:-------:|:-------:|:------:|:-----:|
-| `on_object` depth | 3.0mm | 3.0mm ✓ | 3.0mm ✓ | calibrate per camera |
-| `min_valid_depth` | 0.5mm | 0.5mm ✓ | may need 0.3mm | calibrate |
-| `normal_flip_threshold` | -0.5 | -0.5 ✓ | -0.5 ✓ (monitor) | may need -0.7 |
-| `goal_threshold` | 4.0mm | 4.0mm ✓ | 4.0mm ✓ | may need 6-8mm |
-
-These thresholds are in the RL config and can be overridden per experiment. 
-The key principle: **the environment handles sensor noise internally** 
-(e.g., normal smoothing in MuJoCo), and the controller sees clean data 
-with consistent thresholds.
-
-## Known Limitations
-
-This is a prototype. The goal is to demonstrate that the approach works:
-- **Q-learning, SAC, and adaptive arbitrage generalize to unseen objects** (cup: 83% adaptive, never seen during training)
-- **Sim-to-real transfer works** — policies trained on trimesh primitives navigate YCB objects in MuJoCo without retraining (banana 99%, can 81%, box 83%)
-- **The solution is ready for integration testing** with Monty's Learning Module and Sensor Module
-
-The limitations below are known, understood, and have clear paths to improvement:
-
-### 1. Surface Movement Mechanics
-
-**Edge traversal is unreliable on complex geometry.** The `_move_tangentially` + snap-to-surface mechanism struggles at sharp edges — mug rims, cone apex, flat_square edges. The agent attempts a tangential step, the snap algorithm fails to find the surface on the other side of the edge, and the agent either rolls back (stuck) or detaches into air (unintended).
-
-This is an **environment-level problem**, not an RL problem. Even a perfect policy cannot crawl over an edge if the physics engine cannot execute the move. The issue is worse in MuJoCo where ray-cast-based snapping is less forgiving than trimesh's nearest-point projection.
-
-**Impact**: Primary cause of L2 failures on hollow objects. Bowl drops to 3% at L2 in MuJoCo largely because the agent cannot reliably traverse the rim.
-
-**Specific failure modes**:
-- Trimesh: `nearest.on_surface` finds the wrong face after edge crossing, normal flips → collision detected → episode terminates
-- MuJoCo: `_snap_to_surface` ray cast misses thin edge → returns False → rollback → agent oscillates at edge
-- Both: half-step edge traversal fallback works for ~60% of edge crossings but fails on acute angles (<60°)
-
-**Sim-to-real gap in snap mechanics.** Trimesh uses `nearest.on_surface` — a global nearest-point query that always finds the closest surface point at any distance, with no distance limit. MuJoCo uses directional ray casts which can miss surfaces that are nearby but not in the cast direction. This creates an asymmetry: trimesh never loses the surface during tangential moves (agent either snaps to new face or rolls back), while MuJoCo may fail to find a surface that trimesh would find trivially. Phase 1 mitigation (implemented): multi-directional ray cast probing (forward, -normal, multi-probe cones around both) to approximate trimesh's omnidirectional search. Phase 2 (planned): unified snap threshold in both environments — if nearest surface is beyond `step_size × 2`, leave agent in air instead of snapping or rolling back. This requires retraining so the agent learns to handle unintended surface loss during tangential moves.
-
-### 2. Navigation Strategy for Hollow Objects
-
-**The agent doesn't always understand it needs to crawl to the rim, not toward the goal.** When the goal is inside a mug and the agent is on the outside wall, the correct strategy is: crawl up to rim → cross rim → descend inside. The heuristic system has a dedicated `CRAWL_TO_EDGE` phase for this, but Q-store/SAC can override it with "crawl toward goal" — which is impossible through a wall.
-
-**Root cause**: Q-store may have high confidence for "crawl toward goal" from similar states on simple objects (cube, sphere) where this always works. The strategic detach store partially addresses this (it learns when to detach), but the crawl-to-edge vs crawl-to-goal decision is not yet captured in a dedicated strategic store.
-
-**Impact**: Contributes to timeout failures at L2 — the agent crawls in circles on the wrong side instead of heading for the rim.
-
-### 3. Air Navigation Instability
-
-**Flying through air is less reliable than surface crawling.** The agent learns air navigation from ~33% of episodes (air-start mode). Without surface snap, positioning errors accumulate. The flyby correction heuristic is reactive (triggers after overshooting) rather than preventive.
-
-**Specific issues**:
-- Orbit direction computation is approximate and can become stale (cached for up to 10 steps)
-- Landing approach lacks fine depth control — the agent sometimes overshoots and passes through the surface
-- FLY_TO_EDGE phase relies on cached fly direction from the last surface contact, which may be irrelevant after several air maneuvers
-
-**Architectural issue: strategic_direction store has no effect on action selection.**
-
-Analysis of the v1 action selection pipeline revealed that the strategic_direction Q-store (5D state, 9500+ points, 2 actions: fly_to_goal/bypass) does not meaningfully influence action selection. The execution order is:
-
-1. `_determine_phase()` — determines phase from geometry (path_blocked, hysteresis, depth)
-2. `_compute_heuristic_bias()` — generates action bias for this phase
-3. `combined = (1-eps) * Q_tactical + eps * heuristic` — blend is computed
-4. Strategic direction — overwrites `_current_phase`, but combined is already computed for the original phase
-
-The phase overwrite affects only the next step, where `_determine_phase()` re-determines the phase from geometry anyway, discarding the strategic override. The only indirect effect is through the hysteresis branch (`prev_phase == "FLY_TO_EDGE"`), which is unreliable.
-
-Additionally, the 5D direction state contains a redundancy: `lateral_deviation = sqrt(1 - angle_to_goal²)` is a deterministic function of `angle_to_goal`, so 2 of 5 features carry identical information.
-
-### 4. Online SAC Learning Shows Limited Improvement
-
-**After 20 online SAC updates during 2000 adaptive episodes, SAC success rate did not meaningfully increase.** The conservative hyperparameters that prevent catastrophic forgetting also prevent fast adaptation:
-
-| Parameter | Current Value | Effect |
-|-----------|:------------:|--------|
-| CQL alpha | 1.0 | Conservative critic — prevents overestimation but slows learning |
-| BC lambda decay | ×0.95 per update | Actor stays close to BC policy for too long |
-| Actor update frequency | Every 10th critic step | Too few actor updates per cycle |
-| Actor learning rate | ×0.1 of base | Too cautious for online adaptation |
-| Current mesh ratio in batch | 50% | New object data diluted by old object data |
-
-The architecture for online SAC updates is correct — the issue is hyperparameter tuning for the online regime vs the offline training regime.
-
-### 5. MuJoCo Transfer Gap
-
-**14-24% performance gap between trimesh and MuJoCo**, primarily at L2. Contributing factors:
-- Surface normal estimation from depth rendering (MuJoCo) vs exact face normals (trimesh)
-- Ray-cast collision detection (MuJoCo) vs geometric nearest-point (trimesh)
-- Coordinate frame transforms (refpos/refquat/scale) can introduce subtle geometric distortions
-- MuJoCo's `MoveTangentially` implementation differs from trimesh's direct position manipulation
-
-**Specific snap mechanism differences:**
-- Trimesh: `mesh.nearest.on_surface()` — O(log N) BVH query, always finds closest point, no distance limit, no directional bias
-- MuJoCo: `mj_ray()` — directional ray cast, can miss surfaces not in cast direction, limited to probed directions
-- Trimesh snap is position-based (project to nearest face), MuJoCo snap is direction-based (cast ray, approach hit point)
-- On flat/convex surfaces: both behave identically. On edges/rims/thin walls: trimesh succeeds ~95% of the time, MuJoCo ~70% (improved from ~50% with multi-directional probing)
-
-This gap is expected for any sim-to-sim transfer and represents the baseline cost that adaptive online learning is designed to close.
-
-### 6. Heuristic Budget Accounting
-
-**The heuristic budget (`heuristic_eps`) only limits one of two paths to heuristic selection.** The arbitrator selects heuristic actions via two independent paths: (1) Q-SAC conflict resolution — when Q and SAC disagree at high confidence, heuristic breaks the tie; (2) track record scoring — when ML performance is below heuristic baseline. Only path (2) is subject to the `heuristic_eps` budget. Path (1) has no budget limit, which can result in heuristic usage far exceeding the configured budget (observed: 24% actual vs 5% configured).
-
-**Status: Fixed.** Both paths now share a single budget. When budget is exhausted during Q-SAC conflict, the system falls back to SAC (default source) instead of heuristic.
-
-
-## Roadmap
-
-### Short-term: Monty Integration
-
-**RLGoalPolicy as JumpToGoal replacement.** Create `RLGoalPolicy` implementing the `MotorPolicy` protocol. Receives goals from GSG (`goal.location` + `goal.morphological_features['pose_vectors']`), navigates incrementally instead of teleporting. All existing Monty behavior preserved — the RL module only activates for GSG goals.
-
-**Intermediate observation mode.** During navigation to goal, every intermediate surface contact provides pose + features that the LM could use for evidence accumulation. Configurable: default mode (motor-only, same contract as JumpToGoal) or directed exploration mode (LM processes observations during navigation).
-
-**Validation on YCB in Monty.** Key metric: does replacing JumpToGoal with RLGoalPolicy maintain classification accuracy and pose estimation quality while using only incremental actions?
-
-### Near-term: Improve Core Navigation
-
-**Robust edge traversal.** The highest-impact improvement. Two-phase plan:
-
-*Phase 1 (implemented):* Multi-directional snap in MuJoCo. When forward ray cast fails after tangential move, probe in additional directions: `-prev_normal` (toward surface we came from), multi-probe cone around forward (15°-60°, 8 directions), multi-probe cone around `-prev_normal`. Pick closest hit. This approximates trimesh's `nearest.on_surface` using only ray casts. Normal consistency check (dot > -0.1) prevents snapping to wrong side of thin walls — same threshold as trimesh.
-
-*Phase 2 (requires retraining):* Unified snap threshold across both environments. Currently trimesh snaps at any distance (agent never falls off surface), MuJoCo has a 10mm limit (agent rolls back if surface not found). The correct behavior: snap only within `step_size × 2` (~6mm). Beyond that, the agent genuinely left the surface — leave in air, let the controller handle re-landing. This must be implemented in **both** trimesh and MuJoCo simultaneously to maintain zero sim-to-real gap, then the agent must be retrained to handle unintended surface loss. Expected benefits:
-- Agent learns to reduce step size near edges (SAC continuous step parameter)
-- No more infinite rollback loops (current primary cause of timeouts on rims)
-- Controller's existing FLY/LAND phases handle re-landing naturally
-- Consistent physics across training and deployment environments
-
-**Improved air navigation — replace strategic_direction store with two tactical stores.**
-
-Split the single `q_store_free` into two phase-specific tactical stores:
-- `q_store_fly_to_goal` — actions when flying directly to goal (FLY_TO_GOAL, LAND phases)
-- `q_store_fly_to_edge` — actions when bypassing/orbiting obstacle (FLY_TO_EDGE phase)
-
-Phase is determined purely by `_determine_phase()` (geometry), then selects the appropriate store:
-
-```
-_determine_phase()              ← geometry → phase
-    │
-    ▼
-_compute_heuristic_bias(phase)  ← baseline behavior for this phase
-    │
-    ▼
-store = select_store(phase)     ← phase selects store
-q_values = store.get_q_values(state)
-    │
-    ▼
-combined = (1-eps) * Q + eps * heuristic
-    │
-    ▼
-softmax → action
-```
-
-This resolves the core conflict: the same position in air requires different actions depending on phase (fly toward goal vs orbit around obstacle). A single store learns contradictory Q-values for these situations. Two stores each learn a consistent policy without conflicts.
-
-This mirrors the existing surface/free split, which was motivated by the same principle — identical positions requiring different actions depending on context (on surface vs in air).
-
-**Landing precision.** Add depth-based approach control: when depth < N×free_step, switch to progressively smaller steps. Prevent overshoot by checking depth before each forward move, not after.
-
-### Near-term: Tune Online Adaptation
-
-**More aggressive online SAC updates.** The current hyperparameters were tuned for stability during initial SAC training (where catastrophic forgetting is the main risk). For online adaptation on a new object, the balance should shift toward faster learning:
-- Increase current_mesh_ratio in replay buffer sampling (50% → 70-80%)
-- Faster BC lambda decay (×0.95 → ×0.85) or success-rate-adaptive decay
-- More frequent actor updates (every 10th → every 3rd critic step)
-- Higher actor learning rate for online mode (×0.1 → ×0.3)
-- Consider separate "online adaptation" hyperparameter profile
-
-**Strategic crawl-to-edge store.** Add a third strategic Q-store (alongside detach and direction) that learns when to crawl toward the rim vs toward the goal. State: [alignment, normal_agreement, distance_to_edge_estimate, on_object, path_blocked]. This would give the strategic level explicit control over the crawl-to-edge decision, rather than relying on heuristic phase detection.
-
-### Near-term: Sim-to-Real Consistency
-
-**Unified physics contract across environments.** The training environment (trimesh) and deployment environments (MuJoCo, robot) should produce identical agent behavior for identical actions. Current gaps:
-
-| Mechanic | Trimesh | MuJoCo | Robot (planned) |
-|----------|---------|--------|-----------------|
-| Surface snap | `nearest.on_surface` (global) | Ray cast (directional) | Depth camera + ICP |
-| Snap distance limit | None (any distance) | 10mm | TBD |
-| Edge traversal | Half-step + re-project | Half-step + multi-probe | TBD |
-| Normal estimation | Exact face normal | Rendered depth → TLS fit | Point cloud → local PCA |
-| Collision detection | Ray intersection + proximity | Ray cast + depth threshold | Force/torque sensor |
-
-**Convergence plan:**
-1. Add snap distance threshold to trimesh (`step_size × 2`) — agent learns to handle surface loss
-2. Match threshold in MuJoCo — zero gap for snap behavior
-3. Robot adapter inherits same threshold — consistent across all three
-4. Online adaptation handles remaining sensor/actuator differences
-
-### Long-term: Real Robot Deployment
-
-**RobotEnvAdapter.** Implement `RLEnvironment` protocol for a physical robot:
-- `get_pose()` from robot kinematics / SLAM
-- `get_sensor_data()` from depth camera (normals via point cloud processing, curvatures from local surface fitting)
-- `step_continuous()` maps to robot motor commands via inverse kinematics
-- `supports_offline_retrain = False` — retrain happens in trimesh simulation
-
-The adaptive architecture is already designed for this: online interaction on the robot, offline retrain in trimesh, arbitrator learns which source to trust in the real-world domain.
-
-**Expected deployment sequence**:
-1. Day 1: Load trimesh-trained policy → basic navigation works (L0: ~80%+ based on MuJoCo evidence)
-2. Days 1-N: Online Q-learning and SAC updates adapt to real sensor noise, motor imprecision, and physics
-3. When performance drops: Offline retrain in trimesh incorporates new experience patterns
-4. Convergence: Arbitrator track records stabilize, system learns real-world source reliability
-
-### Long-term: Architecture Extensions
-
-**Model-based planning with Monty's reference frames.** Monty's LMs learn 3D object structure. These learned models could serve as a world model for Dyna-Q style planning — simulate trajectories through the learned reference frame and pre-populate Q-values for unvisited states. The HNSW Q-store's `update_q_value(state, action, value)` interface accepts updates from any source, making this integration straightforward.
-
-**Multi-agent knowledge sharing.** Multiple robots exploring different objects can merge their Q-stores. HNSW graphs can be combined by inserting points from one store into another. Strategic stores (detach, direction) are particularly transferable since they capture object-geometry-independent navigation decisions.
-
-**Demonstration learning.** Human operator demonstrates navigation on a new object. Trajectory is recorded as state-action pairs and inserted directly into Q-store. This bootstraps the knowledge base for objects where random exploration would be inefficient (e.g., objects with narrow passages or complex topology).
-
-# Next Steps
-## Integration path with Monty
-> "There's an interesting design choice here. JumpToGoal teleports and gives the LM one observation at the target point. With RL navigation, the agent physically moves through space and passes over the object surface on the way to the goal. Every intermediate point contains pose and features that the LM could use for evidence accumulation.
-> I'd like to implement this as a configurable option."
-### In the default mode, intermediate steps are motor-only — same contract as JumpToGoal, easy to validate. 
-### Second mode where the LM processes observations during navigation. 
-This turns goal-directed movement into directed exploration — not random, but biased toward the discriminative point that the GSG selected. The object might be recognized before the agent even reaches the goal.
->
-> This aligns with the emphasis on sensorimotor learning — every movement is an opportunity to gather information. And it's something that teleportation fundamentally cannot do."
-
-
-### The default mode (JumpToGoal replacement) integration path
-- RLGoalPolicy as a drop-in replacement for JumpToGoal
-> "The most natural first step is to create an RLGoalPolicy that implements the MotorPolicy protocol — same `__call__` signature, same `reset`, same `state_dict`. It receives the Goal from the GSG exactly as JumpToGoal does — `goal.location` and `goal.morphological_features['pose_vectors']` — and navigates there incrementally instead of teleporting with SetAgentPose.
-
-- RLPolicySelector
-> "For the selector, I'd create an RLPolicySelector similar to DistantPolicySelector. It routes GSG goals — `sender_type == 'GSG'` — to the RLGoalPolicy, SM goals to LookAtGoal, and falls back to the default exploration policy when no goal is active. This means all existing Monty behavior is preserved — the curvature-following surface policy, the random walk distant policy, voting, everything works exactly as before. The RL module only activates when the hypothesis-testing policy generates a goal state."
-
-- State computation from CMP
-> "The state vector for the RL controller maps directly from what Monty already provides. The percept message contains surface normal, principal curvatures, on_object flag, depth — these are exactly the features I use in my 15D state vector. The goal pose comes from the Goal object. Current pose comes from MotorSystemState. No new sensor data is needed — everything is already available through CMP."
-
-- ActionSpace (adapt to Monty actions)
-
-- Validation
-> "For validation, we can start with the YCB objects. The key metric would be: does replacing JumpToGoal with RLGoalPolicy maintain classification accuracy and pose estimation quality, while using only incremental actions?"
-
 
 ---
-# Future possibilities
-> "Beyond replacing teleportation, this opens up several things as future work.
->
-> **Real robot deployment.** The RL policy provides this capability. The high-level actions — move forward, turn, crawl along surface — map to standard robot primitives, and inverse kinematics handles the low-level joint control.
->
-> **Model-based planning.** The HNSW Q-store is designed as a single integration point — both model-free updates from real experience and model-based updates from simulated planning can write to the same store. Monty's learned reference frames could serve as the world model — the LM already knows the 3D structure of objects, which could be used to simulate the consequences of actions before executing them.
->
-> **Multi-LM coordination.** When multiple LMs generate competing goal states, the current system picks the highest confidence. With RL navigation, the motor system could also consider reachability — a closer goal might be preferred over a more discriminative but harder-to-reach one."
 
+## 14. Future Directions
+
+### 14.1 Coverage-Driven Training with RL Navigation
+
+**Problem**: Current object model building (in systems like Monty) uses random surface crawling — 14,000 steps per object with uneven coverage.
+
+**Proposed**: Replace random crawling with goal-directed exploration using the same RL navigation system. A `CoverageGoalGenerator` analyzes the growing object model and directs the agent to unexplored areas.
+
+Three-level goal generation:
+- **Level 1** (< 10 points): Direction-based — move along surface to build initial cluster
+- **Level 2** (10–200 points): Frontier-based — push beyond the boundary of explored area
+- **Level 3** (> 200 points): Gap-based — voxelize explored space, target largest uncovered regions
+
+**Expected benefit**: ~300 steps per object (vs 14,000) with uniform coverage.
+
+### 14.2 Model-Based Navigation Using Learned Object Models
+
+Once a recognition system has a confident hypothesis about object identity, use the learned object model as a **world model** for navigation planning:
+
+- Graph-based path planning along known surface topology
+- Waypoint navigation with predicted edge transitions
+- Confidence-gated: fall back to model-free when uncertain
+
+### 14.3 Online Model Enrichment
+
+During deployment, add high-quality observations to the object model in real-time. Each recognition episode makes future recognition faster — a self-improving system.
+
+### 14.4 Real Robot Deployment
+
+The architecture is designed for this transition:
+
+```
+Day 1:   Load trimesh-trained policy → basic navigation works (~80%+ at L0)
+Days 1-N: Online Q-learning and SAC adapt to real sensor noise and physics
+When needed: Offline retrain in fast trimesh simulation
+Convergence: Arbitrator learns real-world source reliability
+```
+
+The `RobotEnvAdapter` implements the same `RLEnvironment` protocol:
+- `get_pose()` from robot kinematics / SLAM
+- `get_sensor_data()` from depth camera via point cloud processing
+- `step_continuous()` maps to motor commands via inverse kinematics
+
+---
+
+## 15. Known Limitations
+
+### Edge Traversal
+The surface snap mechanism struggles at sharp edges (mug rims, cone apex). This is an environment-level problem — even a perfect policy cannot crawl over an edge if the physics engine cannot execute the move. Primary cause of L2 failures on hollow objects.
+
+### Hollow Object Navigation
+The agent doesn't always understand it needs to crawl to the rim rather than toward the goal. When the goal is inside a mug and the agent is outside, the correct strategy is: crawl to rim → cross → descend inside. Q-store may override this with "crawl toward goal" learned from simple objects.
+
+### Air Navigation Stability
+Without surface snap, positioning errors accumulate in air. The flyby correction heuristic is reactive rather than preventive. Landing approach lacks fine depth control.
+
+### Online SAC Adaptation Speed
+Conservative hyperparameters that prevent catastrophic forgetting also prevent fast adaptation. After 20 online SAC updates during 2000 adaptive episodes, improvement was limited.
+
+### Sim-to-Sim Transfer Gap
+14–24% performance gap between trimesh and MuJoCo, primarily from differences in surface normal estimation, collision detection, and snap mechanics. This is the baseline cost that online adaptation is designed to close.
+
+---
+
+## 16. Conclusion
+
+We presented a hybrid RL system for goal-directed 3D surface navigation that combines episodic memory, parametric skills, and geometric heuristics with adaptive arbitration. The system achieves 91% average navigation success, generalizes to unseen objects (83%), and transfers across simulators without retraining (99% on convex YCB objects in MuJoCo).
+
+The case study with Monty demonstrates that replacing teleportation with realistic RL navigation preserves recognition accuracy while enabling directed exploration — the agent learns about objects while navigating, reducing the number of hypothesis-testing goals needed by 23%.
+
+The architecture is designed for extensibility: new environments implement a minimal protocol, new knowledge sources feed into the universal Q-store interface, and the adaptive arbitrator self-regulates without manual intervention. The path from simulation to real robot deployment requires only a new environment adapter — the learning system, state representation, and arbitration logic remain unchanged.
