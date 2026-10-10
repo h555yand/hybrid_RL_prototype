@@ -2,27 +2,35 @@
 
 ## Abstract
 
-We present a hybrid reinforcement learning system for goal-directed navigation on 3D object surfaces. The system combines three complementary learning mechanisms — **episodic memory** (kernel-based Q-learning with HNSW nearest-neighbor search), **learned skills** (Soft Actor-Critic with continuous actions), and **geometric heuristics** (hand-crafted domain knowledge) — unified by an **adaptive arbitrator** that selects the best action source per step based on confidence and track record.
+We present a hybrid reinforcement learning system for goal-directed navigation on 3D object surfaces. The system combines three complementary learning mechanisms 
+ - **episodic memory** (kernel-based Q-learning with HNSW nearest-neighbor search)
+ - **learned skills** (Soft Actor-Critic with continuous actions)
+ - **geometric heuristics** (hand-crafted domain knowledge).
 
-The architecture is inspired by biological memory systems: episodic memory provides one-shot learning and fast adaptation (hippocampal analogy), parametric policy captures generalized skills through repetition (procedural memory analogy), and the arbitrator implements a metacognitive switching mechanism between behavior modes.
+**Adaptive arbitrator** selects the best action source per step based on confidence and track record.
 
-We validate the approach on a lightweight trimesh simulator across 9 object geometries, demonstrate sim-to-sim transfer to MuJoCo with real YCB objects (no retraining), and present a case study integrating the system with the Thousand Brains Project's Monty framework for object recognition. Key results: **91% average navigation success** across all difficulty levels, **83% on unseen objects** (zero-shot generalization), and **99% on convex YCB objects** in MuJoCo without fine-tuning.
+The architecture is inspired by biological memory systems: 
+- episodic memory provides one-shot learning and fast adaptation (hippocampal analogy)
+- parametric policy captures generalized skills through repetition (procedural memory analogy)
+- arbitrator implements a metacognitive switching mechanism between behavior modes.
 
-**Title**: Hybrid Episodic-Parametric Reinforcement Learning for Goal-Directed Surface Navigation with Sim-to-Real Transfer
-
-We present a hybrid reinforcement learning system that combines episodic memory with parametric policy learning for goal-directed navigation on 3D object surfaces. The agent must navigate from an arbitrary surface point to a goal pose using only local sensory observations (depth, surface normal, curvatures), without access to a global map or object model. Our system operates in three phases: (1) episodic Q-learning with HNSW-based state stores builds a non-parametric knowledge base through heuristic-guided exploration, (2) behavioral cloning extracts successful trajectories to warm-start a Soft Actor-Critic policy with continuous action parameters, and (3) an adaptive arbitrator selects per-step between episodic memory, parametric policy, and geometric heuristics based on confidence estimation and per-level track records. The architecture uses a frame-invariant 22-dimensional state representation computed entirely in the agent's local coordinate frame, enabling zero-shot transfer across environments. A two-level decision hierarchy separates strategic phase transitions (detach from surface, bypass obstacles) from tactical action selection, with strategic decisions learned retrospectively from episode outcomes. We evaluate on 9 geometric primitives and hollow objects, demonstrating 91% average success rate across difficulty levels. On unseen objects (cup), the adaptive system achieves 83% success through online learning. Cross-simulator transfer from a lightweight trimesh environment to MuJoCo with YCB objects achieves 54-99% success without retraining, validating the sim-to-real architecture. The system is designed for integration with the Thousand Brains Project's sensorimotor framework, replacing teleportation-based goal reaching with physically plausible incremental navigation.
-
+We:
+- validate the approach on a lightweight trimesh simulator across different object geometries
+- demonstrate sim-to-sim transfer to MuJoCo with real YCB objects (no retraining)
+- present a case study integrating the system with the Thousand Brains Project's Monty framework for object recognition.
+  
+Key results:
+- **91% average navigation success** on trimesh across three difficulty levels and objects (sphere, thin_cylinder, cylinder, cube, vase, flat_square, cone, mug, cup)
+- **81% success on unseen complex hollow objects (cup)** (zero-shot generalization)
+- **74% success on YCB objects** (Banana, Cracker Box, Master Chef Can, Bowl, Mug) in MuJoCo without fine-tuning.
 ---
 
 ## 1. Introduction
 
 ### The Problem
 
-Many robotic and cognitive systems require an agent to navigate along 3D object surfaces toward specific goal locations. In object recognition, a perception system may identify a discriminating point on an object — "observe the surface *here* to distinguish a mug from a cup" — and the motor system must navigate the sensor to that point. In robotic manipulation, a gripper must traverse an object's surface to reach a grasp point. In haptic exploration, a tactile sensor must systematically cover an object's geometry.
-
-The standard approach in simulation is **teleportation**: instantly move the agent to the target pose. This is computationally convenient but has no biological or robotic analog. A real agent must navigate incrementally through space, maintaining surface contact, avoiding collisions, traversing edges, and handling the geometric complexity of real objects.
-
-Replacing teleportation with realistic navigation introduces fundamental challenges:
+Many robotic and cognitive systems require an agent to navigate along 3D object surfaces toward specific goal locations.
+Realistic navigation introduces challenges:
 
 - **Surface geometry is complex.** Objects have edges, rims, concavities, and thin walls. An agent must crawl along curved surfaces, detect and traverse edges, detach from surfaces when necessary, fly through air, and land on target surfaces — all without a map.
 
@@ -678,8 +686,26 @@ The key insight: the same `_compute_state()` function processes data from any en
 ```
 
 ---
+## 13. Known Limitations
 
-## 13. Case Study: Integration with Thousand Brains Project (Monty)
+### Edge Traversal
+The surface snap mechanism struggles at sharp edges (mug rims, cone apex). This is an environment-level problem — even a perfect policy cannot crawl over an edge if the physics engine cannot execute the move. Primary cause of L2 failures on hollow objects.
+
+### Hollow Object Navigation
+The agent doesn't always understand it needs to crawl to the rim rather than toward the goal. When the goal is inside a mug and the agent is outside, the correct strategy is: crawl to rim → cross → descend inside. Q-store may override this with "crawl toward goal" learned from simple objects.
+
+### Air Navigation Stability
+Without surface snap, positioning errors accumulate in air. The flyby correction heuristic is reactive rather than preventive. Landing approach lacks fine depth control.
+
+### Online SAC Adaptation Speed
+Conservative hyperparameters that prevent catastrophic forgetting also prevent fast adaptation. After 20 online SAC updates during 2000 adaptive episodes, improvement was limited.
+
+### Sim-to-Sim Transfer Gap
+14–24% performance gap between trimesh and MuJoCo, primarily from differences in surface normal estimation, collision detection, and snap mechanics. This is the baseline cost that online adaptation is designed to close.
+
+---
+
+## 14. Case Study: Integration with Thousand Brains Project (Monty)
 
 ### Background
 
@@ -790,9 +816,9 @@ done = recognition_system.check_recognition_complete()
 
 ---
 
-## 14. Future Directions
+## 15. Future Directions
 
-### 14.1 Coverage-Driven Training with RL Navigation
+### 15.1 Coverage-Driven Training with RL Navigation
 
 **Problem**: Current object model building (in systems like Monty) uses random surface crawling — 14,000 steps per object with uneven coverage.
 
@@ -805,7 +831,7 @@ Three-level goal generation:
 
 **Expected benefit**: ~300 steps per object (vs 14,000) with uniform coverage.
 
-### 14.2 Model-Based Navigation Using Learned Object Models
+### 15.2 Model-Based Navigation Using Learned Object Models
 
 Once a recognition system has a confident hypothesis about object identity, use the learned object model as a **world model** for navigation planning:
 
@@ -813,11 +839,11 @@ Once a recognition system has a confident hypothesis about object identity, use 
 - Waypoint navigation with predicted edge transitions
 - Confidence-gated: fall back to model-free when uncertain
 
-### 14.3 Online Model Enrichment
+### 15.3 Online Model Enrichment
 
 During deployment, add high-quality observations to the object model in real-time. Each recognition episode makes future recognition faster — a self-improving system.
 
-### 14.4 Real Robot Deployment
+### 15.4 Real Robot Deployment
 
 The architecture is designed for this transition:
 
@@ -835,28 +861,9 @@ The `RobotEnvAdapter` implements the same `RLEnvironment` protocol:
 
 ---
 
-## 15. Known Limitations
-
-### Edge Traversal
-The surface snap mechanism struggles at sharp edges (mug rims, cone apex). This is an environment-level problem — even a perfect policy cannot crawl over an edge if the physics engine cannot execute the move. Primary cause of L2 failures on hollow objects.
-
-### Hollow Object Navigation
-The agent doesn't always understand it needs to crawl to the rim rather than toward the goal. When the goal is inside a mug and the agent is outside, the correct strategy is: crawl to rim → cross → descend inside. Q-store may override this with "crawl toward goal" learned from simple objects.
-
-### Air Navigation Stability
-Without surface snap, positioning errors accumulate in air. The flyby correction heuristic is reactive rather than preventive. Landing approach lacks fine depth control.
-
-### Online SAC Adaptation Speed
-Conservative hyperparameters that prevent catastrophic forgetting also prevent fast adaptation. After 20 online SAC updates during 2000 adaptive episodes, improvement was limited.
-
-### Sim-to-Sim Transfer Gap
-14–24% performance gap between trimesh and MuJoCo, primarily from differences in surface normal estimation, collision detection, and snap mechanics. This is the baseline cost that online adaptation is designed to close.
-
----
-
 ## 16. Conclusion
 
-We presented a hybrid RL system for goal-directed 3D surface navigation that combines episodic memory, parametric skills, and geometric heuristics with adaptive arbitration. The system achieves 91% average navigation success, generalizes to unseen objects (83%), and transfers across simulators without retraining (99% on convex YCB objects in MuJoCo).
+We presented a hybrid RL system for goal-directed 3D surface navigation that combines episodic memory, parametric skills, and geometric heuristics with adaptive arbitration. The system achieves 91% average navigation success, generalizes to unseen hollow objects (81%), and transfers across simulators without retraining (74% on YCB objects in MuJoCo).
 
 The case study with Monty demonstrates that replacing teleportation with realistic RL navigation preserves recognition accuracy while enabling directed exploration — the agent learns about objects while navigating, reducing the number of hypothesis-testing goals needed by 23%.
 
